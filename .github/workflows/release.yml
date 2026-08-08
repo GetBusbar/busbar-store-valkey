@@ -79,6 +79,7 @@ jobs:
           out="$(gh release create "${GITHUB_REF_NAME}" \
             --repo "${GITHUB_REPOSITORY}" \
             --title "busbar-store-valkey ${GITHUB_REF_NAME}" \
+            --draft \
             --verify-tag --generate-notes 2>&1)"
           status=$?
           echo "$out"
@@ -231,6 +232,36 @@ jobs:
                  "delete this tag+release, and re-cut." >&2
             exit 1
           fi
+          # NAME GATE. v1.0.4 shipped a COMPLETE 5-asset set that was correctly built, correctly
+          # signed, and completely unloadable: every asset was packed under the retired `redis`
+          # identity, so `store.module: valkey` resolved against nothing and `store.module: redis`
+          # was refused at config load. A count check cannot tell a loadable asset from a present
+          # one, so assert the published stem is EXACTLY the one busbar names
+          # (crates/busbar/src/config/mod.rs STORE_MODULE_VALKEY_ASSET_STEM), for every target the
+          # matrix above builds.
+          ver="${GITHUB_REF_NAME#v}"
+          names="$(gh release view "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json assets --jq '.assets[].name')"
+          echo "$names"
+          for target in aarch64-apple-darwin aarch64-unknown-linux-gnu x86_64-apple-darwin \
+                        x86_64-pc-windows-msvc x86_64-unknown-linux-gnu; do
+            want="busbar-store-valkey-${ver}-${target}.tar.gz"
+            if ! printf '%s\n' "$names" | grep -qx "$want"; then
+              echo "::error::MISNAMED OR MISSING ASSET: expected '${want}' on ${GITHUB_REF_NAME}." \
+                   "busbar resolves the first-party store plugin by the manifest name" \
+                   "'busbar-store-valkey-plugin' and the config alias 'valkey', published as" \
+                   "'busbar-store-valkey-<ver>-<target>.tar.gz'. Anything else is unloadable no" \
+                   "matter how cleanly it built or signed." >&2
+              exit 1
+            fi
+          done
+          # Only now, with assets provably attached, does this stop being a draft and become
+          # the release that `releases/latest` resolves to.
+          gh release edit "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft=false --latest
+          echo "::notice::Published ${GITHUB_REF_NAME} with ${count} asset(s)."
 
   # Instant marketing-site rebuild the moment this plugin ships a real release -- marketing's
   # deploy.yml listens for this exact repository_dispatch event type (plus its own daily-poll

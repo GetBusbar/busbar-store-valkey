@@ -1,6 +1,6 @@
 # store-valkey
 
-**This plugin's version: v1.0.0.** (Independently versioned from busbar
+**This plugin's version: v1.0.5.** (Independently versioned from busbar
 itself — see [Versioning](#versioning) below.)
 
 [![CI](https://github.com/GetBusbar/store-valkey/actions/workflows/ci.yml/badge.svg)](https://github.com/GetBusbar/store-valkey/actions/workflows/ci.yml)
@@ -34,6 +34,11 @@ breaking changes, and neither is silently compatible:
   version floor is recorded under, so the renamed plugin is a *new* identity to
   the loader: it must be installed fresh, and the old floor does not carry
   over. Uninstall `busbar-store-redis-plugin` before installing this.
+- **v1.0.4 and every earlier release are UNLOADABLE by busbar 1.5.3+.** They
+  were published under the retired identity, so both config spellings dead-end:
+  `store.module: valkey` finds no plugin, and `store.module: redis` is refused
+  at config load as a 1.x marker. The first release carrying the loadable
+  identity is **v1.0.5**.
 
 Internally, the lib/plugin crates are `busbar-store-valkey` /
 `busbar-store-valkey-plugin`, the store type is `ValkeyStore`, and the test
@@ -44,7 +49,7 @@ schemes that driver parses. Nothing busbar-owned says "redis" any more.
 
 ## Versioning
 
-This plugin is versioned **independently of busbar** — `v1.0.0` here says
+This plugin is versioned **independently of busbar** — `v1.0.5` here says
 nothing about which busbar release it is. Compatibility with busbar is
 stated separately: **requires busbar 1.5.0+** (the release that ships the
 signed hybrid plugin ABI this crate loads over). Pin both versions
@@ -118,9 +123,9 @@ in busbarAI for the full reference. In short:
 BUSBAR_SIGN_KEY=<signing key> busbar-plugin-pack pack \
     --lib target/release/libbusbar_store_valkey_plugin.so \
     --name busbar-store-valkey-plugin --alias valkey --kind store \
-    --version 1.0.0 --publisher busbar \
+    --version 1.0.5 --publisher busbar \
     --license Apache-2.0 \
-    --out busbar-store-valkey-plugin-1.0.0-x86_64-linux.tar.gz
+    --out busbar-store-valkey-1.0.5-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 For local development without a signing key, `busbar-plugin-pack pack
