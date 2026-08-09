@@ -69,8 +69,8 @@
 //! operators wanting bounded growth reap old `busbar:usage:*` keys on their own retention schedule.
 
 use busbar_api::{
-    AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens, Store,
-    StoreError, StoreResult, TierTokens, UsageDelta, UsageLedger, VirtualKey,
+    AuditRecord, CredentialMeta, CredentialSecret, McpCallRecord, MeteringDelta, MeteringRow,
+    ModelTokens, Store, StoreError, StoreResult, TierTokens, UsageDelta, UsageLedger, VirtualKey,
 };
 use redis::{Commands, Connection};
 use std::sync::Mutex;
@@ -89,6 +89,41 @@ const CRED_PUB_PREFIX: &str = "busbar:cred:pub:";
 const CRED_ID_PREFIX: &str = "busbar:cred:id:";
 const CREDS_BYREV: &str = "busbar:creds:byrev";
 const AUDIT_ZSET: &str = "busbar:audit";
+
+// ── THE DURABLE MCP TOOL-CALL LOG ────────────────────────────────────────────────────────────
+//
+// A DIFFERENT POPULATION from the audit log, kept in its own keyspace on purpose: the audit log is
+// the low-rate admin MUTATION log whose engine-side working set is a bounded ring, while a tool call
+// is data-plane traffic at request rate. Sharing one keyspace means a busy afternoon of tool calls
+// evicts every admin row, so the question of who changed a registration becomes unanswerable exactly
+// when an incident makes somebody ask.
+//
+// The chain is scoped to the PRINCIPAL, so there is ONE ZSET PER PRINCIPAL, scored by `seq`: a
+// global chain would serialise every caller behind one append and would make one caller's evidence
+// unverifiable without possessing every other caller's records. Scoring by `seq` is what makes the
+// per-principal read come back in chain order for free, which is the order the engine verifies in.
+//
+// This backend has no columns, so the "opaque body plus index columns" shape of the SQL backends
+// becomes: the member IS the whole record as JSON (the store never interprets it), and the two
+// things a query needs that JSON cannot answer get their own index structures below.
+const MCP_CALLS_PREFIX: &str = "busbar:mcp:calls:";
+/// Every principal holding at least one record — the boot enumeration. A SET, because a restart has
+/// to resume a chain for a principal this process has not yet seen, and scanning the keyspace for
+/// that answer would be O(keyspace) on the hot path of a boot.
+const MCP_PRINCIPALS_SET: &str = "busbar:mcp:principals";
+/// The RETENTION INDEX: a ZSET scored by `ts`, whose members name `(seq, principal)`. Retention is
+/// global by timestamp and the per-principal sets are scored by `seq`, so without this a purge would
+/// have to read every principal's entire chain to find what aged out. `-inf`..`(before` is exactly
+/// the strictly-older-than the contract specifies.
+const MCP_CALLS_BY_TS: &str = "busbar:mcp:byts";
+/// Separator joining `seq` and `principal` inside a retention-index member. U+0001 rather than `:`
+/// because a busbar key id is caller-visible and may itself contain a colon; a separator that can
+/// occur in the data is a parser that silently mis-splits.
+const MCP_TS_MEMBER_SEP: char = '\u{1}';
+
+fn mcp_calls_key(principal: &str) -> String {
+    format!("{MCP_CALLS_PREFIX}{principal}")
+}
 /// The signed-token REVOCATION denylist (1.5.0). `busbar:denylist:<sub>` holds the operator reason
 /// (a plain string), and `busbar:denylist` is a SET indexing every denied sub so `list_denylist` is
 /// a SMEMBERS.
@@ -1289,6 +1324,101 @@ impl Store for ValkeyStore {
             out.push(rec);
         }
         Ok(out)
+    }
+
+    fn append_mcp_call(&self, record: &McpCallRecord) -> StoreResult<()> {
+        let json = serde_json::to_string(record)
+            .map_err(|e| StoreError(format!("mcp call encode failed: {e}")))?;
+        let key = mcp_calls_key(&record.principal);
+        let score = clamp(record.seq);
+        // Is this sequence already occupied for this principal? The per-principal set is scored by
+        // seq, so the incumbent (if any) is the single member at exactly this score.
+        let incumbent: Vec<String> =
+            self.with_conn(|c| c.zrangebyscore(key.clone(), score, score))?;
+        if let Some(existing) = incumbent.first() {
+            // BYTE-IDENTICAL is the at-least-once retry and is success. DIFFERENT is a forked or
+            // tampered log and is an error: overwriting would destroy exactly the case worth
+            // reporting, and this store never restates a digest it was handed.
+            if existing == &json {
+                return Ok(());
+            }
+            // Names the sequence and nothing else — it must not echo stored (or caller) content.
+            return Err(StoreError(format!(
+                "mcp call log fork: a different record is already persisted at sequence {} for this principal",
+                record.seq
+            )));
+        }
+        let ts_member = format!("{}{MCP_TS_MEMBER_SEP}{}", record.seq, record.principal);
+        // One atomic pipeline: the record, the principal enumeration and the retention index must
+        // land together or not at all. A record present in the chain but absent from the retention
+        // index would never age out; present in the index but absent from the chain would make a
+        // purge report a deletion it did not perform.
+        self.with_conn(|c| {
+            redis::pipe()
+                .atomic()
+                .zadd(key.clone(), &json, score)
+                .ignore()
+                .sadd(MCP_PRINCIPALS_SET, &record.principal)
+                .ignore()
+                .zadd(MCP_CALLS_BY_TS, &ts_member, clamp(record.ts))
+                .ignore()
+                .query(c)
+        })
+    }
+
+    fn list_mcp_calls(&self, principal: &str) -> StoreResult<Vec<McpCallRecord>> {
+        // Scored by seq, so ZRANGE returns the chain in the order the engine verifies it in.
+        let members: Vec<String> = self.with_conn(|c| c.zrange(mcp_calls_key(principal), 0, -1))?;
+        let mut out = Vec::with_capacity(members.len());
+        for m in members {
+            let rec: McpCallRecord = serde_json::from_str(&m)
+                .map_err(|e| StoreError(format!("mcp call decode failed: {e}")))?;
+            out.push(rec);
+        }
+        Ok(out)
+    }
+
+    fn list_mcp_call_principals(&self) -> StoreResult<Vec<String>> {
+        let mut principals: Vec<String> = self.with_conn(|c| c.smembers(MCP_PRINCIPALS_SET))?;
+        // A SET has no order; sort so the enumeration is deterministic across calls and nodes.
+        principals.sort();
+        Ok(principals)
+    }
+
+    fn purge_mcp_calls_before(&self, before: u64) -> StoreResult<u64> {
+        // `(before` is an EXCLUSIVE upper bound: strictly older than, exactly as the contract says,
+        // so a record sitting exactly at the cutoff is kept. Expressed as an exclusive range rather
+        // than `before - 1` because the latter underflows at zero.
+        let doomed: Vec<String> = self.with_conn(|c| {
+            c.zrangebyscore(MCP_CALLS_BY_TS, "-inf", format!("({}", clamp(before)))
+        })?;
+        if doomed.is_empty() {
+            return Ok(0);
+        }
+        let mut removed = 0u64;
+        for member in &doomed {
+            let Some((seq, principal)) = member.split_once(MCP_TS_MEMBER_SEP) else {
+                continue;
+            };
+            let Ok(seq) = seq.parse::<i64>() else {
+                continue;
+            };
+            let key = mcp_calls_key(principal);
+            // Remove the record itself, then its retention-index entry. The count REPORTED is the
+            // count the chain actually lost, taken from the ZREMRANGEBYSCORE reply — never from the
+            // size of the candidate list, which would over-report if a concurrent purge got there
+            // first.
+            let n: u64 = self.with_conn(|c| c.zrembyscore(key.clone(), seq, seq))?;
+            self.with_conn(|c| c.zrem::<_, _, ()>(MCP_CALLS_BY_TS, member))?;
+            removed += n;
+            // A principal whose chain is now empty leaves the enumeration, or a boot would keep
+            // resuming a chain that no longer has anything in it.
+            let left: u64 = self.with_conn(|c| c.zcard(key.clone()))?;
+            if left == 0 {
+                self.with_conn(|c| c.srem::<_, _, ()>(MCP_PRINCIPALS_SET, principal))?;
+            }
+        }
+        Ok(removed)
     }
 
     fn add_denylist(&self, sub: &str, reason: &str) -> StoreResult<()> {
