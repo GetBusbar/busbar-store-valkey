@@ -896,20 +896,18 @@ fn connect_refuses_to_start_under_an_eviction_policy() {
     );
 }
 
-// ── migrate() / with_conn retry — mutation-testing coverage gaps (round: cargo-mutants) ───────
+// ── migrate() / with_conn retry: guards on two predicates in `store-valkey/src/lib.rs` ─────────
 //
-// `cargo-mutants` against `store-valkey/src/lib.rs` found four real coverage gaps (no production
-// bug — the existing logic is correct, but nothing in the suite would have caught it breaking):
-//   - `migrate()`'s `version >= SCHEMA_VERSION` early-return guard (mutating `>=` to `<` survived
-//     every existing test) — nothing exercised a SECOND `connect()` against an
-//     already-migrated namespace, which is exactly the case that guard exists to protect: without
-//     it, every reconnect would wipe the entire shared `busbar:*` keyspace.
-//   - `run()`'s `retry && is_connection_error(&e)` match guard (mutating it to `true`, `false`, or
-//     `retry || is_connection_error(&e)` all survived) — nothing exercised either half of the
-//     condition independently: a non-connection error under `retry: true` (must NOT retry) or a
-//     genuine connection-level error (must retry and transparently recover).
+// The logic these pin is correct; what was missing was anything that would fail if it broke. Both
+// predicates are silent in normal operation and catastrophic when wrong:
+//   - `migrate()`'s `version >= SCHEMA_VERSION` early return. If that comparison were inverted, a
+//     SECOND `connect()` against an already-migrated namespace would wipe the entire shared
+//     `busbar:*` keyspace on every reconnect.
+//   - `run()`'s `retry && is_connection_error(&e)` match guard. Each half must hold on its own: a
+//     non-connection error under `retry: true` must NOT be retried, and a genuine connection-level
+//     error must be retried and transparently recovered.
 
-/// Kills the `version >= SCHEMA_VERSION` -> `version < SCHEMA_VERSION` mutant: a second
+/// Pins the `version >= SCHEMA_VERSION` early return against inversion: a second
 /// `connect()` (fresh `ValkeyStore`, fresh internal `migrate()` call) against a namespace already
 /// at the current schema version must be a pure no-op, not a full `busbar:*` wipe.
 #[test]
@@ -932,9 +930,9 @@ fn reconnecting_to_an_already_migrated_namespace_does_not_wipe_existing_data() {
     );
 }
 
-/// Kills the `true` and `retry || is_connection_error(&e)` mutants: a deterministic
-/// NON-connection error (`WRONGTYPE`, from issuing `LPUSH` against a string-valued key) under
-/// `with_conn` (`retry: true`) must surface directly via the `"command"` error context, never
+/// Pins the `retry && is_connection_error(&e)` guard against a constant-true or `||` form. A
+/// deterministic NON-connection error (`WRONGTYPE`, from issuing `LPUSH` against a string-valued
+/// key) under `with_conn` (`retry: true`) must surface directly via the `"command"` error context, never
 /// silently retry — a retry would issue the exact same doomed command again and report it via the
 /// `"retry after reconnect"` context instead, which is what this test would see if the guard ever
 /// stopped checking `is_connection_error` at all.
@@ -960,9 +958,9 @@ fn with_conn_does_not_retry_a_non_connection_error() {
     store.with_conn(|c| c.del::<_, ()>(&k)).unwrap();
 }
 
-/// Kills the `false` mutant: a genuine connection-level error (the server killing our connection
-/// out from under us — the real-world case `with_conn`'s reconnect-and-retry exists for) must be
-/// transparently recovered, not surfaced to the caller.
+/// Pins the retry half of the guard: a genuine connection-level error (the server killing our
+/// connection out from under us, the real-world case `with_conn`'s reconnect-and-retry exists for)
+/// must be transparently recovered, not surfaced to the caller.
 #[test]
 fn with_conn_transparently_reconnects_after_the_connection_is_dropped() {
     let Some(store) = live_store() else { return };
