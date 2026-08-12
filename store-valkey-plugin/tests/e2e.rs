@@ -25,7 +25,7 @@
 //! `VALKEY_URL` is a HARD FAILURE, never a silent skip, so the only over-the-ABI coverage of the
 //! durable Valkey store path cannot quietly vanish.
 
-use busbar_api::{ModelTokens, Store, TierTokens, UsageLedger, VirtualKey};
+use busbar_api::{McpCallRecord, ModelTokens, Store, TierTokens, UsageLedger, VirtualKey};
 use busbar_plugin_loader::{load_store, plugin_library_filename};
 use busbar_store_valkey::ValkeyStore;
 use std::path::PathBuf;
@@ -36,16 +36,106 @@ use std::time::{Duration, Instant};
 /// explicit signing key to mint virtual keys; busbar no longer auto-generates one.
 const TEST_SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-/// Locate the built `busbar_store_valkey_plugin` cdylib in the target dir, derived from the test
-/// binary's own path (robust to a custom `CARGO_TARGET_DIR`). `None` if it hasn't been built —
-/// under `cargo test` (which builds the whole package including the cdylib target before running
-/// tests) it is always present, so this only guards against unusual invocations.
-fn plugin_path() -> Option<std::path::PathBuf> {
-    let exe = std::env::current_exe().ok()?; // .../target/<profile>/deps/e2e-<hash>
-    let profile_dir = exe.parent()?.parent()?; // .../target/<profile>
+/// Locate the cdylib THIS `cargo test` invocation just built — never a leftover artifact.
+///
+/// This looks ONLY in `target/<profile>/deps/`, never `target/<profile>/`, and that distinction is
+/// the whole point of this function.
+///
+/// `cargo` emits the lib target's cdylib into `deps/` as part of the very build graph that produces
+/// this test binary (this package's lib unit is compiled with BOTH declared crate-types — see
+/// `[lib] crate-type = ["cdylib", "rlib"]` in Cargo.toml), so `deps/libbusbar_store_valkey_plugin.dylib` is by construction up to
+/// date with the source tree under test. Cargo only *uplifts* a copy to `target/<profile>/` for
+/// `cargo build`, NEVER for `cargo test`. A lookup in `target/<profile>/` therefore reads an
+/// artifact that nothing in this test's dependency graph refreshes: whatever some earlier `cargo
+/// build` left there, from any commit — or nothing at all.
+///
+/// Both outcomes of that are lies about durability, and the second is the dangerous one:
+///   * NOTHING there  -> the old code `return`ed with a "skip:" line and reported GREEN. That is how
+///     `cargo test` can pass with ZERO over-the-ABI coverage of the durable store path.
+///   * STALE artifact -> a cdylib built before an ABI change answers every write `Ok(())` and every
+///     read empty, which is BYTE-FOR-BYTE the signature of the unrelayed-seam defect this file
+///     exists to catch (that defect was real: `DynStore`'s `impl Store` overrode 24 methods, none of
+///     them the task/call-log methods, so `put_task` took the accept-and-keep-nothing trait
+///     default). RED on a stale artifact is indistinguishable from RED on the real bug — and an
+///     artifact NEWER than a regression reports GREEN while the shipped ABI is broken. Proven, not
+///     theorised: with a regressed plugin in the tree and a good cdylib in `target/debug/`, the old
+///     lookup passed and this one fails.
+///
+/// Same hazard, and the same reasoning, as the engine's `crates/busbar/Cargo.toml` dev-dependency on
+/// `busbar-store-example-plugin`: keep the cdylib in the build graph so no test can judge a stale
+/// one. Here the plugin's lib IS this package, so that graph edge already exists — what was missing
+/// was reading the artifact that edge actually produces.
+///
+/// Panics rather than skipping: a missing cdylib under `cargo test` means the build graph changed
+/// shape, and the only honest report of that is a failure, not a silent pass.
+/// The newest mtime across every workspace crate's `src/` — "how fresh must a cdylib be to be the
+/// one this source tree describes".
+///
+/// Deliberately ONLY `src/**/*.rs` of each workspace member: editing a `tests/` file or a
+/// `[dev-dependencies]` line recompiles the test binary but NOT the lib, so including those would
+/// fail a perfectly current cdylib.
+fn newest_source_mtime() -> std::time::SystemTime {
+    fn walk(dir: &std::path::Path, newest: &mut std::time::SystemTime) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, newest);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
+                    if m > *newest {
+                        *newest = m;
+                    }
+                }
+            }
+        }
+    }
+    let ws_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the plugin crate always sits under the workspace root");
+    let mut newest = std::time::SystemTime::UNIX_EPOCH;
+    for e in std::fs::read_dir(ws_root).into_iter().flatten().flatten() {
+        let src = e.path().join("src");
+        if src.is_dir() {
+            walk(&src, &mut newest);
+        }
+    }
+    newest
+}
+
+fn plugin_path() -> PathBuf {
+    let exe = std::env::current_exe().expect("current_exe"); // .../target/<profile>/deps/<test>-<hash>
+    let deps_dir = exe.parent().expect("the test binary always lives in deps/");
     let name = plugin_library_filename("busbar_store_valkey_plugin");
-    let candidate = profile_dir.join(&name);
-    candidate.exists().then_some(candidate)
+    let fresh = deps_dir.join(&name);
+    assert!(
+        fresh.exists(),
+        "the store-valkey-plugin cdylib is not at {}, where cargo emits it for the same build that produced \
+         this test binary. Refusing to fall back to target/<profile>/ (an artifact only `cargo \
+         build` refreshes) or to skip: judging a stale cdylib is exactly how an unrelayed plugin \
+         ABI reads as green.",
+        fresh.display()
+    );
+    // FRESHNESS, ASSERTED — not assumed. Under `cargo test` the artifact above is rebuilt by the
+    // same graph that built this binary (proven: delete it, re-run, cargo re-emits it). But this
+    // test binary can also be executed DIRECTLY out of `deps/`, where nothing rebuilds anything,
+    // and a stale cdylib there produces empty reads — indistinguishable from the unrelayed-ABI
+    // defect. So compare it against the sources and fail with a message that says STALE ARTIFACT,
+    // explicitly NOT a durability verdict.
+    let built = std::fs::metadata(&fresh)
+        .and_then(|m| m.modified())
+        .expect("cdylib mtime");
+    let newest_src = newest_source_mtime();
+    assert!(
+        built >= newest_src,
+        "STALE ARTIFACT — THIS IS NOT A DURABILITY FAILURE. {} predates this workspace's sources, \
+         so it cannot answer for the code in the tree; a pre-change cdylib returns empty for every \
+         read, which reads exactly like an unrelayed plugin ABI. Run `cargo build -p {}` (or just \
+         `cargo test`, which rebuilds it) and re-run.",
+        fresh.display(),
+        "busbar-store-valkey-plugin"
+    );
+    fresh
 }
 
 /// The live `VALKEY_URL`, mirroring `busbar-store-valkey`'s own `live_store()` gating discipline
@@ -116,34 +206,47 @@ fn ledger() -> UsageLedger {
 /// This is the proof that `store: valkey` operations over the ABI aren't silently no-ops.
 #[test]
 fn load_and_exercise_valkey_plugin_persists_to_real_valkey_across_reopen() {
-    let Some(path) = plugin_path() else {
-        eprintln!("skip: valkey plugin cdylib not built (run under `cargo test`)");
-        return;
-    };
+    let path = plugin_path();
     let Some(url) = valkey_url() else {
         return;
     };
     let cfg = serde_json::json!({ "url": url }).to_string();
 
     // Isolate from any prior run against a persistent (non-CI) Valkey instance.
+    //
+    // A FRESH ID PER RUN, not a fixed one plus a `delete_key`: `delete_key` TOMBSTONES the row (it
+    // is a soft delete by contract — see `Store::delete_key`), so `get_key` still answers with it
+    // afterwards. Against a re-used Valkey that made this test pass even when the plugin's
+    // `put_key` wrote NOTHING at all: every read below was satisfied by the previous run's row.
+    // Proven, not theorised — a `put_key` stubbed to `Ok(())` passed this test against a re-used
+    // instance and failed it against a flushed one. A per-run id makes every read here answerable
+    // only by THIS run's writes.
     let direct = ValkeyStore::connect(&url).expect("connect directly to seed/clean up");
-    let _ = Store::delete_key(&direct, "vk_e2e_dlopen");
+    let vk_id = format!(
+        "vk_e2e_dlopen_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let vk_id = vk_id.as_str();
 
-    let vk = key("vk_e2e_dlopen");
+    let vk = key(vk_id);
 
     {
         let store = load_store(&path, &cfg).expect("load valkey plugin against a real Valkey");
         store.put_key(&vk).expect("put_key over the ABI");
         store
-            .put_usage("vk_e2e_dlopen", 200, &ledger())
+            .put_usage(vk_id, 200, &ledger())
             .expect("put_usage over the ABI");
         assert_eq!(
             store
-                .get_key("vk_e2e_dlopen")
+                .get_key(vk_id)
                 .expect("get_key over the ABI")
                 .expect("present in the same session")
                 .id,
-            "vk_e2e_dlopen"
+            vk_id
         );
         // `store` (and the `RawPlugin` it wraps) drops here, running `busbar_close` and dropping
         // the plugin's own `ValkeyStore`/connection — the data must be durably in Valkey after
@@ -155,13 +258,13 @@ fn load_and_exercise_valkey_plugin_persists_to_real_valkey_across_reopen() {
     // on the first instance still being alive.
     let reopened = load_store(&path, &cfg).expect("re-load valkey plugin against the same URL");
     let got = reopened
-        .get_key("vk_e2e_dlopen")
+        .get_key(vk_id)
         .expect("get_key after reopen")
         .expect("the key must survive a full plugin close + reopen against the same Valkey");
     assert_eq!(got.group.as_deref(), Some("infra"));
     assert_eq!(got.labels.get("env").map(String::as_str), Some("e2e"));
     let usage = reopened
-        .get_usage("vk_e2e_dlopen", 200)
+        .get_usage(vk_id, 200)
         .expect("get_usage after reopen");
     assert_eq!(usage.requests, 5, "usage ledger must survive the reopen");
     let t = usage
@@ -175,7 +278,7 @@ fn load_and_exercise_valkey_plugin_persists_to_real_valkey_across_reopen() {
     // plugin's `put_key`/`put_usage` over the ABI were silent no-ops (or wrote somewhere other
     // than the configured Valkey), this independent reader would come back empty even though the
     // reopen-via-plugin check above passed.
-    let direct_key = Store::get_key(&direct, "vk_e2e_dlopen")
+    let direct_key = Store::get_key(&direct, vk_id)
         .expect("get_key via the direct connection")
         .expect("the key must be physically present in Valkey, bypassing the plugin");
     assert_eq!(direct_key.name, "e2e-dlopen-key");
@@ -183,14 +286,14 @@ fn load_and_exercise_valkey_plugin_persists_to_real_valkey_across_reopen() {
         direct_key.allowed_scopes,
         Some(vec![busbar_api::ScopeRef::pool("p")])
     );
-    let direct_usage = Store::get_usage(&direct, "vk_e2e_dlopen", 200)
+    let direct_usage = Store::get_usage(&direct, vk_id, 200)
         .expect("get_usage via the direct connection");
     assert_eq!(
         direct_usage.requests, 5,
         "usage must be physically present in Valkey, not just cached in-process by the plugin"
     );
 
-    let _ = Store::delete_key(&direct, "vk_e2e_dlopen");
+    let _ = Store::delete_key(&direct, vk_id);
 }
 
 /// END-TO-END FAILURE: an `open()` config that cannot produce a usable store — malformed JSON, a
@@ -199,10 +302,7 @@ fn load_and_exercise_valkey_plugin_persists_to_real_valkey_across_reopen() {
 /// case here fails before (or instead of) actually connecting.
 #[test]
 fn load_and_exercise_valkey_plugin_bad_config_fails_over_abi() {
-    let Some(path) = plugin_path() else {
-        eprintln!("skip: valkey plugin cdylib not built (run under `cargo test`)");
-        return;
-    };
+    let path = plugin_path();
 
     let err = load_store(&path, "{ not json")
         .err()
@@ -356,10 +456,7 @@ fn admin_test_valkey_url(base: &str) -> String {
 fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
     let Some(base_url) = valkey_url() else { return };
     let url = admin_test_valkey_url(&base_url);
-    let Some(so_path) = plugin_path() else {
-        eprintln!("skip: valkey plugin cdylib not built");
-        return;
-    };
+    let so_path = plugin_path();
 
     // Isolate from any prior run against a persistent (non-CI) Valkey instance.
     let direct = ValkeyStore::connect(&url).expect("connect directly to seed/clean up");
@@ -660,4 +757,182 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
 
     let _ = Store::delete_key(&direct, &key_id);
     let _ = std::fs::remove_dir_all(&work);
+}
+
+/// THE DURABILITY PROOF FOR THE FOUR MCP CALL-LOG METHODS, OVER THE REAL PLUGIN PATH.
+///
+/// This repo ships `feat/durable-mcp-call-log` — `append_mcp_call`/`list_mcp_calls`/
+/// `list_mcp_call_principals`/`purge_mcp_calls_before` against a real Valkey. Every existing test of
+/// those four calls `ValkeyStore` DIRECTLY, in-process, and NONE of them can see the failure that
+/// actually matters in production, because in production this backend is ONLY ever reached as a
+/// plugin: conformance boots the in-process RAM store, so the plugin seam is the only path a real
+/// deployment takes and was, until this test, the one path with zero coverage of these methods.
+///
+/// `busbar_api::Store` DEFAULTS all ten task/call-log methods to accept-and-keep-nothing. A plugin
+/// seam that does not RELAY them silently substitutes those defaults: every `append_mcp_call`
+/// returns `Ok`, every `list_mcp_calls` answers empty, and a deployment loses every tool-call record
+/// while reporting success. That is not hypothetical — the ABI once carried four store methods while
+/// the trait carried ten, so exactly this happened. A unit test passing while the ABI drops every
+/// write is the precise shape this test exists to make impossible.
+///
+/// So it goes through `busbar_plugin_loader::load_store`: a REAL `dlopen` of the built cdylib, the
+/// real C ABI, the real `DynStore`. It writes AT ARITY > 1 (three chained records for one principal
+/// and one for a second), DROPS the handle — which runs `busbar_close` and UNLOADS the library, so
+/// nothing this process still holds can answer the reads — then `dlopen`s AGAIN over the same file
+/// and reads everything back. A restart is what proves durability; a single-row same-session round
+/// trip would not distinguish a relayed method from a lucky trait default, and a multi-row one
+/// across an unload/reload cannot be faked by either.
+///
+/// A third leg reads the same rows through the plain `ValkeyStore`, never touching the cdylib, the
+/// C ABI or the loader — so a plugin that answered from its own in-process cache still fails here.
+#[test]
+fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
+    let path = plugin_path();
+    let Some(url) = valkey_url() else {
+        return;
+    };
+    let cfg = serde_json::json!({ "url": url }).to_string();
+
+    // Start from an EMPTY call log. `list_mcp_call_principals` and `purge_mcp_calls_before` are
+    // GLOBAL, not per-principal, so against a re-used Valkey a leftover chain from an earlier run
+    // would make both of their exact assertions below meaningless. `purge_mcp_calls_before(MAX)` is
+    // the store's own contract-level wipe (it also drops each emptied principal from the
+    // enumeration — see `ValkeyStore::purge_mcp_calls_before`), so this needs no key-pattern
+    // guesswork. No other test in this file touches the `busbar:mcp:*` namespace.
+    let direct = ValkeyStore::connect(&url).expect("connect directly to clean up and verify");
+    Store::purge_mcp_calls_before(&direct, u64::MAX).expect("wipe the call log before this run");
+
+    // Per-run principal ids, for the same reason the key test uses one: a read that only THIS run's
+    // writes can answer. Two of them, because one principal's chain leaking into another's is a real
+    // defect class (this repo fixed a case-folding instance of it) and a single-principal test is
+    // blind to it.
+    let stamp = format!(
+        "{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let p_main = format!("vk_abi_main_{stamp}");
+    let p_other = format!("vk_abi_other_{stamp}");
+
+    let call = |principal: &str, seq: u64, prev: &str, hash: &str| McpCallRecord {
+        principal: principal.to_string(),
+        seq,
+        ts: 2_000 + seq,
+        server: "srv".to_string(),
+        tool: "srv_read_file".to_string(),
+        outcome: "dispatched".to_string(),
+        reason: String::new(),
+        tool_digest: format!("sha256:tool{seq}"),
+        pin_generation: 3,
+        request_id: format!("req-{seq}"),
+        prev_hash: prev.to_string(),
+        hash: hash.to_string(),
+    };
+
+    {
+        // BOOT 1 — a real dlopen of the cdylib; every call below crosses the C ABI.
+        let store = load_store(&path, &cfg).expect("the valkey plugin must load over the real ABI");
+        for (seq, prev, hash) in [(1_u64, "", "h1"), (2, "h1", "h2"), (3, "h2", "h3")] {
+            store
+                .append_mcp_call(&call(&p_main, seq, prev, hash))
+                .expect("append_mcp_call over the ABI");
+        }
+        store
+            .append_mcp_call(&call(&p_other, 1, "", "o1"))
+            .expect("append_mcp_call over the ABI");
+        // Dropping the boxed store drops the loader's `Library` handle: `busbar_close` runs and the
+        // dylib is UNLOADED. Nothing this process still holds can be answering the reads below.
+        drop(store);
+    }
+
+    // BOOT 2 — a second, independent dlopen over the same file, a fresh `busbar_open`, a fresh
+    // connection inside the plugin.
+    let store = load_store(&path, &cfg).expect("the valkey plugin must load again over the real ABI");
+
+    let calls = store.list_mcp_calls(&p_main).expect("list_mcp_calls");
+    assert_eq!(
+        calls.iter().map(|c| c.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "the per-principal call chain must survive the unload/reload over the plugin ABI in chain \
+         order; got {} record(s) back, which is the accept-and-keep-nothing shape of the trait \
+         default an unrelayed seam substitutes",
+        calls.len()
+    );
+    for w in calls.windows(2) {
+        assert_eq!(
+            w[1].prev_hash, w[0].hash,
+            "the chain must still link after the reload: seq {} carries prev_hash {:?} but seq {} \
+             persisted hash {:?}",
+            w[1].seq, w[1].prev_hash, w[0].seq, w[0].hash
+        );
+    }
+    // Every non-indexed field rides the `body` blob; a relay that dropped it would still satisfy a
+    // seq-only check.
+    assert_eq!(calls[2].tool_digest, "sha256:tool3");
+    assert_eq!(calls[2].request_id, "req-3");
+    assert_eq!(calls[2].tool, "srv_read_file");
+    assert_eq!(calls[2].outcome, "dispatched");
+    assert_eq!(calls[1].pin_generation, 3);
+    assert_eq!(
+        store
+            .list_mcp_calls(&p_other)
+            .expect("list_mcp_calls")
+            .len(),
+        1,
+        "one principal's chain must not carry another's records"
+    );
+
+    let principals = store
+        .list_mcp_call_principals()
+        .expect("list_mcp_call_principals");
+    assert_eq!(
+        principals,
+        vec![p_main.clone(), p_other.clone()],
+        "the boot enumeration must name every principal holding records, exactly once each, sorted"
+    );
+
+    // Retention crosses the ABI too, COUNT AND ALL — checked for the number it ACTUALLY removed,
+    // because a relay that dropped the return value would read as 0 and look like a no-op sweep.
+    assert_eq!(
+        store.purge_mcp_calls_before(2_002).expect("purge"),
+        2,
+        "both records at ts 2001 go (one per principal); the one sitting exactly at the cutoff stays"
+    );
+    assert_eq!(
+        store
+            .list_mcp_calls(&p_main)
+            .expect("list_mcp_calls")
+            .len(),
+        2
+    );
+    assert!(store
+        .list_mcp_calls(&p_other)
+        .expect("list_mcp_calls")
+        .is_empty());
+    assert_eq!(
+        store
+            .list_mcp_call_principals()
+            .expect("list_mcp_call_principals"),
+        vec![p_main.clone()],
+        "a principal whose chain the sweep emptied must leave the enumeration, or a boot keeps \
+         resuming a chain with nothing in it"
+    );
+    drop(store);
+
+    // LEG 3 — read the surviving rows through the plain `ValkeyStore`, a code path that never
+    // touches the cdylib, the C ABI or the loader. A plugin answering the reads above out of its
+    // own in-process state (rather than Valkey) passes both boots and fails here.
+    let direct_calls =
+        Store::list_mcp_calls(&direct, &p_main).expect("list_mcp_calls via the direct connection");
+    assert_eq!(
+        direct_calls.iter().map(|c| c.seq).collect::<Vec<_>>(),
+        vec![2, 3],
+        "the records must be physically present in Valkey, not just cached in-process by the plugin"
+    );
+    assert_eq!(direct_calls[1].hash, "h3");
+
+    Store::purge_mcp_calls_before(&direct, u64::MAX).expect("clean up this run's records");
 }

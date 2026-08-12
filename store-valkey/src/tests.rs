@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 use super::*;
-use busbar_api::SecretForm;
+use busbar_api::{McpCallRecord, SecretForm};
 
 /// The password-scrub never lets the URL secret out in an error string, and the URL password
 /// extractor handles every URL shape.
@@ -941,19 +941,18 @@ fn connect_refuses_to_start_under_an_eviction_policy() {
     );
 }
 
-// ── migrate() / with_conn retry — guards for two predicates the broader tests do not pin ──────
+// ── migrate() / with_conn retry: guards on two predicates in `store-valkey/src/lib.rs` ─────────
 //
-// Both predicates below are correct today, but nothing else in the suite would notice them
-// breaking:
-//   - `migrate()`'s `version >= SCHEMA_VERSION` early-return guard. Nothing else exercises a
-//     SECOND `connect()` against an already-migrated namespace, which is exactly the case that
-//     guard exists to protect: without it, every reconnect would wipe the entire shared
-//     `busbar:*` keyspace.
-//   - `run()`'s `retry && is_connection_error(&e)` match guard. Nothing else exercises either half
-//     of the condition independently: a non-connection error under `retry: true` (must NOT retry)
-//     or a genuine connection-level error (must retry and transparently recover).
+// The logic these pin is correct; what was missing was anything that would fail if it broke. Both
+// predicates are silent in normal operation and catastrophic when wrong:
+//   - `migrate()`'s `version >= SCHEMA_VERSION` early return. If that comparison were inverted, a
+//     SECOND `connect()` against an already-migrated namespace would wipe the entire shared
+//     `busbar:*` keyspace on every reconnect.
+//   - `run()`'s `retry && is_connection_error(&e)` match guard. Each half must hold on its own: a
+//     non-connection error under `retry: true` must NOT be retried, and a genuine connection-level
+//     error must be retried and transparently recovered.
 
-/// Pins the `version >= SCHEMA_VERSION` early return specifically: a second
+/// Pins the `version >= SCHEMA_VERSION` early return against inversion: a second
 /// `connect()` (fresh `ValkeyStore`, fresh internal `migrate()` call) against a namespace already
 /// at the current schema version must be a pure no-op, not a full `busbar:*` wipe.
 #[test]
@@ -976,9 +975,9 @@ fn reconnecting_to_an_already_migrated_namespace_does_not_wipe_existing_data() {
     );
 }
 
-/// Pins the `&&` in `retry && is_connection_error(&e)`: a deterministic
-/// NON-connection error (`WRONGTYPE`, from issuing `LPUSH` against a string-valued key) under
-/// `with_conn` (`retry: true`) must surface directly via the `"command"` error context, never
+/// Pins the `retry && is_connection_error(&e)` guard against a constant-true or `||` form. A
+/// deterministic NON-connection error (`WRONGTYPE`, from issuing `LPUSH` against a string-valued
+/// key) under `with_conn` (`retry: true`) must surface directly via the `"command"` error context, never
 /// silently retry — a retry would issue the exact same doomed command again and report it via the
 /// `"retry after reconnect"` context instead, which is what this test would see if the guard ever
 /// stopped checking `is_connection_error` at all.
@@ -1004,10 +1003,9 @@ fn with_conn_does_not_retry_a_non_connection_error() {
     store.with_conn(|c| c.del::<_, ()>(&k)).unwrap();
 }
 
-/// Pins the other half of that guard: a genuine connection-level error (the server killing our
-/// connection
-/// out from under us — the real-world case `with_conn`'s reconnect-and-retry exists for) must be
-/// transparently recovered, not surfaced to the caller.
+/// Pins the retry half of the guard: a genuine connection-level error (the server killing our
+/// connection out from under us, the real-world case `with_conn`'s reconnect-and-retry exists for)
+/// must be transparently recovered, not surfaced to the caller.
 #[test]
 fn with_conn_transparently_reconnects_after_the_connection_is_dropped() {
     let Some(store) = live_store() else { return };
@@ -1394,4 +1392,232 @@ fn a_refused_transaction_does_not_swallow_the_next_write() {
 
     let _ = store.purge_audit_seq_for_test(seq);
     let _ = store.purge_audit_seq_for_test(seq + 1);
+}
+
+// ── THE DURABLE MCP TOOL-CALL LOG ────────────────────────────────────────────────────────────
+//
+// The property under test is not "the write returned Ok" — the trait's default `append_mcp_call`
+// returns `Ok(())` and keeps nothing, so a write's return value is worthless as evidence of
+// durability. The only honest way to know a deployment has durable call evidence is to READ IT
+// BACK, and the only honest way to know it survives a deploy is to read it back on a NEW
+// CONNECTION after the writing store is gone.
+
+fn sample_call(principal: &str, seq: u64, ts: u64, prev_hash: &str, hash: &str) -> McpCallRecord {
+    McpCallRecord {
+        principal: principal.to_string(),
+        seq,
+        ts,
+        server: "srv".to_string(),
+        tool: "srv_read_file".to_string(),
+        outcome: "dispatched".to_string(),
+        reason: String::new(),
+        tool_digest: format!("sha256:tool{seq}"),
+        pin_generation: 3,
+        request_id: format!("req-{seq}"),
+        prev_hash: prev_hash.to_string(),
+        hash: hash.to_string(),
+    }
+}
+
+/// THE TEST THAT MATTERS. A round-trip on one live handle cannot distinguish a backend that wrote
+/// to the server from one holding a HashMap behind the same trait. So this DROPS the store —
+/// closing its connection entirely — then connects a genuinely new one and verifies the
+/// per-principal hash chain still links from what the server hands back.
+#[test]
+fn an_mcp_call_chain_survives_dropping_the_store_and_reconnecting() {
+    let Some(store) = live_store() else { return };
+    // Per-invocation-unique principal: this suite shares ONE Valkey and isolates by key namespace.
+    let p = uid("vk_mcp_restart");
+    store
+        .append_mcp_call(&sample_call(&p, 1, 2_000_000_100, "", "h1"))
+        .unwrap();
+    store
+        .append_mcp_call(&sample_call(&p, 2, 2_000_000_200, "h1", "h2"))
+        .unwrap();
+    store
+        .append_mcp_call(&sample_call(&p, 3, 2_000_000_300, "h2", "h3"))
+        .unwrap();
+    drop(store);
+
+    // A genuinely new connection — nothing carried over in this process.
+    let Some(reopened) = live_store() else { return };
+    let got = reopened.list_mcp_calls(&p).unwrap();
+
+    assert_eq!(
+        got.len(),
+        3,
+        "the call log must survive a reconnect; got {} records back, which is the \
+         accept-and-keep-nothing behaviour this backend exists to replace",
+        got.len()
+    );
+    assert_eq!(
+        got[0].prev_hash, "",
+        "seq 1 opens the chain with an empty prev_hash"
+    );
+    for w in got.windows(2) {
+        assert_eq!(
+            w[1].prev_hash, w[0].hash,
+            "the per-principal chain must still link after a reconnect: seq {} carries prev_hash \
+             {:?} but seq {} persisted hash {:?}",
+            w[1].seq, w[1].prev_hash, w[0].seq, w[0].hash
+        );
+    }
+    // The per-principal set is scored by seq, so the read comes back in chain order.
+    assert_eq!(got.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(got[2].tool_digest, "sha256:tool3");
+    assert_eq!(got[2].request_id, "req-3");
+    assert_eq!(got[1].tool, "srv_read_file");
+    assert_eq!(got[1].pin_generation, 3);
+}
+
+/// The boot enumeration: a restart has to resume a chain for a principal this process has not yet
+/// seen, so the store must be able to name every principal holding records.
+#[test]
+fn mcp_call_principals_are_enumerable_after_a_reconnect() {
+    let Some(store) = live_store() else { return };
+    let a = uid("vk_mcp_enum_a");
+    let b = uid("vk_mcp_enum_b");
+    store
+        .append_mcp_call(&sample_call(&a, 1, 2_000_000_100, "", "a1"))
+        .unwrap();
+    store
+        .append_mcp_call(&sample_call(&b, 1, 2_000_000_100, "", "b1"))
+        .unwrap();
+    store
+        .append_mcp_call(&sample_call(&a, 2, 2_000_000_101, "a1", "a2"))
+        .unwrap();
+    drop(store);
+
+    let Some(reopened) = live_store() else { return };
+    let principals = reopened.list_mcp_call_principals().unwrap();
+    for want in [&a, &b] {
+        assert_eq!(
+            principals.iter().filter(|p| *p == want).count(),
+            1,
+            "{want} must be enumerable after a reconnect, exactly once"
+        );
+    }
+    // The chain scope is the principal: a scoped read returns only its own.
+    assert_eq!(reopened.list_mcp_calls(&a).unwrap().len(), 2);
+    assert_eq!(reopened.list_mcp_calls(&b).unwrap().len(), 1);
+    assert!(
+        reopened
+            .list_mcp_calls(&uid("vk_mcp_absent"))
+            .unwrap()
+            .is_empty(),
+        "a principal with no records reads back empty, not an error"
+    );
+}
+
+/// Retention must ACTUALLY DELETE and report a real count — a purge that returns a number it did
+/// not perform is worse than one that reports nothing purged. It must also retire the principal
+/// from the boot enumeration once its chain is empty.
+#[test]
+fn purge_mcp_calls_before_deletes_and_returns_a_real_count() {
+    let Some(store) = live_store() else { return };
+    let p = uid("vk_mcp_purge");
+    // Retention is GLOBAL by ts, so this test cannot assert an exact global count against a shared
+    // server; it asserts what it OWNS — its own principal's survivors and its own disappearance
+    // from the enumeration — and that the reported count covers its own rows.
+    store
+        .append_mcp_call(&sample_call(&p, 1, 1_000_000_100, "", "h1"))
+        .unwrap();
+    store
+        .append_mcp_call(&sample_call(&p, 2, 1_000_000_200, "h1", "h2"))
+        .unwrap();
+    store
+        .append_mcp_call(&sample_call(&p, 3, 1_000_000_300, "h2", "h3"))
+        .unwrap();
+
+    let purged = store.purge_mcp_calls_before(1_000_000_200).unwrap();
+    assert!(
+        purged >= 1,
+        "purge must report rows it actually removed; got {purged}"
+    );
+    assert_eq!(
+        store
+            .list_mcp_calls(&p)
+            .unwrap()
+            .iter()
+            .map(|r| r.seq)
+            .collect::<Vec<_>>(),
+        vec![2, 3],
+        "rows at or after the cutoff must remain — `before` is strictly less-than, so the row \
+         exactly at the cutoff is kept"
+    );
+
+    let rest = store.purge_mcp_calls_before(1_000_001_000).unwrap();
+    assert!(
+        rest >= 2,
+        "the remaining two rows must actually be removed; got {rest}"
+    );
+    assert!(store.list_mcp_calls(&p).unwrap().is_empty());
+    assert!(
+        !store.list_mcp_call_principals().unwrap().contains(&p),
+        "a principal whose chain is now empty must leave the boot enumeration, or a restart keeps \
+         resuming a chain with nothing in it"
+    );
+}
+
+/// A record arriving on a `(principal, seq)` that already has one is settled the way the contract
+/// settles it: BYTE-IDENTICAL is the retry and succeeds; DIFFERENT is a forked or tampered log and
+/// is an error. Overwriting would destroy the second case instead of reporting it.
+#[test]
+fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
+    let Some(store) = live_store() else { return };
+    let p = uid("vk_mcp_replay");
+
+    let rec = sample_call(&p, 1, 2_000_000_100, "", "h1");
+    store.append_mcp_call(&rec).unwrap();
+    store
+        .append_mcp_call(&rec)
+        .expect("an identical replay is the at-least-once retry and must succeed");
+    assert_eq!(
+        store.list_mcp_calls(&p).unwrap().len(),
+        1,
+        "a replay must not duplicate the row"
+    );
+
+    let forked = sample_call(&p, 1, 2_000_000_100, "", "DIFFERENT");
+    let err = store
+        .append_mcp_call(&forked)
+        .expect_err("a different record at an occupied (principal, seq) is a fork and must error");
+    assert!(
+        !format!("{err}").contains("DIFFERENT"),
+        "the error must not echo stored content back"
+    );
+    assert_eq!(
+        store.list_mcp_calls(&p).unwrap()[0].hash,
+        "h1",
+        "the refused fork must not have overwritten the record already on record"
+    );
+
+    // A differing non-indexed payload under an identical digest is a fork too, not a silent accept.
+    let mut tampered = sample_call(&p, 1, 2_000_000_100, "", "h1");
+    tampered.tool = "srv_other_tool".to_string();
+    store
+        .append_mcp_call(&tampered)
+        .expect_err("a payload that differs under an identical digest is a fork and must error");
+}
+
+/// A busbar key id is caller-visible and may itself contain a colon, so the retention index must
+/// still split correctly when it does — a separator that can occur in the data is a parser that
+/// silently mis-splits, and the failure would surface as a purge that quietly removed nothing.
+#[test]
+fn retention_still_finds_a_principal_whose_id_contains_the_separator_characters() {
+    let Some(store) = live_store() else { return };
+    let p = format!("{}:with:colons", uid("vk_mcp_sep"));
+    store
+        .append_mcp_call(&sample_call(&p, 1, 1_000_000_100, "", "h1"))
+        .unwrap();
+    assert_eq!(store.list_mcp_calls(&p).unwrap().len(), 1);
+    let purged = store.purge_mcp_calls_before(1_000_000_200).unwrap();
+    assert!(
+        purged >= 1,
+        "the colon-bearing principal's record must actually be purged"
+    );
+    assert!(
+        store.list_mcp_calls(&p).unwrap().is_empty(),
+        "a principal id containing the key-prefix separator must still purge correctly"
+    );
 }
