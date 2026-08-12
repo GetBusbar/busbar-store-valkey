@@ -76,7 +76,9 @@ const TEST_SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef
 /// fail a perfectly current cdylib.
 fn newest_source_mtime() -> std::time::SystemTime {
     fn walk(dir: &std::path::Path, newest: &mut std::time::SystemTime) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         for e in rd.flatten() {
             let p = e.path();
             if p.is_dir() {
@@ -286,8 +288,8 @@ fn load_and_exercise_valkey_plugin_persists_to_real_valkey_across_reopen() {
         direct_key.allowed_scopes,
         Some(vec![busbar_api::ScopeRef::pool("p")])
     );
-    let direct_usage = Store::get_usage(&direct, vk_id, 200)
-        .expect("get_usage via the direct connection");
+    let direct_usage =
+        Store::get_usage(&direct, vk_id, 200).expect("get_usage via the direct connection");
     assert_eq!(
         direct_usage.requests, 5,
         "usage must be physically present in Valkey, not just cached in-process by the plugin"
@@ -850,7 +852,8 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 
     // BOOT 2 — a second, independent dlopen over the same file, a fresh `busbar_open`, a fresh
     // connection inside the plugin.
-    let store = load_store(&path, &cfg).expect("the valkey plugin must load again over the real ABI");
+    let store =
+        load_store(&path, &cfg).expect("the valkey plugin must load again over the real ABI");
 
     let calls = store.list_mcp_calls(&p_main).expect("list_mcp_calls");
     assert_eq!(
@@ -902,10 +905,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         "both records at ts 2001 go (one per principal); the one sitting exactly at the cutoff stays"
     );
     assert_eq!(
-        store
-            .list_mcp_calls(&p_main)
-            .expect("list_mcp_calls")
-            .len(),
+        store.list_mcp_calls(&p_main).expect("list_mcp_calls").len(),
         2
     );
     assert!(store
