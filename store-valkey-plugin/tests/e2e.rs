@@ -25,7 +25,7 @@
 //! `VALKEY_URL` is a HARD FAILURE, never a silent skip, so the only over-the-ABI coverage of the
 //! durable Valkey store path cannot quietly vanish.
 
-use busbar_api::{ModelTokens, Store, TierTokens, UsageLedger, VirtualKey};
+use busbar_api::{McpCallRecord, ModelTokens, Store, TierTokens, UsageLedger, VirtualKey};
 use busbar_plugin_loader::{load_store, plugin_library_filename};
 use busbar_store_valkey::ValkeyStore;
 use std::path::PathBuf;
@@ -757,4 +757,182 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
 
     let _ = Store::delete_key(&direct, &key_id);
     let _ = std::fs::remove_dir_all(&work);
+}
+
+/// THE DURABILITY PROOF FOR THE FOUR MCP CALL-LOG METHODS, OVER THE REAL PLUGIN PATH.
+///
+/// This repo ships `feat/durable-mcp-call-log` — `append_mcp_call`/`list_mcp_calls`/
+/// `list_mcp_call_principals`/`purge_mcp_calls_before` against a real Valkey. Every existing test of
+/// those four calls `ValkeyStore` DIRECTLY, in-process, and NONE of them can see the failure that
+/// actually matters in production, because in production this backend is ONLY ever reached as a
+/// plugin: conformance boots the in-process RAM store, so the plugin seam is the only path a real
+/// deployment takes and was, until this test, the one path with zero coverage of these methods.
+///
+/// `busbar_api::Store` DEFAULTS all ten task/call-log methods to accept-and-keep-nothing. A plugin
+/// seam that does not RELAY them silently substitutes those defaults: every `append_mcp_call`
+/// returns `Ok`, every `list_mcp_calls` answers empty, and a deployment loses every tool-call record
+/// while reporting success. That is not hypothetical — the ABI once carried four store methods while
+/// the trait carried ten, so exactly this happened. A unit test passing while the ABI drops every
+/// write is the precise shape this test exists to make impossible.
+///
+/// So it goes through `busbar_plugin_loader::load_store`: a REAL `dlopen` of the built cdylib, the
+/// real C ABI, the real `DynStore`. It writes AT ARITY > 1 (three chained records for one principal
+/// and one for a second), DROPS the handle — which runs `busbar_close` and UNLOADS the library, so
+/// nothing this process still holds can answer the reads — then `dlopen`s AGAIN over the same file
+/// and reads everything back. A restart is what proves durability; a single-row same-session round
+/// trip would not distinguish a relayed method from a lucky trait default, and a multi-row one
+/// across an unload/reload cannot be faked by either.
+///
+/// A third leg reads the same rows through the plain `ValkeyStore`, never touching the cdylib, the
+/// C ABI or the loader — so a plugin that answered from its own in-process cache still fails here.
+#[test]
+fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
+    let path = plugin_path();
+    let Some(url) = valkey_url() else {
+        return;
+    };
+    let cfg = serde_json::json!({ "url": url }).to_string();
+
+    // Start from an EMPTY call log. `list_mcp_call_principals` and `purge_mcp_calls_before` are
+    // GLOBAL, not per-principal, so against a re-used Valkey a leftover chain from an earlier run
+    // would make both of their exact assertions below meaningless. `purge_mcp_calls_before(MAX)` is
+    // the store's own contract-level wipe (it also drops each emptied principal from the
+    // enumeration — see `ValkeyStore::purge_mcp_calls_before`), so this needs no key-pattern
+    // guesswork. No other test in this file touches the `busbar:mcp:*` namespace.
+    let direct = ValkeyStore::connect(&url).expect("connect directly to clean up and verify");
+    Store::purge_mcp_calls_before(&direct, u64::MAX).expect("wipe the call log before this run");
+
+    // Per-run principal ids, for the same reason the key test uses one: a read that only THIS run's
+    // writes can answer. Two of them, because one principal's chain leaking into another's is a real
+    // defect class (this repo fixed a case-folding instance of it) and a single-principal test is
+    // blind to it.
+    let stamp = format!(
+        "{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let p_main = format!("vk_abi_main_{stamp}");
+    let p_other = format!("vk_abi_other_{stamp}");
+
+    let call = |principal: &str, seq: u64, prev: &str, hash: &str| McpCallRecord {
+        principal: principal.to_string(),
+        seq,
+        ts: 2_000 + seq,
+        server: "srv".to_string(),
+        tool: "srv_read_file".to_string(),
+        outcome: "dispatched".to_string(),
+        reason: String::new(),
+        tool_digest: format!("sha256:tool{seq}"),
+        pin_generation: 3,
+        request_id: format!("req-{seq}"),
+        prev_hash: prev.to_string(),
+        hash: hash.to_string(),
+    };
+
+    {
+        // BOOT 1 — a real dlopen of the cdylib; every call below crosses the C ABI.
+        let store = load_store(&path, &cfg).expect("the valkey plugin must load over the real ABI");
+        for (seq, prev, hash) in [(1_u64, "", "h1"), (2, "h1", "h2"), (3, "h2", "h3")] {
+            store
+                .append_mcp_call(&call(&p_main, seq, prev, hash))
+                .expect("append_mcp_call over the ABI");
+        }
+        store
+            .append_mcp_call(&call(&p_other, 1, "", "o1"))
+            .expect("append_mcp_call over the ABI");
+        // Dropping the boxed store drops the loader's `Library` handle: `busbar_close` runs and the
+        // dylib is UNLOADED. Nothing this process still holds can be answering the reads below.
+        drop(store);
+    }
+
+    // BOOT 2 — a second, independent dlopen over the same file, a fresh `busbar_open`, a fresh
+    // connection inside the plugin.
+    let store = load_store(&path, &cfg).expect("the valkey plugin must load again over the real ABI");
+
+    let calls = store.list_mcp_calls(&p_main).expect("list_mcp_calls");
+    assert_eq!(
+        calls.iter().map(|c| c.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "the per-principal call chain must survive the unload/reload over the plugin ABI in chain \
+         order; got {} record(s) back, which is the accept-and-keep-nothing shape of the trait \
+         default an unrelayed seam substitutes",
+        calls.len()
+    );
+    for w in calls.windows(2) {
+        assert_eq!(
+            w[1].prev_hash, w[0].hash,
+            "the chain must still link after the reload: seq {} carries prev_hash {:?} but seq {} \
+             persisted hash {:?}",
+            w[1].seq, w[1].prev_hash, w[0].seq, w[0].hash
+        );
+    }
+    // Every non-indexed field rides the `body` blob; a relay that dropped it would still satisfy a
+    // seq-only check.
+    assert_eq!(calls[2].tool_digest, "sha256:tool3");
+    assert_eq!(calls[2].request_id, "req-3");
+    assert_eq!(calls[2].tool, "srv_read_file");
+    assert_eq!(calls[2].outcome, "dispatched");
+    assert_eq!(calls[1].pin_generation, 3);
+    assert_eq!(
+        store
+            .list_mcp_calls(&p_other)
+            .expect("list_mcp_calls")
+            .len(),
+        1,
+        "one principal's chain must not carry another's records"
+    );
+
+    let principals = store
+        .list_mcp_call_principals()
+        .expect("list_mcp_call_principals");
+    assert_eq!(
+        principals,
+        vec![p_main.clone(), p_other.clone()],
+        "the boot enumeration must name every principal holding records, exactly once each, sorted"
+    );
+
+    // Retention crosses the ABI too, COUNT AND ALL — checked for the number it ACTUALLY removed,
+    // because a relay that dropped the return value would read as 0 and look like a no-op sweep.
+    assert_eq!(
+        store.purge_mcp_calls_before(2_002).expect("purge"),
+        2,
+        "both records at ts 2001 go (one per principal); the one sitting exactly at the cutoff stays"
+    );
+    assert_eq!(
+        store
+            .list_mcp_calls(&p_main)
+            .expect("list_mcp_calls")
+            .len(),
+        2
+    );
+    assert!(store
+        .list_mcp_calls(&p_other)
+        .expect("list_mcp_calls")
+        .is_empty());
+    assert_eq!(
+        store
+            .list_mcp_call_principals()
+            .expect("list_mcp_call_principals"),
+        vec![p_main.clone()],
+        "a principal whose chain the sweep emptied must leave the enumeration, or a boot keeps \
+         resuming a chain with nothing in it"
+    );
+    drop(store);
+
+    // LEG 3 — read the surviving rows through the plain `ValkeyStore`, a code path that never
+    // touches the cdylib, the C ABI or the loader. A plugin answering the reads above out of its
+    // own in-process state (rather than Valkey) passes both boots and fails here.
+    let direct_calls =
+        Store::list_mcp_calls(&direct, &p_main).expect("list_mcp_calls via the direct connection");
+    assert_eq!(
+        direct_calls.iter().map(|c| c.seq).collect::<Vec<_>>(),
+        vec![2, 3],
+        "the records must be physically present in Valkey, not just cached in-process by the plugin"
+    );
+    assert_eq!(direct_calls[1].hash, "h3");
+
+    Store::purge_mcp_calls_before(&direct, u64::MAX).expect("clean up this run's records");
 }
