@@ -9,7 +9,16 @@ description = "The Valkey store as a droppable busbar plugin — a cdylib export
 license = "Apache-2.0"
 
 [lib]
-crate-type = ["cdylib"]
+# cdylib for the C ABI delivery; `rlib` is REQUIRED for `cargo test` to emit the cdylib artifact AT
+# ALL. With `cdylib`-only, cargo builds a trivial "0 tests" harness for this package under `cargo
+# test` and never produces the .dylib/.so — so `tests/e2e.rs`, the ONLY over-the-ABI coverage of the
+# durable valkey path, found nothing and silently skipped, reporting GREEN with zero coverage. The
+# sibling store-postgres-plugin/store-mysql-plugin/store-sqlite-plugin manifests already carry both
+# crate-types for exactly this reason; this one had drifted. Verified, not assumed: with `cdylib`
+# only, `cargo test -p busbar-store-valkey-plugin` leaves no
+# `target/debug/deps/libbusbar_store_valkey_plugin.dylib` even after touching src/lib.rs; with
+# `rlib` added, cargo emits it on every build that recompiles the lib.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # busbar-store-valkey is now a SAME-REPO sibling crate (this plugin brings 100% of what it needs — the
