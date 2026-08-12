@@ -1045,8 +1045,26 @@ fn denylist_add_and_list_round_trips() {
 
 // ── Audit log (unchanged shape) ──────────────────────────────────────────────────────────────
 
+/// Serialises every test that writes the SHARED, fleet-wide audit zset.
+///
+/// `busbar:audit` is one global sorted set keyed by seq, so unlike every other fixture in this file
+/// it cannot be isolated by a `uid()` namespace. `audit_append_and_list_are_ordered_oldest_first`
+/// takes `max(seq) + 1_000` and then requires that record to still be in `list_audit_tail(2)`; the
+/// two sibling tests below write FIXED seqs in the 910/930-million range, so whichever of them lands
+/// between that read and the tail read pushes the record out and fails an assertion about ORDERING
+/// with something that is really a concurrency artifact. Pre-existing on dev — surfaced here because
+/// this suite now runs more tests against one shared server, not because retention changed anything.
+static AUDIT_SEQ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take `AUDIT_SEQ_LOCK`, ignoring poisoning, so one failing audit test does not convert the others
+/// into spurious failures that bury the original.
+fn audit_seq_guard() -> std::sync::MutexGuard<'static, ()> {
+    AUDIT_SEQ_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn audit_append_and_list_are_ordered_oldest_first() {
+    let _serialised = audit_seq_guard();
     let Some(store) = live_store() else { return };
     // The audit zset is SHARED and persistent, and this test used to be the only writer of low
     // seqs, so it could assume it owned the whole thing. It never really did: it only looked that
@@ -1273,6 +1291,7 @@ mod conformance {
 
     #[test]
     fn append_audit_duplicate_seq_is_ok_when_identical_and_an_error_when_different() {
+        let _serialised = super::audit_seq_guard();
         let seq = 910_000_000u64 + (std::process::id() as u64 % 1_000_000);
         let Some((store, _ns)) = setup("aud", seq) else {
             return;
@@ -1350,6 +1369,7 @@ fn one_corrupt_credential_row_does_not_break_the_whole_hydration_delta() {
 /// then a revocation on the original store which MUST land.
 #[test]
 fn a_refused_transaction_does_not_swallow_the_next_write() {
+    let _serialised = audit_seq_guard();
     let Some(store) = live_store() else { return };
     let Some(other) = live_store() else { return };
     let seq = 930_000_000u64 + (std::process::id() as u64 % 1_000_000);
@@ -1509,11 +1529,34 @@ fn mcp_call_principals_are_enumerable_after_a_reconnect() {
     );
 }
 
+/// Serialises the tests that call `purge_mcp_calls_before`.
+///
+/// Retention is GLOBAL BY TIMESTAMP, not scoped to a principal, so a per-principal `uid()` namespace
+/// — which isolates every other test in this file — isolates nothing here: one test's purge deletes
+/// another's rows out from under it if their ts bands overlap, and both retention tests deliberately
+/// write in the same 1_000_000_1xx band because that is what their cutoffs are about. Observed, not
+/// theorised: `retention_still_finds_a_principal_whose_id_contains_the_separator_characters` failed
+/// roughly two runs in three, at "must actually be purged" (its row already deleted by the sibling's
+/// `purge_mcp_calls_before(1_000_001_000)`) or one line earlier at the read-back — a red that looks
+/// exactly like a broken retention index while retention is in fact fine.
+///
+/// A lock rather than disjoint ts bands: any band this test picked would still be inside SOME other
+/// purge's cutoff the moment a third retention test is added, and the failure would come back
+/// looking like a product bug again.
+static MCP_RETENTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take `MCP_RETENTION_LOCK`, ignoring poisoning: a panic in one retention test must not convert
+/// every other one into a spurious failure that buries the original.
+fn mcp_retention_guard() -> std::sync::MutexGuard<'static, ()> {
+    MCP_RETENTION_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Retention must ACTUALLY DELETE and report a real count — a purge that returns a number it did
 /// not perform is worse than one that reports nothing purged. It must also retire the principal
 /// from the boot enumeration once its chain is empty.
 #[test]
 fn purge_mcp_calls_before_deletes_and_returns_a_real_count() {
+    let _serialised = mcp_retention_guard();
     let Some(store) = live_store() else { return };
     let p = uid("vk_mcp_purge");
     // Retention is GLOBAL by ts, so this test cannot assert an exact global count against a shared
@@ -1605,6 +1648,7 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
 /// silently mis-splits, and the failure would surface as a purge that quietly removed nothing.
 #[test]
 fn retention_still_finds_a_principal_whose_id_contains_the_separator_characters() {
+    let _serialised = mcp_retention_guard();
     let Some(store) = live_store() else { return };
     let p = format!("{}:with:colons", uid("vk_mcp_sep"));
     store
