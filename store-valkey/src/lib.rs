@@ -70,7 +70,8 @@
 
 use busbar_api::{
     AuditRecord, CredentialMeta, CredentialSecret, McpCallRecord, MeteringDelta, MeteringRow,
-    ModelTokens, Store, StoreError, StoreResult, TierTokens, UsageDelta, UsageLedger, VirtualKey,
+    ModelTokens, Store, StoreError, StoreResult, TaskEventRow, TaskRow, TierTokens, UsageDelta,
+    UsageLedger, VirtualKey,
 };
 use redis::{Commands, Connection};
 use std::sync::Mutex;
@@ -124,6 +125,63 @@ const MCP_TS_MEMBER_SEP: char = '\u{1}';
 fn mcp_calls_key(principal: &str) -> String {
     format!("{MCP_CALLS_PREFIX}{principal}")
 }
+
+// ── THE DURABLE A2A TASK STORE ────────────────────────────────────────────────────────────────
+//
+// A2A is async BY DESIGN: a task spans turns, can sit interrupted waiting on a human, and can outlive
+// the process that started it. An in-memory task table therefore loses every in-flight task on
+// restart, which is the difference between a resume that is real and one that is nominal.
+//
+// SHAPE, and this is where a key-value backend legitimately parts company with its SQL siblings.
+// store-sqlite/store-mysql/store-postgres each give every `TaskRow` field its own COLUMN, because
+// there the retention sweep, the boot rehydrate and the artifact cursor are all things the DATABASE
+// queries and indexes. Valkey indexes nothing by itself, so columns would buy nothing and cost a
+// hash-field encoding for every field. The row is therefore ONE JSON STRING — which also means the
+// FULL u64 range round-trips with no clamping and no refusal, since JSON has no signed-64 ceiling to
+// hit — and the two questions JSON cannot answer get their own index structures, exactly as the MCP
+// call log does above:
+//   - `busbar:tasks` (SET) — the enumeration `list_tasks` walks. Scanning the keyspace for it would
+//     be O(keyspace) on a boot's hot path.
+//   - `busbar:tasks:byupdated` (ZSET, scored by `updated_at`) — the retention sweep's age index, so a
+//     purge reads the candidates that could possibly be old enough instead of every task there is.
+//     It is an INDEX, never the truth: `purge_tasks_before` re-reads each candidate ROW and re-checks
+//     its state and `updated_at` under WATCH before deleting anything, which is also what makes a
+//     ZSET score (an IEEE double) safe to use as a coarse filter.
+const TASK_ROW_PREFIX: &str = "busbar:task:row:";
+const TASKS_INDEX: &str = "busbar:tasks";
+const TASKS_BY_UPDATED: &str = "busbar:tasks:byupdated";
+/// PER-TASK PROVENANCE: one ZSET per task, scored by `seq`, whose members are whole `TaskEventRow`s
+/// as JSON. Per-task rather than one global chain because tasks are concurrent and long-lived — a
+/// global chain would serialise every task transition behind one append and would make one task's
+/// provenance unverifiable without possessing every other tenant's events. Scoring by `seq` is what
+/// makes the read come back in chain order for free, which is the order the engine verifies in.
+const TASK_EVENTS_PREFIX: &str = "busbar:task:events:";
+
+/// The task states that are TERMINAL, and therefore the only ones `purge_tasks_before` may drop. A
+/// CLOSED set, deliberately: a state token minted by a NEWER engine than this build is one this build
+/// cannot classify, and the safe direction to be wrong in is "never sweep it". An interrupted task
+/// waiting on a human is exactly the row that legitimately sits still for a long time, and compacting
+/// it is losing the work, not reclaiming space.
+const TERMINAL_TASK_STATES: [&str; 4] = ["completed", "failed", "canceled", "rejected"];
+
+/// The row key for one task.
+///
+/// `row:` and `events:` are FIXED, DISTINCT segments at the same position, so no `task_id` can make
+/// one of these keys render as the other's — `busbar:task:row:{x}` and `busbar:task:events:{y}` can
+/// never be equal whatever `x` and `y` are. That is deliberate rather than incidental: this file
+/// already carries a recorded hazard where `cred_row_key`/`cred_pub_key` join caller-supplied
+/// components on an unescaped `:`, so two distinct tuples can render to one key and the second write
+/// silently overwrites the first. A task id is protocol-supplied and opaque — colons very much
+/// included — so the separator question had to be answered structurally here rather than by
+/// convention. It is answered by having exactly ONE variable component per key.
+fn task_row_key(task_id: &str) -> String {
+    format!("{TASK_ROW_PREFIX}{task_id}")
+}
+
+/// The provenance-chain key for one task. See [`task_row_key`] for why this cannot collide with it.
+fn task_events_key(task_id: &str) -> String {
+    format!("{TASK_EVENTS_PREFIX}{task_id}")
+}
 /// The signed-token REVOCATION denylist (1.5.0). `busbar:denylist:<sub>` holds the operator reason
 /// (a plain string), and `busbar:denylist` is a SET indexing every denied sub so `list_denylist` is
 /// a SMEMBERS.
@@ -150,6 +208,16 @@ const REVISION_KEY: &str = "busbar:revision";
 /// genuinely-ambiguous refunded-vs-legacy data anywhere to lose). This is a ONE-TIME safe window: the
 /// NEXT schema bump after 1.5.0 actually ships must NOT reuse this wipe-on-bump shortcut, since real
 /// customer usage/billing history would exist by then and wiping it would itself be a real bug.
+/// The durable MCP tool-call log and the durable A2A TASK STORE both landed WITHOUT bumping this,
+/// and that is a deliberate decision rather than an oversight. Each is a PURELY ADDITIVE keyspace
+/// (`busbar:mcp:*`, `busbar:task:*`/`busbar:tasks*`): nothing that already exists changes shape, so
+/// there is nothing for a migration to do, and a bump here does not mean "migrate" — `migrate()`
+/// handles any `version < SCHEMA_VERSION` by SCANning `busbar:*` and DELETING EVERYTHING. Bumping to
+/// mark an addition that needs no migration would therefore wipe every operator's virtual keys,
+/// credentials, budgets, usage ledgers and audit records on next connect, which is the recorded
+/// hazard on this file ("`migrate()` is a wipe, and its safety argument has expired": that wipe's own
+/// justification is "1.5.0 is unreleased", and 1.5.0, 1.5.1 and 1.5.2 have all shipped). The version
+/// marker moves again only when a migrate-in-place path exists to move it for.
 const SCHEMA_KEY: &str = "busbar:schema";
 const SCHEMA_VERSION: i64 = 6;
 
@@ -1497,6 +1565,208 @@ impl Store for ValkeyStore {
             let rec: AuditRecord = serde_json::from_str(&m)
                 .map_err(|e| StoreError(format!("audit decode failed: {e}")))?;
             out.push(rec);
+        }
+        Ok(out)
+    }
+
+    fn put_task(&self, task: &TaskRow) -> StoreResult<()> {
+        // UPSERT BY task_id: the engine writes through on EVERY state transition, so a second write
+        // for one task must REPLACE the row, never append a second one for the same id. A `SET` on a
+        // single row key is that, structurally.
+        //
+        // No range guard and no clamp anywhere in this method, unlike the SQL siblings: the row is
+        // JSON, so `artifact_cursor`, `created_at` and `updated_at` round-trip across the whole u64
+        // range. That matters most for the cursor — it is how much of a stream has been durably
+        // relayed, and a value that read back as something else would either replay delivered
+        // artifacts or skip undelivered ones with no error ever reported.
+        let json = serde_json::to_string(task)
+            .map_err(|e| StoreError(format!("task encode failed: {e}")))?;
+        let row_key = task_row_key(&task.task_id);
+        // ONE atomic pipeline: the row, the enumeration and the retention index must land together or
+        // not at all. A row present but absent from the enumeration is a task `list_tasks` (and so
+        // the boot rehydrate) would never see again; present in the index but absent as a row would
+        // make a purge walk a candidate that no longer exists.
+        //
+        // ZADD on an existing member OVERWRITES its score, so a state transition re-stamps the
+        // retention index rather than leaving it pinned at the first write's `updated_at`.
+        self.with_conn(|c| {
+            redis::pipe()
+                .atomic()
+                .set(&row_key, &json)
+                .ignore()
+                .sadd(TASKS_INDEX, &task.task_id)
+                .ignore()
+                .zadd(TASKS_BY_UPDATED, &task.task_id, clamp(task.updated_at))
+                .ignore()
+                .query(c)
+        })
+    }
+
+    fn get_task(&self, task_id: &str) -> StoreResult<Option<TaskRow>> {
+        // No principal filter, deliberately: the contract puts the caller-scoping check ENGINE-side,
+        // because an authorization check living in the backend is one an unauthorized reader
+        // bypasses by configuring a different backend.
+        let raw: Option<String> = self.with_conn(|c| c.get(task_row_key(task_id)))?;
+        raw.map(|r| {
+            serde_json::from_str::<TaskRow>(&r)
+                .map_err(|e| StoreError(format!("task decode failed: {e}")))
+        })
+        .transpose()
+    }
+
+    fn list_tasks(&self) -> StoreResult<Vec<TaskRow>> {
+        // UNFILTERED, terminal rows included. The boot rehydrate wants the active rows, the retention
+        // sweep wants the terminal ones and the scoped listing wants one principal's; a store that
+        // pre-filtered for any one of those would break the other two.
+        let ids: Vec<String> = self.with_conn(|c| c.smembers(TASKS_INDEX))?;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let raws: Vec<Option<String>> = self.with_conn(|c| {
+            let mut pipe = redis::pipe();
+            for id in &ids {
+                pipe.get(task_row_key(id));
+            }
+            pipe.query(c)
+        })?;
+        let mut out = Vec::with_capacity(ids.len());
+        // A member whose row is gone is SKIPPED rather than being an error, the same way `list_keys`
+        // handles it: the enumeration can legitimately be a step ahead of a concurrent purge, and a
+        // boot that refused to rehydrate anything because one row was mid-sweep would be worse than
+        // one that rehydrates the rest.
+        for raw in raws.into_iter().flatten() {
+            out.push(
+                serde_json::from_str::<TaskRow>(&raw)
+                    .map_err(|e| StoreError(format!("task decode failed: {e}")))?,
+            );
+        }
+        // A SET has no order; sort so the listing is deterministic across calls and nodes, and by the
+        // same key the SQL siblings' `ORDER BY task_id` gives.
+        out.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+        Ok(out)
+    }
+
+    fn purge_tasks_before(&self, before: u64) -> StoreResult<u64> {
+        // TERMINAL ONLY, and STRICTLY older than the cutoff — see TERMINAL_TASK_STATES for why that
+        // set is closed and why that is the safe direction to be wrong in.
+        //
+        // `(cutoff` is an EXCLUSIVE upper bound, exactly as the contract specifies, so a task sitting
+        // exactly at the cutoff is kept. Expressed as an exclusive range rather than `before - 1`
+        // because the latter underflows at zero.
+        let candidates: Vec<String> = self.with_conn(|c| {
+            c.zrangebyscore(TASKS_BY_UPDATED, "-inf", format!("({}", clamp(before)))
+        })?;
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        let mut removed = 0u64;
+        for id in &candidates {
+            let row_key = task_row_key(id);
+            let events_key = task_events_key(id);
+            // The ZSET is an INDEX, never the truth. Re-read the ROW here and re-check BOTH its state
+            // and its `updated_at` before deleting, under WATCH so a `put_task` that resumes an
+            // interrupted task (or re-stamps its timestamp) between the candidate read and the delete
+            // ABORTS this transaction instead of losing the resumed task. A ZSET score is an IEEE
+            // double and a stale index entry is possible besides, so trusting it would be trusting
+            // the wrong artifact.
+            //
+            // The events go with the task, in the SAME transaction. That cascade is load-bearing
+            // rather than tidiness: `purge_tasks_before` is the ONLY retention method the contract
+            // gives this data, so a purge that left the chain behind would leave `task_events` with
+            // no bound anywhere in the trait.
+            let deleted: u64 = self.with_conn(|c| {
+                redis::transaction(c, &[row_key.as_str()], |c, pipe| {
+                    let raw: Option<String> = c.get(&row_key)?;
+                    let Some(raw) = raw else {
+                        // A stale index entry pointing at a row that is already gone: drop the entry
+                        // (so the sweep does not keep re-walking it) and report NOTHING removed, since
+                        // nothing was.
+                        let applied: Option<()> =
+                            pipe.atomic().zrem(TASKS_BY_UPDATED, id).ignore().query(c)?;
+                        return Ok(applied.map(|()| 0u64));
+                    };
+                    let task: TaskRow = serde_json::from_str(&raw).map_err(|e| {
+                        redis::RedisError::from((
+                            redis::ErrorKind::Client,
+                            "task decode failed",
+                            e.to_string(),
+                        ))
+                    })?;
+                    if task.updated_at >= before
+                        || !TERMINAL_TASK_STATES.contains(&task.state.as_str())
+                    {
+                        // Not actually sweepable: leave the row AND its index entry alone, and run no
+                        // pipeline at all. The entry is not stale — it is a live task whose score
+                        // simply is not below the cutoff the row itself reports.
+                        return Ok(Some(0u64));
+                    }
+                    let applied: Option<()> = pipe
+                        .atomic()
+                        .del(&row_key)
+                        .ignore()
+                        .del(&events_key)
+                        .ignore()
+                        .srem(TASKS_INDEX, id)
+                        .ignore()
+                        .zrem(TASKS_BY_UPDATED, id)
+                        .ignore()
+                        .query(c)?;
+                    Ok(applied.map(|()| 1u64))
+                })
+            })?;
+            // The count REPORTED is the count actually performed — taken from the transaction that
+            // did the deleting, never from the size of the candidate list, which would over-report a
+            // task a concurrent writer resumed or a concurrent purge already took.
+            removed += deleted;
+        }
+        Ok(removed)
+    }
+
+    fn append_task_event(&self, event: &TaskEventRow) -> StoreResult<()> {
+        // UPSERT ON (task_id, seq), and this is where the task-event contract genuinely DIFFERS from
+        // `append_mcp_call`'s below: that one treats an occupied slot holding a DIFFERENT record as a
+        // fork and refuses it, while this one is specified to upsert so the engine's write-through is
+        // idempotent on replay — "rejecting or duplicating a replayed `seq` breaks the chain the
+        // engine will verify on read". Copying the call log's fork check here would be wrong in a way
+        // that looks right, so it is stated rather than left to be inferred from the code.
+        //
+        // The chain is scored by `seq`, so "the record at this seq" is the member at exactly this
+        // score: clearing that score and adding the new member, atomically, IS the upsert. ZADD alone
+        // would not be — a corrected event is a DIFFERENT member string at the same score, which ZADD
+        // would happily add ALONGSIDE the old one, duplicating exactly the seq the contract says must
+        // not duplicate.
+        //
+        // Deliberately NO `put_task` precondition: a `task.submitted` event and the first `put_task`
+        // are two independent write-throughs and the contract states no ordering between them, so
+        // appending an event for a task with no row yet has to work.
+        //
+        // The digests ride through verbatim: this store never computes or recomputes one, because a
+        // digest a store could recompute is a digest a compromised store could forge consistently.
+        let json = serde_json::to_string(event)
+            .map_err(|e| StoreError(format!("task event encode failed: {e}")))?;
+        let key = task_events_key(&event.task_id);
+        let score = clamp(event.seq);
+        self.with_conn(|c| {
+            redis::pipe()
+                .atomic()
+                .zrembyscore(&key, score, score)
+                .ignore()
+                .zadd(&key, &json, score)
+                .ignore()
+                .query(c)
+        })
+    }
+
+    fn list_task_events(&self, task_id: &str) -> StoreResult<Vec<TaskEventRow>> {
+        // Scored by seq, so ZRANGE returns the chain oldest-first — the order the engine's verifier
+        // reads it in — and the scope is the one task, because the chain is per-task.
+        let members: Vec<String> = self.with_conn(|c| c.zrange(task_events_key(task_id), 0, -1))?;
+        let mut out = Vec::with_capacity(members.len());
+        for m in members {
+            out.push(
+                serde_json::from_str::<TaskEventRow>(&m)
+                    .map_err(|e| StoreError(format!("task event decode failed: {e}")))?,
+            );
         }
         Ok(out)
     }
