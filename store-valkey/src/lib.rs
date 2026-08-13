@@ -69,9 +69,9 @@
 //! operators wanting bounded growth reap old `busbar:usage:*` keys on their own retention schedule.
 
 use busbar_api::{
-    AuditRecord, CredentialMeta, CredentialSecret, McpCallRecord, MeteringDelta, MeteringRow,
-    ModelTokens, Store, StoreError, StoreResult, TaskEventRow, TaskRow, TierTokens, UsageDelta,
-    UsageLedger, VirtualKey,
+    AuditRecord, CredentialMeta, CredentialSecret, McpCallRecord, McpDemotionRow, MeteringDelta,
+    MeteringRow, ModelTokens, Store, StoreError, StoreResult, TaskEventRow, TaskRow, TierTokens,
+    UsageDelta, UsageLedger, VirtualKey,
 };
 use redis::{Commands, Connection};
 use std::sync::Mutex;
@@ -182,6 +182,44 @@ fn task_row_key(task_id: &str) -> String {
 fn task_events_key(task_id: &str) -> String {
     format!("{TASK_EVENTS_PREFIX}{task_id}")
 }
+/// THE DURABLE MCP DEMOTION RECORD, as ONE HASH keyed by the upstream's local registration id, whose
+/// values are whole `McpDemotionRow`s as JSON.
+///
+/// A HASH rather than a key per server plus a SET index — which is the shape `tasks` uses — and the
+/// difference is deliberate. A composed key would put a caller-supplied id into the key string, and
+/// this file carries a recorded hazard about exactly that: `cred_row_key`/`cred_pub_key` join
+/// caller-supplied components on an unescaped `:`, so two distinct tuples can render to one key and
+/// the second write silently overwrites the first. `tasks` answers that by having exactly ONE
+/// variable component per key; a hash FIELD answers it outright, since a field is opaque bytes that
+/// are never parsed. The population is one row per registered upstream — small, bounded, and read
+/// whole at boot — so HGETALL is the entire `list_mcp_demotions`, with no index to keep in step and
+/// no window in which a record and its index membership can disagree.
+const MCP_DEMOTIONS_HASH: &str = "busbar:mcp:demotions";
+
+/// THE DURABLE SPENT-APPROVAL LEDGER: one key per redeemed nonce, holding the approval's own
+/// deadline, written with `SET NX EX`.
+///
+/// `SET NX` is the whole test-and-set, in one round trip that the server orders against every other
+/// node's: it sets and reports success, or it finds the key present and reports nothing. A `GET`
+/// followed by a `SET` would tell both halves of a race they were first, which is the shape this
+/// method is specified not to have, and on this backend a fleet sharing one Valkey is the ORDINARY
+/// deployment rather than the exotic one.
+///
+/// `EX` is what bounds the keyspace, and it is strictly better than a sweep: the entry expires with
+/// the approval it records, on the server, without any caller having to remember to run anything.
+/// That matters more here than on a SQL backend — this crate refuses to start against a server whose
+/// `maxmemory-policy` is not `noeviction`, so an unbounded keyspace is not merely untidy, it is an
+/// outage of everything else in the namespace too.
+///
+/// ONE variable component, at the end, for the reason [`task_row_key`] has one: a nonce is opaque
+/// and no id can make this key render as any other key in this file's keyspace.
+const ASK_STATE_PREFIX: &str = "busbar:askstate:";
+
+/// The ledger key for one redeemed approval. See [`ASK_STATE_PREFIX`] for why this cannot collide.
+fn ask_state_key(nonce: &str) -> String {
+    format!("{ASK_STATE_PREFIX}{nonce}")
+}
+
 /// The signed-token REVOCATION denylist (1.5.0). `busbar:denylist:<sub>` holds the operator reason
 /// (a plain string), and `busbar:denylist` is a SET indexing every denied sub so `list_denylist` is
 /// a SMEMBERS.
@@ -208,9 +246,11 @@ const REVISION_KEY: &str = "busbar:revision";
 /// genuinely-ambiguous refunded-vs-legacy data anywhere to lose). This is a ONE-TIME safe window: the
 /// NEXT schema bump after 1.5.0 actually ships must NOT reuse this wipe-on-bump shortcut, since real
 /// customer usage/billing history would exist by then and wiping it would itself be a real bug.
-/// The durable MCP tool-call log and the durable A2A TASK STORE both landed WITHOUT bumping this,
-/// and that is a deliberate decision rather than an oversight. Each is a PURELY ADDITIVE keyspace
-/// (`busbar:mcp:*`, `busbar:task:*`/`busbar:tasks*`): nothing that already exists changes shape, so
+/// The durable MCP tool-call log, the durable A2A TASK STORE and the durable TRUST STATE (the MCP
+/// demotion record and the spent-approval ledger) all landed WITHOUT bumping this, and that is a
+/// deliberate decision rather than an oversight. Each is a PURELY ADDITIVE keyspace
+/// (`busbar:mcp:*`, `busbar:task:*`/`busbar:tasks*`, `busbar:askstate:*`): nothing that already
+/// exists changes shape, so
 /// there is nothing for a migration to do, and a bump here does not mean "migrate" — `migrate()`
 /// handles any `version < SCHEMA_VERSION` by SCANning `busbar:*` and DELETING EVERYTHING. Bumping to
 /// mark an addition that needs no migration would therefore wipe every operator's virtual keys,
@@ -1880,6 +1920,84 @@ impl Store for ValkeyStore {
 
     fn list_denylist(&self) -> StoreResult<Vec<String>> {
         self.with_conn(|c| c.smembers(DENYLIST_INDEX))
+    }
+
+    fn put_mcp_demotion(&self, row: &McpDemotionRow) -> StoreResult<()> {
+        // UPSERT BY server, as the trait requires: HSET on an existing field REPLACES its value, so
+        // a second demotion of one upstream cannot stand a rival record beside the first.
+        //
+        // JSON, so `recorded_at` round-trips across the whole u64 range with no clamp and no refusal
+        // — the same reason `put_task` needs no range guard while its SQL siblings do.
+        let json = serde_json::to_string(row)
+            .map_err(|e| StoreError(format!("demotion encode failed: {e}")))?;
+        self.with_conn(|c| c.hset::<_, _, _, ()>(MCP_DEMOTIONS_HASH, &row.server, &json))
+    }
+
+    fn list_mcp_demotions(&self) -> StoreResult<Vec<McpDemotionRow>> {
+        // The boot read that puts a demotion back in force before the first request is served. ONE
+        // HGETALL: there is no index to reconcile, so there is no window in which a record and its
+        // membership can disagree.
+        //
+        // An EMPTY answer means "no upstream is recorded as demoted" and never "we could not tell" —
+        // a read failure surfaces as an Err, because a server with no record is a server nobody
+        // demoted, which is a different fact from a server that drifted, and conflating them would
+        // quarantine every declaratively-approved deployment at boot. A row that will not decode is
+        // an error for the same reason: silently dropping it would report a quarantine as absent.
+        let raw: std::collections::HashMap<String, String> =
+            self.with_conn(|c| c.hgetall(MCP_DEMOTIONS_HASH))?;
+        let mut rows = raw
+            .into_values()
+            .map(|v| {
+                serde_json::from_str::<McpDemotionRow>(&v)
+                    .map_err(|e| StoreError(format!("demotion decode failed: {e}")))
+            })
+            .collect::<StoreResult<Vec<_>>>()?;
+        // A hash has no order of its own; sorting makes the answer deterministic for a caller that
+        // compares two reads.
+        rows.sort_by(|a, b| a.server.cmp(&b.server));
+        Ok(rows)
+    }
+
+    fn clear_mcp_demotion(&self, server: &str) -> StoreResult<()> {
+        // Removing a record that is not there is a NO-OP, not an error: the engine clears on every
+        // observation that agrees with the operator's approval rather than tracking whether it had
+        // demoted, so the overwhelmingly common call is one against no record at all. HDEL on an
+        // absent field is exactly that, and its count is deliberately ignored.
+        self.with_conn(|c| c.hdel::<_, _, ()>(MCP_DEMOTIONS_HASH, server))
+    }
+
+    fn redeem_ask_state(&self, nonce: &str, expires_at: u64, now: u64) -> StoreResult<bool> {
+        // THE TEST AND SET, as ONE `SET NX EX` the server orders against every other node's. It sets
+        // and reports OK, or it finds the key present and reports nil — and that reply IS the
+        // answer, never a prior read. A GET followed by a SET would tell both halves of a race they
+        // were first, and on this backend a fleet sharing one Valkey is the ORDINARY deployment.
+        //
+        // TTL rather than a caller-run sweep: the entry expires with the approval it records, on the
+        // server. `max(1)` because a zero or negative EX is an error the caller would see as a store
+        // failure — and an already-lapsed approval (`expires_at <= now`) must still get a truthful
+        // test-and-set answer, since the engine owns the expiry decision and refuses a lapsed state
+        // on the seal long before this method is reached. The cap is defensive: a `SET` whose expiry
+        // overflows the server's own millisecond arithmetic is rejected outright, and an approval
+        // with a decade of life left is one whose ledger entry can be bounded without anyone
+        // noticing.
+        const MAX_TTL_SECS: u64 = 315_360_000; // ten years
+        let ttl = expires_at.saturating_sub(now).clamp(1, MAX_TTL_SECS);
+        let key = ask_state_key(nonce);
+        // NO RECONNECT-RETRY. A dropped reply on this command is not a lost read: the SET may well
+        // have landed, and a blind retry would find the key it has just written and report `false` —
+        // refusing an approval this very call granted. `with_conn_no_retry` surfaces the failure
+        // instead, and the engine's call site turns a store error into a REFUSED redemption. Both
+        // answers are closed rather than open; an error is the one that says so.
+        let set: Option<String> = self.with_conn_no_retry(|c| {
+            redis::cmd("SET")
+                .arg(&key)
+                .arg(expires_at)
+                .arg("NX")
+                .arg("EX")
+                .arg(ttl)
+                .query(c)
+        })?;
+        Ok(set.is_some())
     }
 }
 

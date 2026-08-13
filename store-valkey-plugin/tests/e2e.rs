@@ -1175,3 +1175,168 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         .expect("clean up this run's task");
     Store::purge_tasks_before(&direct, u64::MAX).expect("clean up this run's rows");
 }
+
+/// THE DURABILITY PROOF FOR THE FOUR TRUST-STATE METHODS, OVER THE REAL PLUGIN PATH.
+///
+/// Same reasoning as the task-store test above, and a sharper cost. `busbar_api::Store` defaults
+/// `put_mcp_demotion`/`list_mcp_demotions`/`clear_mcp_demotion` to accept-and-keep-nothing and
+/// `redeem_ask_state` to `Ok(true)` — "yes, this call is the first redemption" — so a seam that does
+/// not RELAY them substitutes two security failures, both silent and both green:
+///
+///   * a demotion is written, reported successful and DISCARDED, so a restart hands a quarantined
+///     upstream the operator's approval back; and
+///   * every redeemer of one single-use approval is told it is the first, so a confirm-once tool an
+///     operator gated because it moves money executes once per node and once per restart.
+///
+/// A Valkey deployment reaches this backend ONLY over the plugin seam, and it is the backend a
+/// FLEET reaches for first — so the second-node case below is the ordinary deployment, not an
+/// exotic one. A real `dlopen`, the real C ABI, the real `DynStore`; two simultaneous loads are the
+/// fleet, a drop and a reload is the restart, and a third leg reads through the plain `ValkeyStore`
+/// so a plugin answering out of its own in-process state still fails.
+///
+/// PANICS rather than skipping when no Valkey is configured. This is the only over-the-ABI coverage
+/// of two properties whose unimplemented form is silently green, and a case that can skip is a case
+/// that will skip on the day it matters.
+#[test]
+fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
+    use busbar_api::McpDemotionRow;
+
+    let path = plugin_path();
+    let url = std::env::var("VALKEY_URL").unwrap_or_else(|_| {
+        panic!(
+            "VALKEY_URL is unset, and this case must not skip: it is the only over-the-ABI proof \
+             that a demotion and a spent approval survive a restart on this backend, and both fail \
+             SILENTLY when unrelayed — the trait defaults answer Ok(()) to a demotion and `true` to \
+             every redemption"
+        )
+    });
+    let cfg = serde_json::json!({ "url": url }).to_string();
+
+    let direct = ValkeyStore::connect(&url).expect("connect directly to clean up and verify");
+
+    let stamp = format!(
+        "{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    // Per-run ids, so every read below can only be answered by THIS run's writes, and two runs
+    // against one shared Valkey cannot redeem each other's approvals.
+    let srv_demoted = format!("srv_abi_demoted_{stamp}");
+    let srv_cleared = format!("srv_abi_cleared_{stamp}");
+    let nonce_restart = format!("nonce_abi_restart_{stamp}");
+    let nonce_fleet = format!("nonce_abi_fleet_{stamp}");
+    let nonce_fresh = format!("nonce_abi_fresh_{stamp}");
+    const NOW: u64 = 4_000_000_000;
+
+    let demotion = |server: &str, reason: &str, at: u64| McpDemotionRow {
+        server: server.to_string(),
+        reason: reason.to_string(),
+        recorded_at: at,
+    };
+
+    {
+        // BOOT 1 — a real dlopen of the cdylib; every call below crosses the C ABI.
+        let store = load_store(&path, &cfg).expect("the valkey plugin must load over the real ABI");
+        store
+            .put_mcp_demotion(&demotion(&srv_demoted, "tool-drift", NOW))
+            .expect("put_mcp_demotion");
+        // The UPSERT path crosses the ABI too: a second demotion of one upstream replaces the record.
+        store
+            .put_mcp_demotion(&demotion(&srv_demoted, "digest-mismatch", NOW + 10))
+            .expect("put_mcp_demotion");
+        store
+            .put_mcp_demotion(&demotion(&srv_cleared, "tool-drift", NOW + 20))
+            .expect("put_mcp_demotion");
+        store
+            .clear_mcp_demotion(&srv_cleared)
+            .expect("a later agreeing observation clears the quarantine");
+        assert!(
+            store
+                .redeem_ask_state(&nonce_restart, NOW + 900, NOW)
+                .expect("redeem_ask_state"),
+            "the FIRST redemption must be answered `true`, or nothing below is about single use"
+        );
+        // Dropping the boxed store runs `busbar_close` and unloads the library, so nothing this
+        // process still holds can be answering the reads below.
+        drop(store);
+    }
+
+    // BOOT 2 — a second, independent dlopen against the same Valkey.
+    let store =
+        load_store(&path, &cfg).expect("the valkey plugin must load again over the real ABI");
+
+    let mine = store
+        .list_mcp_demotions()
+        .expect("list_mcp_demotions")
+        .into_iter()
+        .filter(|r| r.server == srv_demoted || r.server == srv_cleared)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mine,
+        vec![demotion(&srv_demoted, "digest-mismatch", NOW + 10)],
+        "the boot read must put the recorded quarantine back in force — at its LATEST reason, and \
+         without the one a later agreeing observation cleared. An empty answer here is the \
+         accept-and-keep-nothing trait default an unrelayed seam substitutes, and it means a \
+         restart hands a demoted upstream the operator's approval back"
+    );
+
+    assert!(
+        !store
+            .redeem_ask_state(&nonce_restart, NOW + 900, NOW + 1)
+            .expect("redeem_ask_state"),
+        "a restart handed a spent approval back over the plugin ABI. The approval has not lapsed — \
+         outliving a restart is the point of it — so the only thing that changed is that the \
+         process which recorded the redemption is gone"
+    );
+
+    // THE FLEET, which on this backend is the ordinary deployment: a second, simultaneous dlopen
+    // against the same Valkey. It shares the signing key, so it shares the seal, and every check but
+    // this one passes on both.
+    let node_b = load_store(&path, &cfg).expect("a second node loads the same plugin");
+    assert!(store
+        .redeem_ask_state(&nonce_fleet, NOW + 900, NOW + 2)
+        .expect("redeem_ask_state"));
+    assert!(
+        !node_b
+            .redeem_ask_state(&nonce_fleet, NOW + 900, NOW + 3)
+            .expect("redeem_ask_state"),
+        "a second node redeemed an approval the first already spent, which is one operator \
+         confirmation executing once per node"
+    );
+    // THE CONTROL: a ledger that refused everything would satisfy both cases above and would have
+    // deleted the feature.
+    assert!(
+        node_b
+            .redeem_ask_state(&nonce_fresh, NOW + 900, NOW + 4)
+            .expect("redeem_ask_state"),
+        "a freshly minted approval is not the one that was spent; refusing it would make the shared \
+         ledger a blanket refusal of every confirmation after the first"
+    );
+    drop(store);
+    drop(node_b);
+
+    // LEG 3 — the same state through the plain `ValkeyStore`, a code path that never touches the
+    // cdylib, the C ABI or the loader. A plugin answering the reads above out of its own in-process
+    // state passes both boots and fails here.
+    assert!(
+        Store::list_mcp_demotions(&direct)
+            .expect("list_mcp_demotions via the direct connection")
+            .iter()
+            .any(|r| r.server == srv_demoted && r.reason == "digest-mismatch"),
+        "the demotion must be physically present in Valkey, not merely cached in the plugin"
+    );
+    assert!(
+        !Store::redeem_ask_state(&direct, &nonce_restart, NOW + 900, NOW + 5)
+            .expect("redeem_ask_state via the direct connection"),
+        "the spent-approval entry must be physically present in Valkey: a direct connection that \
+         never loaded the plugin has to see the redemption the plugin recorded"
+    );
+
+    // Clean up this run's demotion through the contract. The ledger entries are left to their own
+    // TTL on purpose — the contract gives them no delete, and that TTL is exactly the bound this
+    // backend's ledger is supposed to have.
+    Store::clear_mcp_demotion(&direct, &srv_demoted).expect("clean up this run's demotion");
+}

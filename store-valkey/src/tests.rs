@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 use super::*;
-use busbar_api::{McpCallRecord, SecretForm, TaskEventRow, TaskRow};
+use busbar_api::{McpCallRecord, McpDemotionRow, SecretForm, TaskEventRow, TaskRow};
 
 /// The password-scrub never lets the URL secret out in an error string, and the URL password
 /// extractor handles every URL shape.
@@ -2218,4 +2218,365 @@ fn the_task_store_round_trips_the_full_u64_range() {
     assert_eq!(events[0].seq, u64::MAX);
     assert_eq!(events[0].ts, u64::MAX);
     reset_tasks(&store, &[t]);
+}
+
+// ── THE DURABLE MCP DEMOTION RECORD AND THE SPENT-APPROVAL LEDGER ────────────────────────────
+//
+// Both are security state, and both arrived with the same hole: `busbar_api::Store` defaults
+// `put_mcp_demotion`/`list_mcp_demotions`/`clear_mcp_demotion` to accept-and-keep-nothing and
+// `redeem_ask_state` to `Ok(true)` — "yes, this call is the first redemption" — so a backend that
+// implements neither compiles, ships and reports every write successful while discarding it. What
+// that costs is a quarantined upstream that gets the operator's approval back at the next restart,
+// and a single-use human approval that a second node of the fleet redeems again.
+//
+// Valkey is the backend a fleet reaches for FIRST, so the second-node case here is not exotic.
+
+/// THE LIVE STORE, OR A FAILURE. Deliberately NOT `live_store()`, whose `None` arm lets a case
+/// return green having tested nothing: an unimplemented ledger and a test that never ran produce
+/// the same green, and these are exactly the two properties where that costs an operator something.
+/// A test that can skip is a test that will skip on the day it matters.
+fn require_live_store() -> ValkeyStore {
+    let url = std::env::var("VALKEY_URL").unwrap_or_else(|_| {
+        panic!(
+            "VALKEY_URL is unset. These cases are the ONLY coverage of the durable MCP demotion \
+             record and the spent-approval ledger on this backend, and both fail SILENTLY when \
+             unimplemented — the trait defaults answer Ok(()) to a demotion and `true` to every \
+             redemption. Skipping them reports green over a quarantined upstream that comes back \
+             approved and an approval that is redeemable once per node. Point this at a live \
+             Valkey, e.g. redis://127.0.0.1:6379/0"
+        )
+    });
+    ValkeyStore::connect(&url).expect("connect to the live Valkey")
+}
+
+/// Per-process namespacing. Every test in this file shares ONE Valkey, so a fixed key would have two
+/// concurrent runs redeeming each other's approvals and reading each other's demotions.
+fn trust_ns(tag: &str) -> String {
+    format!("{}_{}", tag, std::process::id())
+}
+
+const TRUST_NOW: u64 = 2_000_000_000;
+
+fn demotion(server: &str, reason: &str, recorded_at: u64) -> McpDemotionRow {
+    McpDemotionRow {
+        server: server.to_string(),
+        reason: reason.to_string(),
+        recorded_at,
+    }
+}
+
+/// Drop exactly this suite's own keys — never a blanket wipe, which would race every other
+/// concurrently-running test, and which on the ledger specifically would hand a spent approval back.
+fn reset_trust_state(store: &ValkeyStore, servers: &[&str], nonces: &[&str]) {
+    for s in servers {
+        store
+            .clear_mcp_demotion(s)
+            .expect("clear this test's own demotion");
+    }
+    for n in nonces {
+        store
+            .with_conn(|c| c.del::<_, ()>(ask_state_key(n)))
+            .expect("clear this test's own ledger entry");
+    }
+}
+
+/// A DEMOTION OUTLIVES THE PROCESS THAT RECORDED IT. The engine derives a demotion from a live
+/// observation, and a process that has taken no observation has nothing to derive it from — it
+/// serves the upstream against the digest the operator approved. So without this record on the
+/// server, a restart hands a quarantined upstream its approval back.
+#[test]
+fn a_demotion_survives_dropping_the_store_and_reconnecting() {
+    let url = std::env::var("VALKEY_URL").unwrap_or_else(|_| {
+        panic!("VALKEY_URL is unset; see require_live_store for why this must not skip")
+    });
+    let (a, b, c) = (
+        trust_ns("srv_payments"),
+        trust_ns("srv_search"),
+        trust_ns("srv_mail"),
+    );
+    {
+        let store = ValkeyStore::connect(&url).expect("connect");
+        reset_trust_state(&store, &[&a, &b, &c], &[]);
+        store
+            .put_mcp_demotion(&demotion(&a, "tool-drift", TRUST_NOW))
+            .unwrap();
+        // UPSERT by `server`: a second demotion of one upstream REPLACES the record rather than
+        // standing a rival one beside it, so the boot read cannot hold two answers about one server.
+        store
+            .put_mcp_demotion(&demotion(&a, "digest-mismatch", TRUST_NOW + 10))
+            .unwrap();
+        store
+            .put_mcp_demotion(&demotion(&b, "tool-drift", TRUST_NOW + 20))
+            .unwrap();
+        store
+            .put_mcp_demotion(&demotion(&c, "tool-drift", TRUST_NOW + 30))
+            .unwrap();
+        store
+            .clear_mcp_demotion(&c)
+            .expect("a later observation that agrees with the approval clears the quarantine");
+        store
+            .clear_mcp_demotion(&trust_ns("srv_never_demoted"))
+            .expect("clearing a record that is not there is a no-op, not an error");
+        drop(store);
+    }
+
+    // A genuinely new store and connection — nothing carried over in this process.
+    let reopened = ValkeyStore::connect(&url).expect("reconnect");
+    let mut mine = reopened
+        .list_mcp_demotions()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.server == a || r.server == b || r.server == c)
+        .collect::<Vec<_>>();
+    mine.sort_by(|x, y| x.server.cmp(&y.server));
+    let mut expect = vec![
+        demotion(&a, "digest-mismatch", TRUST_NOW + 10),
+        demotion(&b, "tool-drift", TRUST_NOW + 20),
+    ];
+    expect.sort_by(|x, y| x.server.cmp(&y.server));
+    assert_eq!(
+        mine, expect,
+        "the boot read must put every recorded quarantine back in force before the first request is \
+         served — upserted to the LATEST reason, and WITHOUT the one a later agreeing observation \
+         cleared. An empty or stale answer here is the accept-and-keep-nothing trait default, and \
+         it means a restart hands a demoted upstream the operator's approval back"
+    );
+    reset_trust_state(&reopened, &[&a, &b, &c], &[]);
+}
+
+/// A SERVER ID IS OPAQUE, colons very much included, and this store's own recorded hazard is that
+/// joining caller-supplied components on an unescaped `:` lets two distinct tuples render to one key
+/// so the second write silently overwrites the first. Demotions are held in a HASH FIELD rather than
+/// a composed key precisely so that question is answered structurally, and this pins it: two
+/// registration ids that differ only in where a colon falls are two upstreams.
+#[test]
+fn server_ids_containing_separators_are_not_confusable() {
+    let store = require_live_store();
+    let (a, b) = (format!("{}:x", trust_ns("srv_sep")), trust_ns("srv_sep:x"));
+    reset_trust_state(&store, &[&a, &b], &[]);
+
+    store
+        .put_mcp_demotion(&demotion(&a, "tool-drift", TRUST_NOW))
+        .unwrap();
+    store
+        .put_mcp_demotion(&demotion(&b, "digest-mismatch", TRUST_NOW + 1))
+        .unwrap();
+    let mine = store
+        .list_mcp_demotions()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.server == a || r.server == b)
+        .count();
+    assert_eq!(
+        mine, 2,
+        "two upstream ids that differ only in where a colon falls are two upstreams; a key composed \
+         by joining on an unescaped separator would render both to one record and lose a quarantine"
+    );
+    reset_trust_state(&store, &[&a, &b], &[]);
+}
+
+/// THE SPENT-APPROVAL LEDGER ACROSS A RESTART. The seal that carries a single-use approval is valid
+/// bytes on its second presentation exactly as on its first; only a record that the first happened
+/// tells them apart. In process memory that record dies with the process while the approval it
+/// records is still openable — so this drops the store and connection entirely and asks a new one.
+#[test]
+fn a_reconnected_store_refuses_a_second_redemption_of_the_same_approval() {
+    let url = std::env::var("VALKEY_URL")
+        .unwrap_or_else(|_| panic!("VALKEY_URL is unset; this case must not skip"));
+    let (spent, fresh) = (trust_ns("nonce_restart"), trust_ns("nonce_restart_other"));
+    {
+        let store = ValkeyStore::connect(&url).expect("connect");
+        reset_trust_state(&store, &[], &[&spent, &fresh]);
+        assert!(
+            store
+                .redeem_ask_state(&spent, TRUST_NOW + 900, TRUST_NOW)
+                .unwrap(),
+            "the FIRST redemption must be answered `true`, or nothing below is about single use"
+        );
+        drop(store);
+    }
+
+    let reopened = ValkeyStore::connect(&url).expect("reconnect");
+    assert!(
+        !reopened
+            .redeem_ask_state(&spent, TRUST_NOW + 900, TRUST_NOW + 1)
+            .unwrap(),
+        "a restart handed a spent approval back. The approval has not lapsed — outliving a restart \
+         is the point of it — so the only thing that changed is that the process which recorded the \
+         redemption is gone. On a tool an operator gated because it moves money, that second \
+         redemption is the whole defect the gate exists to stop"
+    );
+    // THE CONTROL, and it is load-bearing: a ledger that refused everything would satisfy the case
+    // above and would have deleted the feature.
+    assert!(
+        reopened
+            .redeem_ask_state(&fresh, TRUST_NOW + 900, TRUST_NOW + 2)
+            .unwrap(),
+        "a different approval is not the one that was spent; refusing it would make the ledger a \
+         blanket refusal of every confirmation after the first"
+    );
+    reset_trust_state(&reopened, &[], &[&spent, &fresh]);
+}
+
+/// TWO CONNECTIONS ARE TWO NODES OF A FLEET, and on this backend that is the ordinary deployment
+/// rather than an exotic one. They share the deployment's signing key, so they share the SEAL —
+/// every check but this one passes on both — and the second redemption needs no timing skill at all:
+/// it is an ordinary sequential request that a load balancer sends somewhere else.
+#[test]
+fn a_second_node_cannot_redeem_an_approval_the_first_already_spent() {
+    let url = std::env::var("VALKEY_URL")
+        .unwrap_or_else(|_| panic!("VALKEY_URL is unset; this case must not skip"));
+    let nonce = trust_ns("nonce_fleet");
+    let node_a = ValkeyStore::connect(&url).expect("node A connects");
+    let node_b = ValkeyStore::connect(&url).expect("node B connects");
+    reset_trust_state(&node_a, &[], &[&nonce]);
+
+    assert!(node_a
+        .redeem_ask_state(&nonce, TRUST_NOW + 900, TRUST_NOW)
+        .unwrap());
+    assert!(
+        !node_b
+            .redeem_ask_state(&nonce, TRUST_NOW + 900, TRUST_NOW)
+            .unwrap(),
+        "a second node of the same deployment redeemed an approval the first already spent, which \
+         is one operator confirmation executing once per node"
+    );
+    reset_trust_state(&node_a, &[], &[&nonce]);
+}
+
+/// CONCURRENT REDEMPTION IS THE ATTACK, not the corner case. Eight independent CONNECTIONS — not
+/// eight threads sharing one — race on one approval through a barrier, which is the arrangement a
+/// read-then-write implementation (GET, then SET) answers "first" to eight times. Exactly one may
+/// win, and on this backend that is what `SET NX` buys and a read-then-write cannot.
+#[test]
+fn exactly_one_of_many_racing_nodes_wins_the_redemption() {
+    let url = std::env::var("VALKEY_URL")
+        .unwrap_or_else(|_| panic!("VALKEY_URL is unset; this case must not skip"));
+    let nonce = trust_ns("nonce_race");
+    let cleanup = ValkeyStore::connect(&url).expect("connect");
+    reset_trust_state(&cleanup, &[], &[&nonce]);
+    drop(cleanup);
+
+    let n = 8usize;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(n));
+    let winners: usize = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let url = url.clone();
+                let nonce = nonce.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                scope.spawn(move || {
+                    let node = ValkeyStore::connect(&url).expect("a racing node connects");
+                    barrier.wait();
+                    node.redeem_ask_state(&nonce, TRUST_NOW + 900, TRUST_NOW)
+                        .expect("redeem_ask_state") as usize
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).sum()
+    });
+
+    assert_eq!(
+        winners, 1,
+        "exactly one redemption of one approval may be the first; {winners} nodes were each told \
+         they were, which is a test-and-set that is really a read followed by a write"
+    );
+    let cleanup = ValkeyStore::connect(&url).expect("connect");
+    reset_trust_state(&cleanup, &[], &[&nonce]);
+}
+
+/// THE LEDGER IS BOUNDED BY ONE APPROVAL-VALIDITY WINDOW, and on this backend the bound is the
+/// server's own TTL rather than a sweep the caller has to remember to run. `now` is what turns the
+/// approval's absolute deadline into that TTL. An entry recording an approval that can no longer be
+/// opened protects nothing, and a keyspace that only grows is its own outage — on a store whose
+/// `noeviction` invariant this crate checks at connect, it is an outage of everything else too.
+#[test]
+fn a_redeemed_entry_carries_a_ttl_bounded_by_the_approvals_own_life() {
+    let store = require_live_store();
+    let (short, long) = (trust_ns("nonce_ttl_short"), trust_ns("nonce_ttl_long"));
+    reset_trust_state(&store, &[], &[&short, &long]);
+
+    assert!(store
+        .redeem_ask_state(&short, TRUST_NOW + 30, TRUST_NOW)
+        .unwrap());
+    assert!(store
+        .redeem_ask_state(&long, TRUST_NOW + 10_000, TRUST_NOW)
+        .unwrap());
+
+    let ttl = |nonce: &str| -> i64 {
+        store
+            .with_conn(|c| c.ttl::<_, i64>(ask_state_key(nonce)))
+            .expect("TTL")
+    };
+    assert!(
+        (1..=30).contains(&ttl(&short)),
+        "the entry must expire with the approval it records: expected a TTL inside the approval's \
+         own 30-second remaining life, got {}",
+        ttl(&short)
+    );
+    assert!(
+        (1..=10_000).contains(&ttl(&long)),
+        "a longer-lived approval keeps a longer-lived entry, bounded by its own deadline; got {}",
+        ttl(&long)
+    );
+    assert!(
+        ttl(&long) > ttl(&short),
+        "the TTL has to track the approval's remaining life, not be a fixed constant — a constant \
+         either evicts a live approval's record early (a double redemption) or keeps a dead one \
+         forever"
+    );
+    reset_trust_state(&store, &[], &[&short, &long]);
+}
+
+/// AN ALREADY-LAPSED APPROVAL IS STILL ANSWERED HONESTLY. `expires_at <= now` is an approval that
+/// can no longer be opened, and the engine refuses it on the seal before ever reaching here — but
+/// this method must not be the thing that breaks on it. It answers the test-and-set truthfully and
+/// keeps the record only as briefly as it could possibly matter.
+#[test]
+fn a_lapsed_approval_still_gets_a_truthful_answer_and_a_bounded_record() {
+    let store = require_live_store();
+    let nonce = trust_ns("nonce_lapsed");
+    reset_trust_state(&store, &[], &[&nonce]);
+
+    assert!(
+        store
+            .redeem_ask_state(&nonce, TRUST_NOW, TRUST_NOW + 60)
+            .unwrap(),
+        "a first redemption is a first redemption even when the approval has lapsed; refusing here \
+         would be this store inventing an expiry policy the engine already owns"
+    );
+    let ttl: i64 = store
+        .with_conn(|c| c.ttl::<_, i64>(ask_state_key(&nonce)))
+        .expect("TTL");
+    assert!(
+        (1..=60).contains(&ttl),
+        "a lapsed approval's record must still be bounded rather than immortal (a zero or negative \
+         EX is an error the caller would see as a store failure); got {ttl}"
+    );
+    reset_trust_state(&store, &[], &[&nonce]);
+}
+
+/// THE FULL u64 RANGE ROUND-TRIPS. Like the task store, the demotion record is JSON, so there is no
+/// signed-64 ceiling to clamp against and no value this backend has to refuse.
+#[test]
+fn the_demotion_record_round_trips_the_full_u64_range() {
+    let store = require_live_store();
+    let server = trust_ns("srv_range");
+    reset_trust_state(&store, &[&server], &[]);
+
+    store
+        .put_mcp_demotion(&demotion(&server, "tool-drift", u64::MAX))
+        .expect("JSON has no signed-64 ceiling to hit");
+    assert_eq!(
+        store
+            .list_mcp_demotions()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.server == server)
+            .expect("the record must be there")
+            .recorded_at,
+        u64::MAX,
+        "recorded_at must read back as itself, never wrapped or clamped"
+    );
+    reset_trust_state(&store, &[&server], &[]);
 }
