@@ -92,3 +92,65 @@ jobs:
         env:
           VALKEY_URL: redis://localhost:6379/0
         run: cargo test -- --ignored --test-threads=1 wipes_the_entire_namespace_destructively
+
+  # COVERAGE — instrumented run of the same workspace suite the `ci` job exercises, uploaded to
+  # Codecov for the README badge and per-PR line-coverage context. Deliberately ADDITIVE and
+  # NON-GATING:
+  #
+  #   * It is NOT a required check (this repo has no ci-umbrella; nothing `needs:` it), so it can
+  #     never turn dev/qa/main red. Coverage reporting is an OBSERVATION, not a correctness gate —
+  #     the gate is the `ci` reusable workflow, which this must never mask or block.
+  #   * It is a SEPARATE job on purpose: `cargo llvm-cov` compiles with `-C instrument-coverage` and
+  #     drops `*.profraw` files, so folding it into a clean-tree job would be unsound.
+  #   * The upload uses `fail_ci_if_error: false` so a Codecov outage or a tokenless rate-limit is a
+  #     no-op here, not a red job — a reporting dependency must never fail the build.
+  #
+  # Mirrors the `migrate-destructive-wipe-test` job's checkout layout (store-valkey at
+  # store-valkey-repo, busbar at busbarAI as its sibling) because busbar-api is an INTERIM sibling
+  # path dependency (../../busbarAI/crates/api) until busbarAI is public, and the digest-pinned
+  # valkey/valkey:8 service + VALKEY_URL the workspace tests need — same image and env the
+  # reusable plugin-ci.yml `valkey` service uses, so the live-Valkey roundtrip tests are covered
+  # here too rather than skipped. `cargo llvm-cov` runs the default (non-#[ignore]'d) suite, so the
+  # destructive-wipe test never fires here.
+  coverage:
+    name: coverage (llvm-cov · codecov)
+    runs-on: ubuntu-latest
+    services:
+      valkey:
+        image: valkey/valkey:8@sha256:495e4fecdc98ee48a20b207726caa5ab6451e0fac3642a9be10d9e70b3068df6
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - name: Checkout store-valkey
+        uses: actions/checkout@v7
+        with:
+          path: store-valkey-repo
+
+      - name: Checkout busbar (sibling path dependency)
+        uses: actions/checkout@v7
+        with:
+          repository: GetBusbar/busbar
+          ref: ${{ env.BUSBAR_REF }}
+          path: busbarAI
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Collect coverage (workspace, live Valkey wired)
+        working-directory: store-valkey-repo
+        env:
+          VALKEY_URL: redis://localhost:6379/0
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+      - name: Upload to Codecov (tokenless; never fails the build)
+        uses: codecov/codecov-action@v5
+        with:
+          files: store-valkey-repo/lcov.info
+          slug: GetBusbar/store-valkey
+          fail_ci_if_error: false
