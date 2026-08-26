@@ -4,6 +4,7 @@
 itself — see [Versioning](#versioning) below.)
 
 [![CI](https://github.com/GetBusbar/store-valkey/actions/workflows/ci.yml/badge.svg)](https://github.com/GetBusbar/store-valkey/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/GetBusbar/store-valkey/branch/main/graph/badge.svg)](https://codecov.io/gh/GetBusbar/store-valkey)
 [![Release](https://img.shields.io/github/v/release/GetBusbar/store-valkey)](https://github.com/GetBusbar/store-valkey/releases)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
