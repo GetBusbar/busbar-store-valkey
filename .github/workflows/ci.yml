@@ -151,6 +151,7 @@ jobs:
       - name: Upload to Codecov (tokenless; never fails the build)
         uses: codecov/codecov-action@v5
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
           files: store-valkey-repo/lcov.info
           slug: GetBusbar/store-valkey
           fail_ci_if_error: false
