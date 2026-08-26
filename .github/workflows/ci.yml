@@ -28,6 +28,7 @@ on:
 jobs:
   ci:
     uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@dev
+    secrets: inherit
     with:
       plugin_crate: busbar-store-valkey-plugin
       plugin_kind: store
