@@ -13,13 +13,11 @@ to build, test, and submit changes.
 
 ## Development setup
 
-`store-valkey` is a Rust `cdylib` plugin. You need a recent stable toolchain
-(`rustup` recommended), and — until [busbarAI](https://github.com/GetBusbar/busbar)
-ships publicly — a sibling checkout of it at `../busbarAI`, since this crate's
-`Cargo.toml` points at busbar's crates as local path dependencies. See the
-README's [Dependencies](README.md#dependencies) section for the exact layout;
-CI checks out `GetBusbar/busbar` at the branch named in the reusable
-`plugin-ci.yml` workflow reference in [`ci.yml`](.github/workflows/ci.yml).
+`store-valkey` is a Rust `cdylib` plugin. You need the toolchain `rust-toolchain.toml` pins
+(`rustup` picks it up). busbar is a git dependency pinned to the rev in `.busbar-ref` — no sibling
+checkout is needed to build. The end-to-end tests boot a real `busbar` built from a checkout at that
+rev, named by `BUSBAR_CHECKOUT` (default `../busbar`); CI checks it out the same way (see
+[`ci.yml`](.github/workflows/ci.yml)).
 
 The meaningful test coverage here needs a **live Valkey** — see the README's
 [Tests](README.md#tests) section. Locally, `cargo test` skips that coverage

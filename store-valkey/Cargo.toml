@@ -2,33 +2,40 @@
 [package]
 name = "busbar-store-valkey"
 version = "1.0.0"
-publish = false            # internal workspace crate; never goes to crates.io
+publish = false            # a first-party plugin crate; shipped linked into busbar or as a signed tarball
 edition = "2021"
 rust-version = "1.97"
-description = "The Valkey backend for busbar's durable governance store — the shared, multi-node db plugin over a KV data model. Implements busbar_api::Store on a mutex-guarded synchronous valkey connection."
+description = "The Valkey backend for busbar's durable governance store — the shared, multi-node db plugin over a KV data model. Implements busbar_contract::records::RecordStore on a mutex-guarded synchronous valkey connection."
 license = "Apache-2.0"
 
+[lib]
+# rlib: THE LOGIC. It carries the store's ONE door registration (`export_store_plugin!(open)`) and its
+# `linked::STORE` row, so a busbar build can link it; the sibling `busbar-store-valkey-plugin` cdylib
+# re-exports it as the dropped-in door. One source, both doors (DECISIONS #2 rule (1)).
+crate-type = ["rlib"]
+
 [dependencies]
-# INTERIM: busbarAI isn't public yet, so this is a local path dependency into a sibling checkout of
-# the monorepo. Once busbarAI ships publicly this should become a git (pinned rev/tag) or crates.io
-# dependency instead — same pattern already applied to busbar-plugin-sdk in ../store-valkey-plugin.
-busbar-api = { path = "../../busbarAI/crates/api" }
+# The ONE busbar crate a plugin names (#40: contract only; DECISIONS #84 merged the plugin SDK into it
+# as `busbar_contract::abi::sdk`). Pinned by git rev to the busbar commit in `.busbar-ref`; a busbar
+# build that links this crate `[patch]`es the busbar git source to its own tree, so ONE copy of the
+# contract links.
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "8b7b6473f47f8d37ae60839c74cfe6a9b64a1dc9" }
 # The upstream RESP client, SYNCHRONOUS only (no async runtime), with rustls-backed TLS for
 # rediss:// URLs. NOTE: this is the ONE name in this repo that is deliberately NOT "valkey" — it is
 # an upstream crates.io package still published under its pre-fork name, so it is not ours to
 # rename; the server it talks to is Valkey, and the RESP dialect is the same one Valkey speaks.
-# Trimming default-features keeps the dependency tree small and license-clean (this crate + its deps
-# are MIT/Apache/BSD — all already in deny.toml's allow-list) and avoids pulling a second async stack
-# into the plugin; the rustls backend reuses the single TLS stack the workspace already pins.
-redis = { version = "1", default-features = false, features = ["tls-rustls"] }
+# Trimming default-features keeps the dependency tree small and license-clean and avoids pulling a
+# second async stack into the plugin; the rustls backend reuses the single TLS stack busbar pins.
+# `script` for the server-side atomic plane-record and usage-floor steps (EVAL).
+redis = { version = "1", default-features = false, features = ["tls-rustls", "script"] }
 # The rediss:// TLS path builds its rustls config against the PROCESS default crypto provider; this
 # crate may live inside a plugin cdylib with its own rustls static state, so it installs the ring
-# provider explicitly at connect. ring only — the same single provider the workspace already pins.
+# provider explicitly at connect. ring only — the same single provider busbar pins.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde_json = "1"
+# `derive` for the plane-record sidecar and the v6 -> v7 migration's legacy row shapes.
+serde = { version = "1", features = ["derive"] }
 
-[dev-dependencies]
-# The shared `Store` contract conformance suite, so the four behaviours the fleet used to disagree
-# on are asserted from ONE place rather than hand-copied into each backend, which is how they
-# drifted apart to begin with.
-busbar-plugin-testkit = { path = "../../busbarAI/crates/plugin-testkit", features = ["store"] }
+# NO busbar dev-dependency. The `RecordStore` contract conformance suite used to arrive here as
+# `busbar-plugin-testkit`; the owner ruled that crate DELETED on 2026-09-22 and #2/#31 forbid a shared
+# test util between plugins, so this crate owns its copy at `src/tests/store_conformance.rs`.

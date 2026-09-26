@@ -52,14 +52,19 @@ schemes that driver parses. Nothing busbar-owned says "redis" any more.
 
 This plugin is versioned **independently of busbar** — `v1.0.5` here says
 nothing about which busbar release it is. Compatibility with busbar is
-stated separately: **requires busbar 1.5.0+** (the release that ships the
-signed hybrid plugin ABI this crate loads over). Pin both versions
+stated separately: the released v1.0.x line **requires busbar 1.5.0+** (the
+release that ships the signed hybrid plugin ABI it loads over); the `dev` line
+speaks the busbar **1.6.0** record contract and builds against the busbar rev
+in [`.busbar-ref`](.busbar-ref). A v1.0.x namespace (schema v6) is upgraded in
+place on first connect. Pin both versions
 explicitly in production; do not assume they move together.
 
-It is a `cdylib` that implements busbar's `Store` trait (via
-[`busbar-plugin-sdk`](https://github.com/GetBusbar/busbar/tree/main/crates/plugin-sdk))
-and is loaded in-process by busbar over the signed store ABI —
-`dlopen`'d, not spawned as a separate process.
+It is a `cdylib` that implements busbar's `RecordStore` contract (via the
+plugin SDK in [`busbar-contract`](https://github.com/GetBusbar/busbar/tree/main/crates/busbar-contract),
+`busbar_contract::abi::sdk`) and is loaded in-process by busbar over the signed store ABI —
+`dlopen`'d, not spawned as a separate process. The same store can also be LINKED into a busbar
+build (its `linked::STORE` row); both doors run the same code, and
+[`tests/conformance.rs`](store-valkey-plugin/tests/conformance.rs) proves they behave as one store.
 
 ## What it is for
 
@@ -68,57 +73,48 @@ and is loaded in-process by busbar over the signed store ABI —
   ledgers, and metering/audit rows — the store is the durability layer
   behind the engine's in-memory enforcement counters (boot-hydrate +
   periodic write-behind flush), not a request-hot-path dependency.
-- **Fleet-honest accrual**: `add_usage` uses Valkey `HINCRBY` for a real
-  atomic accumulate, so N nodes each flushing their own delta-since-last
-  sum to the true fleet total (an absolute `put_usage` overwrite would be
-  last-writer-wins across nodes).
+- **Fleet-honest accrual**: `add_usage` is a real atomic server-side accumulate
+  (`HINCRBY`, each counter floored at 0), so N nodes each flushing their own
+  delta-since-last sum to the true fleet total (an absolute `put_usage`
+  overwrite would be last-writer-wins across nodes).
 
 This crate (`busbar-store-valkey-plugin`) is intentionally a thin
-adapter: all the Valkey schema/serialization/retry/TLS logic lives in the
-`busbar-store-valkey` library crate it wraps, in the `store-valkey/` directory of
-this repository; here we only translate the engine's JSON `open` config into a
-live `ValkeyStore`.
+adapter: all the Valkey schema/serialization/retry/TLS logic — and the `open`
+that turns the engine's JSON config into a live `ValkeyStore` — lives in the
+`busbar-store-valkey` library crate it re-exports, in the `store-valkey/`
+directory of this repository.
 
 ## Build
 
-Needs a Rust toolchain ([rustup](https://rustup.rs)), and — interim,
-until [busbarAI](https://github.com/GetBusbar/busbar) ships publicly —
-a sibling checkout of `busbarAI` at `../busbarAI` (see
-[Dependencies](#dependencies) below).
+Needs a Rust toolchain ([rustup](https://rustup.rs); `rust-toolchain.toml` pins the version CI uses).
+Nothing else: busbar is a pinned git dependency (see [Dependencies](#dependencies)).
 
 ```sh
 cargo build --release      # cdylib: target/release/libbusbar_store_valkey_plugin.{so,dylib}
-cargo test                 # unit tests + the real-ABI/real-Valkey end-to-end test (see tests/e2e.rs)
-cargo clippy --all-targets -- -D warnings
+cargo test                 # the store's suite, the linked + dropped-in conformance, the end-to-end tests
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
+The end-to-end tests boot a REAL `busbar`; they build it from a busbar checkout named by
+`BUSBAR_CHECKOUT` (default: a sibling `../busbar`), which must be at the `.busbar-ref` rev.
+
 ## Dependencies
 
-`busbar-store-valkey`, the KV-modeling logic crate this plugin thinly adapts,
-lives in this repository. `busbar-api` and `busbar-plugin-sdk`, and the
-`busbar-plugin-loader` dev-dependency the end-to-end test uses, come from the
-[busbarAI](https://github.com/GetBusbar/busbar) monorepo.
-Because busbarAI is not yet public, `Cargo.toml` points at these as
-**local path dependencies** (`../busbarAI/crates/...`), which means this
-repo expects to be checked out as a sibling of `busbarAI`:
-
-```
-some-parent-dir/
-├── busbarAI/
-└── store-valkey/
-```
-
-This is an interim measure — once busbarAI ships publicly, these should
-become git (pinned rev/tag) or crates.io dependencies instead. Grep
-`Cargo.toml` for the `INTERIM` comments when doing that migration.
+`busbar-store-valkey`, the store logic (and the store's one door registration and its `linked` row,
+so a busbar build can link it), lives in this repository; `busbar-store-valkey-plugin` re-exports it
+as the droppable cdylib. The one busbar crate either names is `busbar-contract` (the plugin contract
+and SDK); the tests also use `busbar-plugin-loader`. Both are git dependencies on
+[GetBusbar/busbar](https://github.com/GetBusbar/busbar) pinned to the rev in field 1 of
+[`.busbar-ref`](.busbar-ref); CI's `pin` job refuses a manifest that names any other rev, a retired
+busbar crate, or a sibling path.
 
 ## Pack and sign
 
 Once built, the cdylib is packed and signed like any other busbar plugin
 — see
 [`docs/plugins.md`](https://github.com/GetBusbar/busbar/blob/main/docs/plugins.md#signing-and-packaging)
-in busbarAI for the full reference. In short:
+in busbar for the full reference. In short:
 
 ```sh
 BUSBAR_SIGN_KEY=<signing key> busbar-plugin-pack pack \
@@ -184,11 +180,8 @@ default `cargo test`), but under CI (`CI` set) a missing `VALKEY_URL` is
 a **hard failure**, never a silent skip — see
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml), which runs a
 real `valkey/valkey:8` GitHub Actions service container on every push and PR.
-CI also separately runs `busbar-store-valkey`'s own live-Valkey
-integration tests (from the sibling `busbarAI` checkout) against that
-same service container — the coverage that crate's tests were written
-for but had never actually been wired into a CI job before this repo's
-workflow.
+On macOS, where GitHub runs no service containers, CI starts a brew-installed `valkey-server`
+instead.
 
 ## License
 
