@@ -60,7 +60,8 @@ jobs:
           if grep -nE 'path = "\.\./\.\./' */Cargo.toml; then
             echo "::error::a manifest names a sibling-checkout path dependency"; exit 1
           fi
-          if grep -nE 'busbar-(api|plugin-sdk|plugin-testkit)' */Cargo.toml; then
+          # A dependency LINE (`name = ...`), never a comment that records the crate's retirement.
+          if grep -nE '^[[:space:]]*busbar-(api|plugin-sdk|plugin-testkit)[[:space:]]*=' */Cargo.toml; then
             echo "::error::a manifest names a retired busbar crate (#40: busbar-contract only)"; exit 1
           fi
           echo "pinned busbar rev: $pin"
