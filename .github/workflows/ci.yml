@@ -1,157 +1,179 @@
-# Calls the canonical plugin-ci reusable workflow (GetBusbar/busbar/.github/workflows/plugin-ci.yml)
-# instead of hand-copying build/test/signoff steps here — see that file for what actually runs.
+# store-valkey CI — fmt, clippy, build, the store's own suite against a live Valkey, the linked +
+# dropped-in conformance, and the real-busbar end-to-end install, all against the busbar rev this
+# repo PINS.
 #
-# busbar-store-valkey (the real logic crate) now lives IN THIS REPO (the store-valkey/ subdirectory,
-# a same-repo sibling of store-valkey-plugin/ — see this repo's root Cargo.toml), not in busbarAI, so
-# the `ci` job below has no extra sibling-TEST command to run: the reusable workflow's own
-# `cargo test` step (working-directory: plugin, i.e. this checkout's root) already exercises
-# busbar-store-valkey's own unit tests plus store-valkey-plugin's real dlopen ABI e2e test against the
-# `valkey` service container above, because `cargo test` on a virtual workspace with no
-# default-members runs every member by default. This crate's `busbar-api` dependency is STILL a
-# sibling path dependency into busbarAI though (INTERIM until busbarAI is public) — both jobs below
-# need their own busbarAI checkout for that reason.
+# This repo builds standalone: its only busbar dependency (busbar-contract, and busbar-plugin-loader
+# for the conformance and end-to-end tests) is a `git` dependency on https://github.com/GetBusbar/busbar
+# at the rev in field 1 of `.busbar-ref`. No path dependency — so what CI proves is exactly what a
+# busbar build that pulls this repo at a pinned rev links. The end-to-end tests drive a REAL `busbar`
+# binary; CI checks GetBusbar/busbar out at that SAME rev beside this repo and points
+# `BUSBAR_CHECKOUT` at it.
+#
+# LIVE VALKEY, NEVER SKIPPED: under `CI` the store's live tests FAIL without `VALKEY_URL` (they never
+# skip), so both legs start a real server — a `valkey/valkey` service container on Linux, a
+# brew-installed `valkey-server` on macOS (GitHub runs service containers on Linux only).
 name: ci
-
-env:
-  # Same BUSBAR_REF convention ci.yml/release.yml elsewhere establish for the sibling path
-  # dependency (busbar-api) this crate needs — INTERIM until busbarAI is public. Update to `main`
-  # once busbar 1.5.0 ships. Repointed from the stale `1.5.0-dev` (which predates this cycle's
-  # generic-credentials redesign entirely) to `dev`, where that redesign actually landed.
-  #
-  # base_ref FIRST, for the same reason the `ci` job below spells it that way: on a pull_request
-  # event `github.ref_name` is '<number>/merge', which is not a branch name in ANY repository, so
-  # the migrate-destructive-wipe-test job's sibling checkout asked GetBusbar/busbar for a branch
-  # literally called '4/merge' and `git fetch` died with a bare exit code 1 on EVERY pull request
-  # to this repo. base_ref is the branch the PR targets (dev/qa/main) and is empty on push, where
-  # ref_name is already the branch, so this keeps the same-branch intent on both event types.
-  BUSBAR_REF: ${{ github.base_ref || github.ref_name }}
 
 on:
   push:
     branches: [main, dev, qa]
   pull_request:
     branches: [main, dev, qa]
-  # Manual trigger. Needed because `gh run rerun` PINS the reusable-workflow SHA:
-  # a rerun re-uses the plugin-ci.yml snapshot from the original run, so a fix landing in
-  # core's reusable workflow can only be picked up by a NEW run, never by rerunning an old one.
   workflow_dispatch: {}
-jobs:
-  ci:
-    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@dev
-    with:
-      plugin_crate: busbar-store-valkey-plugin
-      plugin_kind: store
-      plugin_alias: valkey
-      service: valkey
-      # UNPINNED from `feat/1.5.5-mcp-integrated` on merge to dev: that pin existed only because
-      # core `dev` did not yet carry the durable MCP tool-call log contract, and the pin's own note
-      # said to move back to the branch ref once that line merged. Core dev now exports all four
-      # methods (append_mcp_call / list_mcp_calls / list_mcp_call_principals /
-      # purge_mcp_calls_before), so the precondition is met and CI tracks the branch again.
-      busbar_ref: ${{ github.base_ref || github.ref_name }}
-      # base_ref FIRST: on a pull_request `github.ref_name` is '<number>/merge', not a branch
-      # name, so this asked busbar for a branch called '5/merge' and the sibling checkout died
-      # with an unreadable git error on EVERY pull request to this repo.
 
-  # migrate()'s destructive-wipe test (store-valkey/src/tests.rs) SCAN+DELETEs the ENTIRE busbar:*
-  # namespace on whatever live Valkey VALKEY_URL points at — it is #[ignore]'d and must run ALONE,
-  # never concurrently with the `ci` job's own tests against the same shared service container (see
-  # that test's own doc comment for the full rationale). It runs here, in its own isolated job
-  # against its own dedicated valkey/valkey:8 service container.
-  migrate-destructive-wipe-test:
-    name: migrate() destructive-wipe test (isolated, own valkey/valkey:8 container)
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # No global RUSTFLAGS: it would also reach the nested real-busbar build (whose warning posture is
+  # busbar's) and change its fingerprint. `clippy -D warnings` holds this repo's code to zero warnings.
+  # The real `busbar` the end-to-end tests boot is built in release; LTO off and more codegen units
+  # keep that build inside the job budget. Behaviour is unchanged (a release profile knob, not a
+  # feature).
+  CARGO_PROFILE_RELEASE_LTO: "off"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+
+jobs:
+  pin:
+    name: the busbar pin is one rev
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rev: ${{ steps.pin.outputs.rev }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Every `rev = "..."` on the busbar git source in every manifest is field 1 of `.busbar-ref`.
+      # Two revs would link two copies of the contract; a rev that disagrees with `.busbar-ref` makes
+      # the pin a lie about what the release builds against.
+      - name: every busbar git dependency names the .busbar-ref rev
+        id: pin
+        run: |
+          set -euo pipefail
+          pin=$(awk '{print $1; exit}' .busbar-ref)
+          [[ "$pin" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::.busbar-ref field 1 is not a full sha: '$pin'"; exit 1; }
+          found=$(grep -hoE 'git = "https://github.com/GetBusbar/busbar", rev = "[0-9a-f]+"' */Cargo.toml | grep -oE '[0-9a-f]{40}' | sort -u)
+          [ -n "$found" ] || { echo "::error::no busbar git dependency found"; exit 1; }
+          if [ "$found" != "$pin" ]; then
+            echo "::error::busbar revs in manifests ($found) != .busbar-ref ($pin)"; exit 1
+          fi
+          if grep -nE 'path = "\.\./\.\./' */Cargo.toml; then
+            echo "::error::a manifest names a sibling-checkout path dependency"; exit 1
+          fi
+          if grep -nE 'busbar-(api|plugin-sdk|plugin-testkit)' */Cargo.toml; then
+            echo "::error::a manifest names a retired busbar crate (#40: busbar-contract only)"; exit 1
+          fi
+          echo "pinned busbar rev: $pin"
+          echo "rev=$pin" >> "$GITHUB_OUTPUT"
+
+  linux:
+    name: fmt, clippy, build, test, conformance, e2e [ubuntu-latest]
+    needs: pin
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
     services:
       valkey:
         image: valkey/valkey:8
         ports:
           - 6379:6379
-        # Runs INSIDE the container (it has its own valkey-cli — the runner does not); GitHub
-        # Actions blocks the job's steps from starting until this reports healthy, so no separate
-        # manual "wait for valkey" step is needed or correct here (mirrors plugin-ci.yml's own valkey
-        # service block).
         options: >-
-          --health-cmd "valkey-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
+          --health-cmd "valkey-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      VALKEY_URL: redis://127.0.0.1:6379/0
+      BUSBAR_CHECKOUT: ${{ github.workspace }}/busbar
     steps:
-      - name: Checkout store-valkey
-        uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          path: store-valkey-repo
-
-      - name: Checkout busbar (sibling path dependency)
-        uses: actions/checkout@v7
+          path: plugin
+      - name: Checkout busbar at the pinned rev (the real binary the end-to-end tests boot)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: GetBusbar/busbar
-          ref: ${{ env.BUSBAR_REF }}
-          path: busbarAI
-
-      - uses: dtolnay/rust-toolchain@stable
+          ref: ${{ needs.pin.outputs.rev }}
+          path: busbar
+      - uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
+        with:
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test -p busbar-store-valkey -- --ignored wipes_the_entire_namespace_destructively
-        working-directory: store-valkey-repo/store-valkey
-        env:
-          VALKEY_URL: redis://localhost:6379/0
-        run: cargo test -- --ignored --test-threads=1 wipes_the_entire_namespace_destructively
-
-  # COVERAGE — instrumented run of the same workspace suite the `ci` job exercises, uploaded to
-  # Codecov for the README badge and per-PR line-coverage context. Deliberately ADDITIVE and
-  # NON-GATING:
-  #
-  #   * It is NOT a required check (this repo has no ci-umbrella; nothing `needs:` it), so it can
-  #     never turn dev/qa/main red. Coverage reporting is an OBSERVATION, not a correctness gate —
-  #     the gate is the `ci` reusable workflow, which this must never mask or block.
-  #   * It is a SEPARATE job on purpose: `cargo llvm-cov` compiles with `-C instrument-coverage` and
-  #     drops `*.profraw` files, so folding it into a clean-tree job would be unsound.
-  #   * The upload uses `fail_ci_if_error: false` so a Codecov outage or a tokenless rate-limit is a
-  #     no-op here, not a red job — a reporting dependency must never fail the build.
-  #
-  # Mirrors the `migrate-destructive-wipe-test` job's checkout layout (store-valkey at
-  # store-valkey-repo, busbar at busbarAI as its sibling) because busbar-api is an INTERIM sibling
-  # path dependency (../../busbarAI/crates/api) until busbarAI is public, and the digest-pinned
-  # valkey/valkey:8 service + VALKEY_URL the workspace tests need — same image and env the
-  # reusable plugin-ci.yml `valkey` service uses, so the live-Valkey roundtrip tests are covered
-  # here too rather than skipped. `cargo llvm-cov` runs the default (non-#[ignore]'d) suite, so the
-  # destructive-wipe test never fires here.
-  coverage:
-    name: coverage (llvm-cov · codecov)
-    runs-on: ubuntu-latest
-    services:
-      valkey:
-        image: valkey/valkey:8@sha256:495e4fecdc98ee48a20b207726caa5ab6451e0fac3642a9be10d9e70b3068df6
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "valkey-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
-    steps:
-      - name: Checkout store-valkey
-        uses: actions/checkout@v7
         with:
-          path: store-valkey-repo
+          workspaces: |
+            plugin
+            busbar
+          key: busbar-${{ needs.pin.outputs.rev }}
+      - name: fmt
+        working-directory: plugin
+        run: cargo fmt --all -- --check
+      - name: clippy
+        working-directory: plugin
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: build (the rlib a busbar build links, and the cdylib a signed tarball carries)
+        working-directory: plugin
+        run: cargo build --workspace --locked
+      - name: build the real busbar + busbar-plugin-pack at the pin
+        working-directory: busbar
+        run: |
+          cargo build --release --locked -p busbar --bin busbar
+          cargo build --release --locked -p busbar-plugin-loader --features pack --bin busbar-plugin-pack
+      - name: test (the store's suite, the both-doors conformance, the end-to-end install)
+        working-directory: plugin
+        run: cargo test --workspace --locked
+      # These mutate server-wide state (CONFIG SET, a namespace wipe), so they run alone, last.
+      - name: test (the exclusive, server-wide cases)
+        working-directory: plugin
+        run: cargo test -p busbar-store-valkey --locked -- --ignored --test-threads=1
 
-      - name: Checkout busbar (sibling path dependency)
-        uses: actions/checkout@v7
+  macos:
+    name: fmt, clippy, build, test, conformance, e2e [macos-latest]
+    needs: pin
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      VALKEY_URL: redis://127.0.0.1:6379/0
+      BUSBAR_CHECKOUT: ${{ github.workspace }}/busbar
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: plugin
+      - name: Checkout busbar at the pinned rev (the real binary the end-to-end tests boot)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: GetBusbar/busbar
-          ref: ${{ env.BUSBAR_REF }}
-          path: busbarAI
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+          ref: ${{ needs.pin.outputs.rev }}
+          path: busbar
+      - name: Start a live Valkey (no service containers on macOS)
+        run: |
+          set -euo pipefail
+          brew install valkey
+          valkey-server --port 6379 --bind 127.0.0.1 --daemonize yes --save "" --appendonly no \
+            --maxmemory-policy noeviction
+          for _ in $(seq 1 30); do valkey-cli -p 6379 ping && exit 0; sleep 1; done
+          echo "::error::valkey did not come up"; exit 1
+      - uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
         with:
-          components: llvm-tools-preview
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Collect coverage (workspace, live Valkey wired)
-        working-directory: store-valkey-repo
-        env:
-          VALKEY_URL: redis://localhost:6379/0
-        run: cargo llvm-cov --workspace --locked --ignore-run-fail --lcov --output-path lcov.info
-      - name: Upload to Codecov (tokenless; never fails the build)
-        uses: codecov/codecov-action@v5
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: store-valkey-repo/lcov.info
-          slug: GetBusbar/store-valkey
-          fail_ci_if_error: false
+          workspaces: |
+            plugin
+            busbar
+          key: busbar-${{ needs.pin.outputs.rev }}
+      - name: clippy
+        working-directory: plugin
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: build
+        working-directory: plugin
+        run: cargo build --workspace --locked
+      - name: build the real busbar + busbar-plugin-pack at the pin
+        working-directory: busbar
+        run: |
+          cargo build --release --locked -p busbar --bin busbar
+          cargo build --release --locked -p busbar-plugin-loader --features pack --bin busbar-plugin-pack
+      - name: test (the store's suite, the both-doors conformance, the end-to-end install)
+        working-directory: plugin
+        run: cargo test --workspace --locked
+      - name: test (the exclusive, server-wide cases)
+        working-directory: plugin
+        run: cargo test -p busbar-store-valkey --locked -- --ignored --test-threads=1

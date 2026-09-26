@@ -6,7 +6,7 @@
 //! exact seam the engine sees when `store: { module: valkey }` is configured: a `Box<dyn Store>`
 //! indistinguishable from a compiled-in store, backed by `dlopen`'d code running the C ABI.
 //!
-//! Unlike a file-backed store (see busbarAI's sqlite plugin end-to-end test, which reopens the
+//! Unlike a file-backed store (see store-sqlite's plugin end-to-end test, which reopens the
 //! same file), Valkey has no "close and reopen the same file" persistence signal to check. Instead
 //! this proves persistence the way that is actually meaningful for a SHARED backend:
 //!
@@ -25,7 +25,10 @@
 //! `VALKEY_URL` is a HARD FAILURE, never a silent skip, so the only over-the-ABI coverage of the
 //! durable Valkey store path cannot quietly vanish.
 
-use busbar_api::{McpCallRecord, ModelTokens, Store, TierTokens, UsageLedger, VirtualKey};
+use busbar_contract::records::{
+    ModelTokens, PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore, RecordStoreResult,
+    ScopeRef, UsageLedger, VirtualKey,
+};
 use busbar_plugin_loader::{load_store, plugin_library_filename};
 use busbar_store_valkey::ValkeyStore;
 use std::path::PathBuf;
@@ -141,7 +144,7 @@ fn plugin_path() -> PathBuf {
 }
 
 /// The live `VALKEY_URL`, mirroring `busbar-store-valkey`'s own `live_store()` gating discipline
-/// (see busbarAI's `crates/store-valkey/src/lib.rs`): skip cleanly when unset LOCALLY, but a
+/// (see `busbar-store-valkey`'s own `live_store()`): skip cleanly when unset LOCALLY, but a
 /// missing `VALKEY_URL` under `CI` is a hard failure, not a silent skip — CI provisions the
 /// `valkey:7` service container and must set this env var (see `.github/workflows/ci.yml`).
 fn valkey_url() -> Option<String> {
@@ -161,12 +164,181 @@ fn valkey_url() -> Option<String> {
     }
 }
 
+// ── THE PLANE-RECORD VOCABULARY (busbar 1.6.0) ─────────────────────────────────────────────────
+//
+// 1.6.0 collapsed the protocol-named durable methods onto eight kind-tagged verbs over an opaque
+// body. The durability properties these tests prove are unchanged, so they keep the typed names and
+// reach the store through the verbs, with the sidecar each 1.6.0 plane writes. The row types exist
+// only so an assertion can read a field back; the store never decodes a body.
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+struct CallRow {
+    principal: String,
+    seq: u64,
+    ts: u64,
+    server: String,
+    tool: String,
+    outcome: String,
+    reason: String,
+    tool_digest: String,
+    pin_generation: u64,
+    request_id: String,
+    prev_hash: String,
+    hash: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+struct TaskRow {
+    task_id: String,
+    context_id: String,
+    principal: String,
+    direction: String,
+    state: String,
+    agent_id: String,
+    artifact_cursor: u64,
+    push_callback: String,
+    created_at: u64,
+    updated_at: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+struct TaskEventRow {
+    task_id: String,
+    seq: u64,
+    ts: u64,
+    kind: String,
+    context_id: String,
+    principal: String,
+    agent_id: String,
+    state: String,
+    request_id: String,
+    prev_hash: String,
+    hash: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+struct DemotionRow {
+    server: String,
+    reason: String,
+    recorded_at: u64,
+}
+
+fn body<T: serde::Serialize>(row: &T) -> Vec<u8> {
+    serde_json::to_vec(row).expect("encode a test row")
+}
+
+fn row<T: serde::de::DeserializeOwned>(body: &[u8]) -> T {
+    serde_json::from_slice(body).expect("a body this suite wrote decodes as the row it wrote")
+}
+
+/// The typed names, over the neutral verbs, for any `RecordStore` — the plugin-backed
+/// `Box<dyn RecordStore>` and the direct `ValkeyStore` alike.
+trait Vocab: RecordStore {
+    fn put_task(&self, t: &TaskRow) -> RecordStoreResult<()> {
+        let terminal = ["completed", "failed", "canceled", "rejected"].contains(&t.state.as_str());
+        self.upsert_plane_record(&PlaneRecord {
+            kind: "task".into(),
+            id: t.task_id.clone(),
+            parent: None,
+            seq: 0,
+            ts: t.updated_at,
+            disposition: if terminal {
+                PlaneDisposition::Terminal
+            } else {
+                PlaneDisposition::Active
+            },
+            body: body(t),
+        })
+    }
+    fn get_task(&self, id: &str) -> RecordStoreResult<Option<TaskRow>> {
+        Ok(self.get_plane_record("task", id)?.map(|b| row(&b)))
+    }
+    fn list_tasks(&self) -> RecordStoreResult<Vec<TaskRow>> {
+        Ok(self
+            .list_plane_records("task", &PlaneSelector::All)?
+            .iter()
+            .filter_map(|b| serde_json::from_slice(b).ok())
+            .collect())
+    }
+    fn purge_tasks_before(&self, before: u64) -> RecordStoreResult<u64> {
+        self.purge_plane_records_before("task", before)
+    }
+    fn append_task_event(&self, e: &TaskEventRow) -> RecordStoreResult<()> {
+        self.append_plane_record(&PlaneRecord {
+            kind: "task_event".into(),
+            id: e.task_id.clone(),
+            parent: Some(e.task_id.clone()),
+            seq: e.seq,
+            ts: e.ts,
+            disposition: PlaneDisposition::Active,
+            body: body(e),
+        })
+    }
+    fn list_task_events(&self, task_id: &str) -> RecordStoreResult<Vec<TaskEventRow>> {
+        Ok(self
+            .list_plane_records("task_event", &PlaneSelector::Parent(task_id.into()))?
+            .iter()
+            .map(|b| row(b))
+            .collect())
+    }
+    fn append_mcp_call(&self, r: &CallRow) -> RecordStoreResult<()> {
+        self.append_plane_record(&PlaneRecord {
+            kind: "call".into(),
+            id: r.principal.clone(),
+            parent: Some(r.principal.clone()),
+            seq: r.seq,
+            ts: r.ts,
+            disposition: PlaneDisposition::Active,
+            body: body(r),
+        })
+    }
+    fn list_mcp_calls(&self, principal: &str) -> RecordStoreResult<Vec<CallRow>> {
+        Ok(self
+            .list_plane_records("call", &PlaneSelector::Parent(principal.into()))?
+            .iter()
+            .map(|b| row(b))
+            .collect())
+    }
+    fn list_mcp_call_principals(&self) -> RecordStoreResult<Vec<String>> {
+        self.list_plane_record_parents("call")
+    }
+    fn purge_mcp_calls_before(&self, before: u64) -> RecordStoreResult<u64> {
+        self.purge_plane_records_before("call", before)
+    }
+    fn put_mcp_demotion(&self, d: &DemotionRow) -> RecordStoreResult<()> {
+        self.upsert_plane_record(&PlaneRecord {
+            kind: "demotion".into(),
+            id: d.server.clone(),
+            parent: None,
+            seq: 0,
+            ts: d.recorded_at,
+            disposition: PlaneDisposition::Active,
+            body: body(d),
+        })
+    }
+    fn list_mcp_demotions(&self) -> RecordStoreResult<Vec<DemotionRow>> {
+        Ok(self
+            .list_plane_records("demotion", &PlaneSelector::All)?
+            .iter()
+            .filter_map(|b| serde_json::from_slice(b).ok())
+            .collect())
+    }
+    fn clear_mcp_demotion(&self, server: &str) -> RecordStoreResult<()> {
+        self.delete_plane_record("demotion", server)
+    }
+    fn redeem_ask_state(&self, nonce: &str, expires_at: u64, now: u64) -> RecordStoreResult<bool> {
+        self.redeem_plane_token("ask", nonce, expires_at, now)
+    }
+}
+
+impl<T: RecordStore + ?Sized> Vocab for T {}
+
 fn key(id: &str) -> VirtualKey {
     VirtualKey {
         id: id.into(),
         generation_hash: "binding:vk_e2e_dlopen:g0".into(),
         name: "e2e-dlopen-key".into(),
-        allowed_scopes: Some(vec![busbar_api::ScopeRef::pool("p")]),
+        allowed_scopes: Some(vec![ScopeRef::pool("p")]),
         enabled: true,
         created_at: 42,
         group: Some("infra".into()),
@@ -174,6 +346,7 @@ fn key(id: &str) -> VirtualKey {
         expires_at: None,
         deleted_at: None,
         revision: 0,
+        ..Default::default()
     }
 }
 
@@ -183,12 +356,9 @@ fn ledger() -> UsageLedger {
         billable_requests: 5,
         models: vec![ModelTokens {
             model: "gpt-5".into(),
-            tokens: TierTokens {
-                input: 20,
-                output: 8,
-                cache_read: 0,
-                cache_write: 0,
-            },
+            usage_units: [("input".to_string(), 20), ("output".to_string(), 8)]
+                .into_iter()
+                .collect(),
         }],
     }
 }
@@ -217,7 +387,7 @@ fn load_and_exercise_valkey_plugin_persists_to_real_valkey_across_reopen() {
     // Isolate from any prior run against a persistent (non-CI) Valkey instance.
     //
     // A FRESH ID PER RUN, not a fixed one plus a `delete_key`: `delete_key` TOMBSTONES the row (it
-    // is a soft delete by contract — see `Store::delete_key`), so `get_key` still answers with it
+    // is a soft delete by contract — see `RecordStore::delete_key`), so `get_key` still answers with it
     // afterwards. Against a re-used Valkey that made this test pass even when the plugin's
     // `put_key` wrote NOTHING at all: every read below was satisfied by the previous run's row.
     // Proven, not theorised — a `put_key` stubbed to `Ok(())` passed this test against a re-used
@@ -269,10 +439,12 @@ fn load_and_exercise_valkey_plugin_persists_to_real_valkey_across_reopen() {
         .get_usage(vk_id, 200)
         .expect("get_usage after reopen");
     assert_eq!(usage.requests, 5, "usage ledger must survive the reopen");
-    let t = usage
-        .tokens_for("gpt-5")
+    let m = usage
+        .models
+        .iter()
+        .find(|m| m.model == "gpt-5")
         .expect("model row survives reopen");
-    assert_eq!((t.input, t.output), (20, 8));
+    assert_eq!((m.tier("input"), m.tier("output")), (20, 8));
     drop(reopened);
 
     // (2) Read back through a TOTALLY INDEPENDENT connection — the plain `ValkeyStore`, used
@@ -280,22 +452,19 @@ fn load_and_exercise_valkey_plugin_persists_to_real_valkey_across_reopen() {
     // plugin's `put_key`/`put_usage` over the ABI were silent no-ops (or wrote somewhere other
     // than the configured Valkey), this independent reader would come back empty even though the
     // reopen-via-plugin check above passed.
-    let direct_key = Store::get_key(&direct, vk_id)
+    let direct_key = RecordStore::get_key(&direct, vk_id)
         .expect("get_key via the direct connection")
         .expect("the key must be physically present in Valkey, bypassing the plugin");
     assert_eq!(direct_key.name, "e2e-dlopen-key");
-    assert_eq!(
-        direct_key.allowed_scopes,
-        Some(vec![busbar_api::ScopeRef::pool("p")])
-    );
+    assert_eq!(direct_key.allowed_scopes, Some(vec![ScopeRef::pool("p")]));
     let direct_usage =
-        Store::get_usage(&direct, vk_id, 200).expect("get_usage via the direct connection");
+        RecordStore::get_usage(&direct, vk_id, 200).expect("get_usage via the direct connection");
     assert_eq!(
         direct_usage.requests, 5,
         "usage must be physically present in Valkey, not just cached in-process by the plugin"
     );
 
-    let _ = Store::delete_key(&direct, vk_id);
+    let _ = RecordStore::delete_key(&direct, vk_id);
 }
 
 /// END-TO-END FAILURE: an `open()` config that cannot produce a usable store — malformed JSON, a
@@ -336,7 +505,7 @@ fn load_and_exercise_valkey_plugin_bad_config_fails_over_abi() {
 // Everything above loads the plugin via `busbar_plugin_loader::load_store()` — a direct Rust
 // function call no real end user ever makes. `admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey`
 // instead drives an ACTUAL `busbar` binary the way an operator (or CI's own INSTALL-AND-SERVE
-// step, see busbarAI's `.github/workflows/plugin-ci.yml`) does:
+// step) does:
 //
 //   1. Pack the built cdylib into a real tarball with the real `busbar-plugin-pack` tool.
 //   2. Boot a real `busbar` process (admin listener up, no valkey plugin loaded yet).
@@ -373,40 +542,68 @@ impl Drop for ChildGuard {
     }
 }
 
-/// The sibling busbarAI checkout's root — same convention this repo's Cargo.toml path deps and
-/// store-postgres's own `e2e.rs` already use.
-fn busbarai_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../busbarAI")
-        .canonicalize()
-        .expect("sibling busbarAI checkout must exist (see Cargo.toml path deps)")
+/// The busbar checkout the real binaries are built from: `BUSBAR_CHECKOUT` when set (CI checks
+/// GetBusbar/busbar out at the `.busbar-ref` rev and points this at it), otherwise a sibling
+/// `../busbar` beside this repo. It must be the rev `.busbar-ref` pins — the rev this plugin's
+/// contract comes from. A missing checkout is a FAILURE, never a skip: this is the only proof that
+/// a real busbar installs and boots on this store.
+fn busbar_root() -> PathBuf {
+    let root = match std::env::var_os("BUSBAR_CHECKOUT") {
+        Some(p) => PathBuf::from(p),
+        None => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../busbar"),
+    };
+    root.canonicalize().unwrap_or_else(|e| {
+        panic!(
+            "no busbar checkout at {} ({e}): set BUSBAR_CHECKOUT to a checkout of \
+             GetBusbar/busbar at the .busbar-ref rev",
+            root.display()
+        )
+    })
 }
 
-/// Build (once, cached by cargo) the real `busbar` and `busbar-plugin-pack` binaries from the
-/// sibling busbarAI checkout — never a fixture, never a stub.
+/// Build (once, cached by cargo) the real `busbar` binary and the real `busbar-plugin-pack` tool
+/// from that checkout — never a fixture, never a stub. The pack tool is a feature-gated bin of
+/// `busbar-plugin-loader` in busbar 1.6.0.
 fn build_real_binaries() -> (PathBuf, PathBuf) {
-    let root = busbarai_root();
-    let status = Command::new("cargo")
-        .args([
+    let root = busbar_root();
+    for args in [
+        &["build", "--release", "-p", "busbar", "--bin", "busbar"][..],
+        &[
             "build",
             "--release",
             "-p",
-            "busbar",
-            "-p",
+            "busbar-plugin-loader",
+            "--features",
+            "pack",
+            "--bin",
             "busbar-plugin-pack",
-        ])
-        .current_dir(&root)
-        .status()
-        .expect("run cargo build for busbar + busbar-plugin-pack");
-    assert!(
-        status.success(),
-        "building the real busbar + busbar-plugin-pack binaries must succeed"
-    );
+        ][..],
+    ] {
+        let status = Command::new("cargo")
+            .args(args)
+            .current_dir(&root)
+            .status()
+            .expect("run cargo build for busbar + busbar-plugin-pack");
+        assert!(
+            status.success(),
+            "building the real busbar + busbar-plugin-pack binaries must succeed ({args:?})"
+        );
+    }
+    // The nested `cargo build` inherits this process's environment, so a `CARGO_TARGET_DIR` set for
+    // the outer `cargo test` redirects it too; look where it actually put the binaries.
+    let target = match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(dir) => root.join(dir),
+        None => root.join("target"),
+    };
     (
-        root.join("target/release/busbar"),
-        root.join("target/release/busbar-plugin-pack"),
+        target.join("release/busbar"),
+        target.join("release/busbar-plugin-pack"),
     )
 }
+
+/// A placeholder provider credential: busbar 1.6.0 refuses to boot on an unresolvable provider
+/// credential (BUSBAR-9007), and the mock provider is never dialled.
+const SECRET_PLACEHOLDER: &str = "0000000000000000000000000000000000000000000000000000000000000001";
 
 /// A free-at-the-moment localhost port (bind-then-drop; a TOCTOU race is possible in principle
 /// but is the standard, accepted pattern for test port allocation and hasn't been a problem for
@@ -567,6 +764,8 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
             .env("BUSBAR_PROVIDERS", &providers)
             .env("E2E_ADMIN_TOKEN", &admin_token)
             .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
+            // busbar 1.6.0 refuses to boot on an unresolvable provider credential (BUSBAR-9007).
+            .env("MOCK_KEY", SECRET_PLACEHOLDER)
             .env("BUSBAR_STATE_FILE", "")
             .env("BUSBAR_CONFIG_OVERLAY", &overlay)
             .stdout(Stdio::from(log.try_clone().expect("clone log fd")))
@@ -650,7 +849,7 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
     }
 
     // Boot #2: same config, now with the persisted overlay naming the valkey plugin as the store
-    // module — the real dlopen + Store::connect/migrate path executes here, before the listener
+    // module — the real dlopen + RecordStore::connect/migrate path executes here, before the listener
     // ever answers a request.
     let guard2 = ChildGuard(spawn("2"));
     assert!(
@@ -730,12 +929,12 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
     // INDEPENDENT VERIFICATION #1: the typed Store trait, via the plain busbar-store-valkey crate
     // — a code path that never touches the plugin cdylib, the C ABI, the loader, or the admin
     // HTTP surface at all.
-    let vk = Store::get_key(&direct, &key_id)
+    let vk = RecordStore::get_key(&direct, &key_id)
         .expect("get_key via the direct connection")
         .expect("the virtual key minted through the real admin API must be physically in Valkey");
     assert_eq!(vk.id, key_id);
     assert_eq!(vk.name, "e2e-admin-install-verify");
-    let creds = Store::list_credentials(&direct, &key_id)
+    let creds = RecordStore::list_credentials(&direct, &key_id)
         .expect("list_credentials via the direct connection");
     let cred = creds
         .iter()
@@ -757,7 +956,7 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
         "raw Valkey row must contain the minted key's own id and name: {raw_key_row}"
     );
 
-    let _ = Store::delete_key(&direct, &key_id);
+    let _ = RecordStore::delete_key(&direct, &key_id);
     let _ = std::fs::remove_dir_all(&work);
 }
 
@@ -770,7 +969,7 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
 /// plugin: conformance boots the in-process RAM store, so the plugin seam is the only path a real
 /// deployment takes and was, until this test, the one path with zero coverage of these methods.
 ///
-/// `busbar_api::Store` DEFAULTS all ten task/call-log methods to accept-and-keep-nothing. A plugin
+/// The contract DEFAULTS every plane-record verb to accept-and-keep-nothing. A plugin
 /// seam that does not RELAY them silently substitutes those defaults: every `append_mcp_call`
 /// returns `Ok`, every `list_mcp_calls` answers empty, and a deployment loses every tool-call record
 /// while reporting success. That is not hypothetical — the ABI once carried four store methods while
@@ -802,7 +1001,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // enumeration — see `ValkeyStore::purge_mcp_calls_before`), so this needs no key-pattern
     // guesswork. No other test in this file touches the `busbar:mcp:*` namespace.
     let direct = ValkeyStore::connect(&url).expect("connect directly to clean up and verify");
-    Store::purge_mcp_calls_before(&direct, u64::MAX).expect("wipe the call log before this run");
+    Vocab::purge_mcp_calls_before(&direct, u64::MAX).expect("wipe the call log before this run");
 
     // Per-run principal ids, for the same reason the key test uses one: a read that only THIS run's
     // writes can answer. Two of them, because one principal's chain leaking into another's is a real
@@ -819,7 +1018,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let p_main = format!("vk_abi_main_{stamp}");
     let p_other = format!("vk_abi_other_{stamp}");
 
-    let call = |principal: &str, seq: u64, prev: &str, hash: &str| McpCallRecord {
+    let call = |principal: &str, seq: u64, prev: &str, hash: &str| CallRow {
         principal: principal.to_string(),
         seq,
         ts: 2_000 + seq,
@@ -926,7 +1125,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // touches the cdylib, the C ABI or the loader. A plugin answering the reads above out of its
     // own in-process state (rather than Valkey) passes both boots and fails here.
     let direct_calls =
-        Store::list_mcp_calls(&direct, &p_main).expect("list_mcp_calls via the direct connection");
+        Vocab::list_mcp_calls(&direct, &p_main).expect("list_mcp_calls via the direct connection");
     assert_eq!(
         direct_calls.iter().map(|c| c.seq).collect::<Vec<_>>(),
         vec![2, 3],
@@ -934,14 +1133,14 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     );
     assert_eq!(direct_calls[1].hash, "h3");
 
-    Store::purge_mcp_calls_before(&direct, u64::MAX).expect("clean up this run's records");
+    Vocab::purge_mcp_calls_before(&direct, u64::MAX).expect("clean up this run's records");
 }
 
 /// THE DURABILITY PROOF FOR THE SIX A2A TASK-STORE METHODS, OVER THE REAL PLUGIN PATH.
 ///
 /// The sibling proof above does this for the MCP call log; this one exists because the task methods
 /// are a SEPARATE half of the same defaulted seam and half the fleet used to be missing them.
-/// `busbar_api::Store` defaults `put_task` to `Ok(())`, `get_task` to `Ok(None)` and `list_tasks` to
+/// The contract defaults the upsert to `Ok(())`, the point read to `Ok(None)` and the listing to
 /// `Ok(vec![])`: a backend that does not override them ACCEPTS EVERY WRITE AND REPORTS SUCCESS while
 /// keeping nothing. An operator would find "task state survives a restart" false on their own
 /// deployment, which is the worst place to discover it.
@@ -959,8 +1158,6 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 /// in-process cache still fails.
 #[test]
 fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
-    use busbar_api::{TaskEventRow, TaskRow};
-
     let path = plugin_path();
     let Some(url) = valkey_url() else {
         return;
@@ -972,7 +1169,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // would make that assertion meaningless. `purge_tasks_before(MAX)` is the store's own
     // contract-level wipe of exactly that population, so this needs no key-pattern guesswork.
     let direct = ValkeyStore::connect(&url).expect("connect directly to clean up and verify");
-    Store::purge_tasks_before(&direct, u64::MAX).expect("wipe terminal tasks before this run");
+    Vocab::purge_tasks_before(&direct, u64::MAX).expect("wipe terminal tasks before this run");
 
     let stamp = format!(
         "{}_{}",
@@ -1111,20 +1308,23 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         "one task's chain must not carry another's events"
     );
 
-    // The task-event contract UPSERTS on (task_id, seq) — the engine's write-through is idempotent
-    // on replay, and rejecting or duplicating a replayed seq breaks the chain it will verify.
-    let mut replayed = event(&t_live, 3, "task.working", "h2", "h3");
-    replayed.state = "input-required".to_string();
+    // A replayed (task_id, seq) crosses the ABI with the append contract: the IDENTICAL event is the
+    // at-least-once retry and succeeds with no duplicate; a DIFFERENT event there is refused as a
+    // fork (1.6.0 has one append verb for every chain kind; the v6 typed method upserted instead).
     store
-        .append_task_event(&replayed)
-        .expect("a replayed (task_id, seq) upserts rather than erroring");
+        .append_task_event(&event(&t_live, 3, "task.working", "h2", "h3"))
+        .expect("an identical replay over the ABI is the retry and succeeds");
+    let mut forked = event(&t_live, 3, "task.working", "h2", "h3");
+    forked.state = "input-required".to_string();
+    store
+        .append_task_event(&forked)
+        .expect_err("a different event at an occupied seq is refused over the ABI too");
     let events = store.list_task_events(&t_live).expect("list_task_events");
+    assert_eq!(events.len(), 3, "a replay must not append a 4th event");
     assert_eq!(
-        events.len(),
-        3,
-        "a replayed seq must not append a 4th event"
+        events[2].state, "working",
+        "and a refused fork overwrites nothing"
     );
-    assert_eq!(events[2].state, "input-required");
 
     // Retention crosses the ABI too, COUNT AND ALL — checked for the number it ACTUALLY removed,
     // because a relay that dropped the return value would read as 0 and look like a no-op sweep.
@@ -1158,35 +1358,33 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // LEG 3 — read the surviving row through the plain `ValkeyStore`, a code path that never
     // touches the cdylib, the C ABI or the loader. A plugin answering the reads above out of its own
     // in-process state (rather than Valkey) passes both boots and fails here.
-    let direct_task = Store::get_task(&direct, &t_live)
+    let direct_task = Vocab::get_task(&direct, &t_live)
         .expect("get_task via the direct connection")
         .expect("the task must be physically present in Valkey, not just cached in-process");
     assert_eq!(direct_task.artifact_cursor, 9);
     assert_eq!(direct_task.state, "input-required");
     assert_eq!(
-        Store::list_task_events(&direct, &t_live)
+        Vocab::list_task_events(&direct, &t_live)
             .expect("list_task_events via the direct connection")
             .len(),
         3
     );
 
     // Clean up this run's rows through the contract: mark the survivor terminal, then sweep.
-    Store::put_task(&direct, &task(&t_live, "canceled", BASE_TS + 200, 9))
+    Vocab::put_task(&direct, &task(&t_live, "canceled", BASE_TS + 200, 9))
         .expect("clean up this run's task");
-    Store::purge_tasks_before(&direct, u64::MAX).expect("clean up this run's rows");
+    Vocab::purge_tasks_before(&direct, u64::MAX).expect("clean up this run's rows");
 }
 
 /// THE DURABILITY PROOF FOR THE FOUR TRUST-STATE METHODS, OVER THE REAL PLUGIN PATH.
 ///
-/// Same reasoning as the task-store test above, and a sharper cost. `busbar_api::Store` defaults
-/// `put_mcp_demotion`/`list_mcp_demotions`/`clear_mcp_demotion` to accept-and-keep-nothing and
-/// `redeem_ask_state` to `Ok(true)` — "yes, this call is the first redemption" — so a seam that does
-/// not RELAY them substitutes two security failures, both silent and both green:
-///
-///   * a demotion is written, reported successful and DISCARDED, so a restart hands a quarantined
-///     upstream the operator's approval back; and
-///   * every redeemer of one single-use approval is told it is the first, so a confirm-once tool an
-///     operator gated because it moves money executes once per node and once per restart.
+/// Same reasoning as the task-store test above, and a sharper cost. The contract defaults the
+/// demotion's upsert / listing / delete to accept-and-keep-nothing, so a seam that does not RELAY them
+/// discards a demotion while reporting success, and a restart hands a quarantined upstream the
+/// operator's approval back. The redemption defaults FAIL-CLOSED (`Ok(false)`), so an unrelayed seam
+/// refuses every confirmation; what this proves is the other half — that a relayed ledger is really
+/// shared and durable, so a single-use approval executes once, not once per node and once per
+/// restart.
 ///
 /// A Valkey deployment reaches this backend ONLY over the plugin seam, and it is the backend a
 /// FLEET reaches for first — so the second-node case below is the ordinary deployment, not an
@@ -1199,8 +1397,6 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 /// that will skip on the day it matters.
 #[test]
 fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
-    use busbar_api::McpDemotionRow;
-
     let path = plugin_path();
     let url = std::env::var("VALKEY_URL").unwrap_or_else(|_| {
         panic!(
@@ -1231,7 +1427,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let nonce_fresh = format!("nonce_abi_fresh_{stamp}");
     const NOW: u64 = 4_000_000_000;
 
-    let demotion = |server: &str, reason: &str, at: u64| McpDemotionRow {
+    let demotion = |server: &str, reason: &str, at: u64| DemotionRow {
         server: server.to_string(),
         reason: reason.to_string(),
         recorded_at: at,
@@ -1322,14 +1518,14 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // cdylib, the C ABI or the loader. A plugin answering the reads above out of its own in-process
     // state passes both boots and fails here.
     assert!(
-        Store::list_mcp_demotions(&direct)
+        Vocab::list_mcp_demotions(&direct)
             .expect("list_mcp_demotions via the direct connection")
             .iter()
             .any(|r| r.server == srv_demoted && r.reason == "digest-mismatch"),
         "the demotion must be physically present in Valkey, not merely cached in the plugin"
     );
     assert!(
-        !Store::redeem_ask_state(&direct, &nonce_restart, NOW + 900, NOW + 5)
+        !Vocab::redeem_ask_state(&direct, &nonce_restart, NOW + 900, NOW + 5)
             .expect("redeem_ask_state via the direct connection"),
         "the spent-approval entry must be physically present in Valkey: a direct connection that \
          never loaded the plugin has to see the redemption the plugin recorded"
@@ -1338,5 +1534,5 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // Clean up this run's demotion through the contract. The ledger entries are left to their own
     // TTL on purpose — the contract gives them no delete, and that TTL is exactly the bound this
     // backend's ledger is supposed to have.
-    Store::clear_mcp_demotion(&direct, &srv_demoted).expect("clean up this run's demotion");
+    Vocab::clear_mcp_demotion(&direct, &srv_demoted).expect("clean up this run's demotion");
 }

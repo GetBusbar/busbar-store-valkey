@@ -9,45 +9,32 @@ description = "The Valkey store as a droppable busbar plugin — a cdylib export
 license = "Apache-2.0"
 
 [lib]
-# cdylib for the C ABI delivery; `rlib` is REQUIRED for `cargo test` to emit the cdylib artifact AT
-# ALL. With `cdylib`-only, cargo builds a trivial "0 tests" harness for this package under `cargo
-# test` and never produces the .dylib/.so — so `tests/e2e.rs`, the ONLY over-the-ABI coverage of the
-# durable valkey path, found nothing and silently skipped, reporting GREEN with zero coverage. The
-# sibling store-postgres-plugin/store-mysql-plugin/store-sqlite-plugin manifests already carry both
-# crate-types for exactly this reason; this one had drifted. Verified, not assumed: with `cdylib`
-# only, `cargo test -p busbar-store-valkey-plugin` leaves no
-# `target/debug/deps/libbusbar_store_valkey_plugin.dylib` even after touching src/lib.rs; with
-# `rlib` added, cargo emits it on every build that recompiles the lib.
+# cdylib: the DROPPED-IN door (a signed tarball in `plugins/`). `rlib` is REQUIRED for `cargo test` to
+# emit the cdylib artifact AT ALL: with `cdylib` only, cargo builds a trivial "0 tests" harness for
+# this package under `cargo test` and never produces the .dylib/.so, so the over-the-ABI tests find
+# nothing.
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# busbar-store-valkey is now a SAME-REPO sibling crate (this plugin brings 100% of what it needs — the
-# real logic lives here, not in busbarAI). Only busbar-api/busbar-plugin-sdk still reach into busbarAI
-# — INTERIM local path dependencies into a sibling checkout, since busbarAI isn't public yet; once it
-# ships publicly these become git (pinned rev/tag) or crates.io dependencies instead.
-busbar-api = { path = "../../busbarAI/crates/api" }
-busbar-plugin-sdk = { path = "../../busbarAI/crates/plugin-sdk" }
+# THE LOGIC, same repo. Its `export_store_plugin!(open)` registers the image's one door; this crate
+# only makes that door a loadable library.
 busbar-store-valkey = { path = "../store-valkey" }
-serde_json = "1"
 
 [dev-dependencies]
-# INTERIM local path deps into busbarAI, same rationale as above — dev-only (the end-to-end test loads
-# the built cdylib over the real loader ABI seam, and separately connects to the live Valkey
-# independently via the plain busbar-store-valkey lib crate), never shipped in the plugin artifact
-# itself.
-busbar-plugin-loader = { path = "../../busbarAI/crates/plugin-loader" }
-# Dev-only: the real-admin-API e2e test builds+drives an actual `busbar` process over HTTP (install a
-# signed plugin tarball via POST /api/v1/admin/plugins, mint a key+credential via POST /admin/keys) —
-# a blocking client keeps this test synchronous like the rest of this file (no tokio runtime needed).
-# Same major version busbarAI's own `busbar` crate pins (crates/busbar/Cargo.toml), rustls-tls only —
-# no default features, mirroring that crate's own trimmed feature set.
+# The conformance and end-to-end tests load the built cdylib over the REAL loader (sign, pack, scan,
+# open) and the linked row through the same registry — dev-only, never in the shipped artifact. Same
+# pinned rev as the logic crate's busbar-contract, so one busbar source resolves.
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "8b7b6473f47f8d37ae60839c74cfe6a9b64a1dc9" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "8b7b6473f47f8d37ae60839c74cfe6a9b64a1dc9" }
+serde_json = "1"
+# The typed rows the durability tests read back out of opaque plane-record bodies.
+serde = { version = "1", features = ["derive"] }
+# The real-admin-API e2e test drives an actual `busbar` process over HTTP (install a signed plugin
+# tarball via POST /api/v1/admin/plugins, mint a key+credential via POST /admin/keys) — a blocking
+# client keeps this test synchronous like the rest of the file. rustls-tls only.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-# Dev-only: the real-admin-API e2e test's independent verification step reads the raw Valkey row
-# bytes directly (bypassing busbar-store-valkey's own Store impl too, not just the plugin/ABI) —
-# same version pin as busbar-store-valkey itself. (Upstream crates.io package, still published
-# under its pre-fork name — not ours to rename; see busbar-store-valkey's own Cargo.toml.)
+# The real-admin-API e2e test's independent verification step reads the raw Valkey row bytes
+# directly (bypassing busbar-store-valkey's own store impl too) — same version as the logic crate.
 redis = { version = "1", default-features = false, features = ["tls-rustls"] }
-# Dev-only: base64-encodes the packed tarball into POST /api/v1/admin/plugins's JSON body — already
-# in the dependency graph transitively (reqwest), pinned here explicitly since the test uses it
-# directly.
+# Base64-encodes the packed tarball into POST /api/v1/admin/plugins's JSON body.
 base64 = "0.22"

@@ -2,8 +2,9 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The **Valkey** backend for busbar's durable governance store — the
-//! shared, multi-node `db` plugin over a KEY-VALUE data model. Implements `busbar_api::Store` on a
-//! mutex-guarded SYNCHRONOUS connection, depending only on the `busbar-api` contract (plus the
+//! shared, multi-node `db` plugin over a KEY-VALUE data model. Implements
+//! [`busbar_contract::records::RecordStore`] on a mutex-guarded SYNCHRONOUS connection, depending only on
+//! the `busbar-contract` crate (plus the
 //! upstream RESP driver crate, which is still published on crates.io under its pre-fork name and is
 //! therefore the ONE spelling in this repo that is not ours to rename), never on the engine.
 //!
@@ -16,8 +17,9 @@
 //!
 //! `AwsCredential`/`aws_credentials` (a type/table that only ever held SigV4 credentials, discovered
 //! mid-audit to be vendor-shaped rather than designed) is replaced by a kind-polymorphic
-//! `CredentialMeta`/`CredentialSecret` — see `busbar_api::store` for the full rationale. `VirtualKey`
-//! gains `deleted_at` (tombstone, not hard-delete — see [`Store::delete_key`]'s doc) and `revision`
+//! `CredentialMeta`/`CredentialSecret` — see `busbar_contract::records` for the full rationale.
+//! `VirtualKey` gains `deleted_at` (tombstone, not hard-delete — see [`RecordStore::delete_key`]'s doc)
+//! and `revision`
 //! (a store-global monotonic counter for incremental hydration).
 //!
 //! - **virtual keys** — `busbar:key:<id>` holds the JSON [`VirtualKey`] (now carrying `deleted_at`/
@@ -41,6 +43,20 @@
 //!   (HINCRBY, same as `requests`), `key_group_at_use`/`pricing_version` (`HSETNX` — first-write-wins,
 //!   the attribution snapshot at first use of the bucket), and the `tokens_cache_creation` field is
 //!   renamed `tokens_cache_write` (a naming-drift fix: identical concept, same as `TierTokens`).
+//!
+//! ## Schema v7 — busbar 1.6.0
+//!
+//! - **plane records** — busbar 1.6.0 replaced the protocol-named durable methods (`put_task`,
+//!   `append_mcp_call`, `put_mcp_demotion`, `redeem_ask_state`, …) with eight kind-tagged verbs over an
+//!   opaque [`PlaneRecord`] plus [`RecordStore::plane_token_live`]. ONE keyspace per kind holds every
+//!   kind's records (see [`plane`]); the store never decodes a body. The v6 typed task / task-event /
+//!   demotion / spent-approval keyspaces are copied into it in place on connect ([`legacy`]).
+//! - **usage** — the four reserved units keep their `m:<model>:<tier>` hash fields; every other
+//!   (open) unit gets a `u:<hex unit>:<model>` field. `add_usage` floors each counter at 0 server-side.
+//! - **metering** — `priced_from_ms` joins the row's identity (a rate-card edit splits the day's
+//!   cell); open classes ride as `u:<class>` fields.
+//! - **keys** — the contract's own wire carries `idp_subject`/`binding_mode`/`minted_by` and every
+//!   scope kind in its own `allowed_{kind}s` field; a v6 row reads back unchanged.
 //!
 //! ## Atomicity
 //!
@@ -68,10 +84,10 @@
 //! `purge_metering_before` are left at the trait's `Ok(0)` default (no obligation to self-bound);
 //! operators wanting bounded growth reap old `busbar:usage:*` keys on their own retention schedule.
 
-use busbar_api::{
-    AuditRecord, CredentialMeta, CredentialSecret, McpCallRecord, McpDemotionRow, MeteringDelta,
-    MeteringRow, ModelTokens, Store, StoreError, StoreResult, TaskEventRow, TaskRow, TierTokens,
-    UsageDelta, UsageLedger, VirtualKey,
+use busbar_contract::records::{
+    AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
+    PlaneRecord, PlaneSelector, RecordStore, RecordStoreError, RecordStoreResult, UsageDelta,
+    UsageLedger, VirtualKey, RESERVED_UNITS,
 };
 use redis::{Commands, Connection};
 use std::sync::Mutex;
@@ -91,134 +107,15 @@ const CRED_ID_PREFIX: &str = "busbar:cred:id:";
 const CREDS_BYREV: &str = "busbar:creds:byrev";
 const AUDIT_ZSET: &str = "busbar:audit";
 
-// ── THE DURABLE MCP TOOL-CALL LOG ────────────────────────────────────────────────────────────
+// ── THE PLANE-RECORD KEYSPACE (1.6.0) ─────────────────────────────────────────────────────────
 //
-// A DIFFERENT POPULATION from the audit log, kept in its own keyspace on purpose: the audit log is
-// the low-rate admin MUTATION log whose engine-side working set is a bounded ring, while a tool call
-// is data-plane traffic at request rate. Sharing one keyspace means a busy afternoon of tool calls
-// evicts every admin row, so the question of who changed a registration becomes unanswerable exactly
-// when an incident makes somebody ask.
-//
-// The chain is scoped to the PRINCIPAL, so there is ONE ZSET PER PRINCIPAL, scored by `seq`: a
-// global chain would serialise every caller behind one append and would make one caller's evidence
-// unverifiable without possessing every other caller's records. Scoring by `seq` is what makes the
-// per-principal read come back in chain order for free, which is the order the engine verifies in.
-//
-// This backend has no columns, so the "opaque body plus index columns" shape of the SQL backends
-// becomes: the member IS the whole record as JSON (the store never interprets it), and the two
-// things a query needs that JSON cannot answer get their own index structures below.
-const MCP_CALLS_PREFIX: &str = "busbar:mcp:calls:";
-/// Every principal holding at least one record — the boot enumeration. A SET, because a restart has
-/// to resume a chain for a principal this process has not yet seen, and scanning the keyspace for
-/// that answer would be O(keyspace) on the hot path of a boot.
-const MCP_PRINCIPALS_SET: &str = "busbar:mcp:principals";
-/// The RETENTION INDEX: a ZSET scored by `ts`, whose members name `(seq, principal)`. Retention is
-/// global by timestamp and the per-principal sets are scored by `seq`, so without this a purge would
-/// have to read every principal's entire chain to find what aged out. `-inf`..`(before` is exactly
-/// the strictly-older-than the contract specifies.
-const MCP_CALLS_BY_TS: &str = "busbar:mcp:byts";
-/// Separator joining `seq` and `principal` inside a retention-index member. U+0001 rather than `:`
-/// because a busbar key id is caller-visible and may itself contain a colon; a separator that can
-/// occur in the data is a parser that silently mis-splits.
-const MCP_TS_MEMBER_SEP: char = '\u{1}';
-
-fn mcp_calls_key(principal: &str) -> String {
-    format!("{MCP_CALLS_PREFIX}{principal}")
-}
-
-// ── THE DURABLE A2A TASK STORE ────────────────────────────────────────────────────────────────
-//
-// A2A is async BY DESIGN: a task spans turns, can sit interrupted waiting on a human, and can outlive
-// the process that started it. An in-memory task table therefore loses every in-flight task on
-// restart, which is the difference between a resume that is real and one that is nominal.
-//
-// SHAPE, and this is where a key-value backend legitimately parts company with its SQL siblings.
-// store-sqlite/store-mysql/store-postgres each give every `TaskRow` field its own COLUMN, because
-// there the retention sweep, the boot rehydrate and the artifact cursor are all things the DATABASE
-// queries and indexes. Valkey indexes nothing by itself, so columns would buy nothing and cost a
-// hash-field encoding for every field. The row is therefore ONE JSON STRING — which also means the
-// FULL u64 range round-trips with no clamping and no refusal, since JSON has no signed-64 ceiling to
-// hit — and the two questions JSON cannot answer get their own index structures, exactly as the MCP
-// call log does above:
-//   - `busbar:tasks` (SET) — the enumeration `list_tasks` walks. Scanning the keyspace for it would
-//     be O(keyspace) on a boot's hot path.
-//   - `busbar:tasks:byupdated` (ZSET, scored by `updated_at`) — the retention sweep's age index, so a
-//     purge reads the candidates that could possibly be old enough instead of every task there is.
-//     It is an INDEX, never the truth: `purge_tasks_before` re-reads each candidate ROW and re-checks
-//     its state and `updated_at` under WATCH before deleting anything, which is also what makes a
-//     ZSET score (an IEEE double) safe to use as a coarse filter.
-const TASK_ROW_PREFIX: &str = "busbar:task:row:";
-const TASKS_INDEX: &str = "busbar:tasks";
-const TASKS_BY_UPDATED: &str = "busbar:tasks:byupdated";
-/// PER-TASK PROVENANCE: one ZSET per task, scored by `seq`, whose members are whole `TaskEventRow`s
-/// as JSON. Per-task rather than one global chain because tasks are concurrent and long-lived — a
-/// global chain would serialise every task transition behind one append and would make one task's
-/// provenance unverifiable without possessing every other tenant's events. Scoring by `seq` is what
-/// makes the read come back in chain order for free, which is the order the engine verifies in.
-const TASK_EVENTS_PREFIX: &str = "busbar:task:events:";
-
-/// The task states that are TERMINAL, and therefore the only ones `purge_tasks_before` may drop. A
-/// CLOSED set, deliberately: a state token minted by a NEWER engine than this build is one this build
-/// cannot classify, and the safe direction to be wrong in is "never sweep it". An interrupted task
-/// waiting on a human is exactly the row that legitimately sits still for a long time, and compacting
-/// it is losing the work, not reclaiming space.
-const TERMINAL_TASK_STATES: [&str; 4] = ["completed", "failed", "canceled", "rejected"];
-
-/// The row key for one task.
-///
-/// `row:` and `events:` are FIXED, DISTINCT segments at the same position, so no `task_id` can make
-/// one of these keys render as the other's — `busbar:task:row:{x}` and `busbar:task:events:{y}` can
-/// never be equal whatever `x` and `y` are. That is deliberate rather than incidental: this file
-/// already carries a recorded hazard where `cred_row_key`/`cred_pub_key` join caller-supplied
-/// components on an unescaped `:`, so two distinct tuples can render to one key and the second write
-/// silently overwrites the first. A task id is protocol-supplied and opaque — colons very much
-/// included — so the separator question had to be answered structurally here rather than by
-/// convention. It is answered by having exactly ONE variable component per key.
-fn task_row_key(task_id: &str) -> String {
-    format!("{TASK_ROW_PREFIX}{task_id}")
-}
-
-/// The provenance-chain key for one task. See [`task_row_key`] for why this cannot collide with it.
-fn task_events_key(task_id: &str) -> String {
-    format!("{TASK_EVENTS_PREFIX}{task_id}")
-}
-/// THE DURABLE MCP DEMOTION RECORD, as ONE HASH keyed by the upstream's local registration id, whose
-/// values are whole `McpDemotionRow`s as JSON.
-///
-/// A HASH rather than a key per server plus a SET index — which is the shape `tasks` uses — and the
-/// difference is deliberate. A composed key would put a caller-supplied id into the key string, and
-/// this file carries a recorded hazard about exactly that: `cred_row_key`/`cred_pub_key` join
-/// caller-supplied components on an unescaped `:`, so two distinct tuples can render to one key and
-/// the second write silently overwrites the first. `tasks` answers that by having exactly ONE
-/// variable component per key; a hash FIELD answers it outright, since a field is opaque bytes that
-/// are never parsed. The population is one row per registered upstream — small, bounded, and read
-/// whole at boot — so HGETALL is the entire `list_mcp_demotions`, with no index to keep in step and
-/// no window in which a record and its index membership can disagree.
-const MCP_DEMOTIONS_HASH: &str = "busbar:mcp:demotions";
-
-/// THE DURABLE SPENT-APPROVAL LEDGER: one key per redeemed nonce, holding the approval's own
-/// deadline, written with `SET NX EX`.
-///
-/// `SET NX` is the whole test-and-set, in one round trip that the server orders against every other
-/// node's: it sets and reports success, or it finds the key present and reports nothing. A `GET`
-/// followed by a `SET` would tell both halves of a race they were first, which is the shape this
-/// method is specified not to have, and on this backend a fleet sharing one Valkey is the ORDINARY
-/// deployment rather than the exotic one.
-///
-/// `EX` is what bounds the keyspace, and it is strictly better than a sweep: the entry expires with
-/// the approval it records, on the server, without any caller having to remember to run anything.
-/// That matters more here than on a SQL backend — this crate refuses to start against a server whose
-/// `maxmemory-policy` is not `noeviction`, so an unbounded keyspace is not merely untidy, it is an
-/// outage of everything else in the namespace too.
-///
-/// ONE variable component, at the end, for the reason [`task_row_key`] has one: a nonce is opaque
-/// and no id can make this key render as any other key in this file's keyspace.
-const ASK_STATE_PREFIX: &str = "busbar:askstate:";
-
-/// The ledger key for one redeemed approval. See [`ASK_STATE_PREFIX`] for why this cannot collide.
-fn ask_state_key(nonce: &str) -> String {
-    format!("{ASK_STATE_PREFIX}{nonce}")
-}
+// Every kind a plane declares (`task`, `task_event`, `call`, `demotion`, …) is stored by the
+// kind-neutral verbs in [`plane`]; the single-use token ledger the `redeem_plane_token` verb keeps is
+// there too. The v6 typed keyspaces those verbs replaced (`busbar:task:*`, `busbar:tasks*`,
+// `busbar:mcp:demotions`, `busbar:askstate:*`) are copied in on connect by [`legacy`]; the v6 MCP
+// tool-call log (`busbar:mcp:*`) is left in place, unread (see `legacy`'s doc for why).
+mod legacy;
+pub mod plane;
 
 /// The signed-token REVOCATION denylist (1.5.0). `busbar:denylist:<sub>` holds the operator reason
 /// (a plain string), and `busbar:denylist` is a SET indexing every denied sub so `list_denylist` is
@@ -258,8 +155,17 @@ const REVISION_KEY: &str = "busbar:revision";
 /// hazard on this file ("`migrate()` is a wipe, and its safety argument has expired": that wipe's own
 /// justification is "1.5.0 is unreleased", and 1.5.0, 1.5.1 and 1.5.2 have all shipped). The version
 /// marker moves again only when a migrate-in-place path exists to move it for.
+///
+/// v7 (busbar 1.6.0) is that path: the typed task / task-event / demotion / spent-approval keyspaces
+/// are copied IN PLACE into the kind-neutral plane-record keyspace ([`legacy::migrate_v6_to_v7`]).
+/// Nothing a v6 namespace holds is wiped: keys, credentials, usage, metering, audit and the denylist
+/// read back unchanged under v7, and the v6 MCP call log stays where it is. Only a namespace OLDER
+/// than v6 (a 1.5.0 development build, never released) still takes the wipe below.
 const SCHEMA_KEY: &str = "busbar:schema";
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
+/// The last schema that is WIPED rather than migrated when found: anything below it predates the
+/// first release. v6 and later are always migrated in place.
+const FIRST_MIGRATED_SCHEMA: i64 = 6;
 
 /// Internal sentinel: `delete_key`'s outer retry loop uses this to distinguish "credential
 /// membership changed since our watch-set pre-read, restart with a fresh watch set" from a real
@@ -302,16 +208,53 @@ fn escape_glob(s: &str) -> String {
     out
 }
 
-/// Hash field for one (model, tier) token counter: `m:<model>:<tier>`. Parsed with a RIGHT split on
-/// the tier so a model name containing `:` still round-trips.
-fn model_field(model: &str, tier: &str) -> String {
-    format!("m:{model}:{tier}")
+/// Hash field for one (model, unit) counter in a usage window. The four RESERVED units keep the v6
+/// spelling `m:<model>:<tier>` (parsed with a RIGHT split on the tier, so a model name containing `:`
+/// still round-trips, and a v6 row reads back unchanged). Every OTHER (open) unit is spelled
+/// `u:<hex unit>:<model>`: an open unit name is caller-supplied and may itself contain `:`, and hex
+/// has none, so the split is unambiguous whatever the model and unit are.
+fn usage_field(model: &str, unit: &str) -> String {
+    if RESERVED_UNITS.contains(&unit) {
+        format!("m:{model}:{unit}")
+    } else {
+        format!("u:{}:{model}", hex(unit.as_bytes()))
+    }
 }
 
-/// Parse a `m:<model>:<tier>` hash field back into `(model, tier)`.
-fn parse_model_field(field: &str) -> Option<(&str, &str)> {
-    field.strip_prefix("m:")?.rsplit_once(':')
+/// Parse a usage-window hash field back into `(model, unit)` — the inverse of [`usage_field`].
+/// `None` for the two request counters and anything else that is not a unit field.
+fn parse_usage_field(field: &str) -> Option<(String, String)> {
+    if let Some(rest) = field.strip_prefix("m:") {
+        let (model, tier) = rest.rsplit_once(':')?;
+        return Some((model.to_string(), tier.to_string()));
+    }
+    let rest = field.strip_prefix("u:")?;
+    let (unit_hex, model) = rest.split_once(':')?;
+    let unit = String::from_utf8(unhex(unit_hex)?).ok()?;
+    Some((model.to_string(), unit))
 }
+
+/// Lower-case hex of `bytes` — the collision-free spelling of a caller-supplied component inside a
+/// key or field name (hex contains no separator character).
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// The inverse of [`hex`]; `None` on anything that is not an even-length lower/upper-case hex string.
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
 fn metering_set(bucket: u64) -> String {
     format!("busbar:metering:{bucket}")
 }
@@ -333,17 +276,38 @@ fn escape_metering_component(s: &str) -> String {
     out
 }
 
-fn metering_row(bucket: u64, key_id: &str, model: &str, provider: &str) -> String {
-    // Each component is escaped before joining (see `escape_metering_component`), so the join is
-    // injective: two different `(key_id, model, provider)` triples can never produce the same row
-    // key, even when a component itself contains `|` or `\`.
-    format!(
+/// The hash key of one metering cell: `(bucket, key_id, model, provider, priced_from_ms)`.
+///
+/// `priced_from_ms` joins the identity (DECISIONS #79: a rate-card edit SPLITS the day's cell at the
+/// edit, and each half prices at the card it was earned under). A cell whose price started at `0` —
+/// the opening entry, and every row written before the field existed — keeps the v6 three-component
+/// key, so a v6 cell and a v7 write of the same undated cell are one cell. A dated cell appends a
+/// fourth `|<ms>` component. Each component is escaped before joining (see
+/// `escape_metering_component`), so the join is injective: an escaped component never contains a bare
+/// `|`, so a three-component key and a four-component key can never render the same, and two
+/// different identities never share a row.
+fn metering_row(
+    bucket: u64,
+    key_id: &str,
+    model: &str,
+    provider: &str,
+    priced_from_ms: u64,
+) -> String {
+    let base = format!(
         "busbar:metering:{bucket}:{}|{}|{}",
         escape_metering_component(key_id),
         escape_metering_component(model),
         escape_metering_component(provider)
-    )
+    );
+    match priced_from_ms {
+        0 => base,
+        ms => format!("{base}|{ms}"),
+    }
 }
+
+/// The metering-cell hash field an open (non-token) ledgered class accumulates under. Everything after
+/// the fixed `u:` prefix is the class name, verbatim, so no class name can collide with a fixed field.
+const METERING_UNIT_PREFIX: &str = "u:";
 
 /// Clamp a `u64` into `i64` for Valkey integer ops (HINCRBY is signed) - a value above `i64::MAX` pins
 /// to `i64::MAX`, never wraps. Mirrors the SQL backends.
@@ -416,7 +380,32 @@ fn is_connection_error(e: &redis::RedisError) -> bool {
     e.is_io_error() || e.is_connection_dropped() || e.is_connection_refusal() || e.is_timeout()
 }
 
-/// Valkey `Store` backend (durable, shared across a cluster). A single
+/// ADD-THEN-FLOOR over one hash: `ARGV` is `field, delta` pairs; each field is `HINCRBY`'d and, if
+/// the result went below 0, pinned to 0. A counter a v6 build left negative (its unfloored HINCRBY)
+/// is read as the 0 it always reported before the add, so the add lands on what readers saw. The add
+/// itself stays an integer HINCRBY (Lua numbers are doubles; a read-add-write in Lua would round
+/// counters past 2^53). One script, so the server runs every pair atomically — the
+/// same guarantee the v6 `MULTI` pipeline gave, plus the per-counter floor the contract's
+/// `UsageLedger::apply_delta` specifies.
+static ADD_FLOORED: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
+    redis::Script::new(
+        r"
+        for i = 1, #ARGV, 2 do
+            local cur = redis.call('HGET', KEYS[1], ARGV[i])
+            if cur and tonumber(cur) < 0 then
+                redis.call('HSET', KEYS[1], ARGV[i], 0)
+            end
+            local v = redis.call('HINCRBY', KEYS[1], ARGV[i], ARGV[i + 1])
+            if v < 0 then
+                redis.call('HSET', KEYS[1], ARGV[i], 0)
+            end
+        end
+        return 0
+        ",
+    )
+});
+
+/// Valkey `RecordStore` backend (durable, shared across a cluster). A single
 /// mutex-guarded synchronous connection with one-shot reconnect - governance is off the request hot
 /// path, so serializing access is fine.
 pub struct ValkeyStore {
@@ -432,7 +421,7 @@ impl ValkeyStore {
     /// `rediss://:pass@host:6380/0` for TLS via rustls + OS-native roots), using the
     /// [`DEFAULT_CONNECT_TIMEOUT`]. See [`Self::connect_with_timeout`] for a caller-supplied
     /// timeout.
-    pub fn connect(url: &str) -> StoreResult<Self> {
+    pub fn connect(url: &str) -> RecordStoreResult<Self> {
         Self::connect_with_timeout(url, DEFAULT_CONNECT_TIMEOUT)
     }
 
@@ -440,16 +429,17 @@ impl ValkeyStore {
     /// upstream driver crate gives no DSN-level timeout escape hatch, so a blackholed/firewalled
     /// host would otherwise hang `get_connection()` indefinitely and wedge engine boot; bounding
     /// the initial TCP connect here fails fast instead.
-    pub fn connect_with_timeout(url: &str, timeout: Duration) -> StoreResult<Self> {
+    pub fn connect_with_timeout(url: &str, timeout: Duration) -> RecordStoreResult<Self> {
         let secret = url_password(url);
         if url.starts_with("rediss://") {
             let _ = rustls::crypto::ring::default_provider().install_default();
         }
-        let client = redis::Client::open(url)
-            .map_err(|e| StoreError(scrub(format!("valkey connect: {e}"), secret.as_deref())))?;
-        let conn = client
-            .get_connection_with_timeout(timeout)
-            .map_err(|e| StoreError(scrub(format!("valkey connect: {e}"), secret.as_deref())))?;
+        let client = redis::Client::open(url).map_err(|e| {
+            RecordStoreError(scrub(format!("valkey connect: {e}"), secret.as_deref()))
+        })?;
+        let conn = client.get_connection_with_timeout(timeout).map_err(|e| {
+            RecordStoreError(scrub(format!("valkey connect: {e}"), secret.as_deref()))
+        })?;
         let store = Self {
             client,
             conn: Mutex::new(Some(conn)),
@@ -467,7 +457,7 @@ impl ValkeyStore {
     /// there. Refuse to start rather than risk it. If `CONFIG GET` itself is disabled by an ACL
     /// (a legitimate hardened deployment), we cannot verify the policy either way — fail loud with a
     /// distinct message rather than silently assuming it's safe.
-    fn assert_noeviction(&self) -> StoreResult<()> {
+    fn assert_noeviction(&self) -> RecordStoreResult<()> {
         let pairs: Vec<(String, String)> = self.with_conn(|c| {
             redis::cmd("CONFIG")
                 .arg("GET")
@@ -480,7 +470,7 @@ impl ValkeyStore {
             .map(|(_, v)| v.as_str());
         match policy {
             Some("noeviction") => Ok(()),
-            Some(other) => Err(StoreError(format!(
+            Some(other) => Err(RecordStoreError(format!(
                 "valkey maxmemory-policy is '{other}', not 'noeviction': an eviction policy \
                  can silently drop a denylist entry (un-revoking a key) or a metering row \
                  (destroying billing evidence) under memory pressure with no error anywhere. \
@@ -488,7 +478,7 @@ impl ValkeyStore {
                  the server's own config, since CONFIG SET does not survive a restart) before \
                  pointing busbar at this instance."
             ))),
-            None => Err(StoreError(
+            None => Err(RecordStoreError(
                 "valkey CONFIG GET maxmemory-policy returned no value — either this server \
                  restricts CONFIG GET via ACL, or something unexpected happened. Refusing to start: \
                  cannot verify the noeviction invariant governance data durability depends on."
@@ -497,15 +487,20 @@ impl ValkeyStore {
         }
     }
 
-    /// SCHEMA-VERSION BUMP (currently v6; see `SCHEMA_VERSION`'s own doc for what each bump did): a
-    /// `busbar:*` namespace written by an older build is WIPED and re-marked - 1.5.0 is unreleased,
-    /// so this is a bump, never a migration. A fresh namespace is simply marked; a namespace already
-    /// at the current version passes through untouched.
-    fn migrate(&self) -> StoreResult<()> {
+    /// SCHEMA MIGRATION (currently v7; see `SCHEMA_VERSION`'s own doc for what each version did).
+    /// A fresh namespace is simply marked; one already at the current version passes through
+    /// untouched; a v6 namespace is upgraded IN PLACE ([`legacy::migrate_v6_to_v7`], idempotent, the
+    /// marker written last so a crash mid-upgrade re-runs it on the next connect); a namespace older
+    /// than v6 (a never-released 1.5.0 development build) is wiped and re-marked, as it always was.
+    fn migrate(&self) -> RecordStoreResult<()> {
         let marker: Option<i64> = self.with_conn(|c| c.get::<_, Option<i64>>(SCHEMA_KEY))?;
         let version = marker.unwrap_or(0);
         if version >= SCHEMA_VERSION {
             return Ok(());
+        }
+        if version >= FIRST_MIGRATED_SCHEMA {
+            legacy::migrate_v6_to_v7(self)?;
+            return self.with_conn(|c| c.set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION));
         }
         let existing: Vec<String> = self.with_conn(|c| {
             c.scan_match::<_, String>("busbar:*")?
@@ -514,10 +509,9 @@ impl ValkeyStore {
         if existing.is_empty() {
             return self.with_conn(|c| c.set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION));
         }
-        // Any presence of a busbar:* namespace pre-v5 (marker present-but-older, or a pre-marker
-        // legacy namespace) is wiped: 1.5.0 is unreleased, so there is no live data to preserve
-        // across this specific bump, unlike the v2/v3/v4 bumps this crate's history navigated
-        // around a possibly-populated dev database more carefully.
+        // A busbar:* namespace older than v6 (marker present-but-older, or a pre-marker legacy
+        // namespace) is wiped: it was written by an unreleased 1.5.0 development build, so there is
+        // no released data to preserve across this specific boundary.
         self.with_conn(|c| {
             let mut pipe = redis::pipe();
             pipe.atomic();
@@ -534,7 +528,7 @@ impl ValkeyStore {
     fn with_conn<T>(
         &self,
         f: impl FnMut(&mut Connection) -> redis::RedisResult<T>,
-    ) -> StoreResult<T> {
+    ) -> RecordStoreResult<T> {
         self.run(f, true)
     }
 
@@ -543,7 +537,7 @@ impl ValkeyStore {
     fn with_conn_no_retry<T>(
         &self,
         f: impl FnMut(&mut Connection) -> redis::RedisResult<T>,
-    ) -> StoreResult<T> {
+    ) -> RecordStoreResult<T> {
         self.run(f, false)
     }
 
@@ -551,7 +545,7 @@ impl ValkeyStore {
         &self,
         mut f: impl FnMut(&mut Connection) -> redis::RedisResult<T>,
         retry: bool,
-    ) -> StoreResult<T> {
+    ) -> RecordStoreResult<T> {
         let mut guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         if guard.is_none() {
             *guard = Some(
@@ -610,8 +604,8 @@ impl ValkeyStore {
         }
     }
 
-    fn err(&self, e: redis::RedisError, ctx: &str) -> StoreError {
-        StoreError(scrub(format!("valkey {ctx}: {e}"), self.secret.as_deref()))
+    fn err(&self, e: redis::RedisError, ctx: &str) -> RecordStoreError {
+        RecordStoreError(scrub(format!("valkey {ctx}: {e}"), self.secret.as_deref()))
     }
 
     /// Allocate the next revision — a plain `INCR`. Called once per key/credential mutation, inside
@@ -623,14 +617,45 @@ impl ValkeyStore {
     }
 }
 
-fn key_from_json(raw: &str) -> StoreResult<VirtualKey> {
-    serde_json::from_str(raw).map_err(|e| StoreError(format!("key decode failed: {e}")))
+/// `put_credential`'s owner precondition, read inside its WATCHed transaction: the key row named by
+/// `key_id` must exist and must not be tombstoned. An unparseable owner row is refused too — a
+/// credential cannot be attached to a key whose liveness cannot be established.
+fn owner_is_live(c: &mut Connection, key_row: &str, key_id: &str) -> redis::RedisResult<()> {
+    let raw: Option<String> = c.get(key_row)?;
+    let refuse = |why: String| {
+        Err(redis::RedisError::from((
+            redis::ErrorKind::Client,
+            "put_credential refused",
+            why,
+        )))
+    };
+    let Some(raw) = raw else {
+        return refuse(format!(
+            "put_credential: key '{key_id}' does not exist; a credential must hang off a real key"
+        ));
+    };
+    match key_from_json(&raw) {
+        Ok(k) if k.deleted_at.is_none() => Ok(()),
+        Ok(_) => refuse(format!(
+            "put_credential: key '{key_id}' is tombstoned; its credentials were revoked with it \
+             and are never reissued"
+        )),
+        Err(_) => refuse(format!(
+            "put_credential: key '{key_id}' does not decode; refusing to attach a credential to it"
+        )),
+    }
 }
-fn cred_to_json(cred: &CredentialSecret) -> StoreResult<String> {
-    serde_json::to_string(cred).map_err(|e| StoreError(format!("credential encode failed: {e}")))
+
+fn key_from_json(raw: &str) -> RecordStoreResult<VirtualKey> {
+    serde_json::from_str(raw).map_err(|e| RecordStoreError(format!("key decode failed: {e}")))
 }
-fn cred_from_json(raw: &str) -> StoreResult<CredentialSecret> {
-    serde_json::from_str(raw).map_err(|e| StoreError(format!("credential decode failed: {e}")))
+fn cred_to_json(cred: &CredentialSecret) -> RecordStoreResult<String> {
+    serde_json::to_string(cred)
+        .map_err(|e| RecordStoreError(format!("credential encode failed: {e}")))
+}
+fn cred_from_json(raw: &str) -> RecordStoreResult<CredentialSecret> {
+    serde_json::from_str(raw)
+        .map_err(|e| RecordStoreError(format!("credential decode failed: {e}")))
 }
 
 /// Parse a `"<key_id>:<kind>:<slot>"` pointer value back into its parts. `kind` cannot itself contain
@@ -650,7 +675,7 @@ fn parse_slot_pointer(s: &str) -> Option<(String, String, u8)> {
 #[cfg(test)]
 impl ValkeyStore {
     /// Remove a key row and every index entry pointing at it, tombstone included.
-    pub(crate) fn purge_key_for_test(&self, id: &str) -> StoreResult<()> {
+    pub(crate) fn purge_key_for_test(&self, id: &str) -> RecordStoreResult<()> {
         self.with_conn(|c| {
             redis::pipe()
                 .atomic()
@@ -667,7 +692,7 @@ impl ValkeyStore {
     }
 
     /// Remove a credential's id pointer. The slot row itself goes with its owning key.
-    pub(crate) fn purge_credential_for_test(&self, id: &str) -> StoreResult<()> {
+    pub(crate) fn purge_credential_for_test(&self, id: &str) -> RecordStoreResult<()> {
         self.with_conn(|c| {
             redis::pipe()
                 .atomic()
@@ -678,7 +703,7 @@ impl ValkeyStore {
     }
 
     /// Remove whatever occupies one audit `seq`.
-    pub(crate) fn purge_audit_seq_for_test(&self, seq: u64) -> StoreResult<()> {
+    pub(crate) fn purge_audit_seq_for_test(&self, seq: u64) -> RecordStoreResult<()> {
         let score = clamp(seq);
         self.with_conn(|c| {
             redis::pipe()
@@ -693,8 +718,8 @@ impl ValkeyStore {
     }
 }
 
-impl Store for ValkeyStore {
-    fn put_key(&self, key: &VirtualKey) -> StoreResult<()> {
+impl RecordStore for ValkeyStore {
+    fn put_key(&self, key: &VirtualKey) -> RecordStoreResult<()> {
         let key = key.clone();
         let row_key = format!("{KEY_PREFIX}{}", key.id);
         self.with_conn(|c| {
@@ -740,12 +765,12 @@ impl Store for ValkeyStore {
         })
     }
 
-    fn get_key(&self, id: &str) -> StoreResult<Option<VirtualKey>> {
+    fn get_key(&self, id: &str) -> RecordStoreResult<Option<VirtualKey>> {
         let raw: Option<String> = self.with_conn(|c| c.get(format!("{KEY_PREFIX}{id}")))?;
         raw.map(|r| key_from_json(&r)).transpose()
     }
 
-    fn list_keys(&self) -> StoreResult<Vec<VirtualKey>> {
+    fn list_keys(&self) -> RecordStoreResult<Vec<VirtualKey>> {
         // Deliberately UNFILTERED — including tombstones. See the trait's own doc: this serves both
         // the admin-listing caller (which filters `is_live()` itself) and `list_keys_since`'s default
         // hydration fallback, which needs to SEE a tombstone to evict cached credentials.
@@ -772,7 +797,7 @@ impl Store for ValkeyStore {
         Ok(out)
     }
 
-    fn list_keys_since(&self, since: u64) -> StoreResult<Vec<VirtualKey>> {
+    fn list_keys_since(&self, since: u64) -> RecordStoreResult<Vec<VirtualKey>> {
         // Real delta-fetch: ZRANGEBYSCORE the byrev index, not a full scan-and-filter — the whole
         // point of maintaining `keys:byrev`.
         let ids: Vec<String> =
@@ -794,7 +819,7 @@ impl Store for ValkeyStore {
         Ok(out)
     }
 
-    fn delete_key(&self, id: &str) -> StoreResult<()> {
+    fn delete_key(&self, id: &str) -> RecordStoreResult<()> {
         let ids_key = cred_ids_key(id);
         let key_row = format!("{KEY_PREFIX}{id}");
         // Usage windows: a non-blocking SCAN outside the transaction (mirrors the crate's prior
@@ -919,7 +944,7 @@ impl Store for ValkeyStore {
         })
     }
 
-    fn scrub_key(&self, id: &str) -> StoreResult<()> {
+    fn scrub_key(&self, id: &str) -> RecordStoreResult<()> {
         let key_row = format!("{KEY_PREFIX}{id}");
         self.with_conn(|c| {
             redis::transaction(c, &[key_row.as_str()], |c, pipe| {
@@ -954,7 +979,7 @@ impl Store for ValkeyStore {
         })
     }
 
-    fn get_usage(&self, bucket_id: &str, window_start: u64) -> StoreResult<UsageLedger> {
+    fn get_usage(&self, bucket_id: &str, window_start: u64) -> RecordStoreResult<UsageLedger> {
         let k = usage_key(bucket_id, window_start);
         let fields: Vec<(String, i64)> = self.with_conn(|c| c.hgetall(&k))?;
         if fields.is_empty() {
@@ -970,25 +995,24 @@ impl Store for ValkeyStore {
                 ledger.billable_requests = read_u64(v);
                 continue;
             }
-            let Some((model, tier)) = parse_model_field(&name) else {
+            let Some((model, unit)) = parse_usage_field(&name) else {
                 continue;
             };
             let entry = match ledger.models.iter_mut().find(|m| m.model == model) {
                 Some(m) => m,
                 None => {
                     ledger.models.push(ModelTokens {
-                        model: model.to_string(),
-                        tokens: TierTokens::default(),
+                        model,
+                        ..Default::default()
                     });
                     ledger.models.last_mut().expect("just pushed")
                 }
             };
-            match tier {
-                "input" => entry.tokens.input = read_u64(v),
-                "output" => entry.tokens.output = read_u64(v),
-                "cache_read" => entry.tokens.cache_read = read_u64(v),
-                "cache_write" => entry.tokens.cache_write = read_u64(v),
-                _ => {}
+            // A zero counter is not carried: the map is sparse (`ModelTokens::is_zero` reads an
+            // absent key and a zero one the same), and a v6 row wrote all four tiers, zeros included.
+            let n = read_u64(v);
+            if n != 0 {
+                entry.usage_units.insert(unit, n);
             }
         }
         ledger.models.sort_by(|a, b| a.model.cmp(&b.model));
@@ -1000,7 +1024,7 @@ impl Store for ValkeyStore {
         bucket_id: &str,
         window_start: u64,
         ledger: &UsageLedger,
-    ) -> StoreResult<()> {
+    ) -> RecordStoreResult<()> {
         let k = usage_key(bucket_id, window_start);
         self.with_conn(|c| {
             let mut pipe = redis::pipe();
@@ -1010,125 +1034,101 @@ impl Store for ValkeyStore {
             pipe.hset(&k, "billable_requests", clamp(ledger.billable_requests))
                 .ignore();
             for m in &ledger.models {
-                pipe.hset(&k, model_field(&m.model, "input"), clamp(m.tokens.input))
-                    .ignore();
-                pipe.hset(&k, model_field(&m.model, "output"), clamp(m.tokens.output))
-                    .ignore();
-                pipe.hset(
-                    &k,
-                    model_field(&m.model, "cache_read"),
-                    clamp(m.tokens.cache_read),
-                )
-                .ignore();
-                pipe.hset(
-                    &k,
-                    model_field(&m.model, "cache_write"),
-                    clamp(m.tokens.cache_write),
-                )
-                .ignore();
-            }
-            pipe.query(c)
-        })
-    }
-
-    fn add_usage(&self, bucket_id: &str, window_start: u64, delta: &UsageDelta) -> StoreResult<()> {
-        let k = usage_key(bucket_id, window_start);
-        self.with_conn_no_retry(|c| {
-            let mut pipe = redis::pipe();
-            pipe.atomic();
-            pipe.cmd("HINCRBY")
-                .arg(&k)
-                .arg("requests")
-                .arg(delta.requests)
-                .ignore();
-            pipe.cmd("HINCRBY")
-                .arg(&k)
-                .arg("billable_requests")
-                .arg(delta.billable_requests)
-                .ignore();
-            for m in &delta.models {
-                for (tier, v) in [
-                    ("input", m.tokens.input),
-                    ("output", m.tokens.output),
-                    ("cache_read", m.tokens.cache_read),
-                    ("cache_write", m.tokens.cache_write),
-                ] {
-                    if v != 0 {
-                        pipe.cmd("HINCRBY")
-                            .arg(&k)
-                            .arg(model_field(&m.model, tier))
-                            .arg(v)
-                            .ignore();
-                    }
+                for (unit, n) in &m.usage_units {
+                    pipe.hset(&k, usage_field(&m.model, unit), clamp(*n))
+                        .ignore();
                 }
             }
             pipe.query(c)
         })
     }
 
-    fn add_metering(&self, d: &MeteringDelta) -> StoreResult<()> {
-        let row = metering_row(d.bucket, &d.key_id, &d.model, &d.provider);
-        let set = metering_set(d.bucket);
+    fn add_usage(
+        &self,
+        bucket_id: &str,
+        window_start: u64,
+        delta: &UsageDelta,
+    ) -> RecordStoreResult<()> {
+        // The FLEET-HONEST flush: every counter is an atomic server-side add, so N nodes' deltas sum.
+        // Each counter is FLOORED AT 0 as its delta lands (the contract's `apply_delta`: a refund can
+        // never drive a durable counter negative), which a bare HINCRBY cannot do — a refund larger
+        // than the counter would leave it negative and the NEXT accrual would be swallowed paying
+        // that debt back. So the add-then-floor runs as ONE script the server executes atomically.
+        let k = usage_key(bucket_id, window_start);
+        let mut fields: Vec<(String, i64)> = vec![
+            ("requests".to_string(), delta.requests),
+            ("billable_requests".to_string(), delta.billable_requests),
+        ];
+        for m in &delta.models {
+            for (unit, d) in &m.usage_units {
+                if *d != 0 {
+                    fields.push((usage_field(&m.model, unit), *d));
+                }
+            }
+        }
         self.with_conn_no_retry(|c| {
-            redis::pipe()
-                .atomic()
-                .sadd(&set, &row)
-                .ignore()
-                .cmd("HINCRBY")
-                .arg(&row)
-                .arg("tokens_input")
-                .arg(clamp(d.tokens_input))
-                .ignore()
-                .cmd("HINCRBY")
-                .arg(&row)
-                .arg("tokens_output")
-                .arg(clamp(d.tokens_output))
-                .ignore()
-                .cmd("HINCRBY")
-                .arg(&row)
-                .arg("tokens_cache_read")
-                .arg(clamp(d.tokens_cache_read))
-                .ignore()
-                .cmd("HINCRBY")
-                .arg(&row)
-                .arg("tokens_cache_write")
-                .arg(clamp(d.tokens_cache_write))
-                .ignore()
-                .cmd("HINCRBY")
-                .arg(&row)
-                .arg("requests")
-                .arg(clamp(d.requests))
-                .ignore()
-                .cmd("HINCRBY")
-                .arg(&row)
-                .arg("billable_requests")
-                .arg(clamp(d.billable_requests))
-                .ignore()
-                .hset_multiple(
-                    &row,
-                    &[
-                        ("key_id", d.key_id.as_str()),
-                        ("model", d.model.as_str()),
-                        ("provider", d.provider.as_str()),
-                    ],
-                )
-                .ignore()
-                // First-write-wins attribution snapshot: HSETNX only sets if the field is absent.
-                .cmd("HSETNX")
-                .arg(&row)
-                .arg("key_group_at_use")
-                .arg(&d.key_group_at_use)
-                .ignore()
-                .cmd("HSETNX")
-                .arg(&row)
-                .arg("pricing_version")
-                .arg(&d.pricing_version)
-                .ignore()
-                .query(c)
+            let mut inv = ADD_FLOORED.key(&k);
+            for (f, d) in &fields {
+                inv.arg(f).arg(*d);
+            }
+            inv.invoke::<()>(c)
         })
     }
 
-    fn list_metering(&self, bucket: u64) -> StoreResult<Vec<MeteringRow>> {
+    fn add_metering(&self, d: &MeteringDelta) -> RecordStoreResult<()> {
+        let row = metering_row(d.bucket, &d.key_id, &d.model, &d.provider, d.priced_from_ms);
+        let set = metering_set(d.bucket);
+        self.with_conn_no_retry(|c| {
+            let mut pipe = redis::pipe();
+            pipe.atomic().sadd(&set, &row).ignore();
+            for (field, v) in [
+                ("tokens_input", d.tokens_input),
+                ("tokens_output", d.tokens_output),
+                ("tokens_cache_read", d.tokens_cache_read),
+                ("tokens_cache_write", d.tokens_cache_write),
+                ("requests", d.requests),
+                ("billable_requests", d.billable_requests),
+            ] {
+                pipe.cmd("HINCRBY")
+                    .arg(&row)
+                    .arg(field)
+                    .arg(clamp(v))
+                    .ignore();
+            }
+            for (class, v) in &d.usage_units {
+                pipe.cmd("HINCRBY")
+                    .arg(&row)
+                    .arg(format!("{METERING_UNIT_PREFIX}{class}"))
+                    .arg(clamp(*v))
+                    .ignore();
+            }
+            pipe.hset_multiple(
+                &row,
+                &[
+                    ("key_id", d.key_id.as_str()),
+                    ("model", d.model.as_str()),
+                    ("provider", d.provider.as_str()),
+                ],
+            )
+            .ignore()
+            .hset(&row, "priced_from_ms", d.priced_from_ms.to_string())
+            .ignore()
+            // First-write-wins attribution snapshot: HSETNX only sets if the field is absent.
+            .cmd("HSETNX")
+            .arg(&row)
+            .arg("key_group_at_use")
+            .arg(&d.key_group_at_use)
+            .ignore()
+            .cmd("HSETNX")
+            .arg(&row)
+            .arg("pricing_version")
+            .arg(&d.pricing_version)
+            .ignore()
+            .query(c)
+        })
+    }
+
+    fn list_metering(&self, bucket: u64) -> RecordStoreResult<Vec<MeteringRow>> {
         let set = metering_set(bucket);
         let row_keys: Vec<String> = self.with_conn(|c| c.smembers(&set))?;
         if row_keys.is_empty() {
@@ -1158,17 +1158,26 @@ impl Store for ValkeyStore {
                 billable_requests: 0,
                 key_group_at_use: String::new(),
                 pricing_version: String::new(),
+                priced_from_ms: 0,
+                usage_units: Default::default(),
             };
             for (name, val) in fields {
                 // Every other decode path in this file (key_from_json, cred_from_json, audit
-                // records) propagates a StoreError on a corrupt value rather than silently
+                // records) propagates a RecordStoreError on a corrupt value rather than silently
                 // substituting a default -- a malformed numeric field here must not silently
                 // read back as 0 and under-report billing/usage data.
                 let num = |field: &str, val: &str| {
                     val.parse::<i64>().map_err(|e| {
-                        StoreError(format!("list_metering: bad {field} value {val:?}: {e}"))
+                        RecordStoreError(format!("list_metering: bad {field} value {val:?}: {e}"))
                     })
                 };
+                if let Some(class) = name.strip_prefix(METERING_UNIT_PREFIX) {
+                    let n = read_u64(num(&name, &val)?);
+                    if n != 0 {
+                        m.usage_units.insert(class.to_string(), n);
+                    }
+                    continue;
+                }
                 match name.as_str() {
                     "key_id" => m.key_id = val.clone(),
                     "model" => m.model = val.clone(),
@@ -1185,6 +1194,13 @@ impl Store for ValkeyStore {
                     "billable_requests" => {
                         m.billable_requests = read_u64(num("billable_requests", &val)?)
                     }
+                    "priced_from_ms" => {
+                        m.priced_from_ms = val.parse::<u64>().map_err(|e| {
+                            RecordStoreError(format!(
+                                "list_metering: bad priced_from_ms value {val:?}: {e}"
+                            ))
+                        })?
+                    }
                     "key_group_at_use" => m.key_group_at_use = val.clone(),
                     "pricing_version" => m.pricing_version = val.clone(),
                     _ => {}
@@ -1195,24 +1211,31 @@ impl Store for ValkeyStore {
         Ok(out)
     }
 
-    fn put_credential(&self, secret: &CredentialSecret) -> StoreResult<()> {
+    fn put_credential(&self, secret: &CredentialSecret) -> RecordStoreResult<()> {
         let row_key = cred_row_key(&secret.meta.key_id, &secret.meta.kind, secret.meta.slot);
         let ids_key = cred_ids_key(&secret.meta.key_id);
         let pub_key = cred_pub_key(&secret.meta.kind, &secret.meta.public_id);
         let id_key = cred_id_key(&secret.meta.id);
+        let key_row = format!("{KEY_PREFIX}{}", secret.meta.key_id);
         let mut secret = secret.clone();
         let slot_ptr = format!(
             "{}:{}:{}",
             secret.meta.key_id, secret.meta.kind, secret.meta.slot
         );
         self.with_conn(|c| {
+            // WATCH the OWNING KEY's row too: a credential must hang off a real, live key, and a
+            // `delete_key` committing between that check and the write must abort this, never slip
+            // under it (the tombstone cascade would otherwise be undone through this door).
+            //
             // WATCH both the slot's own row AND the public_id pointer: the uniqueness check reads
             // `pub_key` here, immediately (not through the pipe, so its result is actually
             // inspected — a `SETNX` queued inside an `.ignore()`d pipe command would silently
             // discard the "already claimed" signal, which is exactly the bug this shape avoids). A
             // concurrent writer claiming this public_id between the read and EXEC touches the
             // watched `pub_key`, aborting and retrying this whole closure against fresh state.
-            redis::transaction(c, &[row_key.as_str(), pub_key.as_str()], |c, pipe| {
+            let watched = [row_key.as_str(), pub_key.as_str(), key_row.as_str()];
+            redis::transaction(c, &watched, |c, pipe| {
+                owner_is_live(c, &key_row, &secret.meta.key_id)?;
                 let existing: Option<String> = c.get(&row_key)?;
                 let mut old_pub: Option<String> = None;
                 let mut old_id: Option<String> = None;
@@ -1299,7 +1322,14 @@ impl Store for ValkeyStore {
         &self,
         key: &VirtualKey,
         secret: &CredentialSecret,
-    ) -> StoreResult<()> {
+    ) -> RecordStoreResult<()> {
+        if secret.meta.key_id != key.id {
+            return Err(RecordStoreError(format!(
+                "put_key_with_credential: the credential names key '{}', not the key '{}' being \
+                 minted with it",
+                secret.meta.key_id, key.id
+            )));
+        }
         // Atomic key+credential mint: WATCH both rows so neither write is observed without the
         // other. The credential row cannot pre-exist for a brand-new mint (a fresh id/slot), so this
         // is simpler than `put_credential`'s slot-reuse path — no old-pointer cleanup needed.
@@ -1322,6 +1352,26 @@ impl Store for ValkeyStore {
                 c,
                 &[key_row.as_str(), row_key.as_str(), pub_key.as_str()],
                 |c, pipe| {
+                    // The tombstone precondition `put_key` enforces, on the atomic mint too: a
+                    // live-shaped key must not clear a stored tombstone.
+                    if key.deleted_at.is_none() {
+                        let prior: Option<String> = c.get(&key_row)?;
+                        if prior
+                            .as_deref()
+                            .and_then(|r| key_from_json(r).ok())
+                            .is_some_and(|k| k.deleted_at.is_some())
+                        {
+                            return Err(redis::RedisError::from((
+                                redis::ErrorKind::Client,
+                                "put_key_with_credential refused",
+                                format!(
+                                    "put_key_with_credential: '{}' is tombstoned and its id is \
+                                     never reissued",
+                                    key.id
+                                ),
+                            )));
+                        }
+                    }
                     let pub_holder: Option<String> = c.get(&pub_key)?;
                     if let Some(holder) = &pub_holder {
                         if *holder == slot_ptr {
@@ -1375,7 +1425,7 @@ impl Store for ValkeyStore {
         })
     }
 
-    fn list_credentials(&self, key_id: &str) -> StoreResult<Vec<CredentialMeta>> {
+    fn list_credentials(&self, key_id: &str) -> RecordStoreResult<Vec<CredentialMeta>> {
         let members: Vec<String> = self.with_conn(|c| c.smembers(cred_ids_key(key_id)))?;
         if members.is_empty() {
             return Ok(Vec::new());
@@ -1408,7 +1458,7 @@ impl Store for ValkeyStore {
         &self,
         kind: &str,
         public_id: &str,
-    ) -> StoreResult<Option<CredentialSecret>> {
+    ) -> RecordStoreResult<Option<CredentialSecret>> {
         let ptr: Option<String> = self.with_conn(|c| c.get(cred_pub_key(kind, public_id)))?;
         let Some(ptr) = ptr else {
             return Ok(None);
@@ -1420,7 +1470,7 @@ impl Store for ValkeyStore {
         raw.map(|r| cred_from_json(&r)).transpose()
     }
 
-    fn revoke_credential(&self, id: &str, reason: &str) -> StoreResult<()> {
+    fn revoke_credential(&self, id: &str, reason: &str) -> RecordStoreResult<()> {
         let id_key = cred_id_key(id);
         self.with_conn(|c| {
             redis::transaction(c, &[id_key.as_str()], |c, pipe| {
@@ -1481,7 +1531,7 @@ impl Store for ValkeyStore {
         })
     }
 
-    fn list_credentials_since(&self, since: u64) -> StoreResult<Vec<CredentialSecret>> {
+    fn list_credentials_since(&self, since: u64) -> RecordStoreResult<Vec<CredentialSecret>> {
         let members: Vec<String> =
             self.with_conn(|c| c.zrangebyscore(CREDS_BYREV, format!("({since}"), "+inf"))?;
         if members.is_empty() {
@@ -1539,9 +1589,9 @@ impl Store for ValkeyStore {
         Ok(out)
     }
 
-    fn append_audit(&self, entry: &AuditRecord) -> StoreResult<()> {
+    fn append_audit(&self, entry: &AuditRecord) -> RecordStoreResult<()> {
         let json = serde_json::to_string(entry)
-            .map_err(|e| StoreError(format!("audit encode failed: {e}")))?;
+            .map_err(|e| RecordStoreError(format!("audit encode failed: {e}")))?;
         let score = clamp(entry.seq);
         self.with_conn(|c| {
             // This used to ZREMRANGEBYSCORE the score then ZADD, i.e. OVERWRITE, last writer wins.
@@ -1586,327 +1636,30 @@ impl Store for ValkeyStore {
         })
     }
 
-    fn list_audit(&self) -> StoreResult<Vec<AuditRecord>> {
+    fn list_audit(&self) -> RecordStoreResult<Vec<AuditRecord>> {
         let members: Vec<String> = self.with_conn(|c| c.zrange(AUDIT_ZSET, 0, -1))?;
         let mut out = Vec::with_capacity(members.len());
         for m in members {
             let rec: AuditRecord = serde_json::from_str(&m)
-                .map_err(|e| StoreError(format!("audit decode failed: {e}")))?;
+                .map_err(|e| RecordStoreError(format!("audit decode failed: {e}")))?;
             out.push(rec);
         }
         Ok(out)
     }
 
-    fn list_audit_tail(&self, limit: u64) -> StoreResult<Vec<AuditRecord>> {
+    fn list_audit_tail(&self, limit: u64) -> RecordStoreResult<Vec<AuditRecord>> {
         let start: isize = isize::try_from(limit).map(|n| -n).unwrap_or(isize::MIN);
         let members: Vec<String> = self.with_conn(|c| c.zrange(AUDIT_ZSET, start, -1))?;
         let mut out = Vec::with_capacity(members.len());
         for m in members {
             let rec: AuditRecord = serde_json::from_str(&m)
-                .map_err(|e| StoreError(format!("audit decode failed: {e}")))?;
+                .map_err(|e| RecordStoreError(format!("audit decode failed: {e}")))?;
             out.push(rec);
         }
         Ok(out)
     }
 
-    fn put_task(&self, task: &TaskRow) -> StoreResult<()> {
-        // UPSERT BY task_id: the engine writes through on EVERY state transition, so a second write
-        // for one task must REPLACE the row, never append a second one for the same id. A `SET` on a
-        // single row key is that, structurally.
-        //
-        // No range guard and no clamp anywhere in this method, unlike the SQL siblings: the row is
-        // JSON, so `artifact_cursor`, `created_at` and `updated_at` round-trip across the whole u64
-        // range. That matters most for the cursor — it is how much of a stream has been durably
-        // relayed, and a value that read back as something else would either replay delivered
-        // artifacts or skip undelivered ones with no error ever reported.
-        let json = serde_json::to_string(task)
-            .map_err(|e| StoreError(format!("task encode failed: {e}")))?;
-        let row_key = task_row_key(&task.task_id);
-        // ONE atomic pipeline: the row, the enumeration and the retention index must land together or
-        // not at all. A row present but absent from the enumeration is a task `list_tasks` (and so
-        // the boot rehydrate) would never see again; present in the index but absent as a row would
-        // make a purge walk a candidate that no longer exists.
-        //
-        // ZADD on an existing member OVERWRITES its score, so a state transition re-stamps the
-        // retention index rather than leaving it pinned at the first write's `updated_at`.
-        self.with_conn(|c| {
-            redis::pipe()
-                .atomic()
-                .set(&row_key, &json)
-                .ignore()
-                .sadd(TASKS_INDEX, &task.task_id)
-                .ignore()
-                .zadd(TASKS_BY_UPDATED, &task.task_id, clamp(task.updated_at))
-                .ignore()
-                .query(c)
-        })
-    }
-
-    fn get_task(&self, task_id: &str) -> StoreResult<Option<TaskRow>> {
-        // No principal filter, deliberately: the contract puts the caller-scoping check ENGINE-side,
-        // because an authorization check living in the backend is one an unauthorized reader
-        // bypasses by configuring a different backend.
-        let raw: Option<String> = self.with_conn(|c| c.get(task_row_key(task_id)))?;
-        raw.map(|r| {
-            serde_json::from_str::<TaskRow>(&r)
-                .map_err(|e| StoreError(format!("task decode failed: {e}")))
-        })
-        .transpose()
-    }
-
-    fn list_tasks(&self) -> StoreResult<Vec<TaskRow>> {
-        // UNFILTERED, terminal rows included. The boot rehydrate wants the active rows, the retention
-        // sweep wants the terminal ones and the scoped listing wants one principal's; a store that
-        // pre-filtered for any one of those would break the other two.
-        let ids: Vec<String> = self.with_conn(|c| c.smembers(TASKS_INDEX))?;
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let raws: Vec<Option<String>> = self.with_conn(|c| {
-            let mut pipe = redis::pipe();
-            for id in &ids {
-                pipe.get(task_row_key(id));
-            }
-            pipe.query(c)
-        })?;
-        let mut out = Vec::with_capacity(ids.len());
-        // A member whose row is gone is SKIPPED rather than being an error, the same way `list_keys`
-        // handles it: the enumeration can legitimately be a step ahead of a concurrent purge, and a
-        // boot that refused to rehydrate anything because one row was mid-sweep would be worse than
-        // one that rehydrates the rest.
-        for raw in raws.into_iter().flatten() {
-            out.push(
-                serde_json::from_str::<TaskRow>(&raw)
-                    .map_err(|e| StoreError(format!("task decode failed: {e}")))?,
-            );
-        }
-        // A SET has no order; sort so the listing is deterministic across calls and nodes, and by the
-        // same key the SQL siblings' `ORDER BY task_id` gives.
-        out.sort_by(|a, b| a.task_id.cmp(&b.task_id));
-        Ok(out)
-    }
-
-    fn purge_tasks_before(&self, before: u64) -> StoreResult<u64> {
-        // TERMINAL ONLY, and STRICTLY older than the cutoff — see TERMINAL_TASK_STATES for why that
-        // set is closed and why that is the safe direction to be wrong in.
-        //
-        // `(cutoff` is an EXCLUSIVE upper bound, exactly as the contract specifies, so a task sitting
-        // exactly at the cutoff is kept. Expressed as an exclusive range rather than `before - 1`
-        // because the latter underflows at zero.
-        let candidates: Vec<String> = self.with_conn(|c| {
-            c.zrangebyscore(TASKS_BY_UPDATED, "-inf", format!("({}", clamp(before)))
-        })?;
-        if candidates.is_empty() {
-            return Ok(0);
-        }
-        let mut removed = 0u64;
-        for id in &candidates {
-            let row_key = task_row_key(id);
-            let events_key = task_events_key(id);
-            // The ZSET is an INDEX, never the truth. Re-read the ROW here and re-check BOTH its state
-            // and its `updated_at` before deleting, under WATCH so a `put_task` that resumes an
-            // interrupted task (or re-stamps its timestamp) between the candidate read and the delete
-            // ABORTS this transaction instead of losing the resumed task. A ZSET score is an IEEE
-            // double and a stale index entry is possible besides, so trusting it would be trusting
-            // the wrong artifact.
-            //
-            // The events go with the task, in the SAME transaction. That cascade is load-bearing
-            // rather than tidiness: `purge_tasks_before` is the ONLY retention method the contract
-            // gives this data, so a purge that left the chain behind would leave `task_events` with
-            // no bound anywhere in the trait.
-            let deleted: u64 = self.with_conn(|c| {
-                redis::transaction(c, &[row_key.as_str()], |c, pipe| {
-                    let raw: Option<String> = c.get(&row_key)?;
-                    let Some(raw) = raw else {
-                        // A stale index entry pointing at a row that is already gone: drop the entry
-                        // (so the sweep does not keep re-walking it) and report NOTHING removed, since
-                        // nothing was.
-                        let applied: Option<()> =
-                            pipe.atomic().zrem(TASKS_BY_UPDATED, id).ignore().query(c)?;
-                        return Ok(applied.map(|()| 0u64));
-                    };
-                    let task: TaskRow = serde_json::from_str(&raw).map_err(|e| {
-                        redis::RedisError::from((
-                            redis::ErrorKind::Client,
-                            "task decode failed",
-                            e.to_string(),
-                        ))
-                    })?;
-                    if task.updated_at >= before
-                        || !TERMINAL_TASK_STATES.contains(&task.state.as_str())
-                    {
-                        // Not actually sweepable: leave the row AND its index entry alone, and run no
-                        // pipeline at all. The entry is not stale — it is a live task whose score
-                        // simply is not below the cutoff the row itself reports.
-                        return Ok(Some(0u64));
-                    }
-                    let applied: Option<()> = pipe
-                        .atomic()
-                        .del(&row_key)
-                        .ignore()
-                        .del(&events_key)
-                        .ignore()
-                        .srem(TASKS_INDEX, id)
-                        .ignore()
-                        .zrem(TASKS_BY_UPDATED, id)
-                        .ignore()
-                        .query(c)?;
-                    Ok(applied.map(|()| 1u64))
-                })
-            })?;
-            // The count REPORTED is the count actually performed — taken from the transaction that
-            // did the deleting, never from the size of the candidate list, which would over-report a
-            // task a concurrent writer resumed or a concurrent purge already took.
-            removed += deleted;
-        }
-        Ok(removed)
-    }
-
-    fn append_task_event(&self, event: &TaskEventRow) -> StoreResult<()> {
-        // UPSERT ON (task_id, seq), and this is where the task-event contract genuinely DIFFERS from
-        // `append_mcp_call`'s below: that one treats an occupied slot holding a DIFFERENT record as a
-        // fork and refuses it, while this one is specified to upsert so the engine's write-through is
-        // idempotent on replay — "rejecting or duplicating a replayed `seq` breaks the chain the
-        // engine will verify on read". Copying the call log's fork check here would be wrong in a way
-        // that looks right, so it is stated rather than left to be inferred from the code.
-        //
-        // The chain is scored by `seq`, so "the record at this seq" is the member at exactly this
-        // score: clearing that score and adding the new member, atomically, IS the upsert. ZADD alone
-        // would not be — a corrected event is a DIFFERENT member string at the same score, which ZADD
-        // would happily add ALONGSIDE the old one, duplicating exactly the seq the contract says must
-        // not duplicate.
-        //
-        // Deliberately NO `put_task` precondition: a `task.submitted` event and the first `put_task`
-        // are two independent write-throughs and the contract states no ordering between them, so
-        // appending an event for a task with no row yet has to work.
-        //
-        // The digests ride through verbatim: this store never computes or recomputes one, because a
-        // digest a store could recompute is a digest a compromised store could forge consistently.
-        let json = serde_json::to_string(event)
-            .map_err(|e| StoreError(format!("task event encode failed: {e}")))?;
-        let key = task_events_key(&event.task_id);
-        let score = clamp(event.seq);
-        self.with_conn(|c| {
-            redis::pipe()
-                .atomic()
-                .zrembyscore(&key, score, score)
-                .ignore()
-                .zadd(&key, &json, score)
-                .ignore()
-                .query(c)
-        })
-    }
-
-    fn list_task_events(&self, task_id: &str) -> StoreResult<Vec<TaskEventRow>> {
-        // Scored by seq, so ZRANGE returns the chain oldest-first — the order the engine's verifier
-        // reads it in — and the scope is the one task, because the chain is per-task.
-        let members: Vec<String> = self.with_conn(|c| c.zrange(task_events_key(task_id), 0, -1))?;
-        let mut out = Vec::with_capacity(members.len());
-        for m in members {
-            out.push(
-                serde_json::from_str::<TaskEventRow>(&m)
-                    .map_err(|e| StoreError(format!("task event decode failed: {e}")))?,
-            );
-        }
-        Ok(out)
-    }
-
-    fn append_mcp_call(&self, record: &McpCallRecord) -> StoreResult<()> {
-        let json = serde_json::to_string(record)
-            .map_err(|e| StoreError(format!("mcp call encode failed: {e}")))?;
-        let key = mcp_calls_key(&record.principal);
-        let score = clamp(record.seq);
-        // Is this sequence already occupied for this principal? The per-principal set is scored by
-        // seq, so the incumbent (if any) is the single member at exactly this score.
-        let incumbent: Vec<String> =
-            self.with_conn(|c| c.zrangebyscore(key.clone(), score, score))?;
-        if let Some(existing) = incumbent.first() {
-            // BYTE-IDENTICAL is the at-least-once retry and is success. DIFFERENT is a forked or
-            // tampered log and is an error: overwriting would destroy exactly the case worth
-            // reporting, and this store never restates a digest it was handed.
-            if existing == &json {
-                return Ok(());
-            }
-            // Names the sequence and nothing else — it must not echo stored (or caller) content.
-            return Err(StoreError(format!(
-                "mcp call log fork: a different record is already persisted at sequence {} for this principal",
-                record.seq
-            )));
-        }
-        let ts_member = format!("{}{MCP_TS_MEMBER_SEP}{}", record.seq, record.principal);
-        // One atomic pipeline: the record, the principal enumeration and the retention index must
-        // land together or not at all. A record present in the chain but absent from the retention
-        // index would never age out; present in the index but absent from the chain would make a
-        // purge report a deletion it did not perform.
-        self.with_conn(|c| {
-            redis::pipe()
-                .atomic()
-                .zadd(key.clone(), &json, score)
-                .ignore()
-                .sadd(MCP_PRINCIPALS_SET, &record.principal)
-                .ignore()
-                .zadd(MCP_CALLS_BY_TS, &ts_member, clamp(record.ts))
-                .ignore()
-                .query(c)
-        })
-    }
-
-    fn list_mcp_calls(&self, principal: &str) -> StoreResult<Vec<McpCallRecord>> {
-        // Scored by seq, so ZRANGE returns the chain in the order the engine verifies it in.
-        let members: Vec<String> = self.with_conn(|c| c.zrange(mcp_calls_key(principal), 0, -1))?;
-        let mut out = Vec::with_capacity(members.len());
-        for m in members {
-            let rec: McpCallRecord = serde_json::from_str(&m)
-                .map_err(|e| StoreError(format!("mcp call decode failed: {e}")))?;
-            out.push(rec);
-        }
-        Ok(out)
-    }
-
-    fn list_mcp_call_principals(&self) -> StoreResult<Vec<String>> {
-        let mut principals: Vec<String> = self.with_conn(|c| c.smembers(MCP_PRINCIPALS_SET))?;
-        // A SET has no order; sort so the enumeration is deterministic across calls and nodes.
-        principals.sort();
-        Ok(principals)
-    }
-
-    fn purge_mcp_calls_before(&self, before: u64) -> StoreResult<u64> {
-        // `(before` is an EXCLUSIVE upper bound: strictly older than, exactly as the contract says,
-        // so a record sitting exactly at the cutoff is kept. Expressed as an exclusive range rather
-        // than `before - 1` because the latter underflows at zero.
-        let doomed: Vec<String> = self.with_conn(|c| {
-            c.zrangebyscore(MCP_CALLS_BY_TS, "-inf", format!("({}", clamp(before)))
-        })?;
-        if doomed.is_empty() {
-            return Ok(0);
-        }
-        let mut removed = 0u64;
-        for member in &doomed {
-            let Some((seq, principal)) = member.split_once(MCP_TS_MEMBER_SEP) else {
-                continue;
-            };
-            let Ok(seq) = seq.parse::<i64>() else {
-                continue;
-            };
-            let key = mcp_calls_key(principal);
-            // Remove the record itself, then its retention-index entry. The count REPORTED is the
-            // count the chain actually lost, taken from the ZREMRANGEBYSCORE reply — never from the
-            // size of the candidate list, which would over-report if a concurrent purge got there
-            // first.
-            let n: u64 = self.with_conn(|c| c.zrembyscore(key.clone(), seq, seq))?;
-            self.with_conn(|c| c.zrem::<_, _, ()>(MCP_CALLS_BY_TS, member))?;
-            removed += n;
-            // A principal whose chain is now empty leaves the enumeration, or a boot would keep
-            // resuming a chain that no longer has anything in it.
-            let left: u64 = self.with_conn(|c| c.zcard(key.clone()))?;
-            if left == 0 {
-                self.with_conn(|c| c.srem::<_, _, ()>(MCP_PRINCIPALS_SET, principal))?;
-            }
-        }
-        Ok(removed)
-    }
-
-    fn add_denylist(&self, sub: &str, reason: &str) -> StoreResult<()> {
+    fn add_denylist(&self, sub: &str, reason: &str) -> RecordStoreResult<()> {
         self.with_conn(|c| {
             redis::pipe()
                 .atomic()
@@ -1918,86 +1671,65 @@ impl Store for ValkeyStore {
         })
     }
 
-    fn list_denylist(&self) -> StoreResult<Vec<String>> {
+    fn list_denylist(&self) -> RecordStoreResult<Vec<String>> {
         self.with_conn(|c| c.smembers(DENYLIST_INDEX))
     }
 
-    fn put_mcp_demotion(&self, row: &McpDemotionRow) -> StoreResult<()> {
-        // UPSERT BY server, as the trait requires: HSET on an existing field REPLACES its value, so
-        // a second demotion of one upstream cannot stand a rival record beside the first.
-        //
-        // JSON, so `recorded_at` round-trips across the whole u64 range with no clamp and no refusal
-        // — the same reason `put_task` needs no range guard while its SQL siblings do.
-        let json = serde_json::to_string(row)
-            .map_err(|e| StoreError(format!("demotion encode failed: {e}")))?;
-        self.with_conn(|c| c.hset::<_, _, _, ()>(MCP_DEMOTIONS_HASH, &row.server, &json))
+    // ── THE NEUTRAL KIND-TAGGED PLANE-RECORD VERBS (1.6.0) ─────────────────────────────────────
+    //
+    // One keyspace per kind, for every kind; the store never decodes a body. See [`plane`] for the
+    // layout and for why each step is a server-side script.
+
+    fn upsert_plane_record(&self, record: &PlaneRecord) -> RecordStoreResult<()> {
+        plane::upsert(self, record)
     }
 
-    fn list_mcp_demotions(&self) -> StoreResult<Vec<McpDemotionRow>> {
-        // The boot read that puts a demotion back in force before the first request is served. ONE
-        // HGETALL: there is no index to reconcile, so there is no window in which a record and its
-        // membership can disagree.
-        //
-        // An EMPTY answer means "no upstream is recorded as demoted" and never "we could not tell" —
-        // a read failure surfaces as an Err, because a server with no record is a server nobody
-        // demoted, which is a different fact from a server that drifted, and conflating them would
-        // quarantine every declaratively-approved deployment at boot. A row that will not decode is
-        // an error for the same reason: silently dropping it would report a quarantine as absent.
-        let raw: std::collections::HashMap<String, String> =
-            self.with_conn(|c| c.hgetall(MCP_DEMOTIONS_HASH))?;
-        let mut rows = raw
-            .into_values()
-            .map(|v| {
-                serde_json::from_str::<McpDemotionRow>(&v)
-                    .map_err(|e| StoreError(format!("demotion decode failed: {e}")))
-            })
-            .collect::<StoreResult<Vec<_>>>()?;
-        // A hash has no order of its own; sorting makes the answer deterministic for a caller that
-        // compares two reads.
-        rows.sort_by(|a, b| a.server.cmp(&b.server));
-        Ok(rows)
+    fn get_plane_record(&self, kind: &str, id: &str) -> RecordStoreResult<Option<Vec<u8>>> {
+        plane::get(self, kind, id)
     }
 
-    fn clear_mcp_demotion(&self, server: &str) -> StoreResult<()> {
-        // Removing a record that is not there is a NO-OP, not an error: the engine clears on every
-        // observation that agrees with the operator's approval rather than tracking whether it had
-        // demoted, so the overwhelmingly common call is one against no record at all. HDEL on an
-        // absent field is exactly that, and its count is deliberately ignored.
-        self.with_conn(|c| c.hdel::<_, _, ()>(MCP_DEMOTIONS_HASH, server))
+    fn append_plane_record(&self, record: &PlaneRecord) -> RecordStoreResult<()> {
+        plane::append(self, record)
     }
 
-    fn redeem_ask_state(&self, nonce: &str, expires_at: u64, now: u64) -> StoreResult<bool> {
-        // THE TEST AND SET, as ONE `SET NX EX` the server orders against every other node's. It sets
-        // and reports OK, or it finds the key present and reports nil — and that reply IS the
-        // answer, never a prior read. A GET followed by a SET would tell both halves of a race they
-        // were first, and on this backend a fleet sharing one Valkey is the ORDINARY deployment.
-        //
-        // TTL rather than a caller-run sweep: the entry expires with the approval it records, on the
-        // server. `max(1)` because a zero or negative EX is an error the caller would see as a store
-        // failure — and an already-lapsed approval (`expires_at <= now`) must still get a truthful
-        // test-and-set answer, since the engine owns the expiry decision and refuses a lapsed state
-        // on the seal long before this method is reached. The cap is defensive: a `SET` whose expiry
-        // overflows the server's own millisecond arithmetic is rejected outright, and an approval
-        // with a decade of life left is one whose ledger entry can be bounded without anyone
-        // noticing.
-        const MAX_TTL_SECS: u64 = 315_360_000; // ten years
-        let ttl = expires_at.saturating_sub(now).clamp(1, MAX_TTL_SECS);
-        let key = ask_state_key(nonce);
-        // NO RECONNECT-RETRY. A dropped reply on this command is not a lost read: the SET may well
-        // have landed, and a blind retry would find the key it has just written and report `false` —
-        // refusing an approval this very call granted. `with_conn_no_retry` surfaces the failure
-        // instead, and the engine's call site turns a store error into a REFUSED redemption. Both
-        // answers are closed rather than open; an error is the one that says so.
-        let set: Option<String> = self.with_conn_no_retry(|c| {
-            redis::cmd("SET")
-                .arg(&key)
-                .arg(expires_at)
-                .arg("NX")
-                .arg("EX")
-                .arg(ttl)
-                .query(c)
-        })?;
-        Ok(set.is_some())
+    fn list_plane_records(
+        &self,
+        kind: &str,
+        selector: &PlaneSelector,
+    ) -> RecordStoreResult<Vec<Vec<u8>>> {
+        plane::list(self, kind, selector)
+    }
+
+    fn list_plane_record_parents(&self, kind: &str) -> RecordStoreResult<Vec<String>> {
+        plane::parents(self, kind)
+    }
+
+    fn purge_plane_records_before(&self, kind: &str, before: u64) -> RecordStoreResult<u64> {
+        plane::purge_before(self, kind, before)
+    }
+
+    fn delete_plane_record(&self, kind: &str, id: &str) -> RecordStoreResult<()> {
+        plane::delete(self, kind, id)
+    }
+
+    fn redeem_plane_token(
+        &self,
+        kind: &str,
+        token: &str,
+        expires_at: u64,
+        now: u64,
+    ) -> RecordStoreResult<bool> {
+        plane::redeem_token(self, kind, token, expires_at, now)
+    }
+
+    fn plane_token_live(
+        &self,
+        kind: &str,
+        token: &str,
+        expires_at: u64,
+        now: u64,
+    ) -> RecordStoreResult<bool> {
+        plane::token_live(self, kind, token, expires_at, now)
     }
 }
 
@@ -2009,6 +1741,54 @@ fn now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+// ── THE DOOR (DECISIONS #2 rule (1): compiled in or dropped in, one contract, one loading path) ──
+
+/// The store's registry name, and the alias `store.module: valkey` selects it by.
+pub const NAME: &str = "busbar-store-valkey";
+/// The alias an operator names in `store.module`.
+pub const ALIAS: &str = "valkey";
+
+/// Construct a Valkey-protocol store from the JSON config the engine passes through `open`:
+///
+/// ```json
+/// { "url": "redis://:password@host:6379/0", "connect_timeout_ms": 10000 }
+/// ```
+///
+/// The engine passes `store.settings` verbatim as this JSON config (see the boot store-load),
+/// mirroring how the Postgres plugin receives its libpq URL. `connect_timeout_ms` is optional
+/// (defaults to [`DEFAULT_CONNECT_TIMEOUT`], currently 10s); it bounds the initial connect so a
+/// blackholed/firewalled instance fails fast at boot instead of wedging it indefinitely.
+pub fn open(cfg: &str) -> Result<Box<dyn RecordStore>, String> {
+    let v: serde_json::Value = if cfg.trim().is_empty() {
+        serde_json::Value::Object(Default::default())
+    } else {
+        serde_json::from_str(cfg).map_err(|e| format!("invalid valkey plugin config: {e}"))?
+    };
+    let url = v.get("url").and_then(|x| x.as_str()).ok_or_else(|| {
+        "valkey plugin config requires a \"url\" (a redis:// connection string)".to_string()
+    })?;
+    let store = match v.get("connect_timeout_ms").and_then(|x| x.as_u64()) {
+        Some(ms) => ValkeyStore::connect_with_timeout(url, Duration::from_millis(ms)),
+        None => ValkeyStore::connect(url),
+    }
+    .map_err(|e| format!("valkey plugin: failed to connect: {}", e.0))?;
+    Ok(Box::new(store))
+}
+
+// The image's ONE door registration. The frozen symbols the loader looks up in the
+// `busbar-store-valkey-plugin` cdylib are the contract SDK's, and they answer through this entry; a
+// busbar build that links this crate hands the loader `BUSBAR_COLD_ENTRY` instead.
+busbar_contract::abi::sdk::export_store_plugin!(open);
+
+/// THE LINKED ENTRY: what a build that links this store registers onto the cold-kind axis — the same
+/// row a dropped-in tarball of this store states, opened through the same boundary.
+pub mod linked {
+    /// `(name, alias, boundary)` — the row's statement and the boundary the one cold load runs over,
+    /// exactly what the dropped-in tarball states and exports.
+    pub const STORE: (&str, &str, &busbar_contract::abi::sdk::ColdEntry) =
+        (super::NAME, super::ALIAS, &super::BUSBAR_COLD_ENTRY);
 }
 
 #[cfg(test)]

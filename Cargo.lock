@@ -74,83 +74,74 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
-name = "busbar-api"
-version = "1.5.0"
+name = "busbar-contract"
+version = "1.6.0"
+source = "git+https://github.com/GetBusbar/busbar?rev=8b7b6473f47f8d37ae60839c74cfe6a9b64a1dc9#8b7b6473f47f8d37ae60839c74cfe6a9b64a1dc9"
 dependencies = [
  "async-trait",
+ "futures",
  "hex",
+ "http",
+ "memchr",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "smallvec",
+ "tracing",
+ "tracing-core",
  "zeroize",
 ]
 
 [[package]]
-name = "busbar-plugin-abi"
-version = "1.5.0"
+name = "busbar-kernel-ledger"
+version = "1.6.0"
+source = "git+https://github.com/GetBusbar/busbar?rev=8b7b6473f47f8d37ae60839c74cfe6a9b64a1dc9#8b7b6473f47f8d37ae60839c74cfe6a9b64a1dc9"
 dependencies = [
- "busbar-api",
- "serde",
- "serde_json",
+ "busbar-contract",
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "busbar-kernel-wal"
+version = "1.6.0"
+source = "git+https://github.com/GetBusbar/busbar?rev=8b7b6473f47f8d37ae60839c74cfe6a9b64a1dc9#8b7b6473f47f8d37ae60839c74cfe6a9b64a1dc9"
+dependencies = [
+ "busbar-contract",
+ "sha2 0.11.0",
 ]
 
 [[package]]
 name = "busbar-plugin-loader"
 version = "1.5.0"
+source = "git+https://github.com/GetBusbar/busbar?rev=8b7b6473f47f8d37ae60839c74cfe6a9b64a1dc9#8b7b6473f47f8d37ae60839c74cfe6a9b64a1dc9"
 dependencies = [
  "async-trait",
- "busbar-api",
- "busbar-plugin-abi",
- "busbar-plugin-sign",
+ "busbar-contract",
+ "busbar-kernel-ledger",
+ "busbar-kernel-wal",
+ "ed25519-dalek",
  "flate2",
+ "futures",
  "getrandom 0.3.4",
+ "hex",
  "libc",
  "libloading",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tar",
  "tokio",
  "tracing",
 ]
 
 [[package]]
-name = "busbar-plugin-sdk"
-version = "1.5.0"
-dependencies = [
- "busbar-api",
- "busbar-plugin-abi",
- "serde_json",
- "tracing",
- "tracing-core",
-]
-
-[[package]]
-name = "busbar-plugin-sign"
-version = "1.5.0"
-dependencies = [
- "ed25519-dalek",
- "hex",
- "serde",
- "serde_json",
- "sha2 0.11.0",
-]
-
-[[package]]
-name = "busbar-plugin-testkit"
-version = "1.5.0"
-dependencies = [
- "busbar-api",
-]
-
-[[package]]
 name = "busbar-store-valkey"
 version = "1.0.0"
 dependencies = [
- "busbar-api",
- "busbar-plugin-testkit",
+ "busbar-contract",
  "redis",
  "rustls",
+ "serde",
  "serde_json",
 ]
 
@@ -159,12 +150,12 @@ name = "busbar-store-valkey-plugin"
 version = "1.0.0"
 dependencies = [
  "base64",
- "busbar-api",
+ "busbar-contract",
  "busbar-plugin-loader",
- "busbar-plugin-sdk",
  "busbar-store-valkey",
  "redis",
  "reqwest",
+ "serde",
  "serde_json",
 ]
 
@@ -436,6 +427,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures"
+version = "0.3.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a88cf1f829d945f548cf8fec32c61b1f202b6d93b45848602fc02af4b12ad218"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-io",
+ "futures-sink",
+ "futures-task",
+ "futures-util",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -452,10 +458,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2cd50c473c80f6d7c3670a752354b8e569b1a7cbfdc0419ec88e5edad85e0dc7"
 
 [[package]]
+name = "futures-executor"
+version = "0.3.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6754879cc9f2c66f88c6e5c35344bb0bdb0708b0352b1201815667c7eabc7458"
+dependencies = [
+ "futures-core",
+ "futures-task",
+ "futures-util",
+]
+
+[[package]]
 name = "futures-io"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4577ecaa3c4f96589d473f679a71b596316f6641bc350038b962a5daf0085d7a"
+
+[[package]]
+name = "futures-macro"
+version = "0.3.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d6d3cde68c518367be28956066ddfef33813991b77a55005a69dae04bf3b10b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "futures-sink"
@@ -475,8 +503,10 @@ version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a77a90a256fce34da66415271e30f94ee91c57b04b8a2c042d9cf3220179deaa"
 dependencies = [
+ "futures-channel",
  "futures-core",
  "futures-io",
+ "futures-macro",
  "futures-sink",
  "futures-task",
  "memchr",
@@ -1016,6 +1046,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "ryu",
+ "sha1_smol",
  "socket2",
  "url",
  "xxhash-rust",
@@ -1254,6 +1285,12 @@ dependencies = [
  "ryu",
  "serde",
 ]
+
+[[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
 
 [[package]]
 name = "sha2"
