@@ -19,7 +19,7 @@ crate-type = ["rlib"]
 # as `busbar_contract::abi::sdk`). Pinned by git rev to the busbar commit in `.busbar-ref`; a busbar
 # build that links this crate `[patch]`es the busbar git source to its own tree, so ONE copy of the
 # contract links.
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "8b7b6473f47f8d37ae60839c74cfe6a9b64a1dc9" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "7a5b429041752e00375e120ab1547a8928c3dee4" }
 # The upstream RESP client, SYNCHRONOUS only (no async runtime), with rustls-backed TLS for
 # rediss:// URLs. NOTE: this is the ONE name in this repo that is deliberately NOT "valkey" — it is
 # an upstream crates.io package still published under its pre-fork name, so it is not ours to
