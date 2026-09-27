@@ -1,4 +1,14 @@
-# store-valkey
+<!-- fleet:header:begin (rendered by `cargo xtask fleet render` from GetBusbar/busbar's plugins.yaml; edit it there) -->
+# busbar-store-valkey
+
+The Valkey store as a droppable busbar plugin: a cdylib exporting the store C ABI. Drop it in the plugins folder and set store.module: valkey. One Valkey behind a fleet of busbar nodes means shared virtual keys, budgets, usage, and audit across the cluster.
+
+| kind | alias | crate | busbar | license |
+|---|---|---|---|---|
+| `store` | `valkey` | `busbar-store-valkey-plugin` | 1.6.0 (pinned in `.busbar-ref`) | Apache-2.0 |
+
+[![ci](https://github.com/GetBusbar/busbar-store-valkey/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/GetBusbar/busbar-store-valkey/actions/workflows/ci.yml)
+<!-- fleet:header:end -->
 
 **This plugin's version: v1.0.5.** (Independently versioned from busbar
 itself — see [Versioning](#versioning) below.)
