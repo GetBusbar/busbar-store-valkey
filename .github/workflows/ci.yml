@@ -238,5 +238,5 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: plugin/lcov.info
-          slug: GetBusbar/store-valkey
+          slug: GetBusbar/busbar-store-valkey
           fail_ci_if_error: false

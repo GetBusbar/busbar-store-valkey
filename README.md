@@ -3,9 +3,9 @@
 **This plugin's version: v1.0.5.** (Independently versioned from busbar
 itself — see [Versioning](#versioning) below.)
 
-[![CI](https://github.com/GetBusbar/store-valkey/actions/workflows/ci.yml/badge.svg)](https://github.com/GetBusbar/store-valkey/actions/workflows/ci.yml)
-[![Coverage](https://codecov.io/gh/GetBusbar/store-valkey/branch/dev/graph/badge.svg)](https://codecov.io/gh/GetBusbar/store-valkey)
-[![Release](https://img.shields.io/github/v/release/GetBusbar/store-valkey)](https://github.com/GetBusbar/store-valkey/releases)
+[![CI](https://github.com/GetBusbar/busbar-store-valkey/actions/workflows/ci.yml/badge.svg)](https://github.com/GetBusbar/busbar-store-valkey/actions/workflows/ci.yml)
+[![Coverage](https://codecov.io/gh/GetBusbar/busbar-store-valkey/branch/dev/graph/badge.svg)](https://codecov.io/gh/GetBusbar/busbar-store-valkey)
+[![Release](https://img.shields.io/github/v/release/GetBusbar/busbar-store-valkey)](https://github.com/GetBusbar/busbar-store-valkey/releases)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 The first-party, signed `kind: store` plugin for
