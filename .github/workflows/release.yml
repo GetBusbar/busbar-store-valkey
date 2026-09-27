@@ -357,9 +357,9 @@ jobs:
     uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@dev
     with:
       version: ${{ github.ref_name }}
-      asset_prefix: busbar-store-redis
-      plugin_name: busbar-store-redis-plugin
-      plugin_alias: redis
+      asset_prefix: busbar-store-valkey
+      plugin_name: busbar-store-valkey-plugin
+      plugin_alias: valkey
       plugin_kind: store
       # EMPTY, and correct: this repo publishes exactly one kind of artifact, a signed
       # busbar-store-*.tar.gz per target (see release.yml's `plugin-dist/*.tar.gz` upload) -- no

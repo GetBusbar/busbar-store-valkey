@@ -42,10 +42,10 @@ jobs:
       version: ${{ inputs.version || '' }}
       # Read off the PUBLISHED artifact, not guessed from the crate name: the filename prefix and the
       # manifest name genuinely differ across this fleet (the store repos drop the trailing -plugin
-      # that the auth repos keep, and store-valkey publishes as busbar-store-redis).
-      asset_prefix: busbar-store-redis
-      plugin_name: busbar-store-redis-plugin
-      plugin_alias: redis
+      # that the auth repos keep). This repo publishes busbar-store-valkey-*, alias valkey (release.yml).
+      asset_prefix: busbar-store-valkey
+      plugin_name: busbar-store-valkey-plugin
+      plugin_alias: valkey
       plugin_kind: store
       # EMPTY, and correct: this repo publishes exactly one kind of artifact, a signed
       # busbar-store-*.tar.gz per target (see release.yml's `plugin-dist/*.tar.gz` upload) -- no
