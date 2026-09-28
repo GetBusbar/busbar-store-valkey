@@ -682,7 +682,7 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
             "--lib",
             so_path.to_str().unwrap(),
             "--name",
-            "busbar-store-valkey-plugin",
+            "busbar-store-valkey",
             "--alias",
             "valkey",
             "--kind",
@@ -806,7 +806,7 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
     );
     assert_eq!(
         install_body.get("name").and_then(|v| v.as_str()),
-        Some("busbar-store-valkey-plugin"),
+        Some("busbar-store-valkey"),
         "install response must name the installed plugin: {install_body}"
     );
 
@@ -817,7 +817,7 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
         .put(format!("{admin}/config/settings"))
         .bearer_auth(&admin_token)
         .json(&serde_json::json!({
-            "store": { "module": "busbar-store-valkey-plugin", "settings": { "url": url } },
+            "store": { "module": "busbar-store-valkey", "settings": { "url": url } },
             "persist": true,
         }))
         .send()
@@ -872,7 +872,7 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
         .expect("GET /api/v1/admin/plugins?type=store");
     let list_body = list_resp.text().unwrap_or_default();
     assert!(
-        list_body.contains("busbar-store-valkey-plugin"),
+        list_body.contains("busbar-store-valkey"),
         "the restarted instance must list the installed valkey plugin: {list_body}"
     );
 
