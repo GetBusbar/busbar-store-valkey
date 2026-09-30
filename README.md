@@ -10,6 +10,8 @@ The Valkey store as a droppable busbar plugin: a cdylib exporting the store C AB
 [![ci](https://github.com/GetBusbar/busbar-store-valkey/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/GetBusbar/busbar-store-valkey/actions/workflows/ci.yml)
 <!-- fleet:header:end -->
 
+## What it is for
+
 **This plugin's version: v1.0.5.** (Independently versioned from busbar
 itself — see [Versioning](#versioning) below.)
 
@@ -28,7 +30,7 @@ Valkey behind a fleet of busbar nodes means shared virtual keys, budgets,
 usage, and audit across the cluster — the multi-node story a single-file
 SQLite store cannot offer.
 
-## Renamed: `redis` → `valkey` (BREAKING)
+### Renamed: `redis` → `valkey` (BREAKING)
 
 This plugin, its repository, its crates, and its published artifact are now
 named for **Valkey** — the Linux-Foundation-governed, BSD-licensed store this
@@ -58,7 +60,7 @@ things upstream owns and we cannot rename: the RESP driver crate on crates.io
 (still published under its pre-fork name) and the `redis://` / `rediss://` URL
 schemes that driver parses. Nothing busbar-owned says "redis" any more.
 
-## Versioning
+### Versioning
 
 This plugin is versioned **independently of busbar** — `v1.0.5` here says
 nothing about which busbar release it is. Compatibility with busbar is
@@ -76,7 +78,6 @@ plugin SDK in [`busbar-contract`](https://github.com/GetBusbar/busbar/tree/main/
 build (its `linked::STORE` row); both doors run the same code, and
 [`tests/conformance.rs`](store-valkey-plugin/tests/conformance.rs) proves they behave as one store.
 
-## What it is for
 
 - **Multi-node deployments**: a fleet of busbar nodes sharing one Valkey
   instance share virtual keys, per-key/per-group budgets, token usage
@@ -94,6 +95,20 @@ that turns the engine's JSON config into a live `ValkeyStore` — lives in the
 `busbar-store-valkey` library crate it re-exports, in the `store-valkey/`
 directory of this repository.
 
+## Config
+
+The engine passes `store.settings` through as this plugin's `open`
+config, mirroring how the Postgres store plugin receives its libpq URL:
+
+```json
+{ "url": "redis://:password@host:6379/0", "connect_timeout_ms": 10000 }
+```
+
+| Setting | Required | Notes |
+|---|---|---|
+| `url` | yes | A `redis://` or `rediss://` (TLS) connection string — the URL scheme is the upstream RESP driver's, not a busbar name; a Valkey server is what it points at. TLS is backed by `rustls` (`ring` provider) — no OpenSSL dependency. |
+| `connect_timeout_ms` | no | Bounds the initial connect (unlike libpq's DSN-level `connect_timeout`, the upstream driver crate has no URL-level escape hatch, so this crate adds one). Defaults to 10s. A blackholed/firewalled Valkey host fails fast at boot instead of wedging the engine indefinitely. |
+
 ## Build
 
 Needs a Rust toolchain ([rustup](https://rustup.rs); `rust-toolchain.toml` pins the version CI uses).
@@ -109,7 +124,7 @@ cargo fmt --all -- --check
 The end-to-end tests boot a REAL `busbar`; they build it from a busbar checkout named by
 `BUSBAR_CHECKOUT` (default: a sibling `../busbar`), which must be at the `.busbar-ref` rev.
 
-## Dependencies
+### Dependencies
 
 `busbar-store-valkey`, the store logic (and the store's one door registration and its `linked` row,
 so a busbar build can link it), lives in this repository; `busbar-store-valkey-plugin` re-exports it
@@ -119,7 +134,7 @@ and SDK); the tests also use `busbar-plugin-loader`. Both are git dependencies o
 [`.busbar-ref`](.busbar-ref); CI's `pin` job refuses a manifest that names any other rev, a retired
 busbar crate, or a sibling path.
 
-## Pack and sign
+### Pack and sign
 
 Once built, the cdylib is packed and signed like any other busbar plugin
 — see
@@ -150,20 +165,6 @@ store:
 
 — see [`docs/configuration.md`](https://github.com/GetBusbar/busbar/blob/main/docs/configuration.md)
 for the full store config reference.
-
-## Config
-
-The engine passes `store.settings` through as this plugin's `open`
-config, mirroring how the Postgres store plugin receives its libpq URL:
-
-```json
-{ "url": "redis://:password@host:6379/0", "connect_timeout_ms": 10000 }
-```
-
-| Setting | Required | Notes |
-|---|---|---|
-| `url` | yes | A `redis://` or `rediss://` (TLS) connection string — the URL scheme is the upstream RESP driver's, not a busbar name; a Valkey server is what it points at. TLS is backed by `rustls` (`ring` provider) — no OpenSSL dependency. |
-| `connect_timeout_ms` | no | Bounds the initial connect (unlike libpq's DSN-level `connect_timeout`, the upstream driver crate has no URL-level escape hatch, so this crate adds one). Defaults to 10s. A blackholed/firewalled Valkey host fails fast at boot instead of wedging the engine indefinitely. |
 
 ## Tests
 

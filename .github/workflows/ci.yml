@@ -21,4 +21,7 @@ jobs:
       busbar_checkout: true
       macos_test: "cargo test --workspace --locked"
       extra_test: "cargo test -p busbar-store-valkey --locked -- --ignored --test-threads=1"
+      plugin_crate: busbar-store-valkey-plugin
+      plugin_kind: store
+      plugin_alias: valkey
     secrets: inherit

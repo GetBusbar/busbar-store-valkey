@@ -1,7 +1,6 @@
-# Contributing to store-valkey
+# Contributing to busbar-store-valkey
 
-Thanks for your interest in improving `store-valkey`. This document covers how
-to build, test, and submit changes.
+Thanks for your interest in improving `busbar-store-valkey`.
 
 ## Ground rules
 
@@ -11,53 +10,23 @@ to build, test, and submit changes.
   [Apache-2.0](LICENSE) license.
 - Security issues go through [SECURITY.md](SECURITY.md), **not** public issues.
 
-## Development setup
+## Layout
 
-`store-valkey` is a Rust `cdylib` plugin. You need the toolchain `rust-toolchain.toml` pins
-(`rustup` picks it up). busbar is a git dependency pinned to the rev in `.busbar-ref` — no sibling
-checkout is needed to build. The end-to-end tests boot a real `busbar` built from a checkout at that
-rev, named by `BUSBAR_CHECKOUT` (default `../busbar`); CI checks it out the same way (see
-[`ci.yml`](.github/workflows/ci.yml)).
-
-The meaningful test coverage here needs a **live Valkey** — see the README's
-[Tests](README.md#tests) section. Locally, `cargo test` skips that coverage
-cleanly if `VALKEY_URL` is unset; set it to point at a real Valkey to exercise it:
-
-```bash
-export VALKEY_URL=redis://localhost:6379/0
-cargo build --release                       # cdylib
-cargo test                                   # unit tests + the e2e dlopen/live-Valkey test
-cargo clippy --all-targets -- -D warnings    # lints must be clean
-cargo fmt --all -- --check                   # format before committing
-```
+Every busbar plugin repo has the same shape. This one is a two-crate Cargo workspace:
+`store-valkey/` holds the plugin's logic and `store-valkey-plugin/` is the thin `cdylib` that
+packages it as a droppable `kind: store` plugin. busbar itself is a git dependency
+pinned to the commit in `.busbar-ref`. The CI, release and lint configuration are
+rendered from [busbar's plugin registry](https://github.com/GetBusbar/busbar/blob/main/plugins.yaml);
+change them there, not here.
 
 ## Before you open a pull request
 
-1. **`cargo fmt --all`** — code must be rustfmt-clean.
-2. **`cargo clippy --all-targets -- -D warnings`** — no warnings.
-3. **`cargo build && cargo test`** — green, including the live-Valkey end-to-end
-   test in `tests/e2e.rs` (it hard-fails under `CI=1` rather than silently
-   skipping — never let that coverage quietly vanish).
-4. Add or update tests for any behavior change.
-5. Update documentation (`README.md`, doc comments) when you change behavior or config.
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+```
 
-## Architecture
-
-This repo is deliberately a thin adapter (`src/lib.rs`): it turns the engine's
-JSON `open` config into a `ValkeyStore` and hands the trait object to
-[`busbar-plugin-sdk`](https://github.com/GetBusbar/busbar/tree/main/crates/plugin-sdk),
-which emits the C ABI symbols the loader resolves. All the Valkey schema,
-serialization, and retry/TLS logic lives in the `busbar-store-valkey` library
-crate this plugin wraps, in the `store-valkey/` directory of THIS repository, so
-most substantive changes belong here.
-
-## Commit & PR conventions
-
-- Keep commits focused; squash noisy WIP commits before opening the PR.
-- Write a clear PR description: what changed, why, and how it was verified.
-- Reference any related issue.
-- Stage files by name; avoid sweeping `git add -A` that pulls in unrelated changes.
-
-## Questions
-
-Open a discussion or issue. We're happy to help you get oriented.
+The README's Tests section names any live backend the full suite needs. Add or update
+tests for any behavior change, and update the README when you change behavior or
+config. Keep commits focused and describe what changed, why, and how it was verified.
