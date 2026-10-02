@@ -37,4 +37,4 @@ reqwest = { workspace = true, features = ["blocking", "json"] }
 # directly (bypassing busbar-store-valkey's own store impl too) — same version as the logic crate.
 redis = { workspace = true, features = ["tls-rustls"] }
 # Base64-encodes the packed tarball into POST /api/v1/admin/plugins's JSON body.
-base64 = "0.22"
+base64 = { workspace = true }
