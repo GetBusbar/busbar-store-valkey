@@ -19,7 +19,7 @@ crate-type = ["rlib"]
 # as `busbar_contract::abi::sdk`). Pinned by git rev to the busbar commit in `.busbar-ref`; a busbar
 # build that links this crate `[patch]`es the busbar git source to its own tree, so ONE copy of the
 # contract links.
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "23d8a6b46deb158839df8bc02115b09023633040" }
+busbar-contract = { workspace = true }
 # The upstream RESP client, SYNCHRONOUS only (no async runtime), with rustls-backed TLS for
 # rediss:// URLs. NOTE: this is the ONE name in this repo that is deliberately NOT "valkey" — it is
 # an upstream crates.io package still published under its pre-fork name, so it is not ours to
@@ -27,14 +27,14 @@ busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "23d8a6b4
 # Trimming default-features keeps the dependency tree small and license-clean and avoids pulling a
 # second async stack into the plugin; the rustls backend reuses the single TLS stack busbar pins.
 # `script` for the server-side atomic plane-record and usage-floor steps (EVAL).
-redis = { version = "1", default-features = false, features = ["tls-rustls", "script"] }
+redis = { workspace = true, features = ["tls-rustls"] }
 # The rediss:// TLS path builds its rustls config against the PROCESS default crypto provider; this
 # crate may live inside a plugin cdylib with its own rustls static state, so it installs the ring
 # provider explicitly at connect. ring only — the same single provider busbar pins.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-serde_json = "1"
+rustls = { workspace = true }
+serde_json = { workspace = true }
 # `derive` for the plane-record sidecar and the v6 -> v7 migration's legacy row shapes.
-serde = { version = "1", features = ["derive"] }
+serde = { workspace = true }
 
 # NO busbar dev-dependency. The `RecordStore` contract conformance suite used to arrive here as
 # `busbar-plugin-testkit`; the owner ruled that crate DELETED on 2026-09-22 and #2/#31 forbid a shared
