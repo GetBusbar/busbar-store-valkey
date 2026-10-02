@@ -24,17 +24,17 @@ busbar-store-valkey = { path = "../store-valkey" }
 # The conformance and end-to-end tests load the built cdylib over the REAL loader (sign, pack, scan,
 # open) and the linked row through the same registry — dev-only, never in the shipped artifact. Same
 # pinned rev as the logic crate's busbar-contract, so one busbar source resolves.
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "23d8a6b46deb158839df8bc02115b09023633040" }
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "23d8a6b46deb158839df8bc02115b09023633040" }
-serde_json = "1"
+busbar-plugin-loader = { workspace = true }
+busbar-contract = { workspace = true }
+serde_json = { workspace = true }
 # The typed rows the durability tests read back out of opaque plane-record bodies.
-serde = { version = "1", features = ["derive"] }
+serde = { workspace = true }
 # The real-admin-API e2e test drives an actual `busbar` process over HTTP (install a signed plugin
 # tarball via POST /api/v1/admin/plugins, mint a key+credential via POST /admin/keys) — a blocking
 # client keeps this test synchronous like the rest of the file. rustls-tls only.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { workspace = true, features = ["blocking", "json"] }
 # The real-admin-API e2e test's independent verification step reads the raw Valkey row bytes
 # directly (bypassing busbar-store-valkey's own store impl too) — same version as the logic crate.
-redis = { version = "1", default-features = false, features = ["tls-rustls"] }
+redis = { workspace = true, features = ["tls-rustls"] }
 # Base64-encodes the packed tarball into POST /api/v1/admin/plugins's JSON body.
 base64 = "0.22"
