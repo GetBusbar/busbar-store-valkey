@@ -9,9 +9,9 @@ description = "The Valkey backend for busbar's durable governance store — the 
 license = "Apache-2.0"
 
 [lib]
-# rlib: THE LOGIC. It carries the store's ONE door registration (`export_store_plugin!(open)`) and its
-# `linked::STORE` row, so a busbar build can link it; the sibling `busbar-store-valkey-plugin` cdylib
-# re-exports it as the dropped-in door. One source, both doors (DECISIONS #2 rule (1)).
+# rlib: THE LOGIC, and the store's door (`store_door!` over its `StoreSlots`: `door`, the row a
+# busbar build that links this crate registers). The sibling `busbar-store-valkey-plugin` cdylib
+# exports the same `door` as the dropped-in door. One source, both doors (DECISIONS #2 rule (1)).
 crate-type = ["rlib"]
 
 [dependencies]

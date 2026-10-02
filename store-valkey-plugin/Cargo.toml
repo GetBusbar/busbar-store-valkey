@@ -16,17 +16,20 @@ license = "Apache-2.0"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# THE LOGIC, same repo. Its `export_store_plugin!(open)` registers the image's one door; this crate
-# only makes that door a loadable library.
+# THE STORE, same repo. Its `store_door!` is the store's door; this crate only exports that door
+# as a loadable library.
 busbar-store-valkey = { path = "../store-valkey" }
+# `export_door!`. Same pinned rev as the logic crate's, so one busbar source resolves.
+busbar-contract = { workspace = true }
 
 [dev-dependencies]
 # The conformance and end-to-end tests load the built cdylib over the REAL loader (sign, pack, scan,
 # open) and the linked row through the same registry — dev-only, never in the shipped artifact. Same
 # pinned rev as the logic crate's busbar-contract, so one busbar source resolves.
 busbar-plugin-loader = { workspace = true }
-busbar-contract = { workspace = true }
 serde_json = { workspace = true }
+# Drives the store v3 slots (`StoreCalls`, async) to completion on a current-thread runtime.
+tokio = { workspace = true, features = ["rt"] }
 # The typed rows the durability tests read back out of opaque plane-record bodies.
 serde = { workspace = true }
 # The real-admin-API e2e test drives an actual `busbar` process over HTTP (install a signed plugin

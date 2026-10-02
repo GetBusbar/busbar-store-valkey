@@ -1256,6 +1256,10 @@ fn wipes_the_entire_namespace_destructively() {
 #[path = "tests/store_conformance.rs"]
 mod store_conformance;
 
+/// The store v3 slots (`StoreSlots`): the durable `op_id` dedupe, the money slots, the journal,
+/// sessions and the kernel's records.
+mod slots_tests;
+
 mod conformance {
     use super::store_conformance::conf;
     use super::{live_store, ValkeyStore};
@@ -1573,19 +1577,22 @@ const TERMINAL: [&str; 4] = ["completed", "failed", "canceled", "rejected"];
 /// The typed names, over the neutral verbs, for any `RecordStore`.
 trait Vocab: RecordStore {
     fn put_task(&self, t: &TaskRow) -> RecordStoreResult<()> {
-        self.upsert_plane_record(&PlaneRecord {
-            kind: "task".into(),
-            id: t.task_id.clone(),
-            parent: None,
-            seq: 0,
-            ts: t.updated_at,
-            disposition: if TERMINAL.contains(&t.state.as_str()) {
-                PlaneDisposition::Terminal
-            } else {
-                PlaneDisposition::Active
-            },
-            body: body(t),
-        })
+        self.upsert_plane_record(
+            PlaneRecord {
+                kind: "task".into(),
+                id: t.task_id.clone(),
+                parent: None,
+                seq: 0,
+                ts: t.updated_at,
+                disposition: if TERMINAL.contains(&t.state.as_str()) {
+                    PlaneDisposition::Terminal
+                } else {
+                    PlaneDisposition::Active
+                },
+                body: body(t),
+            }
+            .view(),
+        )
     }
     fn get_task(&self, id: &str) -> RecordStoreResult<Option<TaskRow>> {
         Ok(self.get_plane_record("task", id)?.map(|b| row(&b)))
@@ -1601,15 +1608,18 @@ trait Vocab: RecordStore {
         self.purge_plane_records_before("task", before)
     }
     fn append_task_event(&self, e: &TaskEventRow) -> RecordStoreResult<()> {
-        self.append_plane_record(&PlaneRecord {
-            kind: "task_event".into(),
-            id: e.task_id.clone(),
-            parent: Some(e.task_id.clone()),
-            seq: e.seq,
-            ts: e.ts,
-            disposition: PlaneDisposition::Active,
-            body: body(e),
-        })
+        self.append_plane_record(
+            PlaneRecord {
+                kind: "task_event".into(),
+                id: e.task_id.clone(),
+                parent: Some(e.task_id.clone()),
+                seq: e.seq,
+                ts: e.ts,
+                disposition: PlaneDisposition::Active,
+                body: body(e),
+            }
+            .view(),
+        )
     }
     fn list_task_events(&self, task_id: &str) -> RecordStoreResult<Vec<TaskEventRow>> {
         Ok(self
@@ -1619,15 +1629,18 @@ trait Vocab: RecordStore {
             .collect())
     }
     fn append_mcp_call(&self, r: &CallRow) -> RecordStoreResult<()> {
-        self.append_plane_record(&PlaneRecord {
-            kind: "call".into(),
-            id: r.principal.clone(),
-            parent: Some(r.principal.clone()),
-            seq: r.seq,
-            ts: r.ts,
-            disposition: PlaneDisposition::Active,
-            body: body(r),
-        })
+        self.append_plane_record(
+            PlaneRecord {
+                kind: "call".into(),
+                id: r.principal.clone(),
+                parent: Some(r.principal.clone()),
+                seq: r.seq,
+                ts: r.ts,
+                disposition: PlaneDisposition::Active,
+                body: body(r),
+            }
+            .view(),
+        )
     }
     fn list_mcp_calls(&self, principal: &str) -> RecordStoreResult<Vec<CallRow>> {
         Ok(self
@@ -1643,15 +1656,18 @@ trait Vocab: RecordStore {
         self.purge_plane_records_before("call", before)
     }
     fn put_mcp_demotion(&self, d: &DemotionRow) -> RecordStoreResult<()> {
-        self.upsert_plane_record(&PlaneRecord {
-            kind: "demotion".into(),
-            id: d.server.clone(),
-            parent: None,
-            seq: 0,
-            ts: d.recorded_at,
-            disposition: PlaneDisposition::Active,
-            body: body(d),
-        })
+        self.upsert_plane_record(
+            PlaneRecord {
+                kind: "demotion".into(),
+                id: d.server.clone(),
+                parent: None,
+                seq: 0,
+                ts: d.recorded_at,
+                disposition: PlaneDisposition::Active,
+                body: body(d),
+            }
+            .view(),
+        )
     }
     fn list_mcp_demotions(&self) -> RecordStoreResult<Vec<DemotionRow>> {
         Ok(self
@@ -1890,11 +1906,11 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
         body: body(&rec),
     };
     store
-        .append_plane_record(&moved)
+        .append_plane_record(moved.view())
         .expect_err("a record whose ts differs at an occupied position is a fork");
     moved.ts = 2_000_000_100;
     store
-        .append_plane_record(&moved)
+        .append_plane_record(moved.view())
         .expect("the same sidecar and body is the identical replay");
 }
 

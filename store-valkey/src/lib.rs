@@ -48,7 +48,7 @@
 //!
 //! - **plane records** — busbar 1.6.0 replaced the protocol-named durable methods (`put_task`,
 //!   `append_mcp_call`, `put_mcp_demotion`, `redeem_ask_state`, …) with eight kind-tagged verbs over an
-//!   opaque [`PlaneRecord`] plus [`RecordStore::plane_token_live`]. ONE keyspace per kind holds every
+//!   opaque [`PlaneRecord`](busbar_contract::records::PlaneRecord) plus [`RecordStore::plane_token_live`]. ONE keyspace per kind holds every
 //!   kind's records (see [`plane`]); the store never decodes a body. The v6 typed task / task-event /
 //!   demotion / spent-approval keyspaces are copied into it in place on connect ([`legacy`]).
 //! - **usage** — the four reserved units keep their `m:<model>:<tier>` hash fields; every other
@@ -84,9 +84,11 @@
 //! `purge_metering_before` are left at the trait's `Ok(0)` default (no obligation to self-bound);
 //! operators wanting bounded growth reap old `busbar:usage:*` keys on their own retention schedule.
 
+#![forbid(unsafe_code)]
+
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
-    PlaneRecord, PlaneSelector, RecordStore, RecordStoreError, RecordStoreResult, UsageDelta,
+    PlaneRecordRef, PlaneSelector, RecordStore, RecordStoreError, RecordStoreResult, UsageDelta,
     UsageLedger, VirtualKey, RESERVED_UNITS,
 };
 use redis::{Commands, Connection};
@@ -387,9 +389,10 @@ fn is_connection_error(e: &redis::RedisError) -> bool {
 /// counters past 2^53). One script, so the server runs every pair atomically — the
 /// same guarantee the v6 `MULTI` pipeline gave, plus the per-counter floor the contract's
 /// `UsageLedger::apply_delta` specifies.
-static ADD_FLOORED: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
-    redis::Script::new(
-        r"
+///
+/// The source is also queued as a plain `EVAL` inside an `op_id` write's `MULTI` (`slots`), where
+/// an `EVALSHA` could miss a flushed script cache after the transaction had begun.
+const ADD_FLOORED_LUA: &str = r"
         for i = 1, #ARGV, 2 do
             local cur = redis.call('HGET', KEYS[1], ARGV[i])
             if cur and tonumber(cur) < 0 then
@@ -401,9 +404,9 @@ static ADD_FLOORED: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::ne
             end
         end
         return 0
-        ",
-    )
-});
+        ";
+static ADD_FLOORED: std::sync::LazyLock<redis::Script> =
+    std::sync::LazyLock::new(|| redis::Script::new(ADD_FLOORED_LUA));
 
 /// Valkey `RecordStore` backend (durable, shared across a cluster). A single
 /// mutex-guarded synchronous connection with one-shot reconnect - governance is off the request hot
@@ -665,6 +668,83 @@ fn parse_slot_pointer(s: &str) -> Option<(String, String, u8)> {
     let (rest, slot) = s.rsplit_once(':')?;
     let (key_id, kind) = rest.rsplit_once(':')?;
     Some((key_id.to_string(), kind.to_string(), slot.parse().ok()?))
+}
+
+/// The fields one usage delta adds, as `(hash field, delta)` pairs for [`ADD_FLOORED_LUA`]: the two
+/// request counters always, and every non-zero unit.
+fn usage_fields(delta: &UsageDelta) -> Vec<(String, i64)> {
+    let mut fields: Vec<(String, i64)> = vec![
+        ("requests".to_string(), delta.requests),
+        ("billable_requests".to_string(), delta.billable_requests),
+    ];
+    for m in &delta.models {
+        for (unit, d) in &m.usage_units {
+            if *d != 0 {
+                fields.push((usage_field(&m.model, unit), *d));
+            }
+        }
+    }
+    fields
+}
+
+/// Queue one metering delta's writes on `pipe` (the caller makes it atomic): the row joins its
+/// bucket's set, every counter is an `HINCRBY`, the identity fields are set, and the attribution
+/// snapshot is first-write-wins.
+fn queue_metering(pipe: &mut redis::Pipeline, d: &MeteringDelta) {
+    let row = metering_row(d.bucket, &d.key_id, &d.model, &d.provider, d.priced_from_ms);
+    pipe.sadd(metering_set(d.bucket), &row).ignore();
+    for (field, v) in [
+        ("tokens_input", d.tokens_input),
+        ("tokens_output", d.tokens_output),
+        ("tokens_cache_read", d.tokens_cache_read),
+        ("tokens_cache_write", d.tokens_cache_write),
+        ("requests", d.requests),
+        ("billable_requests", d.billable_requests),
+    ] {
+        pipe.cmd("HINCRBY")
+            .arg(&row)
+            .arg(field)
+            .arg(clamp(v))
+            .ignore();
+    }
+    for (class, v) in &d.usage_units {
+        pipe.cmd("HINCRBY")
+            .arg(&row)
+            .arg(format!("{METERING_UNIT_PREFIX}{class}"))
+            .arg(clamp(*v))
+            .ignore();
+    }
+    pipe.hset_multiple(
+        &row,
+        &[
+            ("key_id", d.key_id.as_str()),
+            ("model", d.model.as_str()),
+            ("provider", d.provider.as_str()),
+        ],
+    )
+    .ignore()
+    .hset(&row, "priced_from_ms", d.priced_from_ms.to_string())
+    .ignore()
+    // First-write-wins attribution snapshot: HSETNX only sets if the field is absent.
+    .cmd("HSETNX")
+    .arg(&row)
+    .arg("key_group_at_use")
+    .arg(&d.key_group_at_use)
+    .ignore()
+    .cmd("HSETNX")
+    .arg(&row)
+    .arg("pricing_version")
+    .arg(&d.pricing_version)
+    .ignore();
+}
+
+/// The refusal an audit append answers when `seq` already holds a DIFFERENT record.
+fn audit_fork(stored: &AuditRecord, entry: &AuditRecord) -> String {
+    format!(
+        "append_audit: seq {} already holds a DIFFERENT record; the audit chain has forked \
+         (stored action '{}', incoming '{}')",
+        entry.seq, stored.action, entry.action
+    )
 }
 
 /// Test-only cleanup surface. The conformance suite runs against a SHARED live Valkey that is not
@@ -1055,17 +1135,7 @@ impl RecordStore for ValkeyStore {
         // than the counter would leave it negative and the NEXT accrual would be swallowed paying
         // that debt back. So the add-then-floor runs as ONE script the server executes atomically.
         let k = usage_key(bucket_id, window_start);
-        let mut fields: Vec<(String, i64)> = vec![
-            ("requests".to_string(), delta.requests),
-            ("billable_requests".to_string(), delta.billable_requests),
-        ];
-        for m in &delta.models {
-            for (unit, d) in &m.usage_units {
-                if *d != 0 {
-                    fields.push((usage_field(&m.model, unit), *d));
-                }
-            }
-        }
+        let fields = usage_fields(delta);
         self.with_conn_no_retry(|c| {
             let mut inv = ADD_FLOORED.key(&k);
             for (f, d) in &fields {
@@ -1076,55 +1146,11 @@ impl RecordStore for ValkeyStore {
     }
 
     fn add_metering(&self, d: &MeteringDelta) -> RecordStoreResult<()> {
-        let row = metering_row(d.bucket, &d.key_id, &d.model, &d.provider, d.priced_from_ms);
-        let set = metering_set(d.bucket);
         self.with_conn_no_retry(|c| {
             let mut pipe = redis::pipe();
-            pipe.atomic().sadd(&set, &row).ignore();
-            for (field, v) in [
-                ("tokens_input", d.tokens_input),
-                ("tokens_output", d.tokens_output),
-                ("tokens_cache_read", d.tokens_cache_read),
-                ("tokens_cache_write", d.tokens_cache_write),
-                ("requests", d.requests),
-                ("billable_requests", d.billable_requests),
-            ] {
-                pipe.cmd("HINCRBY")
-                    .arg(&row)
-                    .arg(field)
-                    .arg(clamp(v))
-                    .ignore();
-            }
-            for (class, v) in &d.usage_units {
-                pipe.cmd("HINCRBY")
-                    .arg(&row)
-                    .arg(format!("{METERING_UNIT_PREFIX}{class}"))
-                    .arg(clamp(*v))
-                    .ignore();
-            }
-            pipe.hset_multiple(
-                &row,
-                &[
-                    ("key_id", d.key_id.as_str()),
-                    ("model", d.model.as_str()),
-                    ("provider", d.provider.as_str()),
-                ],
-            )
-            .ignore()
-            .hset(&row, "priced_from_ms", d.priced_from_ms.to_string())
-            .ignore()
-            // First-write-wins attribution snapshot: HSETNX only sets if the field is absent.
-            .cmd("HSETNX")
-            .arg(&row)
-            .arg("key_group_at_use")
-            .arg(&d.key_group_at_use)
-            .ignore()
-            .cmd("HSETNX")
-            .arg(&row)
-            .arg("pricing_version")
-            .arg(&d.pricing_version)
-            .ignore()
-            .query(c)
+            pipe.atomic();
+            queue_metering(&mut pipe, d);
+            pipe.query(c)
         })
     }
 
@@ -1623,11 +1649,7 @@ impl RecordStore for ValkeyStore {
                     return Err(redis::RedisError::from((
                         redis::ErrorKind::Client,
                         "append_audit refused",
-                        format!(
-                            "append_audit: seq {} already holds a DIFFERENT record; the audit \
-                             chain has forked (stored action '{}', incoming '{}')",
-                            entry.seq, stored.action, entry.action
-                        ),
+                        audit_fork(&stored, entry),
                     )));
                 }
                 pipe.atomic().zadd(AUDIT_ZSET, &json, score).ignore();
@@ -1680,7 +1702,7 @@ impl RecordStore for ValkeyStore {
     // One keyspace per kind, for every kind; the store never decodes a body. See [`plane`] for the
     // layout and for why each step is a server-side script.
 
-    fn upsert_plane_record(&self, record: &PlaneRecord) -> RecordStoreResult<()> {
+    fn upsert_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
         plane::upsert(self, record)
     }
 
@@ -1688,14 +1710,14 @@ impl RecordStore for ValkeyStore {
         plane::get(self, kind, id)
     }
 
-    fn append_plane_record(&self, record: &PlaneRecord) -> RecordStoreResult<()> {
+    fn append_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
         plane::append(self, record)
     }
 
     fn list_plane_records(
         &self,
         kind: &str,
-        selector: &PlaneSelector,
+        selector: &PlaneSelector<'_>,
     ) -> RecordStoreResult<Vec<Vec<u8>>> {
         plane::list(self, kind, selector)
     }
@@ -1744,52 +1766,51 @@ fn now() -> u64 {
 }
 
 // ── THE DOOR (DECISIONS #2 rule (1): compiled in or dropped in, one contract, one loading path) ──
+//
+// The store's door lives HERE, in the logic crate (`slots`: `store_door!` over this store's
+// `StoreSlots`): a busbar build that links this crate registers `door` as its compiled-in row
+// (`LinkedRow::of(door)`), and the sibling `busbar-store-valkey-plugin` cdylib exports the same
+// `door` as the image's one symbol (`export_door!`). One source, both doors.
 
-/// The store's registry name, and the alias `store.module: valkey` selects it by.
+/// The store's package name: the name its Statement states and its signed tarball carries.
 pub const NAME: &str = "busbar-store-valkey";
-/// The alias an operator names in `store.module`.
-pub const ALIAS: &str = "valkey";
 
-/// Construct a Valkey-protocol store from the JSON config the engine passes through `open`:
-///
-/// ```json
-/// { "url": "redis://:password@host:6379/0", "connect_timeout_ms": 10000 }
-/// ```
-///
-/// The engine passes `store.settings` verbatim as this JSON config (see the boot store-load),
-/// mirroring how the Postgres plugin receives its libpq URL. `connect_timeout_ms` is optional
-/// (defaults to [`DEFAULT_CONNECT_TIMEOUT`], currently 10s); it bounds the initial connect so a
-/// blackholed/firewalled instance fails fast at boot instead of wedging it indefinitely.
-pub fn open(cfg: &str) -> Result<Box<dyn RecordStore>, String> {
-    let v: serde_json::Value = if cfg.trim().is_empty() {
-        serde_json::Value::Object(Default::default())
-    } else {
-        serde_json::from_str(cfg).map_err(|e| format!("invalid valkey plugin config: {e}"))?
-    };
-    let url = v.get("url").and_then(|x| x.as_str()).ok_or_else(|| {
-        "valkey plugin config requires a \"url\" (a redis:// connection string)".to_string()
-    })?;
-    let store = match v.get("connect_timeout_ms").and_then(|x| x.as_u64()) {
-        Some(ms) => ValkeyStore::connect_with_timeout(url, Duration::from_millis(ms)),
-        None => ValkeyStore::connect(url),
+impl ValkeyStore {
+    /// Construct a Valkey-protocol store from the settings JSON the host hands `open`:
+    ///
+    /// ```json
+    /// { "url": "redis://:password@host:6379/0", "connect_timeout_ms": 10000 }
+    /// ```
+    ///
+    /// `connect_timeout_ms` is optional (defaults to [`DEFAULT_CONNECT_TIMEOUT`], currently 10s); it
+    /// bounds the initial connect so a blackholed/firewalled instance fails fast at boot instead of
+    /// wedging it indefinitely.
+    ///
+    /// # Errors
+    /// A text naming why the settings do not open a store.
+    pub fn from_settings(settings: &[u8]) -> Result<Self, String> {
+        let v: serde_json::Value = if settings.iter().all(u8::is_ascii_whitespace) {
+            serde_json::Value::Object(Default::default())
+        } else {
+            serde_json::from_slice(settings)
+                .map_err(|e| format!("invalid valkey plugin config: {e}"))?
+        };
+        let url = v.get("url").and_then(|x| x.as_str()).ok_or_else(|| {
+            "valkey plugin config requires a \"url\" (a redis:// connection string)".to_string()
+        })?;
+        match v.get("connect_timeout_ms").and_then(|x| x.as_u64()) {
+            Some(ms) => ValkeyStore::connect_with_timeout(url, Duration::from_millis(ms)),
+            None => ValkeyStore::connect(url),
+        }
+        .map_err(|e| format!("valkey plugin: failed to connect: {}", e.0))
     }
-    .map_err(|e| format!("valkey plugin: failed to connect: {}", e.0))?;
-    Ok(Box::new(store))
 }
 
-// The image's ONE door registration. The frozen symbols the loader looks up in the
-// `busbar-store-valkey-plugin` cdylib are the contract SDK's, and they answer through this entry; a
-// busbar build that links this crate hands the loader `BUSBAR_COLD_ENTRY` instead.
-busbar_contract::abi::sdk::export_store_plugin!(open);
+mod slots;
 
-/// THE LINKED ENTRY: what a build that links this store registers onto the cold-kind axis — the same
-/// row a dropped-in tarball of this store states, opened through the same boundary.
-pub mod linked {
-    /// `(name, alias, boundary)` — the row's statement and the boundary the one cold load runs over,
-    /// exactly what the dropped-in tarball states and exports.
-    pub const STORE: (&str, &str, &busbar_contract::abi::sdk::ColdEntry) =
-        (super::NAME, super::ALIAS, &super::BUSBAR_COLD_ENTRY);
-}
+/// THE STORE DOOR (store v3, `busbar_contract::abi::store`): every slot of the store v3 table over
+/// [`ValkeyStore`], through the contract's store SDK.
+pub use slots::door;
 
 #[cfg(test)]
 mod tests;

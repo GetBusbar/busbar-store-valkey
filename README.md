@@ -71,12 +71,20 @@ in [`.busbar-ref`](.busbar-ref). A v1.0.x namespace (schema v6) is upgraded in
 place on first connect. Pin both versions
 explicitly in production; do not assume they move together.
 
-It is a `cdylib` that implements busbar's `RecordStore` contract (via the
-plugin SDK in [`busbar-contract`](https://github.com/GetBusbar/busbar/tree/main/crates/busbar-contract),
-`busbar_contract::abi::sdk`) and is loaded in-process by busbar over the signed store ABI —
-`dlopen`'d, not spawned as a separate process. The same store can also be LINKED into a busbar
-build (its `linked::STORE` row); both doors run the same code, and
+It is a `cdylib` that implements busbar's store v3 table (`RecordStore` plus the
+`StoreSlots` additions of the store SDK in
+[`busbar-contract`](https://github.com/GetBusbar/busbar/tree/main/crates/busbar-contract),
+`busbar_contract::abi::sdk::store`) and is loaded in-process by busbar over the memory ABI —
+`dlopen`'d, not spawned as a separate process. The logic crate states the store's one door
+(`store_door!`, `busbar_store_valkey::door`); the cdylib exports it (`export_door!`), and a busbar
+build can LINK the same door (`LinkedRow::of(door)`). Both doors run the same code, and
 [`tests/conformance.rs`](store-valkey-plugin/tests/conformance.rs) proves they behave as one store.
+
+The store v3 additions are durable in Valkey: every `op_id` write is deduped by a record
+(`busbar:op:*`, kept 24 h) written in the same atomic step as its effect (`WATCH`/`MULTI`/`EXEC`,
+or one server-side script for the plane append), and the money slots (`busbar:cap:*`,
+`busbar:slice:*`), the journal (`busbar:journal:*`), sessions (`busbar:session*`) and the
+kernel's records (`busbar:records:*`) are additive keyspaces beside the v7 ones.
 
 
 - **Multi-node deployments**: a fleet of busbar nodes sharing one Valkey
