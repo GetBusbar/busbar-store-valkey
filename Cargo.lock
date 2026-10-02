@@ -76,7 +76,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 [[package]]
 name = "busbar-contract"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=23d8a6b46deb158839df8bc02115b09023633040#23d8a6b46deb158839df8bc02115b09023633040"
+source = "git+https://github.com/GetBusbar/busbar?rev=e1d3d8b097201859751d77208e66249d98b50a4b#e1d3d8b097201859751d77208e66249d98b50a4b"
 dependencies = [
  "async-trait",
  "futures",
@@ -98,7 +98,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-ledger"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=23d8a6b46deb158839df8bc02115b09023633040#23d8a6b46deb158839df8bc02115b09023633040"
+source = "git+https://github.com/GetBusbar/busbar?rev=e1d3d8b097201859751d77208e66249d98b50a4b#e1d3d8b097201859751d77208e66249d98b50a4b"
 dependencies = [
  "busbar-contract",
  "serde",
@@ -108,7 +108,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-wal"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=23d8a6b46deb158839df8bc02115b09023633040#23d8a6b46deb158839df8bc02115b09023633040"
+source = "git+https://github.com/GetBusbar/busbar?rev=e1d3d8b097201859751d77208e66249d98b50a4b#e1d3d8b097201859751d77208e66249d98b50a4b"
 dependencies = [
  "busbar-contract",
  "sha2 0.11.0",
@@ -117,7 +117,7 @@ dependencies = [
 [[package]]
 name = "busbar-plugin-loader"
 version = "1.5.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=23d8a6b46deb158839df8bc02115b09023633040#23d8a6b46deb158839df8bc02115b09023633040"
+source = "git+https://github.com/GetBusbar/busbar?rev=e1d3d8b097201859751d77208e66249d98b50a4b#e1d3d8b097201859751d77208e66249d98b50a4b"
 dependencies = [
  "async-trait",
  "busbar-contract",
@@ -392,7 +392,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1002,7 +1002,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1159,7 +1159,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
