@@ -7,7 +7,7 @@ Thanks for your interest in improving `busbar-store-valkey`.
 - Be respectful and constructive in all project spaces (see
   [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)).
 - By contributing, you agree your contributions are licensed under the project's
-  [Apache-2.0](LICENSE) license.
+  [MIT](LICENSE) license.
 - Security issues go through [SECURITY.md](SECURITY.md), **not** public issues.
 
 ## Layout
