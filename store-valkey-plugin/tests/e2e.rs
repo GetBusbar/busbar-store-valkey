@@ -2,18 +2,19 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! End-to-end coverage of the `busbar-store-valkey-plugin` cdylib loaded over the REAL loader
-//! `load_store` seam against a REAL, live Valkey (not a mock, not an in-process fake). This is the
-//! exact seam the engine sees when `store: { module: valkey }` is configured: a `Box<dyn Store>`
-//! indistinguishable from a compiled-in store, backed by `dlopen`'d code running the C ABI.
+//! (`load_dropped`, then `LoadedStore::open`, the way the host opens a store: see [`load`]) against
+//! a REAL, live Valkey (not a mock, not an in-process fake): a `Box<dyn RecordStore>`
+//! indistinguishable from a compiled-in store, backed by `dlopen`'d code answering over the store
+//! kind's memory ABI.
 //!
 //! Unlike a file-backed store (see store-sqlite's plugin end-to-end test, which reopens the
 //! same file), Valkey has no "close and reopen the same file" persistence signal to check. Instead
 //! this proves persistence the way that is actually meaningful for a SHARED backend:
 //!
-//!   1. `dlopen` the plugin, write a key + usage ledger through it over the C ABI, then DROP it
-//!      (which runs `busbar_close`, closing the plugin's own Valkey connection).
+//!   1. `dlopen` the plugin, write a key + usage ledger through it over the memory ABI, then DROP it
+//!      (which runs the door's `close`, closing the plugin's own Valkey connection).
 //!   2. Independently connect to the SAME Valkey instance via the plain `busbar-store-valkey`
-//!      library crate — a code path that never touches the cdylib, the C ABI, or the loader at
+//!      library crate — a code path that never touches the cdylib, the memory ABI, or the loader at
 //!      all — and confirm the data is genuinely present.
 //!
 //! If the plugin's `put_key`/`put_usage` over the ABI were silent no-ops (or wrote to some
@@ -29,11 +30,52 @@ use busbar_contract::records::{
     ModelTokens, PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore, RecordStoreResult,
     ScopeRef, UsageLedger, VirtualKey,
 };
-use busbar_plugin_loader::{load_store, plugin_library_filename};
+use busbar_plugin_loader::dispatch::kinds::store::Store;
+use busbar_plugin_loader::dispatch::{
+    load_dropped, rendering_of_library, Bind, DispatchConfig, Dispatcher, NoSink,
+};
+use busbar_plugin_loader::plugin_library_filename;
+use busbar_plugin_loader::store_v3::LoadedStore;
 use busbar_store_valkey::ValkeyStore;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// A node id no earlier run or instance used, for `LoadedStore::open`: its bridge mints each op id
+/// as `(node, counter from 0)`, and this store's dedupe is DURABLE, so two instances sharing a node
+/// would replay each other's op ids (the kernel draws the node from the OS CSPRNG per process).
+fn node() -> u64 {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    (t ^ (u64::from(std::process::id()) << 32))
+        .wrapping_add(N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) << 48)
+        | 1
+}
+
+/// Open the built cdylib the way the host opens a dropped-in store: its Statement rendered as
+/// `busbar-plugin-pack` renders it into the signed manifest, `load_dropped` (dlopen,
+/// `busbar_plugin_door`, the Statement compared byte for byte), then `LoadedStore::open`. Dropping
+/// the handle closes the instance and unloads the library.
+fn load(path: &Path, cfg: &str) -> Result<Box<dyn RecordStore>, String> {
+    let stated = rendering_of_library(path)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "the library exports no busbar_plugin_door".to_string())?;
+    let dispatcher = Arc::new(Dispatcher::new(DispatchConfig::default()));
+    let bind = Bind {
+        instance: Arc::from("store-valkey-e2e"),
+        max_inflight_cap: 64,
+        sink: Arc::new(NoSink),
+        dispatcher: dispatcher.adopter(),
+        conns: None,
+    };
+    let plugin = load_dropped::<Store>(path, &stated, bind).map_err(|e| e.to_string())?;
+    let store = LoadedStore::open(plugin, dispatcher, cfg.as_bytes(), node())?;
+    Ok(Box::new(store))
+}
 
 /// Fixed ed25519 signing secret (64 hex = 32 bytes) for this e2e test. 1.5.1 requires an
 /// explicit signing key to mint virtual keys; busbar no longer auto-generates one.
@@ -236,19 +278,22 @@ fn row<T: serde::de::DeserializeOwned>(body: &[u8]) -> T {
 trait Vocab: RecordStore {
     fn put_task(&self, t: &TaskRow) -> RecordStoreResult<()> {
         let terminal = ["completed", "failed", "canceled", "rejected"].contains(&t.state.as_str());
-        self.upsert_plane_record(&PlaneRecord {
-            kind: "task".into(),
-            id: t.task_id.clone(),
-            parent: None,
-            seq: 0,
-            ts: t.updated_at,
-            disposition: if terminal {
-                PlaneDisposition::Terminal
-            } else {
-                PlaneDisposition::Active
-            },
-            body: body(t),
-        })
+        self.upsert_plane_record(
+            PlaneRecord {
+                kind: "task".into(),
+                id: t.task_id.clone(),
+                parent: None,
+                seq: 0,
+                ts: t.updated_at,
+                disposition: if terminal {
+                    PlaneDisposition::Terminal
+                } else {
+                    PlaneDisposition::Active
+                },
+                body: body(t),
+            }
+            .view(),
+        )
     }
     fn get_task(&self, id: &str) -> RecordStoreResult<Option<TaskRow>> {
         Ok(self.get_plane_record("task", id)?.map(|b| row(&b)))
@@ -264,15 +309,18 @@ trait Vocab: RecordStore {
         self.purge_plane_records_before("task", before)
     }
     fn append_task_event(&self, e: &TaskEventRow) -> RecordStoreResult<()> {
-        self.append_plane_record(&PlaneRecord {
-            kind: "task_event".into(),
-            id: e.task_id.clone(),
-            parent: Some(e.task_id.clone()),
-            seq: e.seq,
-            ts: e.ts,
-            disposition: PlaneDisposition::Active,
-            body: body(e),
-        })
+        self.append_plane_record(
+            PlaneRecord {
+                kind: "task_event".into(),
+                id: e.task_id.clone(),
+                parent: Some(e.task_id.clone()),
+                seq: e.seq,
+                ts: e.ts,
+                disposition: PlaneDisposition::Active,
+                body: body(e),
+            }
+            .view(),
+        )
     }
     fn list_task_events(&self, task_id: &str) -> RecordStoreResult<Vec<TaskEventRow>> {
         Ok(self
@@ -282,15 +330,18 @@ trait Vocab: RecordStore {
             .collect())
     }
     fn append_mcp_call(&self, r: &CallRow) -> RecordStoreResult<()> {
-        self.append_plane_record(&PlaneRecord {
-            kind: "call".into(),
-            id: r.principal.clone(),
-            parent: Some(r.principal.clone()),
-            seq: r.seq,
-            ts: r.ts,
-            disposition: PlaneDisposition::Active,
-            body: body(r),
-        })
+        self.append_plane_record(
+            PlaneRecord {
+                kind: "call".into(),
+                id: r.principal.clone(),
+                parent: Some(r.principal.clone()),
+                seq: r.seq,
+                ts: r.ts,
+                disposition: PlaneDisposition::Active,
+                body: body(r),
+            }
+            .view(),
+        )
     }
     fn list_mcp_calls(&self, principal: &str) -> RecordStoreResult<Vec<CallRow>> {
         Ok(self
@@ -306,15 +357,18 @@ trait Vocab: RecordStore {
         self.purge_plane_records_before("call", before)
     }
     fn put_mcp_demotion(&self, d: &DemotionRow) -> RecordStoreResult<()> {
-        self.upsert_plane_record(&PlaneRecord {
-            kind: "demotion".into(),
-            id: d.server.clone(),
-            parent: None,
-            seq: 0,
-            ts: d.recorded_at,
-            disposition: PlaneDisposition::Active,
-            body: body(d),
-        })
+        self.upsert_plane_record(
+            PlaneRecord {
+                kind: "demotion".into(),
+                id: d.server.clone(),
+                parent: None,
+                seq: 0,
+                ts: d.recorded_at,
+                disposition: PlaneDisposition::Active,
+                body: body(d),
+            }
+            .view(),
+        )
     }
     fn list_mcp_demotions(&self) -> RecordStoreResult<Vec<DemotionRow>> {
         Ok(self
@@ -364,14 +418,14 @@ fn ledger() -> UsageLedger {
 }
 
 /// END-TO-END PERSISTENCE: dlopen the real valkey plugin against a REAL, live Valkey, write a key +
-/// usage through it over the C ABI, drop the plugin (closing its connection via `RawPlugin`'s
-/// `Drop`, which runs `busbar_close`), then verify the data actually landed in Valkey two
+/// usage through it over the memory ABI, drop the plugin (closing its connection: dropping the `LoadedStore`
+/// runs the door's `close`), then verify the data actually landed in Valkey two
 /// independent ways:
-///   1. re-dlopen the SAME cdylib against the SAME `VALKEY_URL` — a fresh `busbar_open`/fresh
-///      `DynStore` instance, proving the plugin itself doesn't just hold an in-memory cache
+///   1. re-dlopen the SAME cdylib against the SAME `VALKEY_URL` — a fresh door `open`/fresh
+///      `LoadedStore` instance, proving the plugin itself doesn't just hold an in-memory cache
 ///      across calls.
 ///   2. connect to the SAME Valkey with `busbar_store_valkey::ValkeyStore::connect` directly — a
-///      totally independent code path that never goes through the cdylib, the C ABI, or the
+///      totally independent code path that never goes through the cdylib, the memory ABI, or the
 ///      loader at all — proving the plugin actually wrote real Valkey keys, not just satisfying
 ///      its own in-process round-trip.
 ///
@@ -407,7 +461,7 @@ fn load_and_exercise_valkey_plugin_persists_to_real_valkey_across_reopen() {
     let vk = key(vk_id);
 
     {
-        let store = load_store(&path, &cfg).expect("load valkey plugin against a real Valkey");
+        let store = load(&path, &cfg).expect("load valkey plugin against a real Valkey");
         store.put_key(&vk).expect("put_key over the ABI");
         store
             .put_usage(vk_id, 200, &ledger())
@@ -420,15 +474,15 @@ fn load_and_exercise_valkey_plugin_persists_to_real_valkey_across_reopen() {
                 .id,
             vk_id
         );
-        // `store` (and the `RawPlugin` it wraps) drops here, running `busbar_close` and dropping
+        // `store` (the `LoadedStore`) drops here, running the door's `close` and dropping
         // the plugin's own `ValkeyStore`/connection — the data must be durably in Valkey after
         // this, not just an in-process cache inside the plugin.
     }
 
     // (1) Re-dlopen the SAME cdylib against the SAME `VALKEY_URL`: a fresh plugin instance, fresh
-    // `busbar_open`, fresh connection inside the plugin — proves the ABI round-trip isn't relying
+    // door `open`, fresh connection inside the plugin — proves the ABI round-trip isn't relying
     // on the first instance still being alive.
-    let reopened = load_store(&path, &cfg).expect("re-load valkey plugin against the same URL");
+    let reopened = load(&path, &cfg).expect("re-load valkey plugin against the same URL");
     let got = reopened
         .get_key(vk_id)
         .expect("get_key after reopen")
@@ -448,7 +502,7 @@ fn load_and_exercise_valkey_plugin_persists_to_real_valkey_across_reopen() {
     drop(reopened);
 
     // (2) Read back through a TOTALLY INDEPENDENT connection — the plain `ValkeyStore`, used
-    // directly, never touching the cdylib, the C ABI, or `busbar-plugin-loader` at all. If the
+    // directly, never touching the cdylib, the memory ABI, or `busbar-plugin-loader` at all. If the
     // plugin's `put_key`/`put_usage` over the ABI were silent no-ops (or wrote somewhere other
     // than the configured Valkey), this independent reader would come back empty even though the
     // reopen-via-plugin check above passed.
@@ -475,7 +529,7 @@ fn load_and_exercise_valkey_plugin_persists_to_real_valkey_across_reopen() {
 fn load_and_exercise_valkey_plugin_bad_config_fails_over_abi() {
     let path = plugin_path();
 
-    let err = load_store(&path, "{ not json")
+    let err = load(&path, "{ not json")
         .err()
         .expect("malformed config JSON must fail to load, not silently succeed");
     assert!(
@@ -483,7 +537,7 @@ fn load_and_exercise_valkey_plugin_bad_config_fails_over_abi() {
         "the plugin's own error message should survive the ABI crossing intact: {err}"
     );
 
-    let err = load_store(&path, "{}")
+    let err = load(&path, "{}")
         .err()
         .expect("a config missing url must fail to load");
     assert!(
@@ -491,7 +545,7 @@ fn load_and_exercise_valkey_plugin_bad_config_fails_over_abi() {
         "expected the plugin's own missing-url message, got: {err}"
     );
 
-    let err = load_store(&path, r#"{"url":"not-a-valkey-url"}"#)
+    let err = load(&path, r#"{"url":"not-a-valkey-url"}"#)
         .err()
         .expect("an unparseable valkey url must fail to load, not silently succeed");
     assert!(
@@ -502,7 +556,7 @@ fn load_and_exercise_valkey_plugin_bad_config_fails_over_abi() {
 
 // ── THE REAL "prod ready" bar: install over the real admin HTTP API, exercise it, verify ──────
 //
-// Everything above loads the plugin via `busbar_plugin_loader::load_store()` — a direct Rust
+// Everything above loads the plugin via [`load`] (`load_dropped` + `LoadedStore`) — a direct Rust
 // function call no real end user ever makes. `admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey`
 // instead drives an ACTUAL `busbar` binary the way an operator (or CI's own INSTALL-AND-SERVE
 // step) does:
@@ -521,7 +575,7 @@ fn load_and_exercise_valkey_plugin_bad_config_fails_over_abi() {
 //      key AND a credential in one call (there is no separate `/keys/{id}/credentials` endpoint;
 //      confirmed by reading `crates/busbar/src/admin/v1/json/mod.rs`'s full route table).
 //   7. INDEPENDENTLY verify both rows physically landed in the real Valkey two ways: (a) the typed
-//      `ValkeyStore`/`Store` trait — a code path that never touches the plugin, the C ABI, the
+//      `ValkeyStore`/`Store` trait — a code path that never touches the plugin, the memory ABI, the
 //      loader, or the HTTP admin surface at all; and (b) a raw `redis::Client` GET of the exact
 //      key bytes (`busbar:key:<id>`) — proof independent even of `busbar-store-valkey`'s own
 //      encode/decode path, the strongest verification available short of `valkey-cli` itself.
@@ -927,7 +981,7 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
     drop(guard);
 
     // INDEPENDENT VERIFICATION #1: the typed Store trait, via the plain busbar-store-valkey crate
-    // — a code path that never touches the plugin cdylib, the C ABI, the loader, or the admin
+    // — a code path that never touches the plugin cdylib, the memory ABI, the loader, or the admin
     // HTTP surface at all.
     let vk = RecordStore::get_key(&direct, &key_id)
         .expect("get_key via the direct connection")
@@ -976,16 +1030,16 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
 /// the trait carried ten, so exactly this happened. A unit test passing while the ABI drops every
 /// write is the precise shape this test exists to make impossible.
 ///
-/// So it goes through `busbar_plugin_loader::load_store`: a REAL `dlopen` of the built cdylib, the
-/// real C ABI, the real `DynStore`. It writes AT ARITY > 1 (three chained records for one principal
-/// and one for a second), DROPS the handle — which runs `busbar_close` and UNLOADS the library, so
+/// So it goes through [`load`]: a REAL `dlopen` of the built cdylib, the real memory ABI, the real
+/// `LoadedStore`. It writes AT ARITY > 1 (three chained records for one principal
+/// and one for a second), DROPS the handle — which runs `the door's `close`` and UNLOADS the library, so
 /// nothing this process still holds can answer the reads — then `dlopen`s AGAIN over the same file
 /// and reads everything back. A restart is what proves durability; a single-row same-session round
 /// trip would not distinguish a relayed method from a lucky trait default, and a multi-row one
 /// across an unload/reload cannot be faked by either.
 ///
 /// A third leg reads the same rows through the plain `ValkeyStore`, never touching the cdylib, the
-/// C ABI or the loader — so a plugin that answered from its own in-process cache still fails here.
+/// memory ABI or the loader — so a plugin that answered from its own in-process cache still fails here.
 #[test]
 fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let path = plugin_path();
@@ -1034,8 +1088,8 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     };
 
     {
-        // BOOT 1 — a real dlopen of the cdylib; every call below crosses the C ABI.
-        let store = load_store(&path, &cfg).expect("the valkey plugin must load over the real ABI");
+        // BOOT 1 — a real dlopen of the cdylib; every call below crosses the memory ABI.
+        let store = load(&path, &cfg).expect("the valkey plugin must load over the real ABI");
         for (seq, prev, hash) in [(1_u64, "", "h1"), (2, "h1", "h2"), (3, "h2", "h3")] {
             store
                 .append_mcp_call(&call(&p_main, seq, prev, hash))
@@ -1044,15 +1098,14 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         store
             .append_mcp_call(&call(&p_other, 1, "", "o1"))
             .expect("append_mcp_call over the ABI");
-        // Dropping the boxed store drops the loader's `Library` handle: `busbar_close` runs and the
+        // Dropping the boxed store drops the loader's `Library` handle: `the door's `close`` runs and the
         // dylib is UNLOADED. Nothing this process still holds can be answering the reads below.
         drop(store);
     }
 
-    // BOOT 2 — a second, independent dlopen over the same file, a fresh `busbar_open`, a fresh
+    // BOOT 2 — a second, independent dlopen over the same file, a fresh door `open`, a fresh
     // connection inside the plugin.
-    let store =
-        load_store(&path, &cfg).expect("the valkey plugin must load again over the real ABI");
+    let store = load(&path, &cfg).expect("the valkey plugin must load again over the real ABI");
 
     let calls = store.list_mcp_calls(&p_main).expect("list_mcp_calls");
     assert_eq!(
@@ -1122,7 +1175,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     drop(store);
 
     // LEG 3 — read the surviving rows through the plain `ValkeyStore`, a code path that never
-    // touches the cdylib, the C ABI or the loader. A plugin answering the reads above out of its
+    // touches the cdylib, the memory ABI or the loader. A plugin answering the reads above out of its
     // own in-process state (rather than Valkey) passes both boots and fails here.
     let direct_calls =
         Vocab::list_mcp_calls(&direct, &p_main).expect("list_mcp_calls via the direct connection");
@@ -1150,9 +1203,9 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 /// deployment takes, so it is the only path worth proving on. A unit test against `ValkeyStore`
 /// proves the function compiles and works in-process; it does not prove the plugin path reaches it.
 ///
-/// So: a REAL `dlopen` of the built cdylib, the real C ABI, the real `DynStore`. Write at arity > 1
+/// So: a REAL `dlopen` of the built cdylib, the real memory ABI, the real `LoadedStore`. Write at arity > 1
 /// (two tasks, one of them UPSERTED a second time, plus two independent provenance chains), DROP the
-/// handle — `busbar_close` runs and the library is unloaded, so nothing this process still holds can
+/// handle — `the door's `close`` runs and the library is unloaded, so nothing this process still holds can
 /// answer the reads — then `dlopen` again and read everything back. A third leg reads the same rows
 /// through the plain `ValkeyStore`, never touching the cdylib, so a plugin answering out of its own
 /// in-process cache still fails.
@@ -1214,8 +1267,8 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     };
 
     {
-        // BOOT 1 — a real dlopen of the cdylib; every call below crosses the C ABI.
-        let store = load_store(&path, &cfg).expect("the valkey plugin must load over the real ABI");
+        // BOOT 1 — a real dlopen of the cdylib; every call below crosses the memory ABI.
+        let store = load(&path, &cfg).expect("the valkey plugin must load over the real ABI");
         store
             .put_task(&task(&t_live, "working", BASE_TS + 100, 3))
             .expect("put_task over the ABI");
@@ -1238,15 +1291,14 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         store
             .append_task_event(&event(&t_done, 1, "task.completed", "", "d1"))
             .expect("append_task_event over the ABI");
-        // Dropping the boxed store drops the loader's `Library` handle: `busbar_close` runs and the
+        // Dropping the boxed store drops the loader's `Library` handle: `the door's `close`` runs and the
         // dylib is UNLOADED. Nothing this process still holds can be answering the reads below.
         drop(store);
     }
 
-    // BOOT 2 — a second, independent dlopen over the same file, a fresh `busbar_open`, a fresh
+    // BOOT 2 — a second, independent dlopen over the same file, a fresh door `open`, a fresh
     // connection inside the plugin.
-    let store =
-        load_store(&path, &cfg).expect("the valkey plugin must load again over the real ABI");
+    let store = load(&path, &cfg).expect("the valkey plugin must load again over the real ABI");
 
     let got = store.get_task(&t_live).expect("get_task").expect(
         "an in-flight task must survive the unload/reload over the plugin ABI; got None back, \
@@ -1356,7 +1408,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     drop(store);
 
     // LEG 3 — read the surviving row through the plain `ValkeyStore`, a code path that never
-    // touches the cdylib, the C ABI or the loader. A plugin answering the reads above out of its own
+    // touches the cdylib, the memory ABI or the loader. A plugin answering the reads above out of its own
     // in-process state (rather than Valkey) passes both boots and fails here.
     let direct_task = Vocab::get_task(&direct, &t_live)
         .expect("get_task via the direct connection")
@@ -1388,7 +1440,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 ///
 /// A Valkey deployment reaches this backend ONLY over the plugin seam, and it is the backend a
 /// FLEET reaches for first — so the second-node case below is the ordinary deployment, not an
-/// exotic one. A real `dlopen`, the real C ABI, the real `DynStore`; two simultaneous loads are the
+/// exotic one. A real `dlopen`, the real memory ABI, the real `LoadedStore`; two simultaneous loads are the
 /// fleet, a drop and a reload is the restart, and a third leg reads through the plain `ValkeyStore`
 /// so a plugin answering out of its own in-process state still fails.
 ///
@@ -1434,8 +1486,8 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     };
 
     {
-        // BOOT 1 — a real dlopen of the cdylib; every call below crosses the C ABI.
-        let store = load_store(&path, &cfg).expect("the valkey plugin must load over the real ABI");
+        // BOOT 1 — a real dlopen of the cdylib; every call below crosses the memory ABI.
+        let store = load(&path, &cfg).expect("the valkey plugin must load over the real ABI");
         store
             .put_mcp_demotion(&demotion(&srv_demoted, "tool-drift", NOW))
             .expect("put_mcp_demotion");
@@ -1455,14 +1507,13 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
                 .expect("redeem_ask_state"),
             "the FIRST redemption must be answered `true`, or nothing below is about single use"
         );
-        // Dropping the boxed store runs `busbar_close` and unloads the library, so nothing this
+        // Dropping the boxed store runs `the door's `close`` and unloads the library, so nothing this
         // process still holds can be answering the reads below.
         drop(store);
     }
 
     // BOOT 2 — a second, independent dlopen against the same Valkey.
-    let store =
-        load_store(&path, &cfg).expect("the valkey plugin must load again over the real ABI");
+    let store = load(&path, &cfg).expect("the valkey plugin must load again over the real ABI");
 
     let mine = store
         .list_mcp_demotions()
@@ -1491,7 +1542,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // THE FLEET, which on this backend is the ordinary deployment: a second, simultaneous dlopen
     // against the same Valkey. It shares the signing key, so it shares the seal, and every check but
     // this one passes on both.
-    let node_b = load_store(&path, &cfg).expect("a second node loads the same plugin");
+    let node_b = load(&path, &cfg).expect("a second node loads the same plugin");
     assert!(store
         .redeem_ask_state(&nonce_fleet, NOW + 900, NOW + 2)
         .expect("redeem_ask_state"));
@@ -1515,7 +1566,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     drop(node_b);
 
     // LEG 3 — the same state through the plain `ValkeyStore`, a code path that never touches the
-    // cdylib, the C ABI or the loader. A plugin answering the reads above out of its own in-process
+    // cdylib, the memory ABI or the loader. A plugin answering the reads above out of its own in-process
     // state passes both boots and fails here.
     assert!(
         Vocab::list_mcp_demotions(&direct)

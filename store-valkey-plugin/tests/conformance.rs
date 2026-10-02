@@ -1,128 +1,59 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! **ONE VALKEY STORE, BOTH DOORS, ONE ROW** — the store's linked + dropped-in conformance, run
-//! against the busbar rev this repo pins (`.busbar-ref`).
+//! **ONE VALKEY STORE, BOTH DOORS, ONE TABLE** — the store's linked + dropped-in conformance on the
+//! store kind's memory ABI (store v3), run against the busbar rev this repo pins (`.busbar-ref`).
 //!
-//! The store is held two ways at once: LINKED (its `linked::STORE` statement and boundary, the row a
-//! busbar build that compiles it in registers) and DROPPED IN (this crate's built cdylib, signed
-//! first-party under the SAME statement into a temp `plugins/` directory and found by the loader's
-//! scan). Each arm is opened by the one `open_store`, and driven through the same transcript:
+//! The store is held two ways at once: LINKED (the logic crate's `door`, as a busbar build that
+//! compiles it in registers it: `LinkedRow::of(door)` through the loader's `load_linked`) and
+//! DROPPED IN (this crate's built cdylib, its Statement rendered the way `busbar-plugin-pack`
+//! renders it into the signed manifest, then `dlopen`ed by the loader's `load_dropped`). Each is
+//! bound to its own dispatcher, opened the way the host opens a store (`LoadedStore`), and driven
+//! through the same transcript:
 //!
-//! - the row both doors state, and whether it is first-party;
-//! - the refusals `open` gives for configs that cannot produce a store (malformed JSON, no `url`, a
-//!   URL the driver refuses, an unreachable server) — each in the store's own words, across the door;
+//! - the name its Statement states;
+//! - the refusals the store's own `open` gives for settings that cannot produce a store (no `url`,
+//!   malformed JSON, a URL the driver refuses, an unreachable server) — each in the store's own
+//!   words, across the door;
 //! - against the live Valkey (`VALKEY_URL`): one scenario over every surface a governance store
 //!   answers — a key (mint, read, tombstone, the tombstone guard), a credential (mint, the live-owner
 //!   refusal, lookup, revoke), the usage ledger (additive, floored), metering (the dated split), the
-//!   audit chain (replay, fork), and the plane-record verbs (upsert, chain append, replay, fork,
-//!   listing, parents, terminal-only purge with its cascade, single-use token, live token).
+//!   audit chain (replay, fork), the plane-record verbs (upsert, chain append, replay, fork, listing,
+//!   parents, terminal-only purge with its cascade, single-use token, live token) — and the store v3
+//!   slots (window caps, a whole-cell reserve, its replay, a release, the journal and its replay,
+//!   records, sessions).
 //!
-//! The two transcripts must agree byte for byte. Each arm runs in its own namespace (fresh ids, a
+//! The two transcripts must agree line for line. Each arm runs in its own namespace (fresh ids, a
 //! fresh plane kind), so the arms never read each other's rows; the namespace is replaced by a fixed
 //! token before comparing.
 //!
-//! THE RED ARMS, in the same test:
-//! - the same cdylib signed as `secret` is refused at the kind handshake, naming both kinds;
-//! - a PERTURBED dropped-in arm — the same bytes, the same statement, but its namespace already
-//!   holding a different record at a position the scenario appends to — must NOT produce the linked
-//!   transcript: the comparison above is only worth something if it can see a difference.
+//! THE RED ARMS, each its own test: the library asked for as another kind is refused before it is
+//! opened; a manifest whose Statement is one byte off the library's own is refused; and (live) a
+//! PERTURBED dropped-in arm — its namespace already holding a different record at a position the
+//! scenario appends to — must NOT produce the linked transcript.
 //!
 //! The live leg follows this repo's Valkey gate: skipped locally without `VALKEY_URL`, a HARD
-//! FAILURE under `CI` without it. A missing cdylib is always a failure, never a skip: this test IS the
-//! dropped-in door's proof.
+//! FAILURE under `CI` without it. A missing cdylib is always a failure, never a skip: this test IS
+//! the dropped-in door's proof.
 
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use busbar_contract::abi::sdk::store::{Cap, Cell, CellKey, Dimension};
+use busbar_contract::abi::store::OpId;
+use busbar_contract::kinds::RecordBytes;
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, ModelTokensDelta,
     PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore, SecretForm, UsageDelta, VirtualKey,
 };
-use busbar_plugin_loader::sign::{sign, Manifest, SigningKey, TrustPolicy};
-use busbar_plugin_loader::{LinkedPlugin, PluginRegistry};
-
-/// The release key the dropped-in arm is signed with, and the policy's first-party key.
-fn release() -> SigningKey {
-    SigningKey::from_bytes(&[23u8; 32])
-}
-
-/// The version both arms state (a linked row states its binary's version; here, this crate's).
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
-/// failure, never a skip.
-fn cdylib() -> Vec<u8> {
-    let exe = std::env::current_exe().expect("the test binary has a path");
-    let profile = exe
-        .parent()
-        .and_then(|d| d.parent())
-        .expect("target/<profile>");
-    let file = busbar_plugin_loader::plugin_library_filename("busbar_store_valkey_plugin");
-    let found = [profile.join(&file), profile.join("deps").join(&file)]
-        .into_iter()
-        .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
-        .max()
-        .map(|(_, p)| p)
-        .unwrap_or_else(|| panic!("the busbar-store-valkey-plugin cdylib ({file}) is not built"));
-    std::fs::read(found).expect("read the cdylib")
-}
-
-/// The statement a `kind` row of this store makes, at the newest payload schema the loader speaks
-/// for that kind.
-fn statement(kind: &str, name: &str, alias: &str) -> Manifest {
-    let abi = busbar_plugin_loader::supported_abi(kind)
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or_default();
-    Manifest {
-        name: name.into(),
-        alias: alias.into(),
-        kind: kind.into(),
-        version: VERSION.into(),
-        publisher: busbar_plugin_loader::sign::FIRST_PARTY_PUBLISHER.into(),
-        abi_version: abi,
-        sha256: String::new(),
-        signature: String::new(),
-        description: String::new(),
-        homepage: String::new(),
-        license: String::new(),
-        needs: Default::default(),
-        settings_schema: None,
-        schema_derived: false,
-        host: None,
-        declares: Default::default(),
-    }
-}
-
-/// The LINKED row: exactly what a busbar build that links this store states for `linked::STORE`.
-fn linked_row() -> LinkedPlugin {
-    let (name, alias, entry) = busbar_store_valkey::linked::STORE;
-    LinkedPlugin::boundary(statement("store", name, alias), entry)
-}
-
-/// THE DROPPED-IN DOOR: `lib` signed first-party under `manifest` into a fresh `plugins/`
-/// directory, scanned under a policy holding the release key.
-fn dropped(tag: &str, manifest: Manifest, lib: &[u8]) -> PluginRegistry {
-    let dir = std::env::temp_dir().join(format!("store-valkey-conf-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let signed = sign(&release(), manifest, lib);
-    let tarball = busbar_plugin_loader::tarball::package(&signed, "libstore.so", lib).unwrap();
-    std::fs::write(dir.join("store.tar.gz"), tarball).unwrap();
-    let policy = TrustPolicy {
-        first_party_key: Some(release().verifying_key()),
-        binary_version: VERSION.into(),
-        first_party_floors: Default::default(),
-        first_party_high_water: Default::default(),
-        publishers: Default::default(),
-        allow_unsigned: false,
-        allow_third_party: false,
-        min_versions: Default::default(),
-    };
-    let registry =
-        busbar_plugin_loader::scan_and_validate(&dir, &policy).expect("the signed store scans");
-    let _ = std::fs::remove_dir_all(&dir);
-    registry
-}
+use busbar_contract::store_calls::StoreCalls;
+use busbar_plugin_loader::dispatch::kinds::secret::Secret;
+use busbar_plugin_loader::dispatch::kinds::store::Store;
+use busbar_plugin_loader::dispatch::{
+    load_dropped, load_linked, rendering_of_library, Bind, DispatchConfig, Dispatcher, LinkedRow,
+    NoSink, Plugin,
+};
+use busbar_plugin_loader::store_v3::LoadedStore;
 
 /// The live server, per this repo's gate.
 fn valkey_url() -> Option<String> {
@@ -139,12 +70,94 @@ fn valkey_url() -> Option<String> {
     }
 }
 
-/// `open`'s error, or a note that it opened.
-fn open_refusal(registry: &PluginRegistry, alias: &str, cfg: &str) -> String {
-    match registry.open_store(alias, cfg) {
-        Ok(_) => "opened".into(),
-        Err(e) => e,
+/// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
+/// failure, never a skip.
+fn cdylib() -> PathBuf {
+    let exe = std::env::current_exe().expect("the test binary has a path");
+    let profile = exe
+        .parent()
+        .and_then(|d| d.parent())
+        .expect("target/<profile>");
+    let file = busbar_plugin_loader::plugin_library_filename("busbar_store_valkey_plugin");
+    [profile.join(&file), profile.join("deps").join(&file)]
+        .into_iter()
+        .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
+        .max()
+        .map(|(_, p)| p)
+        .unwrap_or_else(|| panic!("the busbar-store-valkey-plugin cdylib ({file}) is not built"))
+}
+
+/// What a door is bound to: its own dispatcher's adopter, no envelope sink, no connections.
+fn bind(d: &Dispatcher) -> Bind {
+    Bind {
+        instance: Arc::from("store-valkey-conformance"),
+        max_inflight_cap: 64,
+        sink: Arc::new(NoSink),
+        dispatcher: d.adopter(),
+        conns: None,
     }
+}
+
+fn dispatcher() -> Arc<Dispatcher> {
+    Arc::new(Dispatcher::new(DispatchConfig::default()))
+}
+
+/// The library's Statement as `busbar-plugin-pack` renders it into the signed manifest.
+fn packed_rendering(lib: &Path) -> Vec<u8> {
+    rendering_of_library(lib)
+        .expect("the library's door renders")
+        .expect("the library exports a door")
+}
+
+/// One door, loaded one way: a plugin and the dispatcher that adopted it.
+type Loaded = (Plugin<Store>, Arc<Dispatcher>);
+
+/// THE LINKED DOOR: the row a busbar build that compiles this store in registers.
+fn linked() -> Loaded {
+    let d = dispatcher();
+    let row = LinkedRow::of(busbar_store_valkey::door).expect("the door states its Statement");
+    let p = load_linked::<Store>(&row, bind(&d)).expect("the linked door loads");
+    (p, d)
+}
+
+/// THE DROPPED-IN DOOR: the built cdylib against the rendering its manifest would carry.
+fn dropped(lib: &Path, stated: &[u8]) -> Loaded {
+    let d = dispatcher();
+    let p = load_dropped::<Store>(lib, stated, bind(&d)).expect("the dropped-in door loads");
+    (p, d)
+}
+
+fn block<T>(f: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(f)
+}
+
+/// A number no other arm, instance or earlier run uses.
+fn unique() -> u64 {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    (t ^ (u64::from(std::process::id()) << 32))
+        .wrapping_add(N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) << 48)
+        | 1
+}
+
+/// A fresh op id (the dedupe is durable: an op id from an earlier run would replay).
+fn op(counter: u64) -> OpId {
+    OpId::from_parts(unique(), counter * 2 + 1)
+}
+
+/// Open the store through one door (`LoadedStore`, the way the host opens it), on a node id no
+/// other instance uses: the bridge mints op ids as `(node, counter from 0)` and the dedupe is
+/// durable.
+fn open(load: &impl Fn() -> Loaded, settings: &str) -> Result<LoadedStore, String> {
+    let (plugin, dispatcher) = load();
+    LoadedStore::open(plugin, dispatcher, settings.as_bytes(), unique())
 }
 
 /// One `Result` as comparable text: `ok:<debug>` or `err:<message>`.
@@ -157,7 +170,9 @@ fn r<T: std::fmt::Debug, E: std::fmt::Display>(res: Result<T, E>) -> String {
 
 /// The live scenario, in namespace `ns`, through `store`. Every observable the scenario produces is
 /// one line of the returned transcript.
-fn scenario(store: &dyn RecordStore, ns: &str) -> Vec<String> {
+fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
+    // The 1.5.5 op set through the store's `RecordStore` face (the v3 slots below are `StoreCalls`).
+    let store: &dyn RecordStore = loaded;
     let mut t = Vec::new();
     let kind = format!("conf_{ns}");
     let key_id = format!("{ns}_key");
@@ -305,49 +320,29 @@ fn scenario(store: &dyn RecordStore, ns: &str) -> Vec<String> {
             body: body.as_bytes().to_vec(),
         }
     };
-    t.push(r(
-        store.upsert_plane_record(&rec("t1", None, 0, 10, false, "v1"))
-    ));
-    t.push(r(
-        store.upsert_plane_record(&rec("t1", None, 0, 11, false, "v2"))
-    ));
-    t.push(r(
-        store.upsert_plane_record(&rec("t2", None, 0, 12, true, "done"))
-    ));
+    t.push(r(store.upsert_plane_record(
+        rec("t1", None, 0, 10, false, "v1").view(),
+    )));
+    t.push(r(store.upsert_plane_record(
+        rec("t1", None, 0, 11, false, "v2").view(),
+    )));
+    t.push(r(store.upsert_plane_record(
+        rec("t2", None, 0, 12, true, "done").view(),
+    )));
     for (seq, body) in [(2, "e2"), (1, "e1"), (3, "e3")] {
-        t.push(r(store.append_plane_record(&rec(
-            "t1",
-            Some("t1"),
-            seq,
-            20,
-            false,
-            body,
-        ))));
+        t.push(r(store.append_plane_record(
+            rec("t1", Some("t1"), seq, 20, false, body).view(),
+        )));
     }
-    t.push(r(store.append_plane_record(&rec(
-        "t1",
-        Some("t1"),
-        2,
-        20,
-        false,
-        "e2",
-    ))));
-    t.push(r(store.append_plane_record(&rec(
-        "t1",
-        Some("t1"),
-        2,
-        20,
-        false,
-        "FORK",
-    ))));
-    t.push(r(store.append_plane_record(&rec(
-        "p:x",
-        Some("p:x"),
-        1,
-        30,
-        false,
-        "c1",
-    ))));
+    t.push(r(store.append_plane_record(
+        rec("t1", Some("t1"), 2, 20, false, "e2").view(),
+    )));
+    t.push(r(store.append_plane_record(
+        rec("t1", Some("t1"), 2, 20, false, "FORK").view(),
+    )));
+    t.push(r(store.append_plane_record(
+        rec("p:x", Some("p:x"), 1, 30, false, "c1").view(),
+    )));
     let text = |bodies: Vec<Vec<u8>>| {
         bodies
             .into_iter()
@@ -423,188 +418,326 @@ fn scenario(store: &dyn RecordStore, ns: &str) -> Vec<String> {
                 .unwrap(),
         ]
     ));
+    // THE STORE V3 SLOTS, through the door's own table.
+    let bucket = format!("{ns}_cap");
+    let k = CellKey {
+        bucket: &bucket,
+        pool: None,
+        dimension: Dimension::Requests,
+        window_start: 60,
+    };
+    let cells = [Cell { key: k, amount: 2 }, Cell { key: k, amount: 1 }];
+    let stream = format!("{ns}_stream");
+    let schema = format!("{ns}_schema");
+    let principal = format!("{ns}_principal");
+    let session = unique() >> 2;
+    block(async {
+        t.push(format!(
+            "reserve, no cap = {:?}",
+            StoreCalls::reserve(loaded, op(1), 0, &cells).await
+        ));
+        let caps = [Cap {
+            key: k,
+            cap: 3,
+            config_gen: 1,
+        }];
+        t.push(format!(
+            "window_caps = {:?}",
+            StoreCalls::window_caps(loaded, op(2), &caps).await
+        ));
+        let id = op(3);
+        let grants = StoreCalls::reserve(loaded, id, 0, &cells).await;
+        t.push(format!(
+            "reserve = {:?}",
+            grants.as_ref().map(|g| g
+                .iter()
+                .map(|g| (g.granted, g.valid_until_ms))
+                .collect::<Vec<_>>())
+        ));
+        let replay = StoreCalls::reserve(loaded, id, 0, &cells).await;
+        t.push(format!(
+            "replay answers the original grants = {}",
+            replay.as_ref().ok() == grants.as_ref().ok()
+        ));
+        t.push(format!(
+            "reserve past the cap = {:?}",
+            StoreCalls::reserve(loaded, op(4), 0, &cells[1..]).await
+        ));
+        if let Ok(g) = &grants {
+            let items = [(g[0].slice_id, 5)];
+            t.push(format!(
+                "release = {:?}",
+                StoreCalls::slice_release(loaded, op(5), 0, &items).await
+            ));
+        }
+        let rb = |b: &[u8]| RecordBytes::new(b.to_vec()).unwrap();
+        let id = op(6);
+        t.push(format!(
+            "append_batch = {:?}",
+            StoreCalls::append_batch(loaded, id, &stream, &[rb(b"one"), rb(b"two")]).await
+        ));
+        t.push(format!(
+            "append_batch replay = {:?}",
+            StoreCalls::append_batch(loaded, id, &stream, &[rb(b"one"), rb(b"two")]).await
+        ));
+        t.push(format!(
+            "append_batch reused op id = {:?}",
+            StoreCalls::append_batch(loaded, id, &stream, &[rb(b"three")]).await
+        ));
+        t.push(format!(
+            "record_put = {:?}",
+            StoreCalls::record_put(loaded, &schema, b"k", &rb(b"v")).await
+        ));
+        t.push(format!(
+            "record_get = {:?}",
+            StoreCalls::record_get(loaded, &schema, b"k")
+                .await
+                .map(|v| v.map(|v| String::from_utf8_lossy(v.as_slice()).into_owned()))
+        ));
+        t.push(format!(
+            "session_put = {:?}",
+            StoreCalls::session_put(loaded, session, "node-a", &principal).await
+        ));
+        t.push(format!(
+            "sessions_for = {:?}",
+            StoreCalls::sessions_for(loaded, &principal)
+                .await
+                .map(|v| v.into_iter().map(|(_, node)| node).collect::<Vec<_>>())
+        ));
+        t.push(format!(
+            "session_remove = {:?}",
+            StoreCalls::session_remove(loaded, session).await
+        ));
+    });
     t.iter().map(|l| l.replace(ns, "NS")).collect()
 }
 
-/// What one door does with the store's alias, as one comparable transcript.
+/// What one door does, as one comparable transcript. `load` loads the door afresh: a refused
+/// `open` consumes the instance it was offered. `plant` writes through the opened store before the
+/// scenario runs (the perturbed RED arm).
 fn transcript(
-    registry: &PluginRegistry,
-    alias: &str,
+    load: impl Fn() -> Loaded,
     live: Option<(&str, &str)>,
-) -> serde_json::Value {
-    let p = registry.resolve(alias).expect("the alias resolves");
-    let stated = Manifest {
-        sha256: String::new(),
-        signature: String::new(),
-        ..p.manifest.clone()
-    };
-    let refusals = [
-        "{ not json".to_string(),
-        "{}".to_string(),
-        r#"{"url":"not-a-valkey-url"}"#.to_string(),
-        r#"{"url":"redis://127.0.0.1:1/0","connect_timeout_ms":300}"#.to_string(),
-    ]
-    .map(|cfg| open_refusal(registry, alias, &cfg));
-    let scenario = live.map(|(url, ns)| {
-        let store = registry
-            .open_store(alias, &serde_json::json!({ "url": url }).to_string())
+    plant: impl Fn(&LoadedStore, &str),
+) -> Vec<String> {
+    let mut t = vec![format!("name = {}", load().0.name())];
+    for cfg in [
+        "",
+        "{ not json",
+        r#"{"url":"not-a-valkey-url"}"#,
+        r#"{"url":"redis://127.0.0.1:1/0","connect_timeout_ms":300}"#,
+    ] {
+        t.push(format!("open {cfg:?} = {:?}", open(&load, cfg).map(|_| ())));
+    }
+    if let Some((url, ns)) = live {
+        let s = open(&load, &serde_json::json!({ "url": url }).to_string())
             .expect("the store opens against the live Valkey");
-        scenario(store.as_ref(), ns)
-    });
-    serde_json::json!({
-        "row": stated,
-        "first_party": p.first_party(),
-        "refusals": refusals,
-        "scenario": scenario,
-    })
+        t.push(format!("facts = {:?}", s.facts()));
+        plant(&s, ns);
+        t.extend(scenario(&s, ns));
+    }
+    t
+}
+
+/// The two transcripts are equal, line for line; a divergence names its first line.
+fn same(linked: &[String], dropped: &[String]) {
+    for (i, (a, b)) in linked.iter().zip(dropped).enumerate() {
+        assert_eq!(
+            a, b,
+            "the two doors diverge at line {i}:\n linked:     {a}\n dropped in: {b}"
+        );
+    }
+    assert_eq!(
+        linked.len(),
+        dropped.len(),
+        "the two doors ran different scripts"
+    );
 }
 
 /// A fresh namespace for one arm.
 fn ns(arm: &str) -> String {
-    format!(
-        "vkconf{arm}{}x{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-            % 1_000_000_000
-    )
+    format!("vkconf{arm}{:x}", unique())
 }
 
-/// The Valkey store registers ONE row and behaves as ONE store through either door — and neither a
-/// wrong-kind signing nor a perturbed store passes for it (the RED arms).
+/// The Valkey store behaves as ONE store through either door, and the dropped-in library states the
+/// linked door's Statement byte for byte.
 #[test]
 fn the_linked_and_the_dropped_in_valkey_store_are_one_store() {
-    let row = linked_row();
-    let (manifest, alias) = (row.manifest.clone(), row.manifest.alias.clone());
-    assert_eq!(manifest.name, "busbar-store-valkey");
-    assert_eq!(alias, "valkey");
-    let lib = cdylib();
     let url = valkey_url();
+    let lib = cdylib();
+    let stated = packed_rendering(&lib);
+    assert_eq!(
+        stated,
+        LinkedRow::of(busbar_store_valkey::door)
+            .expect("the linked row")
+            .statement,
+        "the dropped-in library states the linked door's Statement byte for byte"
+    );
 
-    let linked_registry = PluginRegistry::empty().link(vec![row]).unwrap();
-    let ns_linked = ns("l");
+    let (ns_l, ns_d) = (ns("l"), ns("d"));
     let linked = transcript(
-        &linked_registry,
-        &alias,
-        url.as_deref().map(|u| (u, ns_linked.as_str())),
+        linked,
+        url.as_deref().map(|u| (u, ns_l.as_str())),
+        |_, _| {},
     );
-    let dropped_registry = dropped("dropped", manifest.clone(), &lib);
-    let ns_dropped = ns("d");
     let dropped_in = transcript(
-        &dropped_registry,
-        &alias,
-        url.as_deref().map(|u| (u, ns_dropped.as_str())),
+        || dropped(&lib, &stated),
+        url.as_deref().map(|u| (u, ns_d.as_str())),
+        |_, _| {},
     );
-    assert_eq!(linked, dropped_in, "the two doors are not one store");
+    same(&linked, &dropped_in);
+    assert_eq!(linked[0], format!("name = {}", busbar_store_valkey::NAME));
 
     // The transcript is about the store, not about nothing: the refusals are the store's own words,
     // and (live) the scenario did what a governance store is for.
-    let refusals = linked["refusals"].as_array().unwrap();
+    assert!(linked[1].contains("requires a \\\"url\\\""), "{linked:#?}");
     assert!(
-        refusals[0]
-            .as_str()
-            .unwrap()
-            .contains("invalid valkey plugin config"),
-        "{refusals:?}"
+        linked[2].contains("invalid valkey plugin config"),
+        "{linked:#?}"
     );
     assert!(
-        refusals[1].as_str().unwrap().contains("requires a \"url\""),
-        "{refusals:?}"
+        linked[3].contains("valkey plugin: failed to connect"),
+        "{linked:#?}"
     );
     assert!(
-        refusals[2]
-            .as_str()
-            .unwrap()
-            .contains("valkey plugin: failed to connect"),
-        "{refusals:?}"
+        linked[4].contains("valkey plugin: failed to connect"),
+        "{linked:#?}"
     );
-    assert!(
-        refusals[3]
-            .as_str()
-            .unwrap()
-            .contains("valkey plugin: failed to connect"),
-        "{refusals:?}"
-    );
-    assert_eq!(linked["first_party"], true);
     if url.is_some() {
-        let lines: Vec<String> = linked["scenario"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect();
-        let has = |needle: &str| lines.iter().any(|l| l.contains(needle));
+        let has = |needle: &str| linked.iter().any(|l| l.contains(needle));
+        let find = |p: &str| {
+            linked
+                .iter()
+                .find(|l| l.starts_with(p))
+                .unwrap_or_else(|| panic!("no {p} line in {linked:#?}"))
+                .clone()
+        };
+        assert!(find("facts").contains("ephemeral: false"), "{linked:#?}");
         assert!(
             has("does not exist; a credential must hang off a real key"),
-            "{lines:?}"
+            "{linked:#?}"
         );
         assert!(
             has("is tombstoned and its id is never reissued"),
-            "{lines:?}"
+            "{linked:#?}"
         );
-        assert!(has("the chain has forked"), "{lines:?}");
-        assert!(has("the audit chain has forked"), "{lines:?}");
-        assert!(has(r#"chain:["e1", "e2", "e3"]"#), "{lines:?}");
-        assert!(has(r#"parents:["p:x", "t1"]"#), "{lines:?}");
-        assert!(has("live:[true, false, false]"), "{lines:?}");
+        assert!(has("the chain has forked"), "{linked:#?}");
+        assert!(has("the audit chain has forked"), "{linked:#?}");
+        assert!(has(r#"chain:["e1", "e2", "e3"]"#), "{linked:#?}");
+        assert!(has(r#"parents:["p:x", "t1"]"#), "{linked:#?}");
+        assert!(has("live:[true, false, false]"), "{linked:#?}");
         assert!(
             has("purge:5"),
             "a kind other than `task` drops EVERY row older than the cutoff (t1, t2, e1-e3): \
-             {lines:?}"
+             {linked:#?}"
         );
-        assert!(has("redeem:[true, false]"), "{lines:?}");
-        assert!(has("metering:[(0, 2, 6"), "{lines:?}");
+        assert!(has("redeem:[true, false]"), "{linked:#?}");
+        assert!(has("metering:[(0, 2, 6"), "{linked:#?}");
+        assert!(find("reserve, no cap").contains("NoCap"), "{linked:#?}");
+        assert_eq!(
+            find("reserve ="),
+            format!("reserve = Ok([(2, {m}), (1, {m})])", m = u64::MAX)
+        );
+        assert!(find("replay").ends_with("true"), "{linked:#?}");
+        assert!(find("reserve past").contains("Exhausted"), "{linked:#?}");
+        assert_eq!(find("release"), "release = Ok([2])");
+        assert!(
+            find("append_batch =").contains("seq: 2, epoch: 0"),
+            "{linked:#?}"
+        );
+        assert_eq!(
+            find("append_batch replay"),
+            find("append_batch =").replace("append_batch =", "append_batch replay =")
+        );
+        assert_eq!(
+            find("append_batch reused"),
+            "append_batch reused op id = Err(Conflict)"
+        );
+        assert_eq!(find("record_get"), "record_get = Ok(Some(\"v\"))");
+        assert_eq!(find("sessions_for"), "sessions_for = Ok([\"node-a\"])");
     }
+}
 
-    // RED ARM 1: the same bytes signed as another kind are refused at the kind handshake.
-    let wrong = dropped(
-        "as-secret",
-        statement("secret", "busbar-store-valkey", "valkey-as-secret"),
-        &lib,
+/// RED ARM (live): a PERTURBED dropped-in store — its namespace already holds a different record at
+/// a chain position the scenario appends to — must not reproduce the linked transcript. Without a
+/// server the perturbation is the settings: an unreachable server is another store.
+#[test]
+fn a_perturbed_dropped_in_store_does_not_pass_for_the_linked_one() {
+    let url = valkey_url();
+    let lib = cdylib();
+    let stated = packed_rendering(&lib);
+    let (ns_l, ns_r) = (ns("l"), ns("r"));
+    let linked = transcript(
+        linked,
+        url.as_deref().map(|u| (u, ns_l.as_str())),
+        |_, _| {},
     );
-    let e = match wrong.open_secret("valkey-as-secret", "{}") {
-        Ok(_) => panic!("a store library signed as secret opened; it must be refused"),
-        Err(e) => e,
-    };
-    assert!(
-        e.contains("exports kind 'store' but is being loaded as 'secret'"),
-        "the handshake refusal must name both kinds: {e}"
-    );
-
-    // RED ARM 2: a PERTURBED dropped-in store — its namespace already holds a different record at a
-    // chain position the scenario appends to — must not reproduce the linked transcript. Server-free,
-    // the perturbation is the statement: the same bytes under another alias are another row.
     let red = match url.as_deref() {
-        Some(u) => {
-            let ns_red = ns("r");
-            let direct = dropped_registry
-                .open_store(&alias, &serde_json::json!({ "url": u }).to_string())
-                .unwrap();
-            direct
-                .append_plane_record(&PlaneRecord {
-                    kind: format!("conf_{ns_red}"),
-                    id: "t1".into(),
-                    parent: Some("t1".into()),
-                    seq: 3,
-                    ts: 20,
-                    disposition: PlaneDisposition::Active,
-                    body: b"planted".to_vec(),
-                })
-                .unwrap();
-            transcript(&dropped_registry, &alias, Some((u, ns_red.as_str())))
-        }
+        Some(u) => transcript(
+            || dropped(&lib, &stated),
+            Some((u, ns_r.as_str())),
+            |s, ns| {
+                RecordStore::append_plane_record(
+                    s,
+                    PlaneRecord {
+                        kind: format!("conf_{ns}"),
+                        id: "t1".into(),
+                        parent: Some("t1".into()),
+                        seq: 3,
+                        ts: 20,
+                        disposition: PlaneDisposition::Active,
+                        body: b"planted".to_vec(),
+                    }
+                    .view(),
+                )
+                .expect("plant a rival record");
+            },
+        ),
         None => {
-            let other = Manifest {
-                alias: "valkey-red".into(),
-                ..manifest
-            };
-            transcript(&dropped("red", other, &lib), "valkey-red", None)
+            let mut t = transcript(|| dropped(&lib, &stated), None, |_, _| {});
+            t.push(format!(
+                "open unreachable = {:?}",
+                open(
+                    &|| dropped(&lib, &stated),
+                    r#"{"url":"redis://127.0.0.1:2/0","connect_timeout_ms":300}"#
+                )
+                .map(|_| ())
+            ));
+            t
         }
     };
     assert_ne!(
         red, linked,
         "a perturbed store must not pass for the linked one"
     );
+}
+
+/// RED ARM: the library asked for as another kind is refused before it is opened.
+#[test]
+fn a_store_library_asked_for_as_a_secret_is_refused() {
+    let lib = cdylib();
+    let stated = packed_rendering(&lib);
+    let d = dispatcher();
+    let e = match load_dropped::<Secret>(&lib, &stated, bind(&d)) {
+        Ok(_) => panic!("a store library loaded as secret"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        e.contains("the manifest states kind Store, not Secret"),
+        "{e}"
+    );
+}
+
+/// RED ARM: a manifest whose Statement is one byte off the library's own is refused.
+#[test]
+fn a_statement_one_byte_off_is_refused() {
+    let lib = cdylib();
+    let mut other = packed_rendering(&lib);
+    other.push(0);
+    let d = dispatcher();
+    let e = match load_dropped::<Store>(&lib, &other, bind(&d)) {
+        Ok(_) => panic!("a library loaded under a Statement that is not its own"),
+        Err(e) => e.to_string(),
+    };
+    assert!(e.contains("repack the plugin"), "{e}");
 }

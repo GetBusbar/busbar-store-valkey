@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! **THE PLANE-RECORD KEYSPACE (busbar 1.6.0).** The eight kind-tagged verbs over an opaque
-//! [`PlaneRecord`], plus [`RecordStore::plane_token_live`](busbar_contract::records::RecordStore).
+//! [`PlaneRecord`](busbar_contract::records::PlaneRecord), plus [`RecordStore::plane_token_live`](busbar_contract::records::RecordStore).
 //!
 //! ## Layout
 //!
@@ -38,8 +38,10 @@
 //! still orders correctly.
 
 use crate::{clamp, hex, ValkeyStore};
+use busbar_contract::abi::sdk::store::{OpRefused, OpResult};
+use busbar_contract::abi::store::OP_ID_RETENTION_SECS;
 use busbar_contract::records::{
-    PlaneDisposition, PlaneRecord, PlaneSelector, RecordStoreError, RecordStoreResult,
+    PlaneDisposition, PlaneRecordRef, PlaneSelector, RecordStoreError, RecordStoreResult,
 };
 use redis::Commands;
 
@@ -95,8 +97,8 @@ fn parse_field(f: &str) -> Option<(u64, &str)> {
 }
 
 /// A chain position is `(parent, seq)`; a top-level record is its own `id` at `seq`.
-fn identity(record: &PlaneRecord) -> &str {
-    record.parent.as_deref().unwrap_or(&record.id)
+fn identity<'a>(record: &PlaneRecordRef<'a>) -> &'a str {
+    record.parent.unwrap_or(record.id)
 }
 
 /// THE TYPED SIDECAR — everything about a record except its body, as ONE deterministic string.
@@ -106,7 +108,7 @@ fn identity(record: &PlaneRecord) -> &str {
 /// terminal-only purge reads). Then the JSON of `{id, parent, seq, ts}` — every field that identifies
 /// or orders the record. Deterministic, so a byte comparison of two sidecars is a comparison of the
 /// records they describe (the append fork check).
-fn sidecar(record: &PlaneRecord) -> RecordStoreResult<String> {
+fn sidecar(record: &PlaneRecordRef<'_>) -> RecordStoreResult<String> {
     #[derive(serde::Serialize)]
     struct Sidecar<'a> {
         id: &'a str,
@@ -115,8 +117,8 @@ fn sidecar(record: &PlaneRecord) -> RecordStoreResult<String> {
         ts: u64,
     }
     let json = serde_json::to_string(&Sidecar {
-        id: &record.id,
-        parent: record.parent.as_deref(),
+        id: record.id,
+        parent: record.parent,
         seq: record.seq,
         ts: record.ts,
     })
@@ -173,6 +175,38 @@ static APPEND: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| 
         end
         write(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5],
               ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6])
+        return 0"
+    ))
+});
+
+/// APPEND UNDER AN `op_id` (`slots`): [`APPEND`], deduped on the op's record. `KEYS` as
+/// [`APPEND`], then `KEYS[6]` = the op's record (a hash: `b` = the op's value fields, `a` = its
+/// answer); `ARGV` as [`APPEND`], then `ARGV[7]` = the op's value fields, `ARGV[8]` = the record's
+/// lifetime in seconds. Returns `0` = written, or nothing to write (the op replayed, or the
+/// identical record already at the position); `1` = a fork; `2` = the op id was used with different
+/// value fields. Only a write records the op, in the same script, so the record and the write are
+/// one step: neither is ever seen without the other.
+static APPEND_OP: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
+    redis::Script::new(&format!(
+        "{LUA_WRITE}
+        local prior = redis.call('HGET', KEYS[6], 'b')
+        if prior then
+            if prior == ARGV[7] then
+                return 0
+            end
+            return 2
+        end
+        local old = redis.call('HGET', KEYS[1], ARGV[1])
+        if old then
+            if old == ARGV[2] and redis.call('HGET', KEYS[2], ARGV[1]) == ARGV[3] then
+                return 0
+            end
+            return 1
+        end
+        write(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5],
+              ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6])
+        redis.call('HSET', KEYS[6], 'b', ARGV[7], 'a', '')
+        redis.call('EXPIRE', KEYS[6], ARGV[8])
         return 0"
     ))
 });
@@ -253,12 +287,12 @@ fn write_script<T: redis::FromRedisValue>(
 fn put(
     store: &ValkeyStore,
     script: &redis::Script,
-    record: &PlaneRecord,
+    record: PlaneRecordRef<'_>,
 ) -> RecordStoreResult<i64> {
-    let keys = Keys::of(&record.kind);
-    let ident = identity(record);
+    let keys = Keys::of(record.kind);
+    let ident = identity(&record);
     let f = field(record.seq, ident);
-    let side = sidecar(record)?;
+    let side = sidecar(&record)?;
     let idx = keys.idx(ident);
     write_script(store, |c| {
         script
@@ -269,7 +303,7 @@ fn put(
             .key(&keys.pcount)
             .arg(&f)
             .arg(&side)
-            .arg(record.body.as_slice())
+            .arg(record.body)
             .arg(clamp(record.ts))
             .arg(clamp(record.seq))
             .arg(ident)
@@ -279,7 +313,7 @@ fn put(
 
 /// `upsert_plane_record`: UPSERT BY position — a second write for one record replaces it, never
 /// stands a rival beside it.
-pub(crate) fn upsert(store: &ValkeyStore, record: &PlaneRecord) -> RecordStoreResult<()> {
+pub(crate) fn upsert(store: &ValkeyStore, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
     put(store, &UPSERT, record).map(|_| ())
 }
 
@@ -287,22 +321,70 @@ pub(crate) fn upsert(store: &ValkeyStore, record: &PlaneRecord) -> RecordStoreRe
 /// the at-least-once write-through retrying, and is success with no write; a DIFFERENT record there
 /// is two records claiming one chain position — a forked or tampered log — and is an error that
 /// leaves the stored record standing. The same settlement `append_audit` makes.
-pub(crate) fn append(store: &ValkeyStore, record: &PlaneRecord) -> RecordStoreResult<()> {
+pub(crate) fn append(store: &ValkeyStore, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
     match put(store, &APPEND, record)? {
         0 => Ok(()),
-        // Names the position and nothing else — never stored (or caller) content.
-        _ => Err(RecordStoreError(format!(
-            "append_plane_record: kind '{}' already holds a different record at sequence {} of \
-             this chain; the chain has forked",
-            record.kind, record.seq
-        ))),
+        _ => Err(fork(&record)),
+    }
+}
+
+/// The fork refusal: names the position and nothing else — never stored (or caller) content.
+fn fork(record: &PlaneRecordRef<'_>) -> RecordStoreError {
+    RecordStoreError(format!(
+        "append_plane_record: kind '{}' already holds a different record at sequence {} of \
+         this chain; the chain has forked",
+        record.kind, record.seq
+    ))
+}
+
+/// `append_plane_record` under an `op_id` ([`APPEND_OP`]): `op_key` is the op's record, `body` its
+/// value fields. A replay or the identical record is `Ok` with nothing written; a different record
+/// at the position is the fork [`append`] refuses; the op id used with different value fields is a
+/// conflict.
+pub(crate) fn append_op(
+    store: &ValkeyStore,
+    op_key: &str,
+    body: &str,
+    record: PlaneRecordRef<'_>,
+) -> OpResult<()> {
+    let keys = Keys::of(record.kind);
+    let ident = identity(&record);
+    let f = field(record.seq, ident);
+    let side = sidecar(&record).map_err(|e| OpRefused::Failed(e.0))?;
+    let idx = keys.idx(ident);
+    let answer: i64 = write_script(store, |c| {
+        APPEND_OP
+            .key(&keys.rec)
+            .key(&keys.body)
+            .key(&keys.byts)
+            .key(&idx)
+            .key(&keys.pcount)
+            .key(op_key)
+            .arg(&f)
+            .arg(&side)
+            .arg(record.body)
+            .arg(clamp(record.ts))
+            .arg(clamp(record.seq))
+            .arg(ident)
+            .arg(body)
+            .arg(OP_ID_RETENTION_SECS)
+            .invoke(c)
+    })
+    .map_err(|e| OpRefused::Failed(e.0))?;
+    match answer {
+        0 => Ok(()),
+        1 => Err(OpRefused::Failed(fork(&record).0)),
+        _ => Err(OpRefused::Conflict),
     }
 }
 
 /// Append `record` only if its position is EMPTY; an occupied one (identical or not) is left as it
 /// is. The v6 → v7 migration's write: a record already in the plane keyspace is newer than any v6 row
 /// could be, and is never overwritten by one.
-pub(crate) fn append_if_absent(store: &ValkeyStore, record: &PlaneRecord) -> RecordStoreResult<()> {
+pub(crate) fn append_if_absent(
+    store: &ValkeyStore,
+    record: PlaneRecordRef<'_>,
+) -> RecordStoreResult<()> {
     put(store, &APPEND, record).map(|_| ())
 }
 
@@ -324,7 +406,7 @@ type ChainRead = (Vec<String>, Vec<Option<String>>, Vec<Option<Vec<u8>>>);
 pub(crate) fn list(
     store: &ValkeyStore,
     kind: &str,
-    selector: &PlaneSelector,
+    selector: &PlaneSelector<'_>,
 ) -> RecordStoreResult<Vec<Vec<u8>>> {
     let keys = Keys::of(kind);
     let mut rows: Vec<(u64, String, Vec<u8>)> = match selector {

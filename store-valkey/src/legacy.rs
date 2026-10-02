@@ -132,7 +132,7 @@ pub(crate) fn migrate_v6_to_v7(store: &ValkeyStore) -> RecordStoreResult<()> {
             let e: rows::TaskEvent = decode("task event", &key, &raw)?;
             plane::append_if_absent(
                 store,
-                &PlaneRecord {
+                PlaneRecord {
                     kind: KIND_TASK_EVENT.into(),
                     id: e.task_id.clone(),
                     parent: Some(e.task_id.clone()),
@@ -140,7 +140,8 @@ pub(crate) fn migrate_v6_to_v7(store: &ValkeyStore) -> RecordStoreResult<()> {
                     ts: e.ts,
                     disposition: PlaneDisposition::Active,
                     body: encode(&e)?,
-                },
+                }
+                .view(),
             )?;
         }
         store.with_conn(|c| c.del::<_, ()>(&key))?;
@@ -157,7 +158,7 @@ pub(crate) fn migrate_v6_to_v7(store: &ValkeyStore) -> RecordStoreResult<()> {
             };
             plane::append_if_absent(
                 store,
-                &PlaneRecord {
+                PlaneRecord {
                     kind: KIND_TASK.into(),
                     id: t.task_id.clone(),
                     parent: None,
@@ -165,7 +166,8 @@ pub(crate) fn migrate_v6_to_v7(store: &ValkeyStore) -> RecordStoreResult<()> {
                     ts: t.updated_at,
                     disposition,
                     body: encode(&t)?,
-                },
+                }
+                .view(),
             )?;
         }
         store.with_conn(|c| c.del::<_, ()>(&key))?;
@@ -177,7 +179,7 @@ pub(crate) fn migrate_v6_to_v7(store: &ValkeyStore) -> RecordStoreResult<()> {
         let d: rows::Demotion = decode("demotion", MCP_DEMOTIONS_HASH, &raw)?;
         plane::append_if_absent(
             store,
-            &PlaneRecord {
+            PlaneRecord {
                 kind: KIND_DEMOTION.into(),
                 id: server,
                 parent: None,
@@ -185,7 +187,8 @@ pub(crate) fn migrate_v6_to_v7(store: &ValkeyStore) -> RecordStoreResult<()> {
                 ts: d.recorded_at,
                 disposition: PlaneDisposition::Active,
                 body: encode(&d)?,
-            },
+            }
+            .view(),
         )?;
     }
     store.with_conn(|c| c.del::<_, ()>(MCP_DEMOTIONS_HASH))?;
