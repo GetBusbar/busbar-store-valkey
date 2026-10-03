@@ -238,7 +238,9 @@ fn urls_parse_as_the_upstream_driver_read_them() {
     );
     assert!(parse_url("redis://h/?protocol=resp3").is_ok());
     // `#insecure` is the one fragment a TLS URL takes; any other is refused in the driver's words.
-    assert!(parse_url("rediss://h:6380/#insecure").unwrap().tls);
+    let t = parse_url("rediss://h:6380/#insecure").unwrap();
+    assert!(t.tls && t.insecure);
+    assert!(!parse_url("rediss://h:6380/").unwrap().insecure);
     assert_eq!(
         parse_url("rediss://h/#other").unwrap_err().to_string(),
         "only #insecure is supported as URL fragment - InvalidClientConfig"
@@ -3806,4 +3808,60 @@ fn connect_timeout_ms_bounds_the_handshake_after_the_dial() {
         );
         assert!(!err.contains("pw"), "the password is scrubbed: {err}");
     }
+}
+
+/// A SELF-SIGNED `127.0.0.1` certificate (no CA anyone trusts): the server config.
+fn self_signed_tls_server() -> Arc<rustls::ServerConfig> {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![cert.der().clone()],
+        rustls_pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+    )
+    .unwrap();
+    Arc::new(config)
+}
+
+/// `#insecure` (ARCHITECT ruling 2026-10-03 on Q-L16-4): a server whose certificate is
+/// self-signed refuses the load over `rediss://` in the store's words, and is accepted over
+/// `rediss://…#insecure`, its certificate unverified as 1.5.5's driver left it; the kept
+/// connection carries the ops.
+#[test]
+fn rediss_insecure_skips_certificate_verification() {
+    if live_store().is_none() {
+        return;
+    }
+    let proxy = Proxy::start(Front::Tls(self_signed_tls_server()));
+    let port = proxy.at.rsplit_once(':').unwrap().1.to_string();
+    let (_, db, userinfo) = live_parts();
+    let verified = format!("rediss://{userinfo}127.0.0.1:{port}/{db}");
+    let (refused, _) = open_on(&settings_for(&verified), plain);
+    let err = refused.expect_err("a self-signed certificate is not trusted");
+    assert!(
+        err.starts_with(
+            "plugin 'busbar-store-valkey' open failed: valkey plugin: failed to connect: valkey \
+             connect: "
+        ),
+        "{err}"
+    );
+    let (store, _) = open_on(&settings_for(&format!("{verified}#insecure")), plain);
+    let store = store.expect("#insecure accepts the self-signed certificate");
+    let id = uid("vk_insecure");
+    store.put_key(&vk(&id)).unwrap();
+    assert!(store.get_key(&id).unwrap().is_some());
+    assert_eq!(
+        proxy.accepted(),
+        2,
+        "the refused dial, then one kept connection"
+    );
+    let _ = store.purge_key_for_test(&id);
 }
