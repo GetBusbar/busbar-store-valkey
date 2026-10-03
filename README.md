@@ -105,9 +105,12 @@ directory of this repository.
 
 The store holds **no socket and no TLS stack of its own**: it declares one
 outbound `tcp` need and speaks RESP2 over the connection busbar's connector
-dials, secures and wakes for it. Every store op is one connection (dial, `AUTH`,
-`SELECT`, its commands), closed when the op answers; a read that has nothing yet
-pends on the op's ticket instead of blocking a thread. `open` only parses the
+dials, secures and wakes for it. Like 1.5.5's one mutex-guarded connection, the
+store keeps ONE connection across ops (dialled, secured, `AUTH`, `SELECT` once);
+ops take it in turn, and a read that has nothing yet pends on the op's ticket
+instead of blocking a thread. 1.5.5's reconnect-and-retry is kept: a dropped
+connection is re-dialled and a read (or idempotent write) retried once on the
+fresh one; the non-idempotent writes are never replayed. `open` only parses the
 settings; its connect step makes the first connection, migrates the schema and
 checks `maxmemory-policy noeviction`, so an unreachable or misconfigured server
 still refuses the store at boot, in the store's own words.
@@ -123,8 +126,8 @@ config, mirroring how the Postgres store plugin receives its libpq URL:
 
 | Setting | Required | Notes |
 |---|---|---|
-| `url` | yes | A `redis://` or `rediss://` (TLS) connection string (`valkey://` / `valkeys://` read the same): `[user[:password]@]host[:port][/db]`. TLS is busbar's connector's (its trust anchors); a unix-socket URL is refused (the connector dials TCP). |
-| `connect_timeout_ms` | no | Validated and accepted for 1.5.5 settings compatibility. The dial is bounded by the store's need timeout (10s, 1.5.5's default) and by the op's deadline. |
+| `url` | yes | A `redis://` or `rediss://` (TLS) connection string (`valkey://` / `valkeys://` read the same): `[user[:password]@]host[:port][/db]`, or a unix-socket URL (`unix://`, `redis+unix://`, `valkey+unix://` `/path?db=N&user=U&pass=P`). TLS is busbar's connector's (its trust anchors, always verified: `#insecure` is accepted and the certificate is still checked). |
+| `connect_timeout_ms` | no | Every dial's timeout (default 10000, 1.5.5's). The handshake after the dial (TLS, `AUTH`, `SELECT`) is bounded by the op's deadline. |
 
 ## Build
 

@@ -289,7 +289,7 @@ async fn put(
     let f = field(record.seq, ident);
     let side = sidecar(&record)?;
     let idx = keys.idx(ident);
-    with_conn!(store, |c| {
+    with_conn_no_retry!(store, |c| {
         script
             .key(&keys.rec)
             .key(&keys.body)
@@ -342,7 +342,7 @@ pub(crate) async fn append_op(
     let f = field(record.seq, ident);
     let side = sidecar(&record).map_err(|e| OpRefused::Failed(e.0))?;
     let idx = keys.idx(ident);
-    let answer: i64 = with_conn!(store, |c| {
+    let answer: i64 = with_conn_no_retry!(store, |c| {
         APPEND_OP
             .key(&keys.rec)
             .key(&keys.body)
@@ -493,7 +493,7 @@ pub(crate) async fn purge_before(
     let keys = Keys::of(kind);
     let cascade = (kind == CASCADING_KIND).then(|| Keys::of(CASCADED_KIND));
     let terminal_only = if kind == CASCADING_KIND { "1" } else { "0" };
-    let removed: i64 = with_conn!(store, |c| {
+    let removed: i64 = with_conn_no_retry!(store, |c| {
         let mut inv = PURGE.key(&keys.rec);
         inv.key(&keys.body).key(&keys.byts).key(&keys.pcount);
         match &cascade {
@@ -529,7 +529,7 @@ pub(crate) async fn delete(
 ) -> RecordStoreResult<()> {
     let keys = Keys::of(kind);
     let idx = keys.idx(id);
-    with_conn!(store, |c| {
+    with_conn_no_retry!(store, |c| {
         DELETE
             .key(&keys.rec)
             .key(&keys.body)
@@ -576,7 +576,7 @@ pub(crate) async fn redeem_token(
 ) -> RecordStoreResult<bool> {
     let ttl = expires_at.saturating_sub(now).clamp(1, MAX_TOKEN_TTL_SECS);
     let key = token_key(kind, token);
-    let set: Option<String> = with_conn!(store, |c| {
+    let set: Option<String> = with_conn_no_retry!(store, |c| {
         cmd("SET")
             .arg(&key)
             .arg(expires_at)

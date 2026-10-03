@@ -72,17 +72,21 @@
 //!
 //! ## Connections, TLS, reconnect
 //!
-//! Every op is ONE connection through the host's connector (the store SDK's `wire::drive`): the
-//! host dials the URL's `host:port` for the store's one declared `tcp` need (egress class
-//! operator-infrastructure), secures it for `rediss://` (the connector's TLS, the need's trust),
-//! and the store sends `AUTH` / `SELECT` as the URL says, then its commands; each read that has
-//! nothing yet PENDS on the op's ticket and is resumed on the connector's wake. The connection is
-//! closed when the op answers. So the 1.5.5 one-shot reconnect-and-retry for idempotent reads is
-//! subsumed (every op starts on a fresh connection), and a non-idempotent write is never replayed
-//! (a lost reply fails the op; its caller retries under the same `op_id`). `open` parses the
-//! settings only; its connect step (`StoreSlots::connect`) makes the first connection, migrates the
-//! schema and checks `noeviction`, so an unreachable or misconfigured server still refuses the load
-//! at boot in the store's own words. Error strings are scrubbed of the URL password.
+//! The store reaches the server through the host's connector (the store SDK's `wire`): the host
+//! dials the URL's `host:port` (or, for a unix-socket URL, its path as `unix:<path>`) for the store's
+//! one declared `tcp` need (egress class operator-infrastructure), secures it for `rediss://` (the
+//! connector's TLS and trust), and the store sends `AUTH` / `SELECT` as the URL says, then its
+//! commands; a read that has nothing yet PENDS on the op's ticket and is resumed on the connector's
+//! wake. Like 1.5.5's one mutex-guarded connection, the store KEEPS one connection across ops
+//! (`wire::Pool` of one, ARCHITECT ruling STORE-KEEP): the handshake runs once per connection, and
+//! ops queue for it. 1.5.5's reconnect-and-retry is kept call for call: a connection-level failure
+//! on a `with_conn!` call (reads and the idempotent writes, as 1.5.5's `with_conn`) closes the
+//! connection and re-runs that call ONCE on a fresh one; the `with_conn_no_retry!` calls (the
+//! non-idempotent writes 1.5.5 never replayed) fail instead, and the next op dials fresh.
+//! `connect_timeout_ms` bounds every dial. `open` parses the settings only; its connect step
+//! (`StoreSlots::connect`) makes the first connection, migrates the schema and checks `noeviction`,
+//! so an unreachable or misconfigured server still refuses the load at boot in the store's own
+//! words. Error strings are scrubbed of the URL password.
 //!
 //! ## Data growth (documented, deliberate)
 //!
@@ -93,7 +97,7 @@
 
 #![forbid(unsafe_code)]
 
-use busbar_contract::abi::sdk::store::wire::Wire;
+use busbar_contract::abi::sdk::store::wire::{Pool, Wire};
 use busbar_contract::records::MeteringDelta;
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringRow, ModelTokens, PlaneRecordRef,
@@ -110,9 +114,45 @@ mod resp;
 
 /// `self.with_conn(|c| EXPR)` over the blocking client, now: `EXPR` on the op's one connection
 /// `c`, its failure in the store's words (`valkey command: …`, the URL password scrubbed).
+///
+/// As 1.5.5's `with_conn`: a CONNECTION-LEVEL failure closes the connection and runs `EXPR` once
+/// more on a fresh one (its failure then reads `valkey reconnect after drop: …` /
+/// `valkey retry after reconnect: …`); any other failure clears a `WATCH` it left in force, as
+/// 1.5.5's did before the connection went back to the next caller.
 macro_rules! with_conn {
     ($me:expr, |$c:ident| $e:expr $(,)?) => {
-        $me.ck($crate::resp::rr(async { $e }).await)
+        match $crate::resp::rr(async { $e }).await {
+            Ok(v) => Ok(v),
+            Err(err) if err.is_connection_error() => match $me.reconnect(&mut *$c).await {
+                Err(e2) => Err($me.err(e2, "reconnect after drop")),
+                Ok(()) => $crate::resp::rr(async { $e })
+                    .await
+                    .map_err(|e2| $me.err(e2, "retry after reconnect")),
+            },
+            Err(err) => {
+                if $c.watching() {
+                    let _ = $crate::resp::cmd("UNWATCH").exec(&mut *$c).await;
+                }
+                Err($me.err(err, "command"))
+            }
+        }
+    };
+}
+
+/// 1.5.5's `with_conn_no_retry`: `EXPR` once, never replayed (a non-idempotent write whose lost
+/// reply may have applied); a connection-level failure leaves the connection unfit, and the next op
+/// dials fresh.
+macro_rules! with_conn_no_retry {
+    ($me:expr, |$c:ident| $e:expr $(,)?) => {
+        match $crate::resp::rr(async { $e }).await {
+            Ok(v) => Ok(v),
+            Err(err) => {
+                if !err.is_connection_error() && $c.watching() {
+                    let _ = $crate::resp::cmd("UNWATCH").exec(&mut *$c).await;
+                }
+                Err($me.err(err, "command"))
+            }
+        }
     };
 }
 
@@ -424,7 +464,8 @@ const ADD_FLOORED_LUA: &str = r"
 /// What the store connects to, parsed once from its settings' URL.
 #[derive(Debug, Clone)]
 struct Target {
-    /// `host:port`, the connection's target on the host's connector.
+    /// The connection's target on the host's connector: `host:port`, or `unix:<path>` for a
+    /// unix-socket URL.
     addr: String,
     /// The host name (for connection security's name check).
     host: String,
@@ -441,88 +482,146 @@ fn url_refused(why: &'static str) -> RedisError {
     RedisError::from((ErrorKind::InvalidClientConfig, why))
 }
 
-/// Parse a Valkey URL (`redis://[user[:password]@]host[:port][/db]`, `rediss://` for TLS; the
-/// `valkey://` / `valkeys://` spellings too), as the upstream driver did.
-fn parse_url(url: &str) -> RedisResult<Target> {
-    let (scheme, rest) = url
-        .split_once("://")
-        .ok_or_else(|| url_refused("Redis URL did not parse"))?;
-    let tls =
-        match scheme {
-            "redis" | "valkey" => false,
-            "rediss" | "valkeys" => true,
-            "redis+unix" | "unix" | "valkey+unix" => return Err(RedisError::from((
-                ErrorKind::InvalidClientConfig,
-                "Redis URL did not parse",
-                "a unix-socket URL is not reachable through the host's connector; use a TCP URL"
-                    .to_string(),
-            ))),
-            _ => return Err(url_refused("Redis URL did not parse")),
-        };
-    let rest = rest.split(['?', '#']).next().unwrap_or("");
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i + 1..]),
-        None => (rest, ""),
-    };
-    let (userinfo, hostport) = match authority.rsplit_once('@') {
-        Some((u, h)) => (Some(u), h),
-        None => (None, authority),
-    };
-    let (host, port) = if let Some(v6) = hostport.strip_prefix('[') {
-        let (h, after) = v6
-            .split_once(']')
-            .ok_or_else(|| url_refused("Redis URL did not parse"))?;
-        (format!("[{h}]"), after.strip_prefix(':'))
-    } else {
-        match hostport.rsplit_once(':') {
-            Some((h, p)) => (h.to_string(), Some(p)),
-            None => (hostport.to_string(), None),
+/// Percent-decode `s` as UTF-8 (the upstream driver's user/password reading); `None` when the
+/// decoded bytes are not UTF-8.
+fn percent_decode_utf8(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
         }
-    };
-    if host.is_empty() || host == "[]" {
-        return Err(url_refused("Missing hostname"));
+        out.push(bytes[i]);
+        i += 1;
     }
-    let port: u16 = match port {
-        None | Some("") => 6379,
-        Some(p) => p
-            .parse()
-            .map_err(|_| url_refused("Redis URL did not parse"))?,
+    String::from_utf8(out).ok()
+}
+
+/// The upstream driver's `protocol=` query check (`2`/`resp2`/`3`/`resp3`). The store speaks
+/// RESP2 whatever it says: every reply it reads converts the same either way.
+fn check_protocol(url: &url::Url) -> RedisResult<()> {
+    match url.query_pairs().find(|(k, _)| k == "protocol") {
+        None => Ok(()),
+        Some((_, p)) if matches!(p.as_ref(), "2" | "resp2" | "3" | "resp3") => Ok(()),
+        Some((_, p)) => Err(RedisError::from((
+            ErrorKind::InvalidClientConfig,
+            "Invalid protocol version",
+            p.into_owned(),
+        ))),
+    }
+}
+
+/// Parse a Valkey URL exactly as the upstream driver 1.5.5 linked read it (`redis` 1.7.1's
+/// `IntoConnectionInfo for &str`): `redis://[user[:password]@]host[:port][/db]`, `rediss://` for TLS
+/// (`#insecure` the one fragment it took), the `valkey://` / `valkeys://` spellings, and the
+/// unix-socket URLs `unix://`, `redis+unix://`, `valkey+unix://` (`?db=`, `?user=`, `?pass=`).
+fn parse_url(input: &str) -> RedisResult<Target> {
+    let url = url::Url::parse(input)
+        .ok()
+        .filter(|u| {
+            matches!(
+                u.scheme(),
+                "redis" | "rediss" | "valkey" | "valkeys" | "redis+unix" | "valkey+unix" | "unix"
+            )
+        })
+        .ok_or_else(|| url_refused("Redis URL did not parse"))?;
+    if matches!(url.scheme(), "unix" | "redis+unix" | "valkey+unix") {
+        return parse_unix(&url);
+    }
+    let host = match url.host() {
+        Some(url::Host::Domain(d)) => d.to_string(),
+        Some(url::Host::Ipv4(v4)) => v4.to_string(),
+        Some(url::Host::Ipv6(v6)) => v6.to_string(),
+        None => return Err(url_refused("Missing hostname")),
     };
-    let auth = match userinfo {
-        None => None,
-        Some(u) => {
-            let (user, pass) = match u.split_once(':') {
-                Some((user, pass)) => (user, Some(pass)),
-                None => (u, None),
-            };
-            let user = (!user.is_empty()).then(|| percent_decode(user));
-            pass.filter(|p| !p.is_empty())
-                .map(|p| (user, percent_decode(p)))
+    if host == "0.0.0.0" || host == "::" {
+        return Err(url_refused(
+            "Cannot connect to a wildcard address (0.0.0.0 or ::)",
+        ));
+    }
+    let port = url.port().unwrap_or(6379);
+    let tls = matches!(url.scheme(), "rediss" | "valkeys");
+    if tls {
+        match url.fragment() {
+            // 1.5.5 skipped the certificate check here; through the host's connector every secured
+            // connection is verified against the connector's trust (no unverified TLS exists).
+            None | Some("insecure") => {}
+            Some(_) => {
+                return Err(url_refused("only #insecure is supported as URL fragment"));
+            }
         }
-    };
-    let db = match path.trim_matches('/') {
+    }
+    check_protocol(&url)?;
+    let db = match url.path().trim_matches('/') {
         "" => 0,
-        d => d
+        path => path
             .parse::<i64>()
             .map_err(|_| url_refused("Invalid database number"))?,
     };
+    let user = if url.username().is_empty() {
+        None
+    } else {
+        Some(
+            percent_decode_utf8(url.username())
+                .ok_or_else(|| url_refused("Username is not valid UTF-8 string"))?,
+        )
+    };
+    let pass = match url.password() {
+        Some(pw) => Some(
+            percent_decode_utf8(pw)
+                .ok_or_else(|| url_refused("Password is not valid UTF-8 string"))?,
+        ),
+        None => None,
+    };
+    let addr = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
     Ok(Target {
-        addr: format!("{host}:{port}"),
-        host: host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .to_string(),
+        addr,
+        host,
         tls,
-        auth,
+        auth: pass.map(|p| (user, p)),
+        db,
+    })
+}
+
+/// A unix-socket URL, as the upstream driver read it: its path, and `db` / `user` / `pass` from
+/// the query.
+fn parse_unix(url: &url::Url) -> RedisResult<Target> {
+    let path = url
+        .to_file_path()
+        .map_err(|()| url_refused("Missing path"))?;
+    let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+    let db = match query.get("db") {
+        Some(db) => db
+            .parse::<i64>()
+            .map_err(|_| url_refused("Invalid database number"))?,
+        None => 0,
+    };
+    check_protocol(url)?;
+    let user = query.get("user").map(|u| u.to_string());
+    let pass = query.get("pass").map(|p| p.to_string());
+    Ok(Target {
+        addr: format!("unix:{}", path.display()),
+        host: String::new(),
+        tls: false,
+        auth: pass.map(|p| (user, p)),
         db,
     })
 }
 
 /// Valkey `RecordStore` backend (durable, shared across a cluster), reached through the HOST'S
-/// CONNECTOR: every op is one connection (dial, secure, `AUTH`, `SELECT`, its commands), closed when
-/// the op answers; the store holds no socket, no TLS stack and no connection of its own between ops.
-/// The 1.5.5 one-shot reconnect-and-retry for idempotent reads is subsumed: every op starts on a
-/// fresh connection.
+/// CONNECTOR: one kept connection (dialled, secured, `AUTH`, `SELECT` once), every op on it in turn,
+/// as 1.5.5's one mutex-guarded connection; the store holds no socket and no TLS stack of its own.
 #[derive(Debug, Clone)]
 pub struct ValkeyStore {
     inner: Arc<Inner>,
@@ -533,11 +632,15 @@ struct Inner {
     target: Target,
     /// The URL password (if any), scrubbed out of every error string this crate emits.
     secret: Option<String>,
-    /// `connect_timeout_ms` as the settings stated it (validated; the connector's need timeout and
-    /// the op's deadline bound the dial).
-    #[allow(dead_code)]
+    /// `connect_timeout_ms` (default [`DEFAULT_CONNECT_TIMEOUT`]): every dial's bound.
     connect_timeout: Duration,
+    /// THE KEPT CONNECTION: 1.5.5 held ONE connection behind a mutex (no pool setting), so the set
+    /// holds one.
+    pool: Arc<Pool>,
 }
+
+/// How many connections the store keeps: 1.5.5's one (it had no pool setting).
+const KEPT_CONNECTIONS: usize = 1;
 
 /// The store's one outbound need: a `tcp` stream to the server the settings' URL names (the store
 /// names the target at each connect), governed as operator infrastructure (private, loopback and
@@ -578,8 +681,8 @@ pub const NEEDS: &[busbar_contract::abi::host::conn::connector::Need] = {
 const NEED_TCP: u32 = 0;
 
 impl ValkeyStore {
-    /// The store for `url` (no connection is made here: every op connects through the host's
-    /// connector), with [`DEFAULT_CONNECT_TIMEOUT`].
+    /// The store for `url` (no connection is made here: `open`'s connect step makes the first,
+    /// through the host's connector), with [`DEFAULT_CONNECT_TIMEOUT`].
     ///
     /// # Errors
     /// A URL the store cannot read, in the upstream driver's words.
@@ -601,60 +704,82 @@ impl ValkeyStore {
                 target,
                 secret,
                 connect_timeout: timeout,
+                pool: Pool::new(KEPT_CONNECTIONS),
             }),
         })
     }
 
-    /// ONE OP'S CONNECTION over `wire`: dial the server through the host's connector, secure it for
-    /// `rediss://`, `AUTH` and `SELECT` as the URL says.
-    async fn conn(&self, wire: Wire) -> RecordStoreResult<Conn> {
-        let t = &self.inner.target;
+    /// The op's connection over `wire`: the kept one when it is idle (its handshake done), else a
+    /// fresh dial (bounded by `connect_timeout_ms`), secured for `rediss://`, `AUTH` and `SELECT`
+    /// as the URL says. A failure reads `valkey {ctx}: …` (1.5.5's `connect` at boot, `reconnect`
+    /// when an op had to dial).
+    async fn conn(&self, wire: Wire, ctx: &str) -> RecordStoreResult<Conn> {
         let failed = |e: String| {
             RecordStoreError(scrub(
-                format!("valkey connect: {e}"),
+                format!("valkey {ctx}: {e}"),
                 self.inner.secret.as_deref(),
             ))
         };
-        wire.connect(NEED_TCP, Some(&t.addr))
+        let ms = self.inner.connect_timeout.as_millis();
+        if ms == 0 {
+            // The upstream driver's TCP connect refused a zero timeout, in std's words.
+            return Err(failed("cannot set a 0 duration timeout".into()));
+        }
+        let ms = u32::try_from(ms).unwrap_or(u32::MAX);
+        wire.connect_timed(NEED_TCP, Some(&self.inner.target.addr), ms)
             .await
             .map_err(|e| failed(e.to_string()))?;
-        if t.tls {
-            wire.upgrade_secure(Some(&t.host))
-                .await
-                .map_err(|e| failed(e.to_string()))?;
-        }
         let mut c = Conn::new(wire);
-        if let Some((user, pass)) = &t.auth {
-            let mut auth = cmd("AUTH");
-            if let Some(u) = user {
-                auth.arg(u);
-            }
-            auth.arg(pass)
-                .exec(&mut c)
-                .await
-                .map_err(|e| failed(e.to_string()))?;
-        }
-        if t.db != 0 {
-            cmd("SELECT")
-                .arg(t.db)
-                .exec(&mut c)
+        if !c.wire().reused() {
+            self.handshake(&mut c)
                 .await
                 .map_err(|e| failed(e.to_string()))?;
         }
         Ok(c)
     }
 
+    /// A NEW connection's handshake: TLS for `rediss://` (before its first byte), `AUTH`, `SELECT`.
+    async fn handshake(&self, c: &mut Conn) -> RedisResult<()> {
+        let t = &self.inner.target;
+        if t.tls {
+            c.wire()
+                .upgrade_secure(Some(&t.host))
+                .await
+                .map_err(|e| RedisError::io(&e))?;
+        }
+        if let Some((user, pass)) = &t.auth {
+            let mut auth = cmd("AUTH");
+            if let Some(u) = user {
+                auth.arg(u);
+            }
+            auth.arg(pass).exec(c).await?;
+        }
+        if t.db != 0 {
+            cmd("SELECT").arg(t.db).exec(c).await?;
+        }
+        Ok(())
+    }
+
+    /// 1.5.5's reconnect after a dropped connection: close it, dial a fresh one, handshake.
+    async fn reconnect(&self, c: &mut Conn) -> RedisResult<()> {
+        c.wire().reconnect().await.map_err(|e| RedisError::io(&e))?;
+        c.reset();
+        self.handshake(c).await
+    }
+
+    /// The store's kept connection set.
+    pub(crate) fn pool(&self) -> &Arc<Pool> {
+        &self.inner.pool
+    }
+
     /// `open`'s connect step: the first connection, the schema migration and the noeviction check,
     /// exactly as 1.5.5's connect ran them (its failures are the load's refusal).
     async fn connect_step(&self, wire: Wire) -> RecordStoreResult<()> {
-        let mut c = self.conn(wire).await?;
+        let mut c = self.conn(wire, "connect").await?;
         self.migrate(&mut c).await?;
-        self.assert_noeviction(&mut c).await
-    }
-
-    /// A command result in the store's words.
-    fn ck<T>(&self, r: RedisResult<T>) -> RecordStoreResult<T> {
-        r.map_err(|e| self.err(e, "command"))
+        let r = self.assert_noeviction(&mut c).await;
+        c.settle();
+        r
     }
 
     /// STARTUP ASSERTION, non-negotiable: `maxmemory-policy` must be `noeviction`. Under any eviction

@@ -50,15 +50,16 @@
 //!
 //! ## Every slot is one op through the host's connector
 //!
-//! Each slot runs its body with the store SDK's `wire::drive`: one connection per op, dialled
-//! through the host's connector on the op's ticket, every command a write and a read that may PEND
-//! (the op answers PENDING and is resumed on the connector's wake), closed when the op answers. The
-//! body is the blocking client's body, `async`.
+//! Each slot runs its body with the store SDK's `wire::drive_kept` on the store's ONE kept
+//! connection (1.5.5's one mutex-guarded connection): drawn when the op starts (dialled through the
+//! host's connector on the op's ticket when there is none), every command a write and a read that
+//! may PEND (the op answers PENDING and is resumed on the connector's wake), handed back when the op
+//! answers. The body is the blocking client's body, `async`.
 
 use std::collections::BTreeMap;
 
 use busbar_contract::abi::sdk::conn::Host;
-use busbar_contract::abi::sdk::store::wire::drive;
+use busbar_contract::abi::sdk::store::wire::drive_kept;
 use busbar_contract::abi::sdk::store::{
     Cap, CapsRefused, Cell, CellKey, Dimension, Grant, Op, OpRefused, OpResult, ReserveRefused,
     Scanned, Step, StoreSlots, Tail,
@@ -261,19 +262,25 @@ macro_rules! deduped {
     }};
 }
 
-/// RUN `$body` AS ONE OP through the host's connector (module doc): `$me` is the store, `$c` the
-/// op's connection; a connection that fails answers `$fail` of its error.
+/// RUN `$body` AS ONE OP through the host's connector (module doc) on the store's kept connection:
+/// `$me` is the store, `$c` the op's connection; a connection that fails answers `$fail` of its
+/// error. A connection the body left with a `WATCH` in force is not kept.
 macro_rules! op {
     ($cx:expr, $store:expr, $fail:expr, |$me:ident, $c:ident| $body:expr) => {{
         let $me = $store.clone();
-        drive($cx, move |w| {
+        let pool = $me.pool().clone();
+        drive_kept($cx, &pool, move |w| {
             Box::pin(async move {
-                let mut conn = match $me.conn(w).await {
+                let mut conn = match $me.conn(w, "reconnect").await {
                     Ok(c) => c,
                     Err(e) => return ($fail)(e),
                 };
-                let $c = &mut conn;
-                $body
+                let answer = {
+                    let $c = &mut conn;
+                    $body
+                };
+                conn.settle();
+                answer
             })
         })
     }};
@@ -805,7 +812,8 @@ impl StoreSlots for ValkeyStore {
 
     fn connect(&self, cx: &mut Op<'_>) -> Step<Result<(), String>> {
         let me = self.clone();
-        drive(cx, move |w| {
+        let pool = me.pool().clone();
+        drive_kept(cx, &pool, move |w| {
             Box::pin(async move {
                 me.connect_step(w)
                     .await
