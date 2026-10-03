@@ -71,12 +71,20 @@ in [`.busbar-ref`](.busbar-ref). A v1.0.x namespace (schema v6) is upgraded in
 place on first connect. Pin both versions
 explicitly in production; do not assume they move together.
 
-It is a `cdylib` that implements busbar's `RecordStore` contract (via the
-plugin SDK in [`busbar-contract`](https://github.com/GetBusbar/busbar/tree/main/crates/busbar-contract),
-`busbar_contract::abi::sdk`) and is loaded in-process by busbar over the signed store ABI —
-`dlopen`'d, not spawned as a separate process. The same store can also be LINKED into a busbar
-build (its `linked::STORE` row); both doors run the same code, and
+It is a `cdylib` that implements busbar's store v3 table (`RecordStore` plus the
+`StoreSlots` additions of the store SDK in
+[`busbar-contract`](https://github.com/GetBusbar/busbar/tree/main/crates/busbar-contract),
+`busbar_contract::abi::sdk::store`) and is loaded in-process by busbar over the memory ABI —
+`dlopen`'d, not spawned as a separate process. The logic crate states the store's one door
+(`store_door!`, `busbar_store_valkey::door`); the cdylib exports it (`export_door!`), and a busbar
+build can LINK the same door (`LinkedRow::of(door)`). Both doors run the same code, and
 [`tests/conformance.rs`](store-valkey-plugin/tests/conformance.rs) proves they behave as one store.
+
+The store v3 additions are durable in Valkey: every `op_id` write is deduped by a record
+(`busbar:op:*`, kept 24 h) written in the same atomic step as its effect (`WATCH`/`MULTI`/`EXEC`,
+or one server-side script for the plane append), and the money slots (`busbar:cap:*`,
+`busbar:slice:*`), the journal (`busbar:journal:*`), sessions (`busbar:session*`) and the
+kernel's records (`busbar:records:*`) are additive keyspaces beside the v7 ones.
 
 
 - **Multi-node deployments**: a fleet of busbar nodes sharing one Valkey
@@ -90,10 +98,22 @@ build (its `linked::STORE` row); both doors run the same code, and
   overwrite would be last-writer-wins across nodes).
 
 This crate (`busbar-store-valkey-plugin`) is intentionally a thin
-adapter: all the Valkey schema/serialization/retry/TLS logic — and the `open`
-that turns the engine's JSON config into a live `ValkeyStore` — lives in the
+adapter: all the Valkey schema/serialization logic — and the `open`
+that turns the engine's JSON config into a `ValkeyStore` — lives in the
 `busbar-store-valkey` library crate it re-exports, in the `store-valkey/`
 directory of this repository.
+
+The store holds **no socket and no TLS stack of its own**: it declares one
+outbound `tcp` need and speaks RESP2 over the connection busbar's connector
+dials, secures and wakes for it. Like 1.5.5's one mutex-guarded connection, the
+store keeps ONE connection across ops (dialled, secured, `AUTH`, `SELECT` once);
+ops take it in turn, and a read that has nothing yet pends on the op's ticket
+instead of blocking a thread. 1.5.5's reconnect-and-retry is kept: a dropped
+connection is re-dialled and a read (or idempotent write) retried once on the
+fresh one; the non-idempotent writes are never replayed. `open` only parses the
+settings; its connect step makes the first connection, migrates the schema and
+checks `maxmemory-policy noeviction`, so an unreachable or misconfigured server
+still refuses the store at boot, in the store's own words.
 
 ## Config
 
@@ -106,8 +126,8 @@ config, mirroring how the Postgres store plugin receives its libpq URL:
 
 | Setting | Required | Notes |
 |---|---|---|
-| `url` | yes | A `redis://` or `rediss://` (TLS) connection string — the URL scheme is the upstream RESP driver's, not a busbar name; a Valkey server is what it points at. TLS is backed by `rustls` (`ring` provider) — no OpenSSL dependency. |
-| `connect_timeout_ms` | no | Bounds the initial connect (unlike libpq's DSN-level `connect_timeout`, the upstream driver crate has no URL-level escape hatch, so this crate adds one). Defaults to 10s. A blackholed/firewalled Valkey host fails fast at boot instead of wedging the engine indefinitely. |
+| `url` | yes | A `redis://` or `rediss://` (TLS) connection string (`valkey://` / `valkeys://` read the same): `[user[:password]@]host[:port][/db]`, or a unix-socket URL (`unix://`, `redis+unix://`, `valkey+unix://` `/path?db=N&user=U&pass=P`). TLS is busbar's connector's (its trust anchors); `rediss://…#insecure` skips certificate verification, as 1.5.5 did (busbar logs a WARN naming the store instance). |
+| `connect_timeout_ms` | no | Bounds every new connection's dial and handshake (TLS, `AUTH`, `SELECT`) in all, as 1.5.5's driver did (default 10000, 1.5.5's). |
 
 ## Build
 

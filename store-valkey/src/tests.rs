@@ -2,7 +2,152 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 use super::*;
-use busbar_contract::records::{PlaneDisposition, SecretForm};
+use busbar_contract::records::{PlaneDisposition, RecordStore, SecretForm};
+#[allow(unused_imports)]
+use redis::Commands;
+use std::sync::OnceLock;
+
+use busbar_contract::abi::store::OpId;
+use busbar_plugin_loader::dispatch::kinds::store::Store;
+use busbar_plugin_loader::dispatch::{
+    load_linked, Bind, DispatchConfig, Dispatcher, LinkedRow, NoSink,
+};
+use busbar_plugin_loader::store_v3::LoadedStore;
+use busbar_plugin_loader::tcp_conns::TcpConns;
+
+/// THE STORE UNDER TEST is the store as the host opens it: its door through the loader
+/// (`load_linked`, `LoadedStore::open`), every op one connection through the host's connector path
+/// (the loader's test connection table over plain TCP). The name the tests always used stands for it.
+pub(crate) type ValkeyStore = LoadedStore;
+
+/// One dispatcher and one connection table for every store the tests open (the host has one each).
+fn host() -> &'static (
+    Arc<Dispatcher>,
+    Arc<dyn busbar_contract::conn::DeclaredConns>,
+) {
+    static HOST: OnceLock<(
+        Arc<Dispatcher>,
+        Arc<dyn busbar_contract::conn::DeclaredConns>,
+    )> = OnceLock::new();
+    HOST.get_or_init(|| {
+        let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
+        let conns: Arc<dyn busbar_contract::conn::DeclaredConns> =
+            Arc::new(TcpConns::new(d.conn_waker()));
+        (d, conns)
+    })
+}
+
+/// The node's `op_id` allocator for the bridge's writes: a node half no earlier run used (the
+/// dedupe is durable) and one counter.
+fn mint() -> OpId {
+    static NODE: OnceLock<u64> = OnceLock::new();
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let node = *NODE.get_or_init(|| {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        (t ^ (u64::from(std::process::id()) << 40)) | 1
+    });
+    OpId::from_parts(
+        node,
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+    )
+}
+
+/// The store's door opened on `settings`, as the host opens it.
+pub(crate) fn open_with(settings: &str) -> Result<LoadedStore, String> {
+    let (d, conns) = host();
+    let row = LinkedRow::of(crate::door).map_err(|e| e.to_string())?;
+    let p = load_linked::<Store>(
+        &row,
+        Bind {
+            instance: Arc::from("store-valkey-test"),
+            max_inflight_cap: 64,
+            sink: Arc::new(NoSink),
+            dispatcher: d.adopter(),
+            conns: Some(conns.clone()),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    LoadedStore::open(p, d.clone(), settings.as_bytes(), mint)
+}
+
+/// `ValkeyStore::connect(url)`, as the tests always spelled it: the door opened on `{"url": url}`.
+pub(crate) trait Connect: Sized {
+    fn connect(url: &str) -> Result<Self, String>;
+}
+
+impl Connect for LoadedStore {
+    fn connect(url: &str) -> Result<Self, String> {
+        open_with(&serde_json::json!({ "url": url }).to_string())
+    }
+}
+
+/// The tests' INDEPENDENT view of the live Valkey (the upstream client, never the store's own
+/// path): what landed, and the cleanup the `RecordStore` surface deliberately cannot do.
+pub(crate) trait Raw {
+    fn with_conn<T>(
+        &self,
+        f: impl FnOnce(&mut redis::Connection) -> redis::RedisResult<T>,
+    ) -> RecordStoreResult<T>;
+
+    /// Remove a key row and every index entry pointing at it, tombstone included.
+    fn purge_key_for_test(&self, id: &str) -> RecordStoreResult<()> {
+        self.with_conn(|c| {
+            redis::pipe()
+                .atomic()
+                .del(format!("{KEY_PREFIX}{id}"))
+                .ignore()
+                .srem(KEYS_INDEX, id)
+                .ignore()
+                .zrem(KEYS_BYREV, id)
+                .ignore()
+                .del(cred_ids_key(id))
+                .ignore()
+                .query(c)
+        })
+    }
+
+    /// Remove a credential's id pointer. The slot row itself goes with its owning key.
+    fn purge_credential_for_test(&self, id: &str) -> RecordStoreResult<()> {
+        self.with_conn(|c| {
+            redis::pipe()
+                .atomic()
+                .del(cred_id_key(id))
+                .ignore()
+                .query(c)
+        })
+    }
+
+    /// Remove whatever occupies one audit `seq`.
+    fn purge_audit_seq_for_test(&self, seq: u64) -> RecordStoreResult<()> {
+        let score = clamp(seq);
+        self.with_conn(|c| {
+            redis::pipe()
+                .atomic()
+                .cmd("ZREMRANGEBYSCORE")
+                .arg(AUDIT_ZSET)
+                .arg(score)
+                .arg(score)
+                .ignore()
+                .query(c)
+        })
+    }
+}
+
+impl Raw for LoadedStore {
+    fn with_conn<T>(
+        &self,
+        f: impl FnOnce(&mut redis::Connection) -> redis::RedisResult<T>,
+    ) -> RecordStoreResult<T> {
+        let url = std::env::var("VALKEY_URL").expect("the live tests run with VALKEY_URL");
+        let mut c = redis::Client::open(url.as_str())
+            .and_then(|c| c.get_connection())
+            .map_err(|e| RecordStoreError(format!("valkey connect: {e}")))?;
+        f(&mut c).map_err(|e| RecordStoreError(format!("valkey command: {e}")))
+    }
+}
 
 /// The password-scrub never lets the URL secret out in an error string, and the URL password
 /// extractor handles every URL shape.
@@ -52,7 +197,82 @@ fn password_scrub_and_extraction() {
 
 #[test]
 fn tls_url_scheme_is_accepted() {
-    assert!(redis::Client::open("rediss://:pw@localhost:6380/0").is_ok());
+    let t = parse_url("rediss://:pw@localhost:6380/0").expect("a rediss URL parses");
+    assert!(t.tls);
+    assert_eq!(t.addr, "localhost:6380");
+    assert_eq!(t.auth, Some((None, "pw".to_string())));
+}
+
+/// The URL reads as the upstream driver read it: user, percent-decoded password, port, database,
+/// IPv6 literals, and its refusals in its words.
+#[test]
+fn urls_parse_as_the_upstream_driver_read_them() {
+    let t = parse_url("redis://alice:p%40ss@db.internal:7000/3").unwrap();
+    assert_eq!(
+        (t.addr.as_str(), t.host.as_str(), t.tls, t.db),
+        ("db.internal:7000", "db.internal", false, 3)
+    );
+    assert_eq!(t.auth, Some((Some("alice".into()), "p@ss".into())));
+    let t = parse_url("valkey://[::1]/").unwrap();
+    assert_eq!(
+        (t.addr.as_str(), t.host.as_str(), t.db),
+        ("[::1]:6379", "::1", 0)
+    );
+    assert_eq!(parse_url("redis://h").unwrap().auth, None);
+    assert_eq!(
+        parse_url("not-a-valkey-url").unwrap_err().to_string(),
+        "Redis URL did not parse - InvalidClientConfig"
+    );
+    assert_eq!(
+        parse_url("redis://h/x").unwrap_err().to_string(),
+        "Invalid database number - InvalidClientConfig"
+    );
+    assert!(parse_url("http://h").is_err());
+    assert_eq!(
+        parse_url("redis://0.0.0.0:6379").unwrap_err().to_string(),
+        "Cannot connect to a wildcard address (0.0.0.0 or ::) - InvalidClientConfig"
+    );
+    assert_eq!(
+        parse_url("redis://h/?protocol=9").unwrap_err().to_string(),
+        "Invalid protocol version - InvalidClientConfig: 9"
+    );
+    assert!(parse_url("redis://h/?protocol=resp3").is_ok());
+    // `#insecure` is the one fragment a TLS URL takes; any other is refused in the driver's words.
+    let t = parse_url("rediss://h:6380/#insecure").unwrap();
+    assert!(t.tls && t.insecure);
+    assert!(!parse_url("rediss://h:6380/").unwrap().insecure);
+    assert_eq!(
+        parse_url("rediss://h/#other").unwrap_err().to_string(),
+        "only #insecure is supported as URL fragment - InvalidClientConfig"
+    );
+}
+
+/// The unix-socket URLs 1.5.5's driver read (VALKEY-UNIX): the path is the connector's
+/// `unix:<path>` target, the database, user and password come from the query.
+#[test]
+fn unix_socket_urls_parse_as_the_upstream_driver_read_them() {
+    for url in [
+        "redis+unix:///run/valkey.sock",
+        "unix:///run/valkey.sock",
+        "valkey+unix:///run/valkey.sock",
+        "unix:/run/valkey.sock",
+    ] {
+        let t = parse_url(url).unwrap_or_else(|e| panic!("{url}: {e}"));
+        assert_eq!(
+            (t.addr.as_str(), t.tls, t.db),
+            ("unix:/run/valkey.sock", false, 0)
+        );
+        assert_eq!(t.auth, None);
+    }
+    let t = parse_url("redis+unix:///run/v.sock?db=2&user=%25al&pass=%26%3F+x").unwrap();
+    assert_eq!(t.db, 2);
+    assert_eq!(t.auth, Some((Some("%al".into()), "&? x".into())));
+    assert_eq!(
+        parse_url("unix:///run/v.sock?db=x")
+            .unwrap_err()
+            .to_string(),
+        "Invalid database number - InvalidClientConfig"
+    );
 }
 
 #[test]
@@ -66,7 +286,7 @@ fn glob_escaping_covers_every_metacharacter() {
 
 /// End-to-end against a REAL Valkey, gated on `VALKEY_URL` (a docker service in CI). Skips
 /// cleanly when unset LOCALLY; under `CI` a missing URL is a HARD FAILURE, never a silent skip.
-fn live_store() -> Option<ValkeyStore> {
+pub(crate) fn live_store() -> Option<ValkeyStore> {
     let url = match std::env::var("VALKEY_URL") {
         Ok(url) => url,
         Err(_) if std::env::var_os("CI").is_some() => {
@@ -992,62 +1212,26 @@ fn reconnecting_to_an_already_migrated_namespace_does_not_wipe_existing_data() {
     );
 }
 
-/// Pins the `retry && is_connection_error(&e)` guard against a constant-true or `||` form. A
-/// deterministic NON-connection error (`WRONGTYPE`, from issuing `LPUSH` against a string-valued
-/// key) under `with_conn` (`retry: true`) must surface directly via the `"command"` error context, never
-/// silently retry — a retry would issue the exact same doomed command again and report it via the
-/// `"retry after reconnect"` context instead, which is what this test would see if the guard ever
-/// stopped checking `is_connection_error` at all.
+/// A deterministic NON-connection error (`WRONGTYPE`: a usage window that is not a hash) surfaces
+/// through the store op in the store's words (the `"command"` context), never retried as a
+/// connection failure.
 #[test]
-fn with_conn_does_not_retry_a_non_connection_error() {
+fn a_server_error_surfaces_through_the_op_in_the_stores_words() {
     let Some(store) = live_store() else { return };
     let id = uid("vk_wrongtype");
-    let k = format!("busbar:test:wrongtype:{id}");
+    let k = usage_key(&id, 60);
     store
-        .with_conn(|c| c.set::<_, _, ()>(&k, "not-a-list"))
+        .with_conn(|c| c.set::<_, _, ()>(&k, "not-a-hash"))
         .unwrap();
-
     let err = store
-        .with_conn(|c| redis::cmd("LPUSH").arg(&k).arg("x").query::<i64>(c))
-        .expect_err("LPUSH against a string-valued key must fail with WRONGTYPE");
+        .get_usage(&id, 60)
+        .expect_err("HGETALL against a string-valued key must fail with WRONGTYPE");
     assert!(
-        err.0.contains("valkey command:"),
-        "a non-connection (WRONGTYPE) error must surface via the 'command' context, never \
-         trigger the reconnect-and-retry path meant only for connection-level errors: {}",
+        err.0.contains("valkey command:") && err.0.contains("WRONGTYPE"),
+        "a server error must surface via the 'command' context: {}",
         err.0
     );
-
     store.with_conn(|c| c.del::<_, ()>(&k)).unwrap();
-}
-
-/// Pins the retry half of the guard: a genuine connection-level error (the server killing our
-/// connection out from under us, the real-world case `with_conn`'s reconnect-and-retry exists for)
-/// must be transparently recovered, not surfaced to the caller.
-#[test]
-fn with_conn_transparently_reconnects_after_the_connection_is_dropped() {
-    let Some(store) = live_store() else { return };
-    let url = std::env::var("VALKEY_URL").unwrap();
-
-    let my_id: i64 = store
-        .with_conn(|c| redis::cmd("CLIENT").arg("ID").query(c))
-        .unwrap();
-    let mut killer = redis::Client::open(url.as_str())
-        .unwrap()
-        .get_connection()
-        .unwrap();
-    let _: () = redis::cmd("CLIENT")
-        .arg("KILL")
-        .arg("ID")
-        .arg(my_id)
-        .query(&mut killer)
-        .expect("kill this store's own connection from an independent connection");
-
-    let id = uid("vk_after_kill");
-    store.put_key(&vk(&id)).expect(
-        "a connection-level error (a killed connection) must trigger transparent \
-         reconnect-and-retry, not surface as a caller-visible failure",
-    );
-    assert!(store.get_key(&id).unwrap().is_some());
 }
 
 // ── Denylist (unchanged shape, still real coverage) ─────────────────────────────────────────
@@ -1256,9 +1440,13 @@ fn wipes_the_entire_namespace_destructively() {
 #[path = "tests/store_conformance.rs"]
 mod store_conformance;
 
+/// The store v3 slots (`StoreSlots`): the durable `op_id` dedupe, the money slots, the journal,
+/// sessions and the kernel's records.
+mod slots_tests;
+
 mod conformance {
     use super::store_conformance::conf;
-    use super::{live_store, ValkeyStore};
+    use super::{live_store, Raw, ValkeyStore};
 
     fn ns(check: &str) -> String {
         format!("vk_c{}{}", std::process::id(), check)
@@ -1573,19 +1761,22 @@ const TERMINAL: [&str; 4] = ["completed", "failed", "canceled", "rejected"];
 /// The typed names, over the neutral verbs, for any `RecordStore`.
 trait Vocab: RecordStore {
     fn put_task(&self, t: &TaskRow) -> RecordStoreResult<()> {
-        self.upsert_plane_record(&PlaneRecord {
-            kind: "task".into(),
-            id: t.task_id.clone(),
-            parent: None,
-            seq: 0,
-            ts: t.updated_at,
-            disposition: if TERMINAL.contains(&t.state.as_str()) {
-                PlaneDisposition::Terminal
-            } else {
-                PlaneDisposition::Active
-            },
-            body: body(t),
-        })
+        self.upsert_plane_record(
+            PlaneRecord {
+                kind: "task".into(),
+                id: t.task_id.clone(),
+                parent: None,
+                seq: 0,
+                ts: t.updated_at,
+                disposition: if TERMINAL.contains(&t.state.as_str()) {
+                    PlaneDisposition::Terminal
+                } else {
+                    PlaneDisposition::Active
+                },
+                body: body(t),
+            }
+            .view(),
+        )
     }
     fn get_task(&self, id: &str) -> RecordStoreResult<Option<TaskRow>> {
         Ok(self.get_plane_record("task", id)?.map(|b| row(&b)))
@@ -1601,15 +1792,18 @@ trait Vocab: RecordStore {
         self.purge_plane_records_before("task", before)
     }
     fn append_task_event(&self, e: &TaskEventRow) -> RecordStoreResult<()> {
-        self.append_plane_record(&PlaneRecord {
-            kind: "task_event".into(),
-            id: e.task_id.clone(),
-            parent: Some(e.task_id.clone()),
-            seq: e.seq,
-            ts: e.ts,
-            disposition: PlaneDisposition::Active,
-            body: body(e),
-        })
+        self.append_plane_record(
+            PlaneRecord {
+                kind: "task_event".into(),
+                id: e.task_id.clone(),
+                parent: Some(e.task_id.clone()),
+                seq: e.seq,
+                ts: e.ts,
+                disposition: PlaneDisposition::Active,
+                body: body(e),
+            }
+            .view(),
+        )
     }
     fn list_task_events(&self, task_id: &str) -> RecordStoreResult<Vec<TaskEventRow>> {
         Ok(self
@@ -1619,15 +1813,18 @@ trait Vocab: RecordStore {
             .collect())
     }
     fn append_mcp_call(&self, r: &CallRow) -> RecordStoreResult<()> {
-        self.append_plane_record(&PlaneRecord {
-            kind: "call".into(),
-            id: r.principal.clone(),
-            parent: Some(r.principal.clone()),
-            seq: r.seq,
-            ts: r.ts,
-            disposition: PlaneDisposition::Active,
-            body: body(r),
-        })
+        self.append_plane_record(
+            PlaneRecord {
+                kind: "call".into(),
+                id: r.principal.clone(),
+                parent: Some(r.principal.clone()),
+                seq: r.seq,
+                ts: r.ts,
+                disposition: PlaneDisposition::Active,
+                body: body(r),
+            }
+            .view(),
+        )
     }
     fn list_mcp_calls(&self, principal: &str) -> RecordStoreResult<Vec<CallRow>> {
         Ok(self
@@ -1643,15 +1840,18 @@ trait Vocab: RecordStore {
         self.purge_plane_records_before("call", before)
     }
     fn put_mcp_demotion(&self, d: &DemotionRow) -> RecordStoreResult<()> {
-        self.upsert_plane_record(&PlaneRecord {
-            kind: "demotion".into(),
-            id: d.server.clone(),
-            parent: None,
-            seq: 0,
-            ts: d.recorded_at,
-            disposition: PlaneDisposition::Active,
-            body: body(d),
-        })
+        self.upsert_plane_record(
+            PlaneRecord {
+                kind: "demotion".into(),
+                id: d.server.clone(),
+                parent: None,
+                seq: 0,
+                ts: d.recorded_at,
+                disposition: PlaneDisposition::Active,
+                body: body(d),
+            }
+            .view(),
+        )
     }
     fn list_mcp_demotions(&self) -> RecordStoreResult<Vec<DemotionRow>> {
         Ok(self
@@ -1890,11 +2090,11 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
         body: body(&rec),
     };
     store
-        .append_plane_record(&moved)
+        .append_plane_record(moved.view())
         .expect_err("a record whose ts differs at an occupied position is a fork");
     moved.ts = 2_000_000_100;
     store
-        .append_plane_record(&moved)
+        .append_plane_record(moved.view())
         .expect("the same sidecar and body is the identical replay");
 }
 
@@ -3018,11 +3218,650 @@ fn v6_namespace_upgrades_in_place_to_v7() {
     let marker: i64 = upgraded.with_conn(|c| c.get(SCHEMA_KEY)).unwrap();
     assert_eq!(marker, SCHEMA_VERSION);
 
-    // Idempotent: a second pass over an already-upgraded namespace changes nothing.
-    crate::legacy::migrate_v6_to_v7(&upgraded).unwrap();
+    // Idempotent: a second pass over an already-upgraded namespace changes nothing (the marker set
+    // back to v6, the next open's connect step runs the upgrade again).
+    upgraded
+        .with_conn(|c| c.set::<_, _, ()>(SCHEMA_KEY, 6i64))
+        .unwrap();
+    let upgraded = ValkeyStore::connect(&url).expect("a second upgrade pass on open");
     assert_eq!(upgraded.list_task_events(&t).unwrap(), vec![e1, e2]);
 
     reset_tasks(&upgraded, &[&t, &done]);
     reset_trust_state(&upgraded, &[&server], &[&nonce]);
     let _ = upgraded.with_conn(|c| c.del::<_, ()>(&call_key));
+}
+
+// ── THE CONNECTION, through the host's connector (ARCHITECT rulings 2026-10-03 12:10Z) ─────────
+//
+// Each test puts an in-test PROXY in front of the live server (`VALKEY_URL`): a TCP, unix-socket or
+// TLS front, forwarding every connection to the server's own address. The proxy counts the
+// connections the store makes and can drop them all, which is how the store's kept connection,
+// its reconnect-and-retry, its unix-socket URLs and its `rediss://` are seen from outside.
+
+/// The front a proxy listens on.
+enum Front {
+    Tcp,
+    Unix(std::path::PathBuf),
+    Tls(Arc<rustls::ServerConfig>),
+}
+
+/// A proxy in front of the live server.
+struct Proxy {
+    /// Where the front listens: `127.0.0.1:port`, or the socket path.
+    at: String,
+    accepted: Arc<std::sync::atomic::AtomicUsize>,
+    /// Every front connection's socket, to drop them all.
+    live: Arc<std::sync::Mutex<Vec<Shut>>>,
+}
+
+enum Shut {
+    Tcp(std::net::TcpStream),
+    Unix(std::os::unix::net::UnixStream),
+}
+
+/// The live server's `host:port`, database and userinfo, as `VALKEY_URL` names them.
+fn live_parts() -> (String, i64, String) {
+    let url = std::env::var("VALKEY_URL").expect("VALKEY_URL");
+    let u = url::Url::parse(&url).expect("VALKEY_URL parses");
+    let addr = format!(
+        "{}:{}",
+        u.host_str().expect("a host"),
+        u.port().unwrap_or(6379)
+    );
+    let db = u.path().trim_matches('/').parse().unwrap_or(0);
+    let userinfo = match (u.username(), u.password()) {
+        ("", None) => String::new(),
+        (user, Some(p)) => format!("{user}:{p}@"),
+        (user, None) => format!("{user}@"),
+    };
+    (addr, db, userinfo)
+}
+
+/// Copy `from` to `to` until either ends.
+fn pump(mut from: impl std::io::Read, mut to: impl std::io::Write) {
+    let mut buf = [0_u8; 16 * 1024];
+    loop {
+        match from.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                if to.write_all(&buf[..n]).is_err() || to.flush().is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+impl Proxy {
+    fn start(front: Front) -> Self {
+        let (backend, _, _) = live_parts();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let live = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (count, held) = (accepted.clone(), live.clone());
+        let at = match front {
+            Front::Unix(path) => {
+                let _ = std::fs::remove_file(&path);
+                let l = std::os::unix::net::UnixListener::bind(&path).expect("bind the socket");
+                std::thread::spawn(move || {
+                    for s in l.incoming() {
+                        let Ok(s) = s else { return };
+                        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        held.lock()
+                            .unwrap()
+                            .push(Shut::Unix(s.try_clone().unwrap()));
+                        let b = std::net::TcpStream::connect(&backend).expect("the live server");
+                        let (s2, b2) = (s.try_clone().unwrap(), b.try_clone().unwrap());
+                        std::thread::spawn(move || pump(s, b));
+                        std::thread::spawn(move || pump(b2, s2));
+                    }
+                });
+                path.display().to_string()
+            }
+            Front::Tcp | Front::Tls(_) => {
+                let tls = match front {
+                    Front::Tls(c) => Some(c),
+                    _ => None,
+                };
+                let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+                let at = l.local_addr().unwrap().to_string();
+                std::thread::spawn(move || {
+                    for s in l.incoming() {
+                        let Ok(s) = s else { return };
+                        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        held.lock().unwrap().push(Shut::Tcp(s.try_clone().unwrap()));
+                        let b = std::net::TcpStream::connect(&backend).expect("the live server");
+                        match &tls {
+                            None => {
+                                let (s2, b2) = (s.try_clone().unwrap(), b.try_clone().unwrap());
+                                std::thread::spawn(move || pump(s, b));
+                                std::thread::spawn(move || pump(b2, s2));
+                            }
+                            Some(config) => {
+                                let conn = rustls::ServerConnection::new(config.clone()).unwrap();
+                                std::thread::spawn(move || tls_pump(conn, s, b));
+                            }
+                        }
+                    }
+                });
+                at
+            }
+        };
+        Self { at, accepted, live }
+    }
+
+    /// How many connections the store made.
+    fn accepted(&self) -> usize {
+        self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Drop every connection the store holds (a server going away under it).
+    fn drop_all(&self) {
+        for s in self.live.lock().unwrap().drain(..) {
+            match s {
+                Shut::Tcp(t) => {
+                    let _ = t.shutdown(std::net::Shutdown::Both);
+                }
+                Shut::Unix(u) => {
+                    let _ = u.shutdown(std::net::Shutdown::Both);
+                }
+            }
+        }
+    }
+}
+
+/// TLS-terminate `front` and forward the plaintext to `back` (one TLS stream, two directions).
+fn tls_pump(conn: rustls::ServerConnection, front: std::net::TcpStream, back: std::net::TcpStream) {
+    use std::io::{Read, Write};
+    front
+        .set_read_timeout(Some(std::time::Duration::from_millis(5)))
+        .unwrap();
+    let tls = Arc::new(std::sync::Mutex::new(rustls::StreamOwned::new(conn, front)));
+    let (t2, mut b2) = (tls.clone(), back.try_clone().unwrap());
+    std::thread::spawn(move || {
+        let mut buf = [0_u8; 16 * 1024];
+        loop {
+            match b2.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    let mut t = t2.lock().unwrap();
+                    if t.write_all(&buf[..n]).is_err() || t.flush().is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    let mut back = back;
+    let mut buf = [0_u8; 16 * 1024];
+    loop {
+        let got = tls.lock().unwrap().read(&mut buf);
+        match got {
+            Ok(0) => return,
+            Ok(n) => {
+                if back.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// The store's door opened on `settings` on a dispatcher of its own, over the connection table
+/// `table` builds; the table too, to read what it was asked.
+fn open_on(
+    settings: &str,
+    table: impl FnOnce(&Dispatcher) -> TcpConns,
+) -> (Result<LoadedStore, String>, Arc<TcpConns>) {
+    open_on_dispatcher(
+        Arc::new(Dispatcher::new(DispatchConfig::default())),
+        settings,
+        table,
+    )
+}
+
+/// [`open_on`] on the dispatcher `d`.
+fn open_on_dispatcher(
+    d: Arc<Dispatcher>,
+    settings: &str,
+    table: impl FnOnce(&Dispatcher) -> TcpConns,
+) -> (Result<LoadedStore, String>, Arc<TcpConns>) {
+    let t = Arc::new(table(&d));
+    let conns: Arc<dyn busbar_contract::conn::DeclaredConns> = t.clone();
+    let row = LinkedRow::of(crate::door).expect("the door");
+    let p = load_linked::<Store>(
+        &row,
+        Bind {
+            instance: Arc::from("store-valkey-test"),
+            max_inflight_cap: 64,
+            sink: Arc::new(NoSink),
+            dispatcher: d.adopter(),
+            conns: Some(conns),
+        },
+    )
+    .expect("the door loads");
+    (LoadedStore::open(p, d, settings.as_bytes(), mint), t)
+}
+
+fn plain(d: &Dispatcher) -> TcpConns {
+    TcpConns::new(d.conn_waker())
+}
+
+fn settings_for(url: &str) -> String {
+    serde_json::json!({ "url": url }).to_string()
+}
+
+/// STORE-KEEP: the store keeps ONE connection across ops (1.5.5's one mutex-guarded connection):
+/// its open and every later op are one connection, one handshake.
+#[test]
+fn the_store_keeps_one_connection_across_ops() {
+    if live_store().is_none() {
+        return;
+    }
+    let proxy = Proxy::start(Front::Tcp);
+    let (_, db, userinfo) = live_parts();
+    let (store, _) = open_on(
+        &settings_for(&format!("redis://{userinfo}{}/{db}", proxy.at)),
+        plain,
+    );
+    let store = store.expect("opens through the proxy");
+    let id = uid("vk_kept");
+    store.put_key(&vk(&id)).unwrap();
+    assert!(store.get_key(&id).unwrap().is_some());
+    store.list_denylist().unwrap();
+    assert_eq!(
+        proxy.accepted(),
+        1,
+        "the open and every op share one kept connection"
+    );
+    let _ = store.purge_key_for_test(&id);
+}
+
+/// VALKEY-RETRY, 1.5.5's own pin: a genuine connection-level error (the server dropping the
+/// store's connection out from under it, the real-world case `with_conn`'s reconnect-and-retry
+/// exists for) is transparently recovered on a fresh connection, not surfaced to the caller.
+#[test]
+fn with_conn_transparently_reconnects_after_the_connection_is_dropped() {
+    if live_store().is_none() {
+        return;
+    }
+    let proxy = Proxy::start(Front::Tcp);
+    let (_, db, userinfo) = live_parts();
+    let (store, _) = open_on(
+        &settings_for(&format!("redis://{userinfo}{}/{db}", proxy.at)),
+        plain,
+    );
+    let store = store.expect("opens");
+    let before = uid("vk_before_drop");
+    store.put_key(&vk(&before)).unwrap();
+    proxy.drop_all();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let id = uid("vk_after_drop");
+    store.put_key(&vk(&id)).expect(
+        "a connection-level error (a dropped connection) must trigger transparent \
+         reconnect-and-retry, not surface as a caller-visible failure",
+    );
+    assert!(store.get_key(&id).unwrap().is_some());
+    assert_eq!(
+        proxy.accepted(),
+        2,
+        "one fresh connection for the retry, then kept"
+    );
+    let _ = store.purge_key_for_test(&before);
+    let _ = store.purge_key_for_test(&id);
+}
+
+/// VALKEY-RETRY's other half: a write 1.5.5 never replayed (`with_conn_no_retry`: the plane
+/// writes, a token redemption) fails on a dropped connection, and the next op dials fresh.
+#[test]
+fn a_no_retry_write_on_a_dropped_connection_fails_and_the_next_op_dials_fresh() {
+    if live_store().is_none() {
+        return;
+    }
+    let proxy = Proxy::start(Front::Tcp);
+    let (_, db, userinfo) = live_parts();
+    let (store, _) = open_on(
+        &settings_for(&format!("redis://{userinfo}{}/{db}", proxy.at)),
+        plain,
+    );
+    let store = store.expect("opens");
+    store.list_denylist().unwrap();
+    proxy.drop_all();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let token = uid("tok_noretry");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let err = store
+        .redeem_plane_token("ask", &token, now + 60, now)
+        .expect_err("a redemption is never replayed on a fresh connection");
+    assert!(err.0.contains("valkey command:"), "{err:?}");
+    store.list_denylist().expect("the next op dials fresh");
+    assert_eq!(proxy.accepted(), 2);
+}
+
+/// VALKEY-UNIX: every unix-socket URL form 1.5.5's driver read reaches the server over a
+/// unix-domain socket through the host's connector (`unix:<path>`).
+#[test]
+fn a_unix_socket_url_reaches_the_server() {
+    if live_store().is_none() {
+        return;
+    }
+    let (_, db, _) = live_parts();
+    let dir = std::env::temp_dir().join(format!("vk-unix-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (n, scheme) in ["redis+unix", "unix", "valkey+unix"].iter().enumerate() {
+        let path = dir.join(format!("s{n}.sock"));
+        let proxy = Proxy::start(Front::Unix(path.clone()));
+        let (store, _) = open_on(
+            &settings_for(&format!("{scheme}://{}?db={db}", proxy.at)),
+            plain,
+        );
+        let store = store.unwrap_or_else(|e| panic!("{scheme}: {e}"));
+        let id = uid("vk_unix");
+        store.put_key(&vk(&id)).unwrap();
+        assert!(store.get_key(&id).unwrap().is_some());
+        assert_eq!(proxy.accepted(), 1);
+        let _ = store.purge_key_for_test(&id);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// VALKEY-TIMEOUT: `connect_timeout_ms` (default 10 s, 1.5.5's) is every dial's timeout, as the
+/// host's table is asked; a zero timeout refuses the load as 1.5.5's driver refused it.
+#[test]
+fn connect_timeout_ms_is_the_dial_timeout() {
+    if live_store().is_none() {
+        return;
+    }
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let (store, table) = open_on(
+        &serde_json::json!({ "url": url, "connect_timeout_ms": 1234 }).to_string(),
+        plain,
+    );
+    store.expect("opens").list_denylist().unwrap();
+    assert_eq!(table.dial_timeouts(), vec![1234]);
+    let (store, table) = open_on(&settings_for(&url), plain);
+    store.expect("opens").list_denylist().unwrap();
+    assert_eq!(table.dial_timeouts(), vec![10_000]);
+    let (store, _) = open_on(
+        &serde_json::json!({ "url": url, "connect_timeout_ms": 0 }).to_string(),
+        plain,
+    );
+    assert_eq!(
+        store.expect_err("a zero timeout refuses the load"),
+        "plugin 'busbar-store-valkey' open failed: valkey plugin: failed to connect: valkey \
+         connect: cannot set a 0 duration timeout"
+    );
+}
+
+/// A CA and a server certificate it signed for `127.0.0.1` (the proxy's address; an IP SAN): the
+/// server config, and the CA (DER).
+fn tls_server() -> (Arc<rustls::ServerConfig>, Vec<u8>) {
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let issuer = rcgen::Issuer::from_params(&ca_params, ca_key);
+    let key = rcgen::KeyPair::generate().unwrap();
+    let leaf = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
+        .unwrap()
+        .signed_by(&key, &issuer)
+        .unwrap();
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![leaf.der().clone()],
+        rustls_pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+    )
+    .unwrap();
+    (Arc::new(config), ca.der().to_vec())
+}
+
+/// TLS: a `rediss://` URL is secured from its first byte through the host's connector (the test
+/// table's TLS standing in for the connector's TLS wrap, trusting a test CA), and the kept
+/// connection stays secure; without the CA the load fails in the store's words.
+#[test]
+fn a_rediss_url_is_secured_through_the_hosts_connector() {
+    if live_store().is_none() {
+        return;
+    }
+    let (config, ca) = tls_server();
+    let proxy = Proxy::start(Front::Tls(config));
+    let port = proxy.at.rsplit_once(':').unwrap().1.to_string();
+    let (_, db, userinfo) = live_parts();
+    let url = format!("rediss://{userinfo}127.0.0.1:{port}/{db}");
+    let (store, _) = open_on(&settings_for(&url), |d| {
+        TcpConns::with_roots(d.conn_waker(), &ca)
+    });
+    let store = store.expect("opens over TLS");
+    let id = uid("vk_tls");
+    store.put_key(&vk(&id)).unwrap();
+    assert!(store.get_key(&id).unwrap().is_some());
+    assert_eq!(proxy.accepted(), 1, "one secured connection, kept");
+    let _ = store.purge_key_for_test(&id);
+
+    let (untrusted, _) = open_on(&settings_for(&url), plain);
+    let err = untrusted.expect_err("no TLS without trust");
+    assert!(
+        err.starts_with(
+            "plugin 'busbar-store-valkey' open failed: valkey plugin: failed to connect: valkey \
+             connect: "
+        ),
+        "{err}"
+    );
+}
+
+/// Host services offering the clock alone (the dispatcher's own timebase), refusing the rest: the
+/// host clock a wire's bound runs on.
+struct ClockOnly;
+
+impl busbar_contract::services::HostServices for ClockOnly {
+    fn now(&self) -> busbar_contract::services::Reading {
+        busbar_contract::services::Reading {
+            wall_ns: 0,
+            mono_ns: busbar_plugin_loader::dispatch::now_ns(),
+        }
+    }
+    fn dest_judge(
+        &self,
+        _: &str,
+        _: u32,
+        _: bool,
+        _: Option<busbar_contract::services::Later>,
+    ) -> busbar_contract::services::Ran {
+        refused_now()
+    }
+    fn records_get(
+        &self,
+        _: &busbar_contract::services::Caller,
+        _: &str,
+        _: &[u8],
+        _: busbar_contract::services::Later,
+    ) -> busbar_contract::services::Ran {
+        refused_now()
+    }
+    fn records_list(
+        &self,
+        _: &busbar_contract::services::Caller,
+        _: busbar_contract::services::RecordsList,
+        _: busbar_contract::services::Later,
+    ) -> busbar_contract::services::Ran {
+        refused_now()
+    }
+    fn records_claim(
+        &self,
+        _: &busbar_contract::services::Caller,
+        _: &str,
+        _: &[u8],
+        _: u64,
+        _: busbar_contract::services::Later,
+    ) -> busbar_contract::services::Ran {
+        refused_now()
+    }
+    fn sign(
+        &self,
+        _: &busbar_contract::services::Caller,
+        _: &[u8],
+    ) -> busbar_contract::services::Stored {
+        busbar_contract::services::Stored::refused("no")
+    }
+    fn trust_sight(
+        &self,
+        _: &busbar_contract::services::Caller,
+        _: &str,
+        _: &str,
+        _: busbar_contract::services::Later,
+    ) -> busbar_contract::services::Ran {
+        refused_now()
+    }
+    fn trust_due(
+        &self,
+        _: &busbar_contract::services::Caller,
+    ) -> busbar_contract::services::Stored {
+        busbar_contract::services::Stored::refused("no")
+    }
+    fn trust_verify(
+        &self,
+        _: &busbar_contract::services::Caller,
+        _: &str,
+        _: &[u8],
+        _: &[u8],
+    ) -> busbar_contract::services::Stored {
+        busbar_contract::services::Stored::refused("no")
+    }
+    fn entitlement_check(
+        &self,
+        _: &busbar_contract::services::Caller,
+        _: Option<u64>,
+        _: &str,
+    ) -> busbar_contract::services::Stored {
+        busbar_contract::services::Stored::refused("no")
+    }
+    fn random_fill(&self, _: u64) -> busbar_contract::services::Stored {
+        busbar_contract::services::Stored::refused("no")
+    }
+    fn records_secret(
+        &self,
+        _: &str,
+        _: &str,
+        _: busbar_contract::services::Later,
+    ) -> busbar_contract::services::Ran {
+        refused_now()
+    }
+}
+
+fn refused_now() -> busbar_contract::services::Ran {
+    busbar_contract::services::Ran::Now(busbar_contract::services::Stored::refused("no"))
+}
+
+/// VALKEY-TIMEOUT over the whole span 1.5.5's `get_connection_with_timeout` bounded: a server that
+/// accepts the dial and never answers the handshake's `AUTH` (or `SELECT`) refuses the load within
+/// `connect_timeout_ms`, in the store's words, rather than at the op's deadline.
+#[test]
+fn connect_timeout_ms_bounds_the_handshake_after_the_dial() {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let at = l.local_addr().unwrap().to_string();
+    // Accept and hold every connection, saying nothing.
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for s in l.incoming() {
+            held.push(s);
+        }
+    });
+    for url in [format!("redis://:pw@{at}/0"), format!("redis://{at}/3")] {
+        let d = Arc::new(Dispatcher::with_services(
+            DispatchConfig::default(),
+            Arc::new(ClockOnly),
+        ));
+        let t = std::time::Instant::now();
+        let (store, _) = open_on_dispatcher(
+            d,
+            &serde_json::json!({ "url": url, "connect_timeout_ms": 300 }).to_string(),
+            plain,
+        );
+        let err = store.expect_err("the handshake never answers");
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "{url}: bounded by connect_timeout_ms, not the op's deadline: {:?}",
+            t.elapsed()
+        );
+        assert!(
+            err.starts_with(
+                "plugin 'busbar-store-valkey' open failed: valkey plugin: failed to connect: \
+                 valkey connect: "
+            ) && err.contains("deadline passed"),
+            "{url}: {err}"
+        );
+        assert!(!err.contains("pw"), "the password is scrubbed: {err}");
+    }
+}
+
+/// A SELF-SIGNED `127.0.0.1` certificate (no CA anyone trusts): the server config.
+fn self_signed_tls_server() -> Arc<rustls::ServerConfig> {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![cert.der().clone()],
+        rustls_pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+    )
+    .unwrap();
+    Arc::new(config)
+}
+
+/// `#insecure` (ARCHITECT ruling 2026-10-03 on Q-L16-4): a server whose certificate is
+/// self-signed refuses the load over `rediss://` in the store's words, and is accepted over
+/// `rediss://…#insecure`, its certificate unverified as 1.5.5's driver left it; the kept
+/// connection carries the ops.
+#[test]
+fn rediss_insecure_skips_certificate_verification() {
+    if live_store().is_none() {
+        return;
+    }
+    let proxy = Proxy::start(Front::Tls(self_signed_tls_server()));
+    let port = proxy.at.rsplit_once(':').unwrap().1.to_string();
+    let (_, db, userinfo) = live_parts();
+    let verified = format!("rediss://{userinfo}127.0.0.1:{port}/{db}");
+    let (refused, _) = open_on(&settings_for(&verified), plain);
+    let err = refused.expect_err("a self-signed certificate is not trusted");
+    assert!(
+        err.starts_with(
+            "plugin 'busbar-store-valkey' open failed: valkey plugin: failed to connect: valkey \
+             connect: "
+        ),
+        "{err}"
+    );
+    let (store, _) = open_on(&settings_for(&format!("{verified}#insecure")), plain);
+    let store = store.expect("#insecure accepts the self-signed certificate");
+    let id = uid("vk_insecure");
+    store.put_key(&vk(&id)).unwrap();
+    assert!(store.get_key(&id).unwrap().is_some());
+    assert_eq!(
+        proxy.accepted(),
+        2,
+        "the refused dial, then one kept connection"
+    );
+    let _ = store.purge_key_for_test(&id);
 }
