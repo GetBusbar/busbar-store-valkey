@@ -83,7 +83,8 @@
 //! on a `with_conn!` call (reads and the idempotent writes, as 1.5.5's `with_conn`) closes the
 //! connection and re-runs that call ONCE on a fresh one; the `with_conn_no_retry!` calls (the
 //! non-idempotent writes 1.5.5 never replayed) fail instead, and the next op dials fresh.
-//! `connect_timeout_ms` bounds every dial. `open` parses the settings only; its connect step
+//! `connect_timeout_ms` bounds every new connection's dial and handshake (TLS, `AUTH`, `SELECT`)
+//! in all, the span 1.5.5's `get_connection_with_timeout` bounded. `open` parses the settings only; its connect step
 //! (`StoreSlots::connect`) makes the first connection, migrates the schema and checks `noeviction`,
 //! so an unreachable or misconfigured server still refuses the load at boot in the store's own
 //! words. Error strings are scrubbed of the URL password.
@@ -710,9 +711,10 @@ impl ValkeyStore {
     }
 
     /// The op's connection over `wire`: the kept one when it is idle (its handshake done), else a
-    /// fresh dial (bounded by `connect_timeout_ms`), secured for `rediss://`, `AUTH` and `SELECT`
-    /// as the URL says. A failure reads `valkey {ctx}: …` (1.5.5's `connect` at boot, `reconnect`
-    /// when an op had to dial).
+    /// fresh dial, secured for `rediss://`, `AUTH` and `SELECT` as the URL says — the dial AND the
+    /// handshake bounded by `connect_timeout_ms` in all, the span 1.5.5's
+    /// `get_connection_with_timeout` bounded. A failure reads `valkey {ctx}: …` (1.5.5's `connect`
+    /// at boot, `reconnect` when an op had to dial).
     async fn conn(&self, wire: Wire, ctx: &str) -> RecordStoreResult<Conn> {
         let failed = |e: String| {
             RecordStoreError(scrub(
@@ -726,15 +728,18 @@ impl ValkeyStore {
             return Err(failed("cannot set a 0 duration timeout".into()));
         }
         let ms = u32::try_from(ms).unwrap_or(u32::MAX);
-        wire.connect_timed(NEED_TCP, Some(&self.inner.target.addr), ms)
-            .await
-            .map_err(|e| failed(e.to_string()))?;
+        wire.bound(ms);
+        let connected = wire
+            .connect_timed(NEED_TCP, Some(&self.inner.target.addr), ms)
+            .await;
         let mut c = Conn::new(wire);
-        if !c.wire().reused() {
-            self.handshake(&mut c)
-                .await
-                .map_err(|e| failed(e.to_string()))?;
-        }
+        let ready = match connected {
+            Ok(()) if c.wire().reused() => Ok(()),
+            Ok(()) => self.handshake(&mut c).await.map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        c.wire().unbound();
+        ready.map_err(failed)?;
         Ok(c)
     }
 
@@ -760,11 +765,20 @@ impl ValkeyStore {
         Ok(())
     }
 
-    /// 1.5.5's reconnect after a dropped connection: close it, dial a fresh one, handshake.
+    /// 1.5.5's reconnect after a dropped connection: close it, dial a fresh one, handshake (the
+    /// dial and the handshake bounded by `connect_timeout_ms`, as every new connection is).
     async fn reconnect(&self, c: &mut Conn) -> RedisResult<()> {
-        c.wire().reconnect().await.map_err(|e| RedisError::io(&e))?;
-        c.reset();
-        self.handshake(c).await
+        let ms = u32::try_from(self.inner.connect_timeout.as_millis()).unwrap_or(u32::MAX);
+        c.wire().bound(ms);
+        let r = match c.wire().reconnect().await {
+            Ok(()) => {
+                c.reset();
+                self.handshake(c).await
+            }
+            Err(e) => Err(RedisError::io(&e)),
+        };
+        c.wire().unbound();
+        r
     }
 
     /// The store's kept connection set.
