@@ -74,10 +74,17 @@ explicitly in production; do not assume they move together.
 It is a `cdylib` that implements busbar's `RecordStore` contract (via the
 plugin SDK in [`busbar-contract`](https://github.com/GetBusbar/busbar/tree/main/crates/busbar-contract),
 `busbar_contract::abi::sdk`) and is loaded in-process by busbar over the signed store ABI —
-`dlopen`'d, not spawned as a separate process. The same store can also be LINKED into a busbar
-build (its `linked::STORE` row); both doors run the same code, and
+`dlopen`'d, not spawned as a separate process. It answers the store kind's memory ABI (the store v3
+table: `busbar_store_valkey::door`, from `busbar_contract::store_door!`), and the cdylib exports that
+door as its one symbol, `busbar_plugin_door`. The same store can also be LINKED into a busbar
+build (it registers `door` as its row); both doors run the same code, and
 [`tests/conformance.rs`](store-valkey-plugin/tests/conformance.rs) proves they behave as one store.
 
+
+Writes that carry an `op_id` (usage, metering, audit, plane-record appends, the journal, `reserve`,
+`slice_release`, `window_caps`) are deduplicated durably on the server: the op's record is committed
+in the same transaction as its effect and expires after the retention window (24 h), so a replayed
+op, from any node, applies nothing and answers what the first call answered.
 
 - **Multi-node deployments**: a fleet of busbar nodes sharing one Valkey
   instance share virtual keys, per-key/per-group budgets, token usage
@@ -126,7 +133,7 @@ The end-to-end tests boot a REAL `busbar`; they build it from a busbar checkout 
 
 ### Dependencies
 
-`busbar-store-valkey`, the store logic (and the store's one door registration and its `linked` row,
+`busbar-store-valkey`, the store logic (and the store's one door, `door`,
 so a busbar build can link it), lives in this repository; `busbar-store-valkey-plugin` re-exports it
 as the droppable cdylib. The one busbar crate either names is `busbar-contract` (the plugin contract
 and SDK); the tests also use `busbar-plugin-loader`. Both are git dependencies on
