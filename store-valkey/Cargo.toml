@@ -9,9 +9,9 @@ description = "The Valkey backend for busbar's durable governance store — the 
 license = "Apache-2.0"
 
 [lib]
-# rlib: THE LOGIC. It carries the store's ONE door registration (`export_store_plugin!(open)`) and its
-# `linked::STORE` row, so a busbar build can link it; the sibling `busbar-store-valkey-plugin` cdylib
-# re-exports it as the dropped-in door. One source, both doors (DECISIONS #2 rule (1)).
+# rlib: THE LOGIC, and the store's door (`store_door!` over its `StoreSlots`: `door`, the row a
+# busbar build that links this crate registers). The sibling `busbar-store-valkey-plugin` cdylib
+# exports the same `door` as the dropped-in door. One source, both doors (DECISIONS #2 rule (1)).
 crate-type = ["rlib"]
 
 [dependencies]
@@ -35,6 +35,10 @@ rustls = { workspace = true }
 serde_json = { workspace = true }
 # `derive` for the plane-record sidecar and the v6 -> v7 migration's legacy row shapes.
 serde = { workspace = true }
+# The digest an `op_id` write's record keeps of its value fields (SHA-256), so a replay can be told
+# from a conflict without the record holding the fields themselves. Already in the lock through
+# busbar-contract: no new package.
+sha2 = { workspace = true }
 
 # NO busbar dev-dependency. The `RecordStore` contract conformance suite used to arrive here as
 # `busbar-plugin-testkit`; the owner ruled that crate DELETED on 2026-09-22 and #2/#31 forbid a shared

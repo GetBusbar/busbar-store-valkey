@@ -86,7 +86,7 @@
 
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
-    PlaneRecord, PlaneSelector, RecordStore, RecordStoreError, RecordStoreResult, UsageDelta,
+    PlaneRecordRef, PlaneSelector, RecordStore, RecordStoreError, RecordStoreResult, UsageDelta,
     UsageLedger, VirtualKey, RESERVED_UNITS,
 };
 use redis::{Commands, Connection};
@@ -380,30 +380,178 @@ fn is_connection_error(e: &redis::RedisError) -> bool {
     e.is_io_error() || e.is_connection_dropped() || e.is_connection_refusal() || e.is_timeout()
 }
 
-/// ADD-THEN-FLOOR over one hash: `ARGV` is `field, delta` pairs; each field is `HINCRBY`'d and, if
-/// the result went below 0, pinned to 0. A counter a v6 build left negative (its unfloored HINCRBY)
-/// is read as the 0 it always reported before the add, so the add lands on what readers saw. The add
-/// itself stays an integer HINCRBY (Lua numbers are doubles; a read-add-write in Lua would round
-/// counters past 2^53). One script, so the server runs every pair atomically — the
-/// same guarantee the v6 `MULTI` pipeline gave, plus the per-counter floor the contract's
-/// `UsageLedger::apply_delta` specifies.
-static ADD_FLOORED: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
-    redis::Script::new(
-        r"
-        for i = 1, #ARGV, 2 do
-            local cur = redis.call('HGET', KEYS[1], ARGV[i])
-            if cur and tonumber(cur) < 0 then
-                redis.call('HSET', KEYS[1], ARGV[i], 0)
-            end
-            local v = redis.call('HINCRBY', KEYS[1], ARGV[i], ARGV[i + 1])
-            if v < 0 then
-                redis.call('HSET', KEYS[1], ARGV[i], 0)
-            end
-        end
-        return 0
-        ",
+/// The `(field, delta)` pairs one usage write adds to its window hash: the two request counters,
+/// then every non-zero unit delta.
+fn usage_fields(delta: &UsageDelta) -> Vec<(String, i64)> {
+    let mut fields: Vec<(String, i64)> = vec![
+        ("requests".to_string(), delta.requests),
+        ("billable_requests".to_string(), delta.billable_requests),
+    ];
+    for m in &delta.models {
+        for (unit, d) in &m.usage_units {
+            if *d != 0 {
+                fields.push((usage_field(&m.model, unit), *d));
+            }
+        }
+    }
+    fields
+}
+
+/// A server-shaped refusal the staging helpers raise: not a connection fault, a fact about the data.
+fn refusal(what: &'static str, detail: String) -> redis::RedisError {
+    redis::RedisError::from((redis::ErrorKind::Client, what, detail))
+}
+
+/// ADD-THEN-FLOOR over one hash, staged onto `pipe`: each `(field, delta)` pair is added and, if the
+/// result went below 0, pinned to 0. A counter a v6 build left negative (its unfloored HINCRBY) is
+/// read as the 0 it always reported before the add, so the add lands on what readers saw. Pairs apply
+/// in order, so a field named twice accumulates. The counters are read here and the writes staged, so
+/// the caller must hold a `WATCH` on `key` (the transaction it queries `pipe` in): a concurrent write
+/// to the window aborts the transaction and the whole read-add-write runs again on fresh state. The
+/// add stays integer arithmetic (a Lua number is a double and would round counters past 2^53).
+fn stage_usage(
+    c: &mut Connection,
+    pipe: &mut redis::Pipeline,
+    key: &str,
+    fields: &[(String, i64)],
+) -> redis::RedisResult<()> {
+    let mut names: Vec<&str> = fields.iter().map(|(f, _)| f.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    let current: Vec<Option<String>> = redis::cmd("HMGET").arg(key).arg(&names).query(c)?;
+    let mut counters: std::collections::BTreeMap<&str, i64> = std::collections::BTreeMap::new();
+    for (name, raw) in names.iter().zip(current) {
+        let cur = match raw {
+            Some(raw) => raw
+                .parse::<i64>()
+                .map_err(|_| refusal("usage counter", format!("{name} is not an integer")))?,
+            None => 0,
+        };
+        counters.insert(*name, cur.max(0));
+    }
+    for (field, delta) in fields {
+        let cur = counters
+            .get_mut(field.as_str())
+            .expect("every field was read");
+        let sum = cur.checked_add(*delta).ok_or_else(|| {
+            refusal(
+                "usage counter",
+                format!("{field}: increment or decrement would overflow"),
+            )
+        })?;
+        *cur = sum.max(0);
+    }
+    for (field, value) in counters {
+        pipe.hset(key, field, value).ignore();
+    }
+    Ok(())
+}
+
+/// One metering delta's writes, staged onto `pipe` (an atomic pipeline): the cell joins its bucket's
+/// index, every counter is an atomic server-side add, and the attribution snapshot is
+/// first-write-wins.
+fn stage_metering(pipe: &mut redis::Pipeline, d: &MeteringDelta) {
+    let row = metering_row(d.bucket, &d.key_id, &d.model, &d.provider, d.priced_from_ms);
+    let set = metering_set(d.bucket);
+    pipe.sadd(&set, &row).ignore();
+    for (field, v) in [
+        ("tokens_input", d.tokens_input),
+        ("tokens_output", d.tokens_output),
+        ("tokens_cache_read", d.tokens_cache_read),
+        ("tokens_cache_write", d.tokens_cache_write),
+        ("requests", d.requests),
+        ("billable_requests", d.billable_requests),
+    ] {
+        pipe.cmd("HINCRBY")
+            .arg(&row)
+            .arg(field)
+            .arg(clamp(v))
+            .ignore();
+    }
+    for (class, v) in &d.usage_units {
+        pipe.cmd("HINCRBY")
+            .arg(&row)
+            .arg(format!("{METERING_UNIT_PREFIX}{class}"))
+            .arg(clamp(*v))
+            .ignore();
+    }
+    pipe.hset_multiple(
+        &row,
+        &[
+            ("key_id", d.key_id.as_str()),
+            ("model", d.model.as_str()),
+            ("provider", d.provider.as_str()),
+        ],
     )
-});
+    .ignore()
+    .hset(&row, "priced_from_ms", d.priced_from_ms.to_string())
+    .ignore()
+    // First-write-wins attribution snapshot: HSETNX only sets if the field is absent.
+    .cmd("HSETNX")
+    .arg(&row)
+    .arg("key_group_at_use")
+    .arg(&d.key_group_at_use)
+    .ignore()
+    .cmd("HSETNX")
+    .arg(&row)
+    .arg("pricing_version")
+    .arg(&d.pricing_version)
+    .ignore();
+}
+
+/// One audit record's append, staged onto `pipe`, read under the caller's `WATCH` of [`AUDIT_ZSET`]
+/// so a concurrent append cannot land between the read and the write. `staged` holds the records an
+/// earlier call of THIS transaction already staged (a batch), which the server cannot show yet.
+///
+/// This used to ZREMRANGEBYSCORE the score then ZADD, i.e. OVERWRITE, last writer wins. That is the
+/// one outcome the trait rules out outright ("a store never rewrites or recomputes the digest"): it
+/// destroys the evidence in exactly the case that matters most, a second record claiming an occupied
+/// chain position. Compare instead:
+///   nothing there -> append.
+///   identical     -> the write-through retrying after a lost ACK. Benign, Ok, no write.
+///   different     -> a forked or tampered chain. Error, and the stored record stands.
+fn stage_audit<'a>(
+    c: &mut Connection,
+    pipe: &mut redis::Pipeline,
+    entry: &'a AuditRecord,
+    staged: &mut std::collections::BTreeMap<u64, &'a AuditRecord>,
+) -> redis::RedisResult<()> {
+    let fork = |stored_action: &str| {
+        refusal(
+            "append_audit refused",
+            format!(
+                "append_audit: seq {} already holds a DIFFERENT record; the audit chain has \
+                 forked (stored action '{}', incoming '{}')",
+                entry.seq, stored_action, entry.action
+            ),
+        )
+    };
+    if let Some(earlier) = staged.get(&entry.seq) {
+        return if **earlier == *entry {
+            Ok(())
+        } else {
+            Err(fork(&earlier.action))
+        };
+    }
+    let score = clamp(entry.seq);
+    let existing: Vec<String> = c.zrangebyscore(AUDIT_ZSET, score, score)?;
+    if let Some(raw) = existing.first() {
+        let stored: AuditRecord =
+            serde_json::from_str(raw).map_err(|e| refusal("audit decode failed", e.to_string()))?;
+        // No write at all when identical: re-adding the identical member would be a no-op anyway,
+        // and skipping it keeps this path free of any rewrite.
+        return if stored == *entry {
+            Ok(())
+        } else {
+            Err(fork(&stored.action))
+        };
+    }
+    let json =
+        serde_json::to_string(entry).map_err(|e| refusal("audit encode failed", e.to_string()))?;
+    pipe.zadd(AUDIT_ZSET, json, score).ignore();
+    staged.insert(entry.seq, entry);
+    Ok(())
+}
 
 /// Valkey `RecordStore` backend (durable, shared across a cluster). A single
 /// mutex-guarded synchronous connection with one-shot reconnect - governance is off the request hot
@@ -1049,82 +1197,27 @@ impl RecordStore for ValkeyStore {
         window_start: u64,
         delta: &UsageDelta,
     ) -> RecordStoreResult<()> {
-        // The FLEET-HONEST flush: every counter is an atomic server-side add, so N nodes' deltas sum.
-        // Each counter is FLOORED AT 0 as its delta lands (the contract's `apply_delta`: a refund can
-        // never drive a durable counter negative), which a bare HINCRBY cannot do — a refund larger
-        // than the counter would leave it negative and the NEXT accrual would be swallowed paying
-        // that debt back. So the add-then-floor runs as ONE script the server executes atomically.
+        // The FLEET-HONEST flush: every counter is an atomic add, so N nodes' deltas sum. Each counter
+        // is FLOORED AT 0 as its delta lands (the contract's `apply_delta`: a refund can never drive
+        // a durable counter negative), which a bare HINCRBY cannot do — a refund larger than the
+        // counter would leave it negative and the NEXT accrual would be swallowed paying that debt
+        // back. So the add-then-floor runs as ONE WATCHed transaction ([`stage_usage`]).
         let k = usage_key(bucket_id, window_start);
-        let mut fields: Vec<(String, i64)> = vec![
-            ("requests".to_string(), delta.requests),
-            ("billable_requests".to_string(), delta.billable_requests),
-        ];
-        for m in &delta.models {
-            for (unit, d) in &m.usage_units {
-                if *d != 0 {
-                    fields.push((usage_field(&m.model, unit), *d));
-                }
-            }
-        }
+        let fields = usage_fields(delta);
         self.with_conn_no_retry(|c| {
-            let mut inv = ADD_FLOORED.key(&k);
-            for (f, d) in &fields {
-                inv.arg(f).arg(*d);
-            }
-            inv.invoke::<()>(c)
+            redis::transaction(c, &[&k], |c, pipe| {
+                stage_usage(c, pipe, &k, &fields)?;
+                pipe.query(c)
+            })
         })
     }
 
     fn add_metering(&self, d: &MeteringDelta) -> RecordStoreResult<()> {
-        let row = metering_row(d.bucket, &d.key_id, &d.model, &d.provider, d.priced_from_ms);
-        let set = metering_set(d.bucket);
         self.with_conn_no_retry(|c| {
             let mut pipe = redis::pipe();
-            pipe.atomic().sadd(&set, &row).ignore();
-            for (field, v) in [
-                ("tokens_input", d.tokens_input),
-                ("tokens_output", d.tokens_output),
-                ("tokens_cache_read", d.tokens_cache_read),
-                ("tokens_cache_write", d.tokens_cache_write),
-                ("requests", d.requests),
-                ("billable_requests", d.billable_requests),
-            ] {
-                pipe.cmd("HINCRBY")
-                    .arg(&row)
-                    .arg(field)
-                    .arg(clamp(v))
-                    .ignore();
-            }
-            for (class, v) in &d.usage_units {
-                pipe.cmd("HINCRBY")
-                    .arg(&row)
-                    .arg(format!("{METERING_UNIT_PREFIX}{class}"))
-                    .arg(clamp(*v))
-                    .ignore();
-            }
-            pipe.hset_multiple(
-                &row,
-                &[
-                    ("key_id", d.key_id.as_str()),
-                    ("model", d.model.as_str()),
-                    ("provider", d.provider.as_str()),
-                ],
-            )
-            .ignore()
-            .hset(&row, "priced_from_ms", d.priced_from_ms.to_string())
-            .ignore()
-            // First-write-wins attribution snapshot: HSETNX only sets if the field is absent.
-            .cmd("HSETNX")
-            .arg(&row)
-            .arg("key_group_at_use")
-            .arg(&d.key_group_at_use)
-            .ignore()
-            .cmd("HSETNX")
-            .arg(&row)
-            .arg("pricing_version")
-            .arg(&d.pricing_version)
-            .ignore()
-            .query(c)
+            pipe.atomic();
+            stage_metering(&mut pipe, d);
+            pipe.query(c)
         })
     }
 
@@ -1590,47 +1683,9 @@ impl RecordStore for ValkeyStore {
     }
 
     fn append_audit(&self, entry: &AuditRecord) -> RecordStoreResult<()> {
-        let json = serde_json::to_string(entry)
-            .map_err(|e| RecordStoreError(format!("audit encode failed: {e}")))?;
-        let score = clamp(entry.seq);
         self.with_conn(|c| {
-            // This used to ZREMRANGEBYSCORE the score then ZADD, i.e. OVERWRITE, last writer wins.
-            // That is the one outcome the trait rules out outright ("a store never rewrites or
-            // recomputes the digest"): it destroys the evidence in exactly the case that matters
-            // most, a second record claiming an occupied chain position.
-            //
-            // Compare instead, under WATCH so a concurrent append cannot land between the read and
-            // the write:
-            //   nothing there -> append.
-            //   identical     -> the write-through retrying after a lost ACK. Benign, Ok, no write.
-            //   different     -> a forked or tampered chain. Error, and the stored record stands.
             redis::transaction(c, &[AUDIT_ZSET], |c, pipe| {
-                let existing: Vec<String> = c.zrangebyscore(AUDIT_ZSET, score, score)?;
-                if let Some(raw) = existing.first() {
-                    let stored: AuditRecord = serde_json::from_str(raw).map_err(|e| {
-                        redis::RedisError::from((
-                            redis::ErrorKind::Client,
-                            "audit decode failed",
-                            e.to_string(),
-                        ))
-                    })?;
-                    if stored == *entry {
-                        // No write at all: re-adding the identical member would be a no-op anyway,
-                        // and skipping it keeps this path free of any rewrite.
-                        pipe.atomic();
-                        return pipe.query(c);
-                    }
-                    return Err(redis::RedisError::from((
-                        redis::ErrorKind::Client,
-                        "append_audit refused",
-                        format!(
-                            "append_audit: seq {} already holds a DIFFERENT record; the audit \
-                             chain has forked (stored action '{}', incoming '{}')",
-                            entry.seq, stored.action, entry.action
-                        ),
-                    )));
-                }
-                pipe.atomic().zadd(AUDIT_ZSET, &json, score).ignore();
+                stage_audit(c, pipe, entry, &mut std::collections::BTreeMap::new())?;
                 pipe.query(c)
             })
         })
@@ -1680,7 +1735,7 @@ impl RecordStore for ValkeyStore {
     // One keyspace per kind, for every kind; the store never decodes a body. See [`plane`] for the
     // layout and for why each step is a server-side script.
 
-    fn upsert_plane_record(&self, record: &PlaneRecord) -> RecordStoreResult<()> {
+    fn upsert_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
         plane::upsert(self, record)
     }
 
@@ -1688,14 +1743,14 @@ impl RecordStore for ValkeyStore {
         plane::get(self, kind, id)
     }
 
-    fn append_plane_record(&self, record: &PlaneRecord) -> RecordStoreResult<()> {
+    fn append_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
         plane::append(self, record)
     }
 
     fn list_plane_records(
         &self,
         kind: &str,
-        selector: &PlaneSelector,
+        selector: &PlaneSelector<'_>,
     ) -> RecordStoreResult<Vec<Vec<u8>>> {
         plane::list(self, kind, selector)
     }
@@ -1744,51 +1799,48 @@ fn now() -> u64 {
 }
 
 // ── THE DOOR (DECISIONS #2 rule (1): compiled in or dropped in, one contract, one loading path) ──
+//
+// The store's door lives in [`slots`]: `store_door!` over this store's `StoreSlots`, answering the
+// store v3 table (`busbar_contract::abi::store`). A busbar build that links this crate registers
+// `door` as its compiled-in row (`LinkedRow::of(door)`); the sibling `busbar-store-valkey-plugin`
+// cdylib exports the same `door` as the image's one symbol (`export_door!`). One source, both doors.
+mod slots;
+pub use slots::door;
 
-/// The store's registry name, and the alias `store.module: valkey` selects it by.
+/// The store's registry name, the package name its door's Statement states.
 pub const NAME: &str = "busbar-store-valkey";
-/// The alias an operator names in `store.module`.
-pub const ALIAS: &str = "valkey";
 
-/// Construct a Valkey-protocol store from the JSON config the engine passes through `open`:
-///
-/// ```json
-/// { "url": "redis://:password@host:6379/0", "connect_timeout_ms": 10000 }
-/// ```
-///
-/// The engine passes `store.settings` verbatim as this JSON config (see the boot store-load),
-/// mirroring how the Postgres plugin receives its libpq URL. `connect_timeout_ms` is optional
-/// (defaults to [`DEFAULT_CONNECT_TIMEOUT`], currently 10s); it bounds the initial connect so a
-/// blackholed/firewalled instance fails fast at boot instead of wedging it indefinitely.
-pub fn open(cfg: &str) -> Result<Box<dyn RecordStore>, String> {
-    let v: serde_json::Value = if cfg.trim().is_empty() {
-        serde_json::Value::Object(Default::default())
-    } else {
-        serde_json::from_str(cfg).map_err(|e| format!("invalid valkey plugin config: {e}"))?
-    };
-    let url = v.get("url").and_then(|x| x.as_str()).ok_or_else(|| {
-        "valkey plugin config requires a \"url\" (a redis:// connection string)".to_string()
-    })?;
-    let store = match v.get("connect_timeout_ms").and_then(|x| x.as_u64()) {
-        Some(ms) => ValkeyStore::connect_with_timeout(url, Duration::from_millis(ms)),
-        None => ValkeyStore::connect(url),
+impl ValkeyStore {
+    /// Construct a Valkey-protocol store from the JSON settings the engine passes through `open`:
+    ///
+    /// ```json
+    /// { "url": "redis://:password@host:6379/0", "connect_timeout_ms": 10000 }
+    /// ```
+    ///
+    /// The engine passes `store.settings` verbatim, mirroring how the Postgres plugin receives its
+    /// libpq URL. `connect_timeout_ms` is optional (defaults to [`DEFAULT_CONNECT_TIMEOUT`],
+    /// currently 10s); it bounds the initial connect so a blackholed/firewalled instance fails fast
+    /// at boot instead of wedging it indefinitely.
+    ///
+    /// # Errors
+    /// A text naming why the settings do not open a store.
+    pub fn from_settings(settings: &[u8]) -> Result<Self, String> {
+        let cfg = std::str::from_utf8(settings)
+            .map_err(|e| format!("invalid valkey plugin config: {e}"))?;
+        let v: serde_json::Value = if cfg.trim().is_empty() {
+            serde_json::Value::Object(Default::default())
+        } else {
+            serde_json::from_str(cfg).map_err(|e| format!("invalid valkey plugin config: {e}"))?
+        };
+        let url = v.get("url").and_then(|x| x.as_str()).ok_or_else(|| {
+            "valkey plugin config requires a \"url\" (a redis:// connection string)".to_string()
+        })?;
+        match v.get("connect_timeout_ms").and_then(|x| x.as_u64()) {
+            Some(ms) => Self::connect_with_timeout(url, Duration::from_millis(ms)),
+            None => Self::connect(url),
+        }
+        .map_err(|e| format!("valkey plugin: failed to connect: {}", e.0))
     }
-    .map_err(|e| format!("valkey plugin: failed to connect: {}", e.0))?;
-    Ok(Box::new(store))
-}
-
-// The image's ONE door registration. The frozen symbols the loader looks up in the
-// `busbar-store-valkey-plugin` cdylib are the contract SDK's, and they answer through this entry; a
-// busbar build that links this crate hands the loader `BUSBAR_COLD_ENTRY` instead.
-busbar_contract::abi::sdk::export_store_plugin!(open);
-
-/// THE LINKED ENTRY: what a build that links this store registers onto the cold-kind axis — the same
-/// row a dropped-in tarball of this store states, opened through the same boundary.
-pub mod linked {
-    /// `(name, alias, boundary)` — the row's statement and the boundary the one cold load runs over,
-    /// exactly what the dropped-in tarball states and exports.
-    pub const STORE: (&str, &str, &busbar_contract::abi::sdk::ColdEntry) =
-        (super::NAME, super::ALIAS, &super::BUSBAR_COLD_ENTRY);
 }
 
 #[cfg(test)]

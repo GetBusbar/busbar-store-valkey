@@ -38,8 +38,9 @@
 //! still orders correctly.
 
 use crate::{clamp, hex, ValkeyStore};
+use busbar_contract::abi::store::OP_ID_RETENTION_SECS;
 use busbar_contract::records::{
-    PlaneDisposition, PlaneRecord, PlaneSelector, RecordStoreError, RecordStoreResult,
+    PlaneDisposition, PlaneRecordRef, PlaneSelector, RecordStoreError, RecordStoreResult,
 };
 use redis::Commands;
 
@@ -95,8 +96,8 @@ fn parse_field(f: &str) -> Option<(u64, &str)> {
 }
 
 /// A chain position is `(parent, seq)`; a top-level record is its own `id` at `seq`.
-fn identity(record: &PlaneRecord) -> &str {
-    record.parent.as_deref().unwrap_or(&record.id)
+fn identity<'a>(record: &PlaneRecordRef<'a>) -> &'a str {
+    record.parent.unwrap_or(record.id)
 }
 
 /// THE TYPED SIDECAR — everything about a record except its body, as ONE deterministic string.
@@ -106,7 +107,7 @@ fn identity(record: &PlaneRecord) -> &str {
 /// terminal-only purge reads). Then the JSON of `{id, parent, seq, ts}` — every field that identifies
 /// or orders the record. Deterministic, so a byte comparison of two sidecars is a comparison of the
 /// records they describe (the append fork check).
-fn sidecar(record: &PlaneRecord) -> RecordStoreResult<String> {
+fn sidecar(record: &PlaneRecordRef<'_>) -> RecordStoreResult<String> {
     #[derive(serde::Serialize)]
     struct Sidecar<'a> {
         id: &'a str,
@@ -115,8 +116,8 @@ fn sidecar(record: &PlaneRecord) -> RecordStoreResult<String> {
         ts: u64,
     }
     let json = serde_json::to_string(&Sidecar {
-        id: &record.id,
-        parent: record.parent.as_deref(),
+        id: record.id,
+        parent: record.parent,
         seq: record.seq,
         ts: record.ts,
     })
@@ -159,21 +160,49 @@ static UPSERT: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| 
     ))
 });
 
-/// APPEND: as [`UPSERT`], but an occupied position is never overwritten — `0` = written or an
-/// identical replay (no write), `1` = a DIFFERENT record already holds the position (a fork).
+/// The APPEND step as a Lua function, `0` = written or an identical replay (no write), `1` = a
+/// DIFFERENT record already holds the position (a fork). `KEYS = rec, body, byts, idx, pcount`;
+/// `ARGV = F, sidecar, body, ts, seq, identity`. An occupied position is never overwritten.
+const LUA_APPEND: &str = r"
+local function append()
+    local old = redis.call('HGET', KEYS[1], ARGV[1])
+    if old then
+        if old == ARGV[2] and redis.call('HGET', KEYS[2], ARGV[1]) == ARGV[3] then
+            return 0
+        end
+        return 1
+    end
+    write(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5],
+          ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6])
+    return 0
+end
+";
+
+/// APPEND: as [`UPSERT`], but an occupied position is never overwritten (see [`LUA_APPEND`]).
 static APPEND: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
     redis::Script::new(&format!(
-        "{LUA_WRITE}
-        local old = redis.call('HGET', KEYS[1], ARGV[1])
-        if old then
-            if old == ARGV[2] and redis.call('HGET', KEYS[2], ARGV[1]) == ARGV[3] then
-                return 0
-            end
-            return 1
+        "{LUA_WRITE}{LUA_APPEND}
+        return append()"
+    ))
+});
+
+/// APPEND under an op's record (`abi::store` S1-S4): [`LUA_APPEND`], preceded by a read of the op's
+/// record and followed, when the record APPLIED (`0`), by the write of it with its TTL — one script,
+/// so the record and the append commit together. `KEYS` as [`APPEND`] then the op's record key;
+/// `ARGV` as [`APPEND`] then the record's text and its TTL in seconds. Answers `{0|1, ''}`, or
+/// `{2, <the record found>}` when the op was already recorded (nothing is appended).
+static APPEND_RECORDED: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
+    redis::Script::new(&format!(
+        "{LUA_WRITE}{LUA_APPEND}
+        local seen = redis.call('GET', KEYS[6])
+        if seen then
+            return {{2, seen}}
         end
-        write(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5],
-              ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6])
-        return 0"
+        local r = append()
+        if r == 0 then
+            redis.call('SET', KEYS[6], ARGV[7], 'EX', ARGV[8])
+        end
+        return {{r, ''}}"
     ))
 });
 
@@ -249,61 +278,106 @@ fn write_script<T: redis::FromRedisValue>(
     store.with_conn_no_retry(f)
 }
 
-/// Put `record` at its position with `script` ([`UPSERT`] or [`APPEND`]); the script's reply.
-fn put(
+/// Put `record` at its position with `script` ([`UPSERT`], [`APPEND`] or [`APPEND_RECORDED`]); the
+/// script's reply. `op` is the op's record that last script writes: its key, the text, and the TTL
+/// (seconds) it lives for.
+fn put<T: redis::FromRedisValue>(
     store: &ValkeyStore,
     script: &redis::Script,
-    record: &PlaneRecord,
-) -> RecordStoreResult<i64> {
-    let keys = Keys::of(&record.kind);
+    record: &PlaneRecordRef<'_>,
+    op: Option<(&str, &str, u64)>,
+) -> RecordStoreResult<T> {
+    let keys = Keys::of(record.kind);
     let ident = identity(record);
     let f = field(record.seq, ident);
     let side = sidecar(record)?;
     let idx = keys.idx(ident);
     write_script(store, |c| {
-        script
-            .key(&keys.rec)
+        let mut call = script.prepare_invoke();
+        call.key(&keys.rec)
             .key(&keys.body)
             .key(&keys.byts)
             .key(&idx)
             .key(&keys.pcount)
             .arg(&f)
             .arg(&side)
-            .arg(record.body.as_slice())
+            .arg(record.body)
             .arg(clamp(record.ts))
             .arg(clamp(record.seq))
-            .arg(ident)
-            .invoke(c)
+            .arg(ident);
+        if let Some((key, text, ttl)) = op {
+            call.key(key).arg(text).arg(ttl);
+        }
+        call.invoke(c)
     })
 }
 
 /// `upsert_plane_record`: UPSERT BY position — a second write for one record replaces it, never
 /// stands a rival beside it.
-pub(crate) fn upsert(store: &ValkeyStore, record: &PlaneRecord) -> RecordStoreResult<()> {
-    put(store, &UPSERT, record).map(|_| ())
+pub(crate) fn upsert(store: &ValkeyStore, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
+    put::<i64>(store, &UPSERT, &record, None).map(|_| ())
 }
 
 /// `append_plane_record`: an EMPTY position takes the record; the IDENTICAL record already there is
 /// the at-least-once write-through retrying, and is success with no write; a DIFFERENT record there
 /// is two records claiming one chain position — a forked or tampered log — and is an error that
 /// leaves the stored record standing. The same settlement `append_audit` makes.
-pub(crate) fn append(store: &ValkeyStore, record: &PlaneRecord) -> RecordStoreResult<()> {
-    match put(store, &APPEND, record)? {
+pub(crate) fn append(store: &ValkeyStore, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
+    match put::<i64>(store, &APPEND, &record, None)? {
         0 => Ok(()),
-        // Names the position and nothing else — never stored (or caller) content.
-        _ => Err(RecordStoreError(format!(
-            "append_plane_record: kind '{}' already holds a different record at sequence {} of \
-             this chain; the chain has forked",
-            record.kind, record.seq
-        ))),
+        _ => Err(fork_error(&record)),
     }
+}
+
+/// The error a forked chain position answers. Names the position and nothing else — never stored (or
+/// caller) content.
+pub(crate) fn fork_error(record: &PlaneRecordRef<'_>) -> RecordStoreError {
+    RecordStoreError(format!(
+        "append_plane_record: kind '{}' already holds a different record at sequence {} of \
+         this chain; the chain has forked",
+        record.kind, record.seq
+    ))
+}
+
+/// How an append under an op's record settled.
+pub(crate) enum Appended {
+    /// The record was appended (or was an identical replay), and the op's record was written.
+    Written,
+    /// A DIFFERENT record holds the position: nothing was appended, nothing recorded.
+    Fork,
+    /// The op was already recorded: its record's text. Nothing was appended.
+    Recorded(String),
+}
+
+/// `append_plane_record` as an `op_id` write ([`APPEND_RECORDED`]): the append and the op's record
+/// (`op_key`, holding `recorded`, for the retention window) commit in one script.
+pub(crate) fn append_recorded(
+    store: &ValkeyStore,
+    op_key: &str,
+    record: &PlaneRecordRef<'_>,
+    recorded: &str,
+) -> RecordStoreResult<Appended> {
+    let (verdict, seen): (i64, String) = put(
+        store,
+        &APPEND_RECORDED,
+        record,
+        Some((op_key, recorded, OP_ID_RETENTION_SECS)),
+    )?;
+    Ok(match verdict {
+        0 => Appended::Written,
+        2 => Appended::Recorded(seen),
+        _ => Appended::Fork,
+    })
 }
 
 /// Append `record` only if its position is EMPTY; an occupied one (identical or not) is left as it
 /// is. The v6 → v7 migration's write: a record already in the plane keyspace is newer than any v6 row
 /// could be, and is never overwritten by one.
-pub(crate) fn append_if_absent(store: &ValkeyStore, record: &PlaneRecord) -> RecordStoreResult<()> {
-    put(store, &APPEND, record).map(|_| ())
+pub(crate) fn append_if_absent(
+    store: &ValkeyStore,
+    record: PlaneRecordRef<'_>,
+) -> RecordStoreResult<()> {
+    put::<i64>(store, &APPEND, &record, None).map(|_| ())
 }
 
 /// `get_plane_record`: an upserted record lives at `(id, 0)`. No caller-scoping filter, deliberately:
@@ -324,7 +398,7 @@ type ChainRead = (Vec<String>, Vec<Option<String>>, Vec<Option<Vec<u8>>>);
 pub(crate) fn list(
     store: &ValkeyStore,
     kind: &str,
-    selector: &PlaneSelector,
+    selector: &PlaneSelector<'_>,
 ) -> RecordStoreResult<Vec<Vec<u8>>> {
     let keys = Keys::of(kind);
     let mut rows: Vec<(u64, String, Vec<u8>)> = match selector {

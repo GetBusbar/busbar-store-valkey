@@ -130,18 +130,16 @@ pub(crate) fn migrate_v6_to_v7(store: &ValkeyStore) -> RecordStoreResult<()> {
         let members: Vec<Vec<u8>> = store.with_conn(|c| c.zrange(&key, 0, -1))?;
         for raw in members {
             let e: rows::TaskEvent = decode("task event", &key, &raw)?;
-            plane::append_if_absent(
-                store,
-                &PlaneRecord {
-                    kind: KIND_TASK_EVENT.into(),
-                    id: e.task_id.clone(),
-                    parent: Some(e.task_id.clone()),
-                    seq: e.seq,
-                    ts: e.ts,
-                    disposition: PlaneDisposition::Active,
-                    body: encode(&e)?,
-                },
-            )?;
+            let record = PlaneRecord {
+                kind: KIND_TASK_EVENT.into(),
+                id: e.task_id.clone(),
+                parent: Some(e.task_id.clone()),
+                seq: e.seq,
+                ts: e.ts,
+                disposition: PlaneDisposition::Active,
+                body: encode(&e)?,
+            };
+            plane::append_if_absent(store, record.view())?;
         }
         store.with_conn(|c| c.del::<_, ()>(&key))?;
     }
@@ -155,18 +153,16 @@ pub(crate) fn migrate_v6_to_v7(store: &ValkeyStore) -> RecordStoreResult<()> {
             } else {
                 PlaneDisposition::Active
             };
-            plane::append_if_absent(
-                store,
-                &PlaneRecord {
-                    kind: KIND_TASK.into(),
-                    id: t.task_id.clone(),
-                    parent: None,
-                    seq: 0,
-                    ts: t.updated_at,
-                    disposition,
-                    body: encode(&t)?,
-                },
-            )?;
+            let record = PlaneRecord {
+                kind: KIND_TASK.into(),
+                id: t.task_id.clone(),
+                parent: None,
+                seq: 0,
+                ts: t.updated_at,
+                disposition,
+                body: encode(&t)?,
+            };
+            plane::append_if_absent(store, record.view())?;
         }
         store.with_conn(|c| c.del::<_, ()>(&key))?;
     }
@@ -175,18 +171,16 @@ pub(crate) fn migrate_v6_to_v7(store: &ValkeyStore) -> RecordStoreResult<()> {
     let demotions: Vec<(String, Vec<u8>)> = store.with_conn(|c| c.hgetall(MCP_DEMOTIONS_HASH))?;
     for (server, raw) in demotions {
         let d: rows::Demotion = decode("demotion", MCP_DEMOTIONS_HASH, &raw)?;
-        plane::append_if_absent(
-            store,
-            &PlaneRecord {
-                kind: KIND_DEMOTION.into(),
-                id: server,
-                parent: None,
-                seq: 0,
-                ts: d.recorded_at,
-                disposition: PlaneDisposition::Active,
-                body: encode(&d)?,
-            },
-        )?;
+        let record = PlaneRecord {
+            kind: KIND_DEMOTION.into(),
+            id: server,
+            parent: None,
+            seq: 0,
+            ts: d.recorded_at,
+            disposition: PlaneDisposition::Active,
+            body: encode(&d)?,
+        };
+        plane::append_if_absent(store, record.view())?;
     }
     store.with_conn(|c| c.del::<_, ()>(MCP_DEMOTIONS_HASH))?;
 

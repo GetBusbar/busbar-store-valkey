@@ -4,6 +4,7 @@
 //! Server-free unit tests for the plane-record keyspace's encodings (`src/plane.rs`).
 
 use super::*;
+use busbar_contract::records::PlaneRecord;
 
 fn rec(kind: &str, id: &str, parent: Option<&str>, seq: u64, d: PlaneDisposition) -> PlaneRecord {
     PlaneRecord {
@@ -26,9 +27,9 @@ fn a_position_field_round_trips_any_identity() {
         assert_eq!(parse_field(&f), Some((42, ident)), "{f}");
     }
     let child = rec("task_event", "t1", Some("t1"), 3, PlaneDisposition::Active);
-    assert_eq!(identity(&child), "t1");
+    assert_eq!(identity(&child.view()), "t1");
     let top = rec("task", "t9", None, 0, PlaneDisposition::Active);
-    assert_eq!(identity(&top), "t9");
+    assert_eq!(identity(&top.view()), "t9");
 }
 
 /// No kind can make one kind's key render as another's: the kind is hex in every key.
@@ -47,15 +48,15 @@ fn kind_keys_are_injective() {
 #[test]
 fn the_sidecar_flags_and_determinism() {
     let child = rec("call", "c", Some("p"), 1, PlaneDisposition::Active);
-    let s = sidecar(&child).unwrap();
+    let s = sidecar(&child.view()).unwrap();
     assert!(s.starts_with("1a{"), "{s}");
     let done = rec("task", "t", None, 0, PlaneDisposition::Terminal);
-    assert!(sidecar(&done).unwrap().starts_with("0t{"));
-    assert_eq!(sidecar(&child).unwrap(), s);
+    assert!(sidecar(&done.view()).unwrap().starts_with("0t{"));
+    assert_eq!(sidecar(&child.view()).unwrap(), s);
     let mut moved = child.clone();
     moved.ts += 1;
     assert_ne!(
-        sidecar(&moved).unwrap(),
+        sidecar(&moved.view()).unwrap(),
         s,
         "a different ts is a different record"
     );
