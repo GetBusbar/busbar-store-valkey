@@ -25,7 +25,7 @@ jobs:
     secrets: inherit
   release:
     needs: ci
-    uses: GetBusbar/busbar/.github/workflows/plugin-release.yml@c7cc4f6696d53654ba1ac4f8e8c4fad0b9cd9df8
+    uses: GetBusbar/busbar/.github/workflows/plugin-release.yml@180d92c205a7bdc70d1b6de012929757642543c6
     with:
       plugin_crate: busbar-store-valkey-plugin
       manifest_name: busbar-store-valkey
@@ -41,7 +41,7 @@ jobs:
   consumer-verify:
     needs: release
     if: ${{ !cancelled() }}
-    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@c7cc4f6696d53654ba1ac4f8e8c4fad0b9cd9df8
+    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@180d92c205a7bdc70d1b6de012929757642543c6
     with:
       version: ${{ github.ref_name }}
       asset_prefix: busbar-store-valkey

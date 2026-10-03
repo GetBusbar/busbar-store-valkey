@@ -29,8 +29,8 @@ publish = false
 repository = "https://github.com/GetBusbar/busbar-store-valkey"
 
 [workspace.dependencies]
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "c7cc4f6696d53654ba1ac4f8e8c4fad0b9cd9df8" }
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "c7cc4f6696d53654ba1ac4f8e8c4fad0b9cd9df8" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "180d92c205a7bdc70d1b6de012929757642543c6" }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "180d92c205a7bdc70d1b6de012929757642543c6" }
 # busbar's root [workspace.dependencies], third-party rows, at 8fc3b1b2a6d123575a77ce505e501b595fb24cef
 a2a-lf = "0.3.0"
 a2a-pb = "0.2.0"
