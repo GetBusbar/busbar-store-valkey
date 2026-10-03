@@ -54,6 +54,14 @@ impl RedisError {
         }
     }
 
+    /// A CONNECTION-LEVEL failure (the connector's: dropped, refused, timed out; or the server
+    /// closing), worth one reconnect-and-retry, as the upstream driver's `is_io_error` /
+    /// `is_connection_dropped` / `is_connection_refusal` / `is_timeout` were for 1.5.5.
+    #[must_use]
+    pub fn is_connection_error(&self) -> bool {
+        matches!(self.repr, Repr::Io(_))
+    }
+
     fn server(text: String) -> Self {
         Self {
             repr: Repr::Server(text),
@@ -541,6 +549,25 @@ impl Conn {
         match v {
             Value::Error(e) => Err(RedisError::server(e)),
             v => Ok(v),
+        }
+    }
+
+    /// The connection's wire.
+    #[must_use]
+    pub fn wire(&self) -> &Wire {
+        &self.wire
+    }
+
+    /// The connection was replaced by a fresh one: no `WATCH` is in force on it.
+    pub fn reset(&mut self) {
+        self.watching = false;
+    }
+
+    /// The op is done with the connection: one that still has a `WATCH` in force (a body that left
+    /// it in doubt) is not kept for the next op.
+    pub fn settle(&self) {
+        if self.watching {
+            self.wire.discard();
         }
     }
 

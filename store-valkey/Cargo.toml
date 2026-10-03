@@ -26,6 +26,8 @@ busbar-contract = { workspace = true }
 serde_json = { workspace = true }
 # `derive` for the plane-record sidecar and the v6 -> v7 migration's legacy row shapes.
 serde = { workspace = true }
+# The upstream driver's URL reading (1.5.5 parsed the store's URL with it): pure parsing, no socket.
+url = { workspace = true }
 
 [dev-dependencies]
 # The live tests open the store the way the host does: its door through the loader (`load_linked`,
@@ -35,5 +37,9 @@ serde = { workspace = true }
 busbar-plugin-loader = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["rt"] }
 redis = { workspace = true }
+# The TLS proxy the TLS test puts in front of the live server (a self-signed CA), test-only.
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+rcgen = { workspace = true }
 # The `RecordStore` contract conformance suite is this crate's own copy at
 # `src/tests/store_conformance.rs` (#2/#31: no shared test util between plugins).
