@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0
 #
 # RENDERED by `busbar-release plugin sync busbar-store-valkey` from GetBusbar/busbar-release template/ and
 # GetBusbar/busbar's dependency policy; a hand edit is overwritten by the next sync.
@@ -24,7 +24,7 @@ members = [
 [workspace.package]
 edition = "2021"
 rust-version = "1.98"
-license = "MIT"
+license = "Apache-2.0"
 publish = false
 repository = "https://github.com/GetBusbar/busbar-store-valkey"
 
