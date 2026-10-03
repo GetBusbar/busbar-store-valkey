@@ -127,7 +127,7 @@ config, mirroring how the Postgres store plugin receives its libpq URL:
 | Setting | Required | Notes |
 |---|---|---|
 | `url` | yes | A `redis://` or `rediss://` (TLS) connection string (`valkey://` / `valkeys://` read the same): `[user[:password]@]host[:port][/db]`, or a unix-socket URL (`unix://`, `redis+unix://`, `valkey+unix://` `/path?db=N&user=U&pass=P`). TLS is busbar's connector's (its trust anchors, always verified: `#insecure` is accepted and the certificate is still checked). |
-| `connect_timeout_ms` | no | Every dial's timeout (default 10000, 1.5.5's). The handshake after the dial (TLS, `AUTH`, `SELECT`) is bounded by the op's deadline. |
+| `connect_timeout_ms` | no | Bounds every new connection's dial and handshake (TLS, `AUTH`, `SELECT`) in all, as 1.5.5's driver did (default 10000, 1.5.5's). |
 
 ## Build
 

@@ -3419,7 +3419,19 @@ fn open_on(
     settings: &str,
     table: impl FnOnce(&Dispatcher) -> TcpConns,
 ) -> (Result<LoadedStore, String>, Arc<TcpConns>) {
-    let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
+    open_on_dispatcher(
+        Arc::new(Dispatcher::new(DispatchConfig::default())),
+        settings,
+        table,
+    )
+}
+
+/// [`open_on`] on the dispatcher `d`.
+fn open_on_dispatcher(
+    d: Arc<Dispatcher>,
+    settings: &str,
+    table: impl FnOnce(&Dispatcher) -> TcpConns,
+) -> (Result<LoadedStore, String>, Arc<TcpConns>) {
     let t = Arc::new(table(&d));
     let conns: Arc<dyn busbar_contract::conn::DeclaredConns> = t.clone();
     let row = LinkedRow::of(crate::door).expect("the door");
@@ -3649,4 +3661,149 @@ fn a_rediss_url_is_secured_through_the_hosts_connector() {
         ),
         "{err}"
     );
+}
+
+/// Host services offering the clock alone (the dispatcher's own timebase), refusing the rest: the
+/// host clock a wire's bound runs on.
+struct ClockOnly;
+
+impl busbar_contract::services::HostServices for ClockOnly {
+    fn now(&self) -> busbar_contract::services::Reading {
+        busbar_contract::services::Reading {
+            wall_ns: 0,
+            mono_ns: busbar_plugin_loader::dispatch::now_ns(),
+        }
+    }
+    fn dest_judge(
+        &self,
+        _: &str,
+        _: u32,
+        _: bool,
+        _: Option<busbar_contract::services::Later>,
+    ) -> busbar_contract::services::Ran {
+        refused_now()
+    }
+    fn records_get(
+        &self,
+        _: &busbar_contract::services::Caller,
+        _: &str,
+        _: &[u8],
+        _: busbar_contract::services::Later,
+    ) -> busbar_contract::services::Ran {
+        refused_now()
+    }
+    fn records_list(
+        &self,
+        _: &busbar_contract::services::Caller,
+        _: busbar_contract::services::RecordsList,
+        _: busbar_contract::services::Later,
+    ) -> busbar_contract::services::Ran {
+        refused_now()
+    }
+    fn records_claim(
+        &self,
+        _: &busbar_contract::services::Caller,
+        _: &str,
+        _: &[u8],
+        _: u64,
+        _: busbar_contract::services::Later,
+    ) -> busbar_contract::services::Ran {
+        refused_now()
+    }
+    fn sign(
+        &self,
+        _: &busbar_contract::services::Caller,
+        _: &[u8],
+    ) -> busbar_contract::services::Stored {
+        busbar_contract::services::Stored::refused("no")
+    }
+    fn trust_sight(
+        &self,
+        _: &busbar_contract::services::Caller,
+        _: &str,
+        _: &str,
+        _: busbar_contract::services::Later,
+    ) -> busbar_contract::services::Ran {
+        refused_now()
+    }
+    fn trust_due(
+        &self,
+        _: &busbar_contract::services::Caller,
+    ) -> busbar_contract::services::Stored {
+        busbar_contract::services::Stored::refused("no")
+    }
+    fn trust_verify(
+        &self,
+        _: &busbar_contract::services::Caller,
+        _: &str,
+        _: &[u8],
+        _: &[u8],
+    ) -> busbar_contract::services::Stored {
+        busbar_contract::services::Stored::refused("no")
+    }
+    fn entitlement_check(
+        &self,
+        _: &busbar_contract::services::Caller,
+        _: Option<u64>,
+        _: &str,
+    ) -> busbar_contract::services::Stored {
+        busbar_contract::services::Stored::refused("no")
+    }
+    fn random_fill(&self, _: u64) -> busbar_contract::services::Stored {
+        busbar_contract::services::Stored::refused("no")
+    }
+    fn records_secret(
+        &self,
+        _: &str,
+        _: &str,
+        _: busbar_contract::services::Later,
+    ) -> busbar_contract::services::Ran {
+        refused_now()
+    }
+}
+
+fn refused_now() -> busbar_contract::services::Ran {
+    busbar_contract::services::Ran::Now(busbar_contract::services::Stored::refused("no"))
+}
+
+/// VALKEY-TIMEOUT over the whole span 1.5.5's `get_connection_with_timeout` bounded: a server that
+/// accepts the dial and never answers the handshake's `AUTH` (or `SELECT`) refuses the load within
+/// `connect_timeout_ms`, in the store's words, rather than at the op's deadline.
+#[test]
+fn connect_timeout_ms_bounds_the_handshake_after_the_dial() {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let at = l.local_addr().unwrap().to_string();
+    // Accept and hold every connection, saying nothing.
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for s in l.incoming() {
+            held.push(s);
+        }
+    });
+    for url in [format!("redis://:pw@{at}/0"), format!("redis://{at}/3")] {
+        let d = Arc::new(Dispatcher::with_services(
+            DispatchConfig::default(),
+            Arc::new(ClockOnly),
+        ));
+        let t = std::time::Instant::now();
+        let (store, _) = open_on_dispatcher(
+            d,
+            &serde_json::json!({ "url": url, "connect_timeout_ms": 300 }).to_string(),
+            plain,
+        );
+        let err = store.expect_err("the handshake never answers");
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "{url}: bounded by connect_timeout_ms, not the op's deadline: {:?}",
+            t.elapsed()
+        );
+        assert!(
+            err.starts_with(
+                "plugin 'busbar-store-valkey' open failed: valkey plugin: failed to connect: \
+                 valkey connect: "
+            ) && err.contains("deadline passed"),
+            "{url}: {err}"
+        );
+        assert!(!err.contains("pw"), "the password is scrubbed: {err}");
+    }
 }
