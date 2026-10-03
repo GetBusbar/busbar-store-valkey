@@ -5,7 +5,7 @@ The Valkey store as a droppable busbar plugin: a cdylib exporting the store C AB
 
 | kind | alias | crate | busbar | license |
 |---|---|---|---|---|
-| `store` | `valkey` | `busbar-store-valkey-plugin` | 1.6.0 (pinned in `.busbar-ref`) | MIT |
+| `store` | `valkey` | `busbar-store-valkey-plugin` | 1.6.0 (pinned in `.busbar-ref`) | Apache-2.0 |
 
 [![ci](https://github.com/GetBusbar/busbar-store-valkey/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/GetBusbar/busbar-store-valkey/actions/workflows/ci.yml)
 <!-- fleet:header:end -->
