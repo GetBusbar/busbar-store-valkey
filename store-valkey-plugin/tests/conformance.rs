@@ -88,13 +88,29 @@ fn cdylib() -> PathBuf {
 }
 
 /// What a door is bound to: its own dispatcher's adopter, no envelope sink, no connections.
+/// The node's one `op_id` allocator (`LoadedStore::open` mints the bridge's writes from it): a node
+/// half no earlier run used (the dedupe is durable) and one counter.
+fn mint() -> busbar_contract::abi::store::OpId {
+    static NODE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let node = *NODE.get_or_init(|| unique() | 1);
+    busbar_contract::abi::store::OpId::from_parts(
+        node,
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+    )
+}
+
+/// The bind the host makes: the store's declared need served by the loader's test connection table
+/// (plain TCP, the host's connector path).
 fn bind(d: &Dispatcher) -> Bind {
     Bind {
         instance: Arc::from("store-valkey-conformance"),
         max_inflight_cap: 64,
         sink: Arc::new(NoSink),
         dispatcher: d.adopter(),
-        conns: None,
+        conns: Some(Arc::new(busbar_plugin_loader::tcp_conns::TcpConns::new(
+            d.conn_waker(),
+        ))),
     }
 }
 
@@ -157,7 +173,7 @@ fn op(counter: u64) -> OpId {
 /// durable.
 fn open(load: &impl Fn() -> Loaded, settings: &str) -> Result<LoadedStore, String> {
     let (plugin, dispatcher) = load();
-    LoadedStore::open(plugin, dispatcher, settings.as_bytes(), unique())
+    LoadedStore::open(plugin, dispatcher, settings.as_bytes(), mint)
 }
 
 /// One `Result` as comparable text: `ok:<debug>` or `err:<message>`.

@@ -98,10 +98,19 @@ kernel's records (`busbar:records:*`) are additive keyspaces beside the v7 ones.
   overwrite would be last-writer-wins across nodes).
 
 This crate (`busbar-store-valkey-plugin`) is intentionally a thin
-adapter: all the Valkey schema/serialization/retry/TLS logic — and the `open`
-that turns the engine's JSON config into a live `ValkeyStore` — lives in the
+adapter: all the Valkey schema/serialization logic — and the `open`
+that turns the engine's JSON config into a `ValkeyStore` — lives in the
 `busbar-store-valkey` library crate it re-exports, in the `store-valkey/`
 directory of this repository.
+
+The store holds **no socket and no TLS stack of its own**: it declares one
+outbound `tcp` need and speaks RESP2 over the connection busbar's connector
+dials, secures and wakes for it. Every store op is one connection (dial, `AUTH`,
+`SELECT`, its commands), closed when the op answers; a read that has nothing yet
+pends on the op's ticket instead of blocking a thread. `open` only parses the
+settings; its connect step makes the first connection, migrates the schema and
+checks `maxmemory-policy noeviction`, so an unreachable or misconfigured server
+still refuses the store at boot, in the store's own words.
 
 ## Config
 
@@ -114,8 +123,8 @@ config, mirroring how the Postgres store plugin receives its libpq URL:
 
 | Setting | Required | Notes |
 |---|---|---|
-| `url` | yes | A `redis://` or `rediss://` (TLS) connection string — the URL scheme is the upstream RESP driver's, not a busbar name; a Valkey server is what it points at. TLS is backed by `rustls` (`ring` provider) — no OpenSSL dependency. |
-| `connect_timeout_ms` | no | Bounds the initial connect (unlike libpq's DSN-level `connect_timeout`, the upstream driver crate has no URL-level escape hatch, so this crate adds one). Defaults to 10s. A blackholed/firewalled Valkey host fails fast at boot instead of wedging the engine indefinitely. |
+| `url` | yes | A `redis://` or `rediss://` (TLS) connection string (`valkey://` / `valkeys://` read the same): `[user[:password]@]host[:port][/db]`. TLS is busbar's connector's (its trust anchors); a unix-socket URL is refused (the connector dials TCP). |
+| `connect_timeout_ms` | no | Validated and accepted for 1.5.5 settings compatibility. The dial is bounded by the store's need timeout (10s, 1.5.5's default) and by the op's deadline. |
 
 ## Build
 

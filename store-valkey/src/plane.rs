@@ -37,13 +37,13 @@
 //! listing; every listing is re-sorted by the exact `seq` parsed out of `F`, so a `seq` past 2^53
 //! still orders correctly.
 
+use crate::resp::{cmd, pipe, Conn, Script};
 use crate::{clamp, hex, ValkeyStore};
 use busbar_contract::abi::sdk::store::{OpRefused, OpResult};
 use busbar_contract::abi::store::OP_ID_RETENTION_SECS;
 use busbar_contract::records::{
     PlaneDisposition, PlaneRecordRef, PlaneSelector, RecordStoreError, RecordStoreResult,
 };
-use redis::Commands;
 
 /// The kind a purge of which CASCADES: a purged `task` takes its `task_event` chain with it, and only
 /// its own. Nothing else ever removes a task's events, so leaving them would keep chains whose task
@@ -152,8 +152,8 @@ end
 ";
 
 /// UPSERT: `KEYS = rec, body, byts, idx, pcount`; `ARGV = F, sidecar, body, ts, seq, identity`.
-static UPSERT: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
-    redis::Script::new(&format!(
+static UPSERT: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
+    Script::new(&format!(
         "{LUA_WRITE}
         write(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5],
               ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6])
@@ -163,8 +163,8 @@ static UPSERT: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| 
 
 /// APPEND: as [`UPSERT`], but an occupied position is never overwritten — `0` = written or an
 /// identical replay (no write), `1` = a DIFFERENT record already holds the position (a fork).
-static APPEND: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
-    redis::Script::new(&format!(
+static APPEND: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
+    Script::new(&format!(
         "{LUA_WRITE}
         local old = redis.call('HGET', KEYS[1], ARGV[1])
         if old then
@@ -186,8 +186,8 @@ static APPEND: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| 
 /// identical record already at the position); `1` = a fork; `2` = the op id was used with different
 /// value fields. Only a write records the op, in the same script, so the record and the write are
 /// one step: neither is ever seen without the other.
-static APPEND_OP: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
-    redis::Script::new(&format!(
+static APPEND_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
+    Script::new(&format!(
         "{LUA_WRITE}
         local prior = redis.call('HGET', KEYS[6], 'b')
         if prior then
@@ -228,8 +228,8 @@ end
 ";
 
 /// DELETE one identity: `KEYS = rec, body, byts, pcount, idx`; `ARGV = identity`.
-static DELETE: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
-    redis::Script::new(&format!(
+static DELETE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
+    Script::new(&format!(
         "{LUA_DROP_IDENTITY}
         return drop_identity(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5], ARGV[1])"
     ))
@@ -238,8 +238,8 @@ static DELETE: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| 
 /// PURGE: `KEYS = rec, body, byts, pcount` of the kind, then (cascade only) `rec, body, byts,
 /// pcount` of the cascaded kind; `ARGV = before, terminal_only ('1'|'0'), idx_prefix,
 /// cascade_idx_prefix ('' = no cascade)`. Returns how many records OF THE KIND went.
-static PURGE: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
-    redis::Script::new(&format!(
+static PURGE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
+    Script::new(&format!(
         "{LUA_DROP_IDENTITY}
         local function tohex(s)
             return (string.gsub(s, '.', function(c) return string.format('%02x', string.byte(c)) end))
@@ -272,21 +272,16 @@ static PURGE: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
     ))
 });
 
-/// Run a plane script's reply through the store's connection handling. NO reconnect-retry: a dropped
-/// reply on a write is not a lost read — the script may well have run — and a blind replay of an
-/// upsert is harmless but of a purge would under-report its count and of a first append would read
-/// its own write back as an identical replay. The failure surfaces instead.
-fn write_script<T: redis::FromRedisValue>(
-    store: &ValkeyStore,
-    f: impl FnMut(&mut redis::Connection) -> redis::RedisResult<T>,
-) -> RecordStoreResult<T> {
-    store.with_conn_no_retry(f)
-}
+// Every plane write runs ONCE on the op's connection, never replayed: a dropped reply on a write is
+// not a lost read (the script may well have run), and a blind replay of an upsert is harmless but of
+// a purge would under-report its count and of a first append would read its own write back as an
+// identical replay. The failure surfaces instead.
 
 /// Put `record` at its position with `script` ([`UPSERT`] or [`APPEND`]); the script's reply.
-fn put(
+async fn put(
     store: &ValkeyStore,
-    script: &redis::Script,
+    c: &mut Conn,
+    script: &Script,
     record: PlaneRecordRef<'_>,
 ) -> RecordStoreResult<i64> {
     let keys = Keys::of(record.kind);
@@ -294,7 +289,7 @@ fn put(
     let f = field(record.seq, ident);
     let side = sidecar(&record)?;
     let idx = keys.idx(ident);
-    write_script(store, |c| {
+    with_conn!(store, |c| {
         script
             .key(&keys.rec)
             .key(&keys.body)
@@ -308,24 +303,18 @@ fn put(
             .arg(clamp(record.seq))
             .arg(ident)
             .invoke(c)
+            .await
     })
 }
 
 /// `upsert_plane_record`: UPSERT BY position — a second write for one record replaces it, never
 /// stands a rival beside it.
-pub(crate) fn upsert(store: &ValkeyStore, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
-    put(store, &UPSERT, record).map(|_| ())
-}
-
-/// `append_plane_record`: an EMPTY position takes the record; the IDENTICAL record already there is
-/// the at-least-once write-through retrying, and is success with no write; a DIFFERENT record there
-/// is two records claiming one chain position — a forked or tampered log — and is an error that
-/// leaves the stored record standing. The same settlement `append_audit` makes.
-pub(crate) fn append(store: &ValkeyStore, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
-    match put(store, &APPEND, record)? {
-        0 => Ok(()),
-        _ => Err(fork(&record)),
-    }
+pub(crate) async fn upsert(
+    store: &ValkeyStore,
+    c: &mut Conn,
+    record: PlaneRecordRef<'_>,
+) -> RecordStoreResult<()> {
+    put(store, c, &UPSERT, record).await.map(|_| ())
 }
 
 /// The fork refusal: names the position and nothing else — never stored (or caller) content.
@@ -339,10 +328,11 @@ fn fork(record: &PlaneRecordRef<'_>) -> RecordStoreError {
 
 /// `append_plane_record` under an `op_id` ([`APPEND_OP`]): `op_key` is the op's record, `body` its
 /// value fields. A replay or the identical record is `Ok` with nothing written; a different record
-/// at the position is the fork [`append`] refuses; the op id used with different value fields is a
+/// at the position is the fork the append script refuses; the op id used with different value fields is a
 /// conflict.
-pub(crate) fn append_op(
+pub(crate) async fn append_op(
     store: &ValkeyStore,
+    c: &mut Conn,
     op_key: &str,
     body: &str,
     record: PlaneRecordRef<'_>,
@@ -352,7 +342,7 @@ pub(crate) fn append_op(
     let f = field(record.seq, ident);
     let side = sidecar(&record).map_err(|e| OpRefused::Failed(e.0))?;
     let idx = keys.idx(ident);
-    let answer: i64 = write_script(store, |c| {
+    let answer: i64 = with_conn!(store, |c| {
         APPEND_OP
             .key(&keys.rec)
             .key(&keys.body)
@@ -369,6 +359,7 @@ pub(crate) fn append_op(
             .arg(body)
             .arg(OP_ID_RETENTION_SECS)
             .invoke(c)
+            .await
     })
     .map_err(|e| OpRefused::Failed(e.0))?;
     match answer {
@@ -381,19 +372,25 @@ pub(crate) fn append_op(
 /// Append `record` only if its position is EMPTY; an occupied one (identical or not) is left as it
 /// is. The v6 → v7 migration's write: a record already in the plane keyspace is newer than any v6 row
 /// could be, and is never overwritten by one.
-pub(crate) fn append_if_absent(
+pub(crate) async fn append_if_absent(
     store: &ValkeyStore,
+    c: &mut Conn,
     record: PlaneRecordRef<'_>,
 ) -> RecordStoreResult<()> {
-    put(store, &APPEND, record).map(|_| ())
+    put(store, c, &APPEND, record).await.map(|_| ())
 }
 
 /// `get_plane_record`: an upserted record lives at `(id, 0)`. No caller-scoping filter, deliberately:
 /// an authorization check in the backend is one an unauthorized reader bypasses by configuring a
 /// different backend, so the contract keeps it engine-side.
-pub(crate) fn get(store: &ValkeyStore, kind: &str, id: &str) -> RecordStoreResult<Option<Vec<u8>>> {
+pub(crate) async fn get(
+    store: &ValkeyStore,
+    c: &mut Conn,
+    kind: &str,
+    id: &str,
+) -> RecordStoreResult<Option<Vec<u8>>> {
     let keys = Keys::of(kind);
-    store.with_conn(|c| c.hget(&keys.body, field(0, id)))
+    with_conn!(store, |c| c.hget(&keys.body, field(0, id)).await)
 }
 
 /// One chain listing's read: the positions, then each one's sidecar and body (absent if gone).
@@ -403,15 +400,16 @@ type ChainRead = (Vec<String>, Vec<Option<String>>, Vec<Option<Vec<u8>>>);
 /// wants the active rows, retention the terminal ones and a scoped listing one principal's, and a
 /// store that pre-filtered for any one of those would break the other two. Oldest-first by `seq`
 /// (then identity, for `All`), the order a chain verifier reads a parent's records in.
-pub(crate) fn list(
+pub(crate) async fn list(
     store: &ValkeyStore,
+    c: &mut Conn,
     kind: &str,
     selector: &PlaneSelector<'_>,
 ) -> RecordStoreResult<Vec<Vec<u8>>> {
     let keys = Keys::of(kind);
     let mut rows: Vec<(u64, String, Vec<u8>)> = match selector {
         PlaneSelector::All => {
-            let all: Vec<(String, Vec<u8>)> = store.with_conn(|c| c.hgetall(&keys.body))?;
+            let all: Vec<(String, Vec<u8>)> = with_conn!(store, |c| c.hgetall(&keys.body).await)?;
             all.into_iter()
                 .filter_map(|(f, body)| {
                     let (seq, ident) = parse_field(&f)?;
@@ -424,15 +422,15 @@ pub(crate) fn list(
             // The sidecars and the bodies are read in ONE atomic step, so a concurrent write can
             // never pair one record's sidecar with another's body; a position the index named but a
             // concurrent delete removed in between reads back absent and is skipped.
-            let (fs, sides, bodies): ChainRead = store.with_conn(|c| {
-                let fs: Vec<String> = c.zrange(&idx, 0, -1)?;
+            let (fs, sides, bodies): ChainRead = with_conn!(store, |c| {
+                let fs: Vec<String> = c.zrange(&idx, 0, -1).await?;
                 if fs.is_empty() {
                     return Ok((fs, Vec::new(), Vec::new()));
                 }
                 let (sides, bodies): (Vec<Option<String>>, Vec<Option<Vec<u8>>>) =
                         // Explicit HMGET: redis-rs's `hget` sends a one-element list as a
                         // scalar HGET, whose reply would not decode as a list.
-                        redis::pipe()
+                        pipe()
                             .atomic()
                             .cmd("HMGET")
                             .arg(&keys.rec)
@@ -440,7 +438,7 @@ pub(crate) fn list(
                             .cmd("HMGET")
                             .arg(&keys.body)
                             .arg(&fs)
-                            .query(c)?;
+                            .query(c).await?;
                 Ok((fs, sides, bodies))
             })?;
             fs.into_iter()
@@ -465,9 +463,13 @@ pub(crate) fn list(
 
 /// `list_plane_record_parents`: the boot enumeration — every parent holding at least one record of
 /// the kind, exactly once, sorted.
-pub(crate) fn parents(store: &ValkeyStore, kind: &str) -> RecordStoreResult<Vec<String>> {
+pub(crate) async fn parents(
+    store: &ValkeyStore,
+    c: &mut Conn,
+    kind: &str,
+) -> RecordStoreResult<Vec<String>> {
     let keys = Keys::of(kind);
-    let counts: Vec<(String, i64)> = store.with_conn(|c| c.hgetall(&keys.pcount))?;
+    let counts: Vec<(String, i64)> = with_conn!(store, |c| c.hgetall(&keys.pcount).await)?;
     let mut out: Vec<String> = counts
         .into_iter()
         .filter(|(_, n)| *n > 0)
@@ -482,11 +484,16 @@ pub(crate) fn parents(store: &ValkeyStore, kind: &str) -> RecordStoreResult<Vec<
 /// `task` drops only TERMINAL rows (an interrupted task waiting on a human is exactly the row that
 /// legitimately sits still longest) and takes each purged task's `task_event` chain with it; every
 /// other kind drops every row older than `before`.
-pub(crate) fn purge_before(store: &ValkeyStore, kind: &str, before: u64) -> RecordStoreResult<u64> {
+pub(crate) async fn purge_before(
+    store: &ValkeyStore,
+    c: &mut Conn,
+    kind: &str,
+    before: u64,
+) -> RecordStoreResult<u64> {
     let keys = Keys::of(kind);
     let cascade = (kind == CASCADING_KIND).then(|| Keys::of(CASCADED_KIND));
     let terminal_only = if kind == CASCADING_KIND { "1" } else { "0" };
-    let removed: i64 = write_script(store, |c| {
+    let removed: i64 = with_conn!(store, |c| {
         let mut inv = PURGE.key(&keys.rec);
         inv.key(&keys.body).key(&keys.byts).key(&keys.pcount);
         match &cascade {
@@ -506,6 +513,7 @@ pub(crate) fn purge_before(store: &ValkeyStore, kind: &str, before: u64) -> Reco
             .arg(&keys.idx_prefix)
             .arg(cascade.as_ref().map_or("", |k| k.idx_prefix.as_str()))
             .invoke(c)
+            .await
     })?;
     Ok(removed.max(0) as u64)
 }
@@ -513,10 +521,15 @@ pub(crate) fn purge_before(store: &ValkeyStore, kind: &str, before: u64) -> Reco
 /// `delete_plane_record`: every `seq` under the identity goes, so a delete can never leave part of a
 /// chain behind. Deleting what is not there is a NO-OP, not an error: the engine clears on every
 /// observation that agrees with an approval rather than tracking whether it had demoted.
-pub(crate) fn delete(store: &ValkeyStore, kind: &str, id: &str) -> RecordStoreResult<()> {
+pub(crate) async fn delete(
+    store: &ValkeyStore,
+    c: &mut Conn,
+    kind: &str,
+    id: &str,
+) -> RecordStoreResult<()> {
     let keys = Keys::of(kind);
     let idx = keys.idx(id);
-    write_script(store, |c| {
+    with_conn!(store, |c| {
         DELETE
             .key(&keys.rec)
             .key(&keys.body)
@@ -525,6 +538,7 @@ pub(crate) fn delete(store: &ValkeyStore, kind: &str, id: &str) -> RecordStoreRe
             .key(&idx)
             .arg(id)
             .invoke::<i64>(c)
+            .await
     })
     .map(|_| ())
 }
@@ -552,8 +566,9 @@ const MAX_TOKEN_TTL_SECS: u64 = 315_360_000; // ten years
 /// NO RECONNECT-RETRY: a dropped reply is not a lost read — the SET may have landed, and a blind retry
 /// would find its own write and report `false`, refusing a grant this very call recorded. The error
 /// surfaces instead, and the engine turns it into a REFUSED redemption; both answers are closed.
-pub(crate) fn redeem_token(
+pub(crate) async fn redeem_token(
     store: &ValkeyStore,
+    c: &mut Conn,
     kind: &str,
     token: &str,
     expires_at: u64,
@@ -561,14 +576,15 @@ pub(crate) fn redeem_token(
 ) -> RecordStoreResult<bool> {
     let ttl = expires_at.saturating_sub(now).clamp(1, MAX_TOKEN_TTL_SECS);
     let key = token_key(kind, token);
-    let set: Option<String> = store.with_conn_no_retry(|c| {
-        redis::cmd("SET")
+    let set: Option<String> = with_conn!(store, |c| {
+        cmd("SET")
             .arg(&key)
             .arg(expires_at)
             .arg("NX")
             .arg("EX")
             .arg(ttl)
             .query(c)
+            .await
     })?;
     Ok(set.is_some())
 }
@@ -577,8 +593,9 @@ pub(crate) fn redeem_token(
 /// record. LIVE means all three: present, still Active, and `now` not past `expires_at`. A missing
 /// record holds no capability, a terminal one names work that has finished, and a lapsed one is dead
 /// even if nothing finished. Asking twice answers the same twice.
-pub(crate) fn token_live(
+pub(crate) async fn token_live(
     store: &ValkeyStore,
+    c: &mut Conn,
     kind: &str,
     token: &str,
     expires_at: u64,
@@ -588,7 +605,7 @@ pub(crate) fn token_live(
         return Ok(false);
     }
     let keys = Keys::of(kind);
-    let side: Option<String> = store.with_conn(|c| c.hget(&keys.rec, field(0, token)))?;
+    let side: Option<String> = with_conn!(store, |c| c.hget(&keys.rec, field(0, token)).await)?;
     Ok(side.is_some_and(|s| s.as_bytes().get(1) == Some(&b'a')))
 }
 

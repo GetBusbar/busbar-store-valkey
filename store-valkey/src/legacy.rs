@@ -29,9 +29,9 @@
 //! only after its records are in, and the schema marker is written last by the caller. A crash
 //! anywhere re-runs the whole upgrade on the next connect and lands in the same place.
 
+use crate::resp::{cmd, pipe, Conn};
 use crate::{plane, RecordStoreError, RecordStoreResult, ValkeyStore};
 use busbar_contract::records::{PlaneDisposition, PlaneRecord};
-use redis::Commands;
 
 /// v6 key names — read once, here, by the upgrade, and by nothing else in 1.6.0.
 pub(crate) const TASK_ROW_PREFIX: &str = "busbar:task:row:";
@@ -115,23 +115,25 @@ fn encode<T: serde::Serialize>(row: &T) -> RecordStoreResult<Vec<u8>> {
 }
 
 /// Every key matching `pattern` (a literal prefix plus `*`).
-fn scan(store: &ValkeyStore, pattern: &str) -> RecordStoreResult<Vec<String>> {
-    store.with_conn(|c| {
-        c.scan_match::<_, String>(pattern)?
+async fn scan(store: &ValkeyStore, c: &mut Conn, pattern: &str) -> RecordStoreResult<Vec<String>> {
+    with_conn!(store, |c| {
+        c.scan_match::<_, String>(pattern)
+            .await?
             .collect::<Result<Vec<String>, _>>()
     })
 }
 
 /// Run the upgrade. See the module doc.
-pub(crate) fn migrate_v6_to_v7(store: &ValkeyStore) -> RecordStoreResult<()> {
+pub(crate) async fn migrate_v6_to_v7(store: &ValkeyStore, c: &mut Conn) -> RecordStoreResult<()> {
     // TASK EVENTS first, then tasks: a task's events are in before the task row that owns them, so
     // there is no instant at which a migrated task exists with its chain still behind.
-    for key in scan(store, &format!("{TASK_EVENTS_PREFIX}*"))? {
-        let members: Vec<Vec<u8>> = store.with_conn(|c| c.zrange(&key, 0, -1))?;
+    for key in scan(store, c, &format!("{TASK_EVENTS_PREFIX}*")).await? {
+        let members: Vec<Vec<u8>> = with_conn!(store, |c| c.zrange(&key, 0, -1).await)?;
         for raw in members {
             let e: rows::TaskEvent = decode("task event", &key, &raw)?;
             plane::append_if_absent(
                 store,
+                c,
                 PlaneRecord {
                     kind: KIND_TASK_EVENT.into(),
                     id: e.task_id.clone(),
@@ -142,13 +144,14 @@ pub(crate) fn migrate_v6_to_v7(store: &ValkeyStore) -> RecordStoreResult<()> {
                     body: encode(&e)?,
                 }
                 .view(),
-            )?;
+            )
+            .await?;
         }
-        store.with_conn(|c| c.del::<_, ()>(&key))?;
+        with_conn!(store, |c| c.del::<_, ()>(&key).await)?;
     }
 
-    for key in scan(store, &format!("{TASK_ROW_PREFIX}*"))? {
-        let raw: Option<Vec<u8>> = store.with_conn(|c| c.get(&key))?;
+    for key in scan(store, c, &format!("{TASK_ROW_PREFIX}*")).await? {
+        let raw: Option<Vec<u8>> = with_conn!(store, |c| c.get(&key).await)?;
         if let Some(raw) = raw {
             let t: rows::Task = decode("task", &key, &raw)?;
             let disposition = if TERMINAL_TASK_STATES.contains(&t.state.as_str()) {
@@ -158,6 +161,7 @@ pub(crate) fn migrate_v6_to_v7(store: &ValkeyStore) -> RecordStoreResult<()> {
             };
             plane::append_if_absent(
                 store,
+                c,
                 PlaneRecord {
                     kind: KIND_TASK.into(),
                     id: t.task_id.clone(),
@@ -168,17 +172,22 @@ pub(crate) fn migrate_v6_to_v7(store: &ValkeyStore) -> RecordStoreResult<()> {
                     body: encode(&t)?,
                 }
                 .view(),
-            )?;
+            )
+            .await?;
         }
-        store.with_conn(|c| c.del::<_, ()>(&key))?;
+        with_conn!(store, |c| c.del::<_, ()>(&key).await)?;
     }
-    store.with_conn(|c| c.del::<_, ()>(&[TASKS_INDEX, TASKS_BY_UPDATED]))?;
+    with_conn!(store, |c| c
+        .del::<_, ()>(&[TASKS_INDEX, TASKS_BY_UPDATED])
+        .await)?;
 
-    let demotions: Vec<(String, Vec<u8>)> = store.with_conn(|c| c.hgetall(MCP_DEMOTIONS_HASH))?;
+    let demotions: Vec<(String, Vec<u8>)> =
+        with_conn!(store, |c| c.hgetall(MCP_DEMOTIONS_HASH).await)?;
     for (server, raw) in demotions {
         let d: rows::Demotion = decode("demotion", MCP_DEMOTIONS_HASH, &raw)?;
         plane::append_if_absent(
             store,
+            c,
             PlaneRecord {
                 kind: KIND_DEMOTION.into(),
                 id: server,
@@ -189,31 +198,33 @@ pub(crate) fn migrate_v6_to_v7(store: &ValkeyStore) -> RecordStoreResult<()> {
                 body: encode(&d)?,
             }
             .view(),
-        )?;
+        )
+        .await?;
     }
-    store.with_conn(|c| c.del::<_, ()>(MCP_DEMOTIONS_HASH))?;
+    with_conn!(store, |c| c.del::<_, ()>(MCP_DEMOTIONS_HASH).await)?;
 
     // SPENT APPROVALS: each keeps its own remaining life. A key already past its TTL is gone on the
     // server and needs nothing; one with no TTL (never written by v6, which always set EX) is
     // carried with the ten-year bound the redeem verb applies.
-    for key in scan(store, &format!("{ASK_STATE_PREFIX}*"))? {
+    for key in scan(store, c, &format!("{ASK_STATE_PREFIX}*")).await? {
         let nonce = &key[ASK_STATE_PREFIX.len()..];
         let (value, ttl): (Option<String>, i64) =
-            store.with_conn(|c| redis::pipe().get(&key).ttl(&key).query(c))?;
+            with_conn!(store, |c| pipe().get(&key).ttl(&key).query(c).await)?;
         if let Some(value) = value {
             let ttl = if ttl > 0 { ttl } else { 315_360_000 };
             let target = plane::token_key(KIND_ASK, nonce);
-            store.with_conn(|c| {
-                redis::cmd("SET")
+            with_conn!(store, |c| {
+                cmd("SET")
                     .arg(&target)
                     .arg(&value)
                     .arg("NX")
                     .arg("EX")
                     .arg(ttl)
                     .query::<Option<String>>(c)
+                    .await
             })?;
         }
-        store.with_conn(|c| c.del::<_, ()>(&key))?;
+        with_conn!(store, |c| c.del::<_, ()>(&key).await)?;
     }
     Ok(())
 }

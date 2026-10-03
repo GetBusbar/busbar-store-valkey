@@ -47,25 +47,36 @@
 //!
 //! The money arithmetic is exact `u64` in Rust, never in Lua (whose numbers are doubles): the cap
 //! rows are read under `WATCH` and written back whole.
+//!
+//! ## Every slot is one op through the host's connector
+//!
+//! Each slot runs its body with the store SDK's `wire::drive`: one connection per op, dialled
+//! through the host's connector on the op's ticket, every command a write and a read that may PEND
+//! (the op answers PENDING and is resumed on the connector's wake), closed when the op answers. The
+//! body is the blocking client's body, `async`.
 
 use std::collections::BTreeMap;
 
-use redis::{Commands, Connection, Pipeline};
-
+use busbar_contract::abi::sdk::conn::Host;
+use busbar_contract::abi::sdk::store::wire::drive;
 use busbar_contract::abi::sdk::store::{
-    Cap, CapsRefused, Cell, CellKey, Dimension, Grant, OpRefused, OpResult, ReserveRefused,
-    StoreSlots, Tail,
+    Cap, CapsRefused, Cell, CellKey, Dimension, Grant, Op, OpRefused, OpResult, ReserveRefused,
+    Scanned, Step, StoreSlots, Tail,
 };
 use busbar_contract::abi::store::{OpId, OP_ID_RETENTION_SECS};
 use busbar_contract::kinds::{Head, RecordBytes};
-use busbar_contract::records::{AuditRecord, MeteringDelta, PlaneRecordRef, UsageDelta};
-
-use crate::{
-    audit_fork, clamp, hex, queue_metering, usage_fields, usage_key, ValkeyStore, ADD_FLOORED_LUA,
-    AUDIT_ZSET, NAME,
+use busbar_contract::records::{
+    AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, PlaneRecordRef,
+    PlaneSelector, RecordStoreError, RecordStoreResult, UsageDelta, UsageLedger, VirtualKey,
 };
 
-busbar_contract::store_door!(ValkeyStore, NAME, env!("CARGO_PKG_VERSION"), 64);
+use crate::resp::{cmd, pipe, Conn, ErrorKind, RedisError, RedisResult};
+use crate::{
+    audit_fork, clamp, hex, queue_metering, usage_fields, usage_key, ValkeyStore, ADD_FLOORED_LUA,
+    AUDIT_ZSET, NAME, NEEDS,
+};
+
+busbar_contract::store_door!(ValkeyStore, NAME, env!("CARGO_PKG_VERSION"), 64, needs: NEEDS);
 
 const SLICE_SEQ: &str = "busbar:slices";
 const JOURNAL_STREAMS: &str = "busbar:journal:streams";
@@ -179,12 +190,12 @@ fn undecodable<E: Refusal>(answer: &str) -> E {
 }
 
 /// A stored decimal field, `0` when absent.
-fn num(v: Option<String>, what: &str) -> redis::RedisResult<u64> {
+fn num(v: Option<String>, what: &str) -> RedisResult<u64> {
     match v {
         None => Ok(0),
         Some(s) => s.parse().map_err(|_| {
-            redis::RedisError::from((
-                redis::ErrorKind::Client,
+            RedisError::from((
+                ErrorKind::Client,
                 "corrupt store row",
                 format!("{what} is not a u64: {s:?}"),
             ))
@@ -197,72 +208,95 @@ type CapRow = (u64, u64, u64);
 
 /// What one `op_id` write's effect decided under `WATCH`: its answer (the writes are queued on the
 /// pipe), or the refusal it answers with nothing applied.
-type Decided<E> = redis::RedisResult<Result<String, E>>;
+type Decided<E> = RedisResult<Result<String, E>>;
 
-impl ValkeyStore {
-    /// Run one `op_id`-carrying write (module doc, DEDUPE): `WATCH` the op's record and `watch`,
-    /// answer a recorded op from its record, else let `apply` read (its reads are watched) and
-    /// queue its writes, then `EXEC` them with the op's record. An `EXEC` a concurrent writer
-    /// aborted re-runs the whole step. No reconnect-retry: a lost `EXEC` reply may have committed.
-    fn deduped<E: Refusal>(
-        &self,
-        op: OpId,
-        body: &str,
-        watch: &[String],
-        mut apply: impl FnMut(&mut Connection, &mut Pipeline) -> Decided<E>,
-    ) -> Result<String, E> {
-        let opk = op_key(op);
-        let mut keys = Vec::with_capacity(watch.len() + 1);
+/// Pin an `op_id` write's effect (an async block) to its [`Decided`] shape.
+fn decided<E, F: std::future::Future<Output = Decided<E>>>(f: F) -> F {
+    f
+}
+
+/// RUN ONE `op_id`-CARRYING WRITE (module doc, DEDUPE) on `$c`: `WATCH` the op's record and
+/// `$watch`, answer a recorded op from its record, else run the effect (its reads are watched; it
+/// queues its writes on `$pipe`), then `EXEC` them with the op's record. An `EXEC` a concurrent
+/// writer aborted re-runs the whole step. A lost `EXEC` reply is never retried (it may have
+/// committed): the op fails, and its caller retries under the same `op_id`.
+macro_rules! deduped {
+    ($me:expr, $c:ident, $op:expr, $body:expr, $watch:expr, $E:ty, |$cc:ident, $pipe:ident| $apply:expr) => {{
+        let opk = op_key($op);
+        let body: &str = $body;
+        let mut keys: Vec<String> = Vec::with_capacity($watch.len() + 1);
         keys.push(opk.clone());
-        keys.extend(watch.iter().cloned());
-        let ran = self.with_conn_no_retry(|c| {
-            redis::transaction(c, &keys, |c, pipe| {
-                let (b, a): (Option<Vec<u8>>, Option<String>) =
-                    redis::cmd("HMGET").arg(&opk).arg("b").arg("a").query(c)?;
-                if let Some(b) = b {
-                    return Ok(Some(if b == body.as_bytes() {
-                        Ok(a.unwrap_or_default())
-                    } else {
-                        Err(E::conflict())
-                    }));
-                }
-                let answer = match apply(c, pipe)? {
-                    Ok(a) => a,
-                    Err(e) => return Ok(Some(Err(e))),
-                };
-                pipe.hset_multiple(&opk, &[("b", body), ("a", answer.as_str())])
-                    .ignore()
-                    .expire(&opk, OP_ID_RETENTION_SECS as i64)
-                    .ignore();
-                let committed: Option<()> = pipe.query(c)?;
-                Ok(committed.map(|()| Ok(answer)))
+        keys.extend($watch.iter().cloned());
+        let ran: RedisResult<Result<String, $E>> = transaction!($c, &keys, |$c, tx| {
+            let (b, a): (Option<Vec<u8>>, Option<String>) =
+                cmd("HMGET").arg(&opk).arg("b").arg("a").query($c).await?;
+            if let Some(b) = b {
+                return Ok(Some(if b == body.as_bytes() {
+                    Ok(a.unwrap_or_default())
+                } else {
+                    Err(<$E as Refusal>::conflict())
+                }));
+            }
+            let effect: Decided<$E> = decided(async {
+                let $pipe = &mut *tx;
+                let $cc = &mut *$c;
+                $apply
             })
+            .await;
+            let answer = match effect? {
+                Ok(a) => a,
+                Err(e) => return Ok(Some(Err(e))),
+            };
+            tx.hset_multiple(&opk, &[("b", body), ("a", answer.as_str())])
+                .ignore()
+                .expire(&opk, OP_ID_RETENTION_SECS as i64)
+                .ignore();
+            let committed: Option<()> = tx.query($c).await?;
+            Ok(committed.map(|()| Ok(answer)))
         });
         match ran {
             Ok(answer) => answer,
-            Err(e) => Err(E::backend(e.0)),
+            Err(e) => Err(<$E as Refusal>::backend($me.err(e, "command").0)),
         }
-    }
+    }};
+}
 
-    /// A deduped write whose answer is "done".
-    fn done_op(
+/// RUN `$body` AS ONE OP through the host's connector (module doc): `$me` is the store, `$c` the
+/// op's connection; a connection that fails answers `$fail` of its error.
+macro_rules! op {
+    ($cx:expr, $store:expr, $fail:expr, |$me:ident, $c:ident| $body:expr) => {{
+        let $me = $store.clone();
+        drive($cx, move |w| {
+            Box::pin(async move {
+                let mut conn = match $me.conn(w).await {
+                    Ok(c) => c,
+                    Err(e) => return ($fail)(e),
+                };
+                let $c = &mut conn;
+                $body
+            })
+        })
+    }};
+}
+
+/// A failed connection as a `String` refusal.
+fn text(e: RecordStoreError) -> String {
+    e.0
+}
+
+impl ValkeyStore {
+    /// Queue `adds`' usage adds (the floored-add script, as a plain `EVAL`) for one `op_id` write.
+    async fn usage_op(
         &self,
+        c: &mut Conn,
         op: OpId,
         body: &str,
-        watch: &[String],
-        apply: impl FnMut(&mut Connection, &mut Pipeline) -> Decided<OpRefused>,
+        adds: &[(String, Vec<(String, i64)>)],
     ) -> OpResult<()> {
-        self.deduped(op, body, watch, apply).map(drop)
-    }
-
-    /// Queue `cells`' usage adds (the floored-add script, as a plain `EVAL`) for one `op_id` write.
-    fn usage_op(&self, op: OpId, body: &str, cells: &[(&str, u64, &UsageDelta)]) -> OpResult<()> {
-        let adds: Vec<(String, Vec<(String, i64)>)> = cells
-            .iter()
-            .map(|(bucket, window, delta)| (usage_key(bucket, *window), usage_fields(delta)))
-            .collect();
-        self.done_op(op, body, &[], |_, pipe| {
-            for (key, fields) in &adds {
+        let none: [String; 0] = [];
+        deduped!(self, c, op, body, none, OpRefused, |c, pipe| {
+            let _ = &c;
+            for (key, fields) in adds {
                 let eval = pipe.cmd("EVAL").arg(ADD_FLOORED_LUA).arg(1).arg(key);
                 for (f, d) in fields {
                     eval.arg(f).arg(*d);
@@ -271,18 +305,45 @@ impl ValkeyStore {
             }
             Ok(Ok(String::new()))
         })
+        .map(drop)
+    }
+
+    /// Queue every metering delta of `deltas` for one `op_id` write.
+    async fn metering_op(
+        &self,
+        c: &mut Conn,
+        op: OpId,
+        body: &str,
+        deltas: &[MeteringDelta],
+    ) -> OpResult<()> {
+        let none: [String; 0] = [];
+        deduped!(self, c, op, body, none, OpRefused, |c, pipe| {
+            let _ = &c;
+            for d in deltas {
+                queue_metering(pipe, d);
+            }
+            Ok(Ok(String::new()))
+        })
+        .map(drop)
     }
 
     /// Append `entries` to the audit chain for one `op_id` write: each `seq` must be empty (it is
     /// written) or hold the identical record (the write-through retrying; nothing written); a
     /// different record anywhere fails the whole op.
-    fn audit_op(&self, op: OpId, body: &str, entries: &[AuditRecord]) -> OpResult<()> {
+    async fn audit_op(
+        &self,
+        c: &mut Conn,
+        op: OpId,
+        body: &str,
+        entries: &[AuditRecord],
+    ) -> OpResult<()> {
         let json: Vec<String> = entries
             .iter()
             .map(|e| serde_json::to_string(e).map_err(|e| format!("audit encode failed: {e}")))
             .collect::<Result<_, _>>()
             .map_err(OpRefused::Failed)?;
-        self.done_op(op, body, &[AUDIT_ZSET.to_string()], |c, pipe| {
+        let watch = [AUDIT_ZSET.to_string()];
+        deduped!(self, c, op, body, watch, OpRefused, |c, pipe| {
             // What this op already holds at a seq: the stored record, or one queued before it.
             let mut held: BTreeMap<u64, AuditRecord> = BTreeMap::new();
             for (entry, json) in entries.iter().zip(&json) {
@@ -290,12 +351,12 @@ impl ValkeyStore {
                     Some(r) => Some(r.clone()),
                     None => {
                         let score = clamp(entry.seq);
-                        let at: Vec<String> = c.zrangebyscore(AUDIT_ZSET, score, score)?;
+                        let at: Vec<String> = c.zrangebyscore(AUDIT_ZSET, score, score).await?;
                         match at.first() {
                             Some(raw) => {
                                 Some(serde_json::from_str::<AuditRecord>(raw).map_err(|e| {
-                                    redis::RedisError::from((
-                                        redis::ErrorKind::Client,
+                                    RedisError::from((
+                                        ErrorKind::Client,
                                         "audit decode failed",
                                         e.to_string(),
                                     ))
@@ -316,23 +377,24 @@ impl ValkeyStore {
             }
             Ok(Ok(String::new()))
         })
+        .map(drop)
     }
 
     /// The cap row of each key in `keys`: `(cap, config_gen, used)`, or `None` where no cap was
     /// pushed. Read on `c` (the caller has them watched).
-    fn read_caps(
-        c: &mut Connection,
+    async fn read_caps(
+        c: &mut Conn,
         keys: &[String],
-    ) -> redis::RedisResult<BTreeMap<String, Option<CapRow>>> {
+    ) -> RedisResult<BTreeMap<String, Option<CapRow>>> {
         let mut out = BTreeMap::new();
         for k in keys {
-            let (cap, gen, used): (Option<String>, Option<String>, Option<String>) =
-                redis::cmd("HMGET")
-                    .arg(k)
-                    .arg("cap")
-                    .arg("gen")
-                    .arg("used")
-                    .query(c)?;
+            let (cap, gen, used): (Option<String>, Option<String>, Option<String>) = cmd("HMGET")
+                .arg(k)
+                .arg("cap")
+                .arg("gen")
+                .arg("used")
+                .query(c)
+                .await?;
             let row = match cap {
                 None => None,
                 Some(cap) => Some((
@@ -345,92 +407,47 @@ impl ValkeyStore {
         }
         Ok(out)
     }
-}
 
-/// `keys`, sorted and without repeats: a watch list.
-fn distinct(keys: impl Iterator<Item = String>) -> Vec<String> {
-    let mut v: Vec<String> = keys.collect();
-    v.sort();
-    v.dedup();
-    v
-}
-
-impl StoreSlots for ValkeyStore {
-    const TAIL: Tail = Tail {
-        ephemeral: false,
-        durable_plane: true,
-        fork_refusal: true,
-    };
-
-    fn open(settings: &[u8]) -> Result<Self, String> {
-        Self::from_settings(settings)
-    }
-
-    fn add_usage_op(
+    async fn v3_append_batch(
         &self,
+        c: &mut Conn,
         op: OpId,
-        bucket: &str,
-        window_start: u64,
-        delta: &UsageDelta,
-    ) -> OpResult<()> {
-        let body = format!("add_usage:{bucket:?}:{window_start}:{delta:?}");
-        self.usage_op(op, &body, &[(bucket, window_start, delta)])
-    }
-
-    fn add_metering_op(&self, op: OpId, delta: &MeteringDelta) -> OpResult<()> {
-        let body = format!("add_metering:{delta:?}");
-        self.done_op(op, &body, &[], |_, pipe| {
-            queue_metering(pipe, delta);
-            Ok(Ok(String::new()))
-        })
-    }
-
-    fn append_audit_op(&self, op: OpId, entry: &AuditRecord) -> OpResult<()> {
-        let body = format!("append_audit:{entry:?}");
-        self.audit_op(op, &body, std::slice::from_ref(entry))
-    }
-
-    fn append_plane_record_op(&self, op: OpId, record: PlaneRecordRef<'_>) -> OpResult<()> {
-        let body = format!("append_plane_record:{record:?}");
-        crate::plane::append_op(self, &op_key(op), &body, record)
-    }
-
-    fn append_batch(&self, op: OpId, stream: &str, records: &[RecordBytes]) -> OpResult<Head> {
-        let body = format!("append_batch:{stream:?}:{records:?}");
+        body: &str,
+        stream: &str,
+        records: &[RecordBytes],
+    ) -> OpResult<Head> {
         let key = journal_key(stream);
-        let answer =
-            self.deduped::<OpRefused>(op, &body, std::slice::from_ref(&key), |c, pipe| {
-                let len: u64 = c.llen(&key)?;
-                if !records.is_empty() {
-                    let values: Vec<&[u8]> = records.iter().map(RecordBytes::as_slice).collect();
-                    pipe.rpush(&key, values).ignore();
-                }
-                pipe.sadd(JOURNAL_STREAMS, stream).ignore();
-                Ok(Ok((len + records.len() as u64).to_string()))
-            })?;
+        let watch = [key.clone()];
+        let answer = deduped!(self, c, op, body, watch, OpRefused, |c, pipe| {
+            let len: u64 = c.llen(&key).await?;
+            if !records.is_empty() {
+                let values: Vec<&[u8]> = records.iter().map(RecordBytes::as_slice).collect();
+                pipe.rpush(&key, values).ignore();
+            }
+            pipe.sadd(JOURNAL_STREAMS, stream).ignore();
+            Ok(Ok((len + records.len() as u64).to_string()))
+        })?;
         match answer.parse::<u64>() {
             Ok(seq) => Ok(Head { seq, epoch: 0 }),
             Err(_) => Err(undecodable(&answer)),
         }
     }
 
-    fn heads(&self) -> Result<Vec<(String, Head)>, String> {
-        let mut streams: Vec<String> = self
-            .with_conn(|c| c.smembers(JOURNAL_STREAMS))
-            .map_err(|e| e.0)?;
+    async fn v3_heads(&self, c: &mut Conn) -> Result<Vec<(String, Head)>, String> {
+        let mut streams: Vec<String> =
+            with_conn!(self, |c| c.smembers(JOURNAL_STREAMS).await).map_err(|e| e.0)?;
         streams.sort();
         if streams.is_empty() {
             return Ok(Vec::new());
         }
-        let lens: Vec<u64> = self
-            .with_conn(|c| {
-                let mut pipe = redis::pipe();
-                for s in &streams {
-                    pipe.llen(journal_key(s));
-                }
-                pipe.query(c)
-            })
-            .map_err(|e| e.0)?;
+        let lens: Vec<u64> = with_conn!(self, |c| {
+            let mut pipe = pipe();
+            for s in &streams {
+                pipe.llen(journal_key(s));
+            }
+            pipe.query(c).await
+        })
+        .map_err(|e| e.0)?;
         Ok(streams
             .into_iter()
             .zip(lens)
@@ -438,12 +455,18 @@ impl StoreSlots for ValkeyStore {
             .collect())
     }
 
-    fn session_put(&self, session: u64, node: &str, principal: &str) -> Result<(), String> {
+    async fn v3_session_put(
+        &self,
+        c: &mut Conn,
+        session: u64,
+        node: &str,
+        principal: &str,
+    ) -> Result<(), String> {
         let key = session_key(session);
         let id = session.to_string();
-        self.with_conn(|c| {
-            redis::transaction(c, &[key.as_str()], |c, pipe| {
-                let old: Option<String> = c.hget(&key, "principal")?;
+        with_conn!(self, |c| {
+            transaction!(c, &[key.as_str()], |c, pipe| {
+                let old: Option<String> = c.hget(&key, "principal").await?;
                 if let Some(old) = old.filter(|o| o != principal) {
                     pipe.srem(principal_sessions_key(&old), &id).ignore();
                 }
@@ -451,48 +474,52 @@ impl StoreSlots for ValkeyStore {
                     .ignore()
                     .sadd(principal_sessions_key(principal), &id)
                     .ignore();
-                pipe.query(c)
+                pipe.query(c).await
             })
         })
         .map_err(|e| e.0)
     }
 
-    fn session_remove(&self, session: u64) -> Result<(), String> {
+    async fn v3_session_remove(&self, c: &mut Conn, session: u64) -> Result<(), String> {
         let key = session_key(session);
         let id = session.to_string();
-        self.with_conn(|c| {
-            redis::transaction(c, &[key.as_str()], |c, pipe| {
-                let old: Option<String> = c.hget(&key, "principal")?;
+        with_conn!(self, |c| {
+            transaction!(c, &[key.as_str()], |c, pipe| {
+                let old: Option<String> = c.hget(&key, "principal").await?;
                 if let Some(old) = old {
                     pipe.srem(principal_sessions_key(&old), &id).ignore();
                 }
                 pipe.del(&key).ignore();
-                pipe.query(c)
+                pipe.query(c).await
             })
         })
         .map_err(|e| e.0)
     }
 
-    fn sessions_for(&self, principal: &str) -> Result<Vec<(u64, String)>, String> {
-        let ids: Vec<u64> = self
-            .with_conn(|c| c.smembers(principal_sessions_key(principal)))
-            .map_err(|e| e.0)?;
+    async fn v3_sessions_for(
+        &self,
+        c: &mut Conn,
+        principal: &str,
+    ) -> Result<Vec<(u64, String)>, String> {
+        let ids: Vec<u64> = with_conn!(self, |c| c
+            .smembers(principal_sessions_key(principal))
+            .await)
+        .map_err(|e| e.0)?;
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let rows: Vec<(Option<String>, Option<String>)> = self
-            .with_conn(|c| {
-                let mut pipe = redis::pipe();
-                pipe.atomic();
-                for id in &ids {
-                    pipe.cmd("HMGET")
-                        .arg(session_key(*id))
-                        .arg("node")
-                        .arg("principal");
-                }
-                pipe.query(c)
-            })
-            .map_err(|e| e.0)?;
+        let rows: Vec<(Option<String>, Option<String>)> = with_conn!(self, |c| {
+            let mut pipe = pipe();
+            pipe.atomic();
+            for id in &ids {
+                pipe.cmd("HMGET")
+                    .arg(session_key(*id))
+                    .arg("node")
+                    .arg("principal");
+            }
+            pipe.query(c).await
+        })
+        .map_err(|e| e.0)?;
         let mut out: Vec<(u64, String)> = ids
             .into_iter()
             .zip(rows)
@@ -502,28 +529,41 @@ impl StoreSlots for ValkeyStore {
         Ok(out)
     }
 
-    fn record_put(&self, schema: &str, key: &[u8], value: &[u8]) -> Result<(), String> {
+    async fn v3_record_put(
+        &self,
+        c: &mut Conn,
+        schema: &str,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), String> {
         let (k, v) = records_keys(schema);
-        self.with_conn(|c| {
-            redis::pipe()
+        with_conn!(self, |c| {
+            pipe()
                 .atomic()
                 .zadd(&k, key, 0)
                 .ignore()
                 .hset(&v, key, value)
                 .ignore()
                 .query(c)
+                .await
         })
         .map_err(|e| e.0)
     }
 
-    fn record_get(&self, schema: &str, key: &[u8]) -> Result<Option<RecordBytes>, String> {
+    async fn v3_record_get(
+        &self,
+        c: &mut Conn,
+        schema: &str,
+        key: &[u8],
+    ) -> Result<Option<RecordBytes>, String> {
         let (_, v) = records_keys(schema);
-        let got: Option<Vec<u8>> = self.with_conn(|c| c.hget(&v, key)).map_err(|e| e.0)?;
+        let got: Option<Vec<u8>> = with_conn!(self, |c| c.hget(&v, key).await).map_err(|e| e.0)?;
         got.map(record).transpose()
     }
 
-    fn record_scan(
+    async fn v3_record_scan(
         &self,
+        c: &mut Conn,
         schema: &str,
         prefix: &[u8],
         limit: u32,
@@ -543,24 +583,24 @@ impl StoreSlots for ValkeyStore {
             Some(end) => [b"(".as_slice(), end.as_slice()].concat(),
             None => b"+".to_vec(),
         };
-        let keys: Vec<Vec<u8>> = self
-            .with_conn(|c| {
-                redis::cmd("ZRANGEBYLEX")
-                    .arg(&k)
-                    .arg(&min)
-                    .arg(&max)
-                    .arg("LIMIT")
-                    .arg(0)
-                    .arg(limit)
-                    .query(c)
-            })
-            .map_err(|e| e.0)?;
+        let keys: Vec<Vec<u8>> = with_conn!(self, |c| {
+            cmd("ZRANGEBYLEX")
+                .arg(&k)
+                .arg(&min)
+                .arg(&max)
+                .arg("LIMIT")
+                .arg(0)
+                .arg(limit)
+                .query(c)
+                .await
+        })
+        .map_err(|e| e.0)?;
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        let values: Vec<Option<Vec<u8>>> = self
-            .with_conn(|c| redis::cmd("HMGET").arg(&v).arg(&keys).query(c))
-            .map_err(|e| e.0)?;
+        let values: Vec<Option<Vec<u8>>> =
+            with_conn!(self, |c| cmd("HMGET").arg(&v).arg(&keys).query(c).await)
+                .map_err(|e| e.0)?;
         keys.into_iter()
             .zip(values)
             .filter_map(|(key, value)| Some((key, value?)))
@@ -568,31 +608,29 @@ impl StoreSlots for ValkeyStore {
             .collect()
     }
 
-    fn reserve<'c>(
+    async fn v3_reserve(
         &self,
+        c: &mut Conn,
         op: OpId,
-        epoch: u64,
-        cells: impl Iterator<Item = Cell<'c>> + Clone,
-        grants: &mut impl Extend<Grant>,
-    ) -> Result<(), ReserveRefused> {
-        let cells: Vec<Cell<'_>> = cells.collect();
-        let body = format!("reserve:{epoch}:{cells:?}");
-        let slots: Vec<(String, u32)> = cells.iter().map(|c| cap_key(&c.key)).collect();
+        body: &str,
+        slots: &[(String, u32)],
+        amounts: &[u64],
+    ) -> Result<Vec<Grant>, ReserveRefused> {
         let watch = distinct(slots.iter().map(|(k, _)| k.clone()));
-        let answer = self.deduped(op, &body, &watch, |c, pipe| {
-            let held = Self::read_caps(c, &watch)?;
+        let answer = deduped!(self, c, op, body, watch, ReserveRefused, |c, pipe| {
+            let held = Self::read_caps(c, &watch).await?;
             // The chain draw is all or nothing: test every cell against what the cells before it
             // in THIS draw add, and apply only when every cell passes.
             let mut drawn: BTreeMap<&str, u64> = BTreeMap::new();
-            for (i, (cell, (key, dimension))) in cells.iter().zip(&slots).enumerate() {
+            for (i, (amount, (key, dimension))) in amounts.iter().zip(slots).enumerate() {
                 let Some(&Some((cap, _, used))) = held.get(key) else {
                     return Ok(Err(ReserveRefused::NoCap { cell: i as u32 }));
                 };
                 let used = used.saturating_add(drawn.get(key.as_str()).copied().unwrap_or(0));
-                if exhausted(*dimension, used, cell.amount, cap) {
+                if exhausted(*dimension, used, *amount, cap) {
                     return Ok(Err(ReserveRefused::Exhausted { cell: i as u32 }));
                 }
-                *drawn.entry(key.as_str()).or_default() += cell.amount;
+                *drawn.entry(key.as_str()).or_default() += *amount;
             }
             for (key, amount) in &drawn {
                 let used = held[*key].map_or(0, |(_, _, used)| used);
@@ -601,54 +639,52 @@ impl StoreSlots for ValkeyStore {
             }
             // Slice ids are taken outside the transaction: an aborted or refused draw leaves a gap,
             // never a reused id.
-            let last: u64 = c.incr(SLICE_SEQ, cells.len() as u64)?;
-            let first = last + 1 - cells.len() as u64;
-            let mut granted = Vec::with_capacity(cells.len());
-            for ((cell, (key, _)), id) in cells.iter().zip(&slots).zip(first..) {
+            let last: u64 = c.incr(SLICE_SEQ, amounts.len() as u64).await?;
+            let first = last + 1 - amounts.len() as u64;
+            let mut granted = Vec::with_capacity(amounts.len());
+            for ((amount, (key, _)), id) in amounts.iter().zip(slots).zip(first..) {
                 pipe.hset_multiple(
                     slice_key(id),
-                    &[("cap", key.clone()), ("left", cell.amount.to_string())],
+                    &[("cap", key.clone()), ("left", amount.to_string())],
                 )
                 .ignore();
-                granted.push((id, cell.amount, u64::MAX));
+                granted.push((id, *amount, u64::MAX));
             }
             Ok(Ok(serde_json::to_string(&granted).unwrap_or_default()))
         })?;
         let rows: Vec<(u64, u64, u64)> =
             serde_json::from_str(&answer).map_err(|_| undecodable::<ReserveRefused>(&answer))?;
-        grants.extend(
-            rows.into_iter()
-                .map(|(slice_id, granted, valid_until_ms)| Grant {
-                    slice_id,
-                    granted,
-                    valid_until_ms,
-                }),
-        );
-        Ok(())
+        Ok(rows
+            .into_iter()
+            .map(|(slice_id, granted, valid_until_ms)| Grant {
+                slice_id,
+                granted,
+                valid_until_ms,
+            })
+            .collect())
     }
 
-    fn slice_release(
+    async fn v3_slice_release(
         &self,
+        c: &mut Conn,
         op: OpId,
-        epoch: u64,
-        items: impl Iterator<Item = (u64, u64)> + Clone,
-        released: &mut impl Extend<u64>,
-    ) -> OpResult<()> {
-        let items: Vec<(u64, u64)> = items.collect();
-        let body = format!("slice_release:{epoch}:{items:?}");
+        body: &str,
+        items: &[(u64, u64)],
+    ) -> OpResult<Vec<u64>> {
         let mut ids: Vec<u64> = items.iter().map(|(id, _)| *id).collect();
         ids.sort_unstable();
         ids.dedup();
         let watch: Vec<String> = ids.iter().map(|id| slice_key(*id)).collect();
-        let answer = self.deduped(op, &body, &watch, |c, pipe| {
+        let answer = deduped!(self, c, op, body, watch, OpRefused, |c, pipe| {
             // Every named slice must be held, or the whole call is refused.
             let mut held: BTreeMap<u64, (String, u64)> = BTreeMap::new();
             for id in &ids {
-                let (cap, left): (Option<String>, Option<String>) = redis::cmd("HMGET")
+                let (cap, left): (Option<String>, Option<String>) = cmd("HMGET")
                     .arg(slice_key(*id))
                     .arg("cap")
                     .arg("left")
-                    .query(c)?;
+                    .query(c)
+                    .await?;
                 let Some(cap) = cap else {
                     return Ok(Err(OpRefused::Failed(format!(
                         "slice_release: slice {id} is not held"
@@ -659,14 +695,14 @@ impl StoreSlots for ValkeyStore {
             // The slices' caps join the watch before they are read.
             let caps = distinct(held.values().map(|(cap, _)| cap.clone()));
             if !caps.is_empty() {
-                redis::cmd("WATCH").arg(&caps).exec(c)?;
+                cmd("WATCH").arg(&caps).exec(c).await?;
             }
-            let rows = Self::read_caps(c, &caps)?;
+            let rows = Self::read_caps(c, &caps).await?;
             // Clamp each item to what its slice has left: an item naming a slice an EARLIER item
             // of this call emptied takes back 0.
             let mut back_all = Vec::with_capacity(items.len());
             let mut by_cap: BTreeMap<String, u64> = BTreeMap::new();
-            for (id, unspent) in &items {
+            for (id, unspent) in items {
                 let (cap, left) = held.get_mut(id).expect("every item's slice is held");
                 let back = (*unspent).min(*left);
                 *left -= back;
@@ -691,44 +727,23 @@ impl StoreSlots for ValkeyStore {
             }
             Ok(Ok(serde_json::to_string(&back_all).unwrap_or_default()))
         })?;
-        let amounts: Vec<u64> =
-            serde_json::from_str(&answer).map_err(|_| undecodable::<OpRefused>(&answer))?;
-        released.extend(amounts);
-        Ok(())
+        serde_json::from_str(&answer).map_err(|_| undecodable::<OpRefused>(&answer))
     }
 
-    fn add_usage_batch(&self, op: OpId, cells: &[(&str, u64, UsageDelta)]) -> OpResult<()> {
-        let body = format!("add_usage_batch:{cells:?}");
-        let cells: Vec<(&str, u64, &UsageDelta)> =
-            cells.iter().map(|(b, w, d)| (*b, *w, d)).collect();
-        self.usage_op(op, &body, &cells)
-    }
-
-    fn add_metering_batch(&self, op: OpId, deltas: &[MeteringDelta]) -> OpResult<()> {
-        let body = format!("add_metering_batch:{deltas:?}");
-        self.done_op(op, &body, &[], |_, pipe| {
-            for d in deltas {
-                queue_metering(pipe, d);
-            }
-            Ok(Ok(String::new()))
-        })
-    }
-
-    fn append_audit_batch(&self, op: OpId, entries: &[AuditRecord]) -> OpResult<()> {
-        let body = format!("append_audit_batch:{entries:?}");
-        // One transaction: a fork anywhere in the batch writes none of it.
-        self.audit_op(op, &body, entries)
-    }
-
-    fn window_caps(&self, op: OpId, caps: &[Cap<'_>]) -> Result<(), CapsRefused> {
-        let body = format!("window_caps:{caps:?}");
-        let keys: Vec<String> = caps.iter().map(|c| cap_key(&c.key).0).collect();
+    async fn v3_window_caps(
+        &self,
+        c: &mut Conn,
+        op: OpId,
+        body: &str,
+        keys: &[String],
+        values: &[(u64, u64)],
+    ) -> Result<(), CapsRefused> {
         let watch = distinct(keys.iter().cloned());
-        self.deduped(op, &body, &watch, |c, pipe| {
-            let stored = Self::read_caps(c, &watch)?;
+        deduped!(self, c, op, body, watch, CapsRefused, |c, pipe| {
+            let stored = Self::read_caps(c, &watch).await?;
             // Atomic per push: find the first conflict before applying any cap.
             let mut pushed: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
-            for (index, (cap, key)) in caps.iter().zip(&keys).enumerate() {
+            for (index, ((cap, config_gen), key)) in values.iter().zip(keys).enumerate() {
                 let prior = pushed.get(key.as_str()).copied().or_else(|| {
                     stored
                         .get(key)
@@ -737,12 +752,12 @@ impl StoreSlots for ValkeyStore {
                         .map(|(cap, gen, _)| (cap, gen))
                 });
                 match prior {
-                    Some((value, gen)) if gen == cap.config_gen && value != cap.cap => {
+                    Some((value, gen)) if gen == *config_gen && value != *cap => {
                         return Ok(Err(CapsRefused::CapConflict { index }));
                     }
-                    Some((_, gen)) if gen >= cap.config_gen => {}
+                    Some((_, gen)) if gen >= *config_gen => {}
                     _ => {
-                        pushed.insert(key.as_str(), (cap.cap, cap.config_gen));
+                        pushed.insert(key.as_str(), (*cap, *config_gen));
                     }
                 }
             }
@@ -753,6 +768,559 @@ impl StoreSlots for ValkeyStore {
             Ok(Ok(String::new()))
         })
         .map(drop)
+    }
+}
+
+/// `keys`, sorted and without repeats: a watch list.
+fn distinct(keys: impl Iterator<Item = String>) -> Vec<String> {
+    let mut v: Vec<String> = keys.collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// The usage adds of `cells`, as the floored-add script's `(key, fields)`.
+fn usage_adds<'a>(
+    cells: impl Iterator<Item = (&'a str, u64, &'a UsageDelta)>,
+) -> Vec<(String, Vec<(String, i64)>)> {
+    cells
+        .map(|(bucket, window, delta)| (usage_key(bucket, window), usage_fields(delta)))
+        .collect()
+}
+
+impl StoreSlots for ValkeyStore {
+    const TAIL: Tail = Tail {
+        ephemeral: false,
+        durable_plane: true,
+        fork_refusal: true,
+    };
+
+    fn validate(settings: &[u8]) -> Result<(), String> {
+        Self::from_settings(settings).map(drop)
+    }
+
+    fn open(settings: &[u8], _host: Option<Host>) -> Result<Self, String> {
+        Self::from_settings(settings)
+    }
+
+    fn connect(&self, cx: &mut Op<'_>) -> Step<Result<(), String>> {
+        let me = self.clone();
+        drive(cx, move |w| {
+            Box::pin(async move {
+                me.connect_step(w)
+                    .await
+                    .map_err(|e| crate::failed_to_connect(&e))
+            })
+        })
+    }
+
+    fn add_usage_op(
+        &self,
+        cx: &mut Op<'_>,
+        op: OpId,
+        bucket: &str,
+        window_start: u64,
+        delta: &UsageDelta,
+    ) -> Step<OpResult<()>> {
+        let body = format!("add_usage:{bucket:?}:{window_start}:{delta:?}");
+        let adds = usage_adds(std::iter::once((bucket, window_start, delta)));
+        op!(cx, self, |e| Err(OpRefused::Failed(text(e))), |me, c| me
+            .usage_op(c, op, &body, &adds)
+            .await)
+    }
+
+    fn add_metering_op(
+        &self,
+        cx: &mut Op<'_>,
+        op: OpId,
+        delta: &MeteringDelta,
+    ) -> Step<OpResult<()>> {
+        let body = format!("add_metering:{delta:?}");
+        let deltas = vec![delta.clone()];
+        op!(cx, self, |e| Err(OpRefused::Failed(text(e))), |me, c| me
+            .metering_op(c, op, &body, &deltas)
+            .await)
+    }
+
+    fn append_audit_op(
+        &self,
+        cx: &mut Op<'_>,
+        op: OpId,
+        entry: &AuditRecord,
+    ) -> Step<OpResult<()>> {
+        let body = format!("append_audit:{entry:?}");
+        let entries = vec![entry.clone()];
+        op!(cx, self, |e| Err(OpRefused::Failed(text(e))), |me, c| me
+            .audit_op(c, op, &body, &entries)
+            .await)
+    }
+
+    fn append_plane_record_op(
+        &self,
+        cx: &mut Op<'_>,
+        op: OpId,
+        record: PlaneRecordRef<'_>,
+    ) -> Step<OpResult<()>> {
+        let body = format!("append_plane_record:{record:?}");
+        let record = record.to_record();
+        op!(cx, self, |e| Err(OpRefused::Failed(text(e))), |me, c| {
+            crate::plane::append_op(&me, c, &op_key(op), &body, record.view()).await
+        })
+    }
+
+    fn append_batch(
+        &self,
+        cx: &mut Op<'_>,
+        op: OpId,
+        stream: &str,
+        records: &[RecordBytes],
+    ) -> Step<OpResult<Head>> {
+        let body = format!("append_batch:{stream:?}:{records:?}");
+        let (stream, records) = (stream.to_string(), records.to_vec());
+        op!(cx, self, |e| Err(OpRefused::Failed(text(e))), |me, c| me
+            .v3_append_batch(c, op, &body, &stream, &records)
+            .await)
+    }
+
+    fn heads(&self, cx: &mut Op<'_>) -> Step<Result<Vec<(String, Head)>, String>> {
+        op!(cx, self, |e| Err(text(e)), |me, c| me.v3_heads(c).await)
+    }
+
+    fn session_put(
+        &self,
+        cx: &mut Op<'_>,
+        session: u64,
+        node: &str,
+        principal: &str,
+    ) -> Step<Result<(), String>> {
+        let (node, principal) = (node.to_string(), principal.to_string());
+        op!(cx, self, |e| Err(text(e)), |me, c| me
+            .v3_session_put(c, session, &node, &principal)
+            .await)
+    }
+
+    fn session_remove(&self, cx: &mut Op<'_>, session: u64) -> Step<Result<(), String>> {
+        op!(cx, self, |e| Err(text(e)), |me, c| me
+            .v3_session_remove(c, session)
+            .await)
+    }
+
+    fn sessions_for(
+        &self,
+        cx: &mut Op<'_>,
+        principal: &str,
+    ) -> Step<Result<Vec<(u64, String)>, String>> {
+        let principal = principal.to_string();
+        op!(cx, self, |e| Err(text(e)), |me, c| me
+            .v3_sessions_for(c, &principal)
+            .await)
+    }
+
+    fn record_put(
+        &self,
+        cx: &mut Op<'_>,
+        schema: &str,
+        key: &[u8],
+        value: &[u8],
+    ) -> Step<Result<(), String>> {
+        let (schema, key, value) = (schema.to_string(), key.to_vec(), value.to_vec());
+        op!(cx, self, |e| Err(text(e)), |me, c| me
+            .v3_record_put(c, &schema, &key, &value)
+            .await)
+    }
+
+    fn record_get(
+        &self,
+        cx: &mut Op<'_>,
+        schema: &str,
+        key: &[u8],
+    ) -> Step<Result<Option<RecordBytes>, String>> {
+        let (schema, key) = (schema.to_string(), key.to_vec());
+        op!(cx, self, |e| Err(text(e)), |me, c| me
+            .v3_record_get(c, &schema, &key)
+            .await)
+    }
+
+    fn record_scan(
+        &self,
+        cx: &mut Op<'_>,
+        schema: &str,
+        prefix: &[u8],
+        limit: u32,
+    ) -> Step<Result<Scanned, String>> {
+        let (schema, prefix) = (schema.to_string(), prefix.to_vec());
+        op!(cx, self, |e| Err(text(e)), |me, c| me
+            .v3_record_scan(c, &schema, &prefix, limit)
+            .await)
+    }
+
+    fn reserve<'c>(
+        &self,
+        cx: &mut Op<'_>,
+        op: OpId,
+        epoch: u64,
+        cells: impl Iterator<Item = Cell<'c>> + Clone,
+        grants: &mut impl Extend<Grant>,
+    ) -> Step<Result<(), ReserveRefused>> {
+        let cells: Vec<Cell<'_>> = cells.collect();
+        let body = format!("reserve:{epoch}:{cells:?}");
+        let slots: Vec<(String, u32)> = cells.iter().map(|c| cap_key(&c.key)).collect();
+        let amounts: Vec<u64> = cells.iter().map(|c| c.amount).collect();
+        let step = op!(cx, self, |_| Err(ReserveRefused::Unavailable), |me, c| me
+            .v3_reserve(c, op, &body, &slots, &amounts)
+            .await);
+        match step {
+            Step::Ready(Ok(g)) => {
+                grants.extend(g);
+                Step::Ready(Ok(()))
+            }
+            Step::Ready(Err(e)) => Step::Ready(Err(e)),
+            Step::Pending { wake_at_ns } => Step::Pending { wake_at_ns },
+        }
+    }
+
+    fn slice_release(
+        &self,
+        cx: &mut Op<'_>,
+        op: OpId,
+        epoch: u64,
+        items: impl Iterator<Item = (u64, u64)> + Clone,
+        released: &mut impl Extend<u64>,
+    ) -> Step<OpResult<()>> {
+        let items: Vec<(u64, u64)> = items.collect();
+        let body = format!("slice_release:{epoch}:{items:?}");
+        let step = op!(cx, self, |e| Err(OpRefused::Failed(text(e))), |me, c| me
+            .v3_slice_release(c, op, &body, &items)
+            .await);
+        match step {
+            Step::Ready(Ok(back)) => {
+                released.extend(back);
+                Step::Ready(Ok(()))
+            }
+            Step::Ready(Err(e)) => Step::Ready(Err(e)),
+            Step::Pending { wake_at_ns } => Step::Pending { wake_at_ns },
+        }
+    }
+
+    fn add_usage_batch(
+        &self,
+        cx: &mut Op<'_>,
+        op: OpId,
+        cells: &[(&str, u64, UsageDelta)],
+    ) -> Step<OpResult<()>> {
+        let body = format!("add_usage_batch:{cells:?}");
+        let adds = usage_adds(cells.iter().map(|(b, w, d)| (*b, *w, d)));
+        op!(cx, self, |e| Err(OpRefused::Failed(text(e))), |me, c| me
+            .usage_op(c, op, &body, &adds)
+            .await)
+    }
+
+    fn add_metering_batch(
+        &self,
+        cx: &mut Op<'_>,
+        op: OpId,
+        deltas: &[MeteringDelta],
+    ) -> Step<OpResult<()>> {
+        let body = format!("add_metering_batch:{deltas:?}");
+        let deltas = deltas.to_vec();
+        op!(cx, self, |e| Err(OpRefused::Failed(text(e))), |me, c| me
+            .metering_op(c, op, &body, &deltas)
+            .await)
+    }
+
+    fn append_audit_batch(
+        &self,
+        cx: &mut Op<'_>,
+        op: OpId,
+        entries: &[AuditRecord],
+    ) -> Step<OpResult<()>> {
+        let body = format!("append_audit_batch:{entries:?}");
+        let entries = entries.to_vec();
+        // One transaction: a fork anywhere in the batch writes none of it.
+        op!(cx, self, |e| Err(OpRefused::Failed(text(e))), |me, c| me
+            .audit_op(c, op, &body, &entries)
+            .await)
+    }
+
+    fn window_caps(
+        &self,
+        cx: &mut Op<'_>,
+        op: OpId,
+        caps: &[Cap<'_>],
+    ) -> Step<Result<(), CapsRefused>> {
+        let body = format!("window_caps:{caps:?}");
+        let keys: Vec<String> = caps.iter().map(|c| cap_key(&c.key).0).collect();
+        let values: Vec<(u64, u64)> = caps.iter().map(|c| (c.cap, c.config_gen)).collect();
+        op!(cx, self, |e| Err(CapsRefused::Failed(text(e))), |me, c| me
+            .v3_window_caps(c, op, &body, &keys, &values)
+            .await)
+    }
+
+    // ── the 1.5.5 op set: each body is the store's own (`lib.rs`), run as one op ──────────────
+
+    fn put_key(&self, cx: &mut Op<'_>, key: &VirtualKey) -> Step<RecordStoreResult<()>> {
+        let key = key.clone();
+        op!(cx, self, Err, |me, c| me.put_key(c, &key).await)
+    }
+
+    fn get_key(&self, cx: &mut Op<'_>, id: &str) -> Step<RecordStoreResult<Option<VirtualKey>>> {
+        let id = id.to_string();
+        op!(cx, self, Err, |me, c| me.get_key(c, &id).await)
+    }
+
+    fn list_keys(&self, cx: &mut Op<'_>) -> Step<RecordStoreResult<Vec<VirtualKey>>> {
+        op!(cx, self, Err, |me, c| me.list_keys(c).await)
+    }
+
+    fn delete_key(&self, cx: &mut Op<'_>, id: &str) -> Step<RecordStoreResult<()>> {
+        let id = id.to_string();
+        op!(cx, self, Err, |me, c| me.delete_key(c, &id).await)
+    }
+
+    fn scrub_key(&self, cx: &mut Op<'_>, id: &str) -> Step<RecordStoreResult<()>> {
+        let id = id.to_string();
+        op!(cx, self, Err, |me, c| me.scrub_key(c, &id).await)
+    }
+
+    fn list_keys_since(
+        &self,
+        cx: &mut Op<'_>,
+        since: u64,
+    ) -> Step<RecordStoreResult<Vec<VirtualKey>>> {
+        op!(cx, self, Err, |me, c| me.list_keys_since(c, since).await)
+    }
+
+    fn get_usage(
+        &self,
+        cx: &mut Op<'_>,
+        bucket_id: &str,
+        window_start: u64,
+    ) -> Step<RecordStoreResult<UsageLedger>> {
+        let bucket_id = bucket_id.to_string();
+        op!(cx, self, Err, |me, c| me
+            .get_usage(c, &bucket_id, window_start)
+            .await)
+    }
+
+    fn put_usage(
+        &self,
+        cx: &mut Op<'_>,
+        bucket_id: &str,
+        window_start: u64,
+        ledger: &UsageLedger,
+    ) -> Step<RecordStoreResult<()>> {
+        let (bucket_id, ledger) = (bucket_id.to_string(), ledger.clone());
+        op!(cx, self, Err, |me, c| me
+            .put_usage(c, &bucket_id, window_start, &ledger)
+            .await)
+    }
+
+    fn list_metering(
+        &self,
+        cx: &mut Op<'_>,
+        bucket: u64,
+    ) -> Step<RecordStoreResult<Vec<MeteringRow>>> {
+        op!(cx, self, Err, |me, c| me.list_metering(c, bucket).await)
+    }
+
+    /// Left at the 1.5.5 trait's `Ok(0)` (module doc, DATA GROWTH): no connection is made.
+    fn purge_windows_before(&self, _: &mut Op<'_>, _: u64) -> Step<RecordStoreResult<u64>> {
+        Step::Ready(Ok(0))
+    }
+
+    /// Left at the 1.5.5 trait's `Ok(0)` (module doc, DATA GROWTH): no connection is made.
+    fn purge_metering_before(&self, _: &mut Op<'_>, _: &str) -> Step<RecordStoreResult<u64>> {
+        Step::Ready(Ok(0))
+    }
+
+    fn put_credential(
+        &self,
+        cx: &mut Op<'_>,
+        secret: &CredentialSecret,
+    ) -> Step<RecordStoreResult<()>> {
+        let secret = secret.clone();
+        op!(cx, self, Err, |me, c| me.put_credential(c, &secret).await)
+    }
+
+    fn put_key_with_credential(
+        &self,
+        cx: &mut Op<'_>,
+        key: &VirtualKey,
+        secret: &CredentialSecret,
+    ) -> Step<RecordStoreResult<()>> {
+        let (key, secret) = (key.clone(), secret.clone());
+        op!(cx, self, Err, |me, c| me
+            .put_key_with_credential(c, &key, &secret)
+            .await)
+    }
+
+    fn list_credentials(
+        &self,
+        cx: &mut Op<'_>,
+        key_id: &str,
+    ) -> Step<RecordStoreResult<Vec<CredentialMeta>>> {
+        let key_id = key_id.to_string();
+        op!(cx, self, Err, |me, c| me.list_credentials(c, &key_id).await)
+    }
+
+    fn lookup_credential_secret(
+        &self,
+        cx: &mut Op<'_>,
+        kind: &str,
+        public_id: &str,
+    ) -> Step<RecordStoreResult<Option<CredentialSecret>>> {
+        let (kind, public_id) = (kind.to_string(), public_id.to_string());
+        op!(cx, self, Err, |me, c| me
+            .lookup_credential_secret(c, &kind, &public_id)
+            .await)
+    }
+
+    fn revoke_credential(
+        &self,
+        cx: &mut Op<'_>,
+        id: &str,
+        reason: &str,
+    ) -> Step<RecordStoreResult<()>> {
+        let (id, reason) = (id.to_string(), reason.to_string());
+        op!(cx, self, Err, |me, c| me
+            .revoke_credential(c, &id, &reason)
+            .await)
+    }
+
+    fn list_credentials_since(
+        &self,
+        cx: &mut Op<'_>,
+        since: u64,
+    ) -> Step<RecordStoreResult<Vec<CredentialSecret>>> {
+        op!(cx, self, Err, |me, c| me
+            .list_credentials_since(c, since)
+            .await)
+    }
+
+    fn list_audit(&self, cx: &mut Op<'_>) -> Step<RecordStoreResult<Vec<AuditRecord>>> {
+        op!(cx, self, Err, |me, c| me.list_audit(c).await)
+    }
+
+    fn add_denylist(
+        &self,
+        cx: &mut Op<'_>,
+        sub: &str,
+        reason: &str,
+    ) -> Step<RecordStoreResult<()>> {
+        let (sub, reason) = (sub.to_string(), reason.to_string());
+        op!(cx, self, Err, |me, c| me
+            .add_denylist(c, &sub, &reason)
+            .await)
+    }
+
+    fn list_denylist(&self, cx: &mut Op<'_>) -> Step<RecordStoreResult<Vec<String>>> {
+        op!(cx, self, Err, |me, c| me.list_denylist(c).await)
+    }
+
+    fn list_audit_tail(
+        &self,
+        cx: &mut Op<'_>,
+        limit: u64,
+    ) -> Step<RecordStoreResult<Vec<AuditRecord>>> {
+        op!(cx, self, Err, |me, c| me.list_audit_tail(c, limit).await)
+    }
+
+    fn upsert_plane_record(
+        &self,
+        cx: &mut Op<'_>,
+        record: PlaneRecordRef<'_>,
+    ) -> Step<RecordStoreResult<()>> {
+        let record = record.to_record();
+        op!(cx, self, Err, |me, c| me
+            .upsert_plane_record(c, record.view())
+            .await)
+    }
+
+    fn get_plane_record(
+        &self,
+        cx: &mut Op<'_>,
+        kind: &str,
+        id: &str,
+    ) -> Step<RecordStoreResult<Option<Vec<u8>>>> {
+        let (kind, id) = (kind.to_string(), id.to_string());
+        op!(cx, self, Err, |me, c| me
+            .get_plane_record(c, &kind, &id)
+            .await)
+    }
+
+    fn list_plane_records(
+        &self,
+        cx: &mut Op<'_>,
+        kind: &str,
+        selector: &PlaneSelector<'_>,
+    ) -> Step<RecordStoreResult<Vec<Vec<u8>>>> {
+        let (kind, selector) = (kind.to_string(), selector.to_static());
+        op!(cx, self, Err, |me, c| me
+            .list_plane_records(c, &kind, &selector)
+            .await)
+    }
+
+    fn list_plane_record_parents(
+        &self,
+        cx: &mut Op<'_>,
+        kind: &str,
+    ) -> Step<RecordStoreResult<Vec<String>>> {
+        let kind = kind.to_string();
+        op!(cx, self, Err, |me, c| me
+            .list_plane_record_parents(c, &kind)
+            .await)
+    }
+
+    fn purge_plane_records_before(
+        &self,
+        cx: &mut Op<'_>,
+        kind: &str,
+        before: u64,
+    ) -> Step<RecordStoreResult<u64>> {
+        let kind = kind.to_string();
+        op!(cx, self, Err, |me, c| me
+            .purge_plane_records_before(c, &kind, before)
+            .await)
+    }
+
+    fn delete_plane_record(
+        &self,
+        cx: &mut Op<'_>,
+        kind: &str,
+        id: &str,
+    ) -> Step<RecordStoreResult<()>> {
+        let (kind, id) = (kind.to_string(), id.to_string());
+        op!(cx, self, Err, |me, c| me
+            .delete_plane_record(c, &kind, &id)
+            .await)
+    }
+
+    fn redeem_plane_token(
+        &self,
+        cx: &mut Op<'_>,
+        kind: &str,
+        token: &str,
+        expires_at: u64,
+        now: u64,
+    ) -> Step<RecordStoreResult<bool>> {
+        let (kind, token) = (kind.to_string(), token.to_string());
+        op!(cx, self, Err, |me, c| me
+            .redeem_plane_token(c, &kind, &token, expires_at, now)
+            .await)
+    }
+
+    fn plane_token_live(
+        &self,
+        cx: &mut Op<'_>,
+        kind: &str,
+        token: &str,
+        expires_at: u64,
+        now: u64,
+    ) -> Step<RecordStoreResult<bool>> {
+        let (kind, token) = (kind.to_string(), token.to_string());
+        op!(cx, self, Err, |me, c| me
+            .plane_token_live(c, &kind, &token, expires_at, now)
+            .await)
     }
 }
 

@@ -36,7 +36,6 @@ use busbar_plugin_loader::dispatch::{
 };
 use busbar_plugin_loader::plugin_library_filename;
 use busbar_plugin_loader::store_v3::LoadedStore;
-use busbar_store_valkey::ValkeyStore;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -56,6 +55,18 @@ fn node() -> u64 {
         | 1
 }
 
+/// The node's one `op_id` allocator (`LoadedStore::open` mints the bridge's writes from it): a node
+/// half no earlier run used (the dedupe is durable) and one counter.
+fn mint() -> busbar_contract::abi::store::OpId {
+    static NODE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let node = *NODE.get_or_init(node);
+    busbar_contract::abi::store::OpId::from_parts(
+        node,
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+    )
+}
+
 /// Open the built cdylib the way the host opens a dropped-in store: its Statement rendered as
 /// `busbar-plugin-pack` renders it into the signed manifest, `load_dropped` (dlopen,
 /// `busbar_plugin_door`, the Statement compared byte for byte), then `LoadedStore::open`. Dropping
@@ -64,17 +75,43 @@ fn load(path: &Path, cfg: &str) -> Result<Box<dyn RecordStore>, String> {
     let stated = rendering_of_library(path)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "the library exports no busbar_plugin_door".to_string())?;
+    let (dispatcher, bind) = host("store-valkey-e2e");
+    let plugin = load_dropped::<Store>(path, &stated, bind).map_err(|e| e.to_string())?;
+    let store = LoadedStore::open(plugin, dispatcher, cfg.as_bytes(), mint)?;
+    Ok(Box::new(store))
+}
+
+/// A dispatcher and a bind over the loader's test connection table (plain TCP, the host's
+/// connector path): every store op is one connection the "host" dials.
+fn host(instance: &str) -> (Arc<Dispatcher>, Bind) {
     let dispatcher = Arc::new(Dispatcher::new(DispatchConfig::default()));
+    let conns: Arc<dyn busbar_contract::conn::DeclaredConns> = Arc::new(
+        busbar_plugin_loader::tcp_conns::TcpConns::new(dispatcher.conn_waker()),
+    );
     let bind = Bind {
-        instance: Arc::from("store-valkey-e2e"),
+        instance: Arc::from(instance),
         max_inflight_cap: 64,
         sink: Arc::new(NoSink),
         dispatcher: dispatcher.adopter(),
-        conns: None,
+        conns: Some(conns),
     };
-    let plugin = load_dropped::<Store>(path, &stated, bind).map_err(|e| e.to_string())?;
-    let store = LoadedStore::open(plugin, dispatcher, cfg.as_bytes(), node())?;
-    Ok(Box::new(store))
+    (dispatcher, bind)
+}
+
+/// The store through its COMPILED-IN door (`busbar_store_valkey::door`, never the cdylib): the
+/// independent leg the dropped-in store's writes are read back and cleaned up through.
+struct ValkeyStore;
+
+impl ValkeyStore {
+    fn connect(url: &str) -> Result<LoadedStore, String> {
+        let (dispatcher, bind) = host("store-valkey-e2e-direct");
+        let row = busbar_plugin_loader::dispatch::LinkedRow::of(busbar_store_valkey::door)
+            .map_err(|e| e.to_string())?;
+        let plugin = busbar_plugin_loader::dispatch::load_linked::<Store>(&row, bind)
+            .map_err(|e| e.to_string())?;
+        let cfg = format!("{{\"url\":{}}}", serde_json::Value::String(url.to_string()));
+        LoadedStore::open(plugin, dispatcher, cfg.as_bytes(), mint)
+    }
 }
 
 /// Fixed ed25519 signing secret (64 hex = 32 bytes) for this e2e test. 1.5.1 requires an

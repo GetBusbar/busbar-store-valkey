@@ -8,16 +8,254 @@
 //! Every test names its own slots, streams, sessions and keys freshly (process, clock, counter), so
 //! the suite runs in parallel against the one shared Valkey and leaves nothing another test reads.
 
-use super::live_store;
-use crate::ValkeyStore;
+use super::{live_store, Connect, Raw};
+use crate::ValkeyStore as Door;
 use busbar_contract::abi::sdk::store::{
-    Cap, CapsRefused, Cell, CellKey, Dimension, Grant, OpRefused, ReserveRefused, StoreSlots,
+    Cap, CapsRefused, Cell, CellKey, Dimension, Grant, OpRefused, OpResult, ReserveRefused,
+    StoreSlots,
 };
+use busbar_contract::store_calls::StoreFailure;
+
 use busbar_contract::abi::store::OpId;
 use busbar_contract::kinds::{Head, RecordBytes};
 use busbar_contract::records::{
     AuditRecord, PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore, UsageDelta,
 };
+
+/// The store under test: the door as the host opens it (`super::open_with`).
+type ValkeyStore = busbar_plugin_loader::store_v3::LoadedStore;
+
+/// Run one of the store's async calls to its answer (each is one op through the host's connector).
+fn block<T>(f: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a runtime")
+        .block_on(f)
+}
+
+/// A store call's failure, in the slot's own refusal type.
+trait FromFailure {
+    fn from_failure(f: StoreFailure) -> Self;
+}
+
+impl FromFailure for OpRefused {
+    fn from_failure(f: StoreFailure) -> Self {
+        match f {
+            StoreFailure::Conflict => OpRefused::Conflict,
+            StoreFailure::Failed(t) | StoreFailure::Refused(t) | StoreFailure::Fault(t) => {
+                OpRefused::Failed(t)
+            }
+            other => OpRefused::Failed(other.to_string()),
+        }
+    }
+}
+
+impl FromFailure for ReserveRefused {
+    fn from_failure(f: StoreFailure) -> Self {
+        match f {
+            StoreFailure::Reserve(r) => r,
+            StoreFailure::Conflict => ReserveRefused::Conflict,
+            _ => ReserveRefused::Unavailable,
+        }
+    }
+}
+
+impl FromFailure for CapsRefused {
+    fn from_failure(f: StoreFailure) -> Self {
+        match f {
+            StoreFailure::Conflict => CapsRefused::Conflict,
+            StoreFailure::CapConflict(index) => CapsRefused::CapConflict { index },
+            StoreFailure::Failed(t) | StoreFailure::Refused(t) | StoreFailure::Fault(t) => {
+                CapsRefused::Failed(t)
+            }
+            other => CapsRefused::Failed(other.to_string()),
+        }
+    }
+}
+
+impl FromFailure for String {
+    fn from_failure(f: StoreFailure) -> Self {
+        match f {
+            StoreFailure::Failed(t) | StoreFailure::Refused(t) | StoreFailure::Fault(t) => t,
+            other => other.to_string(),
+        }
+    }
+}
+
+fn call<T, E: FromFailure>(
+    f: impl std::future::Future<Output = Result<T, StoreFailure>>,
+) -> Result<T, E> {
+    block(f).map_err(E::from_failure)
+}
+
+/// The store v3 slots these tests drive, through the store's async calls (`StoreCalls`, named by
+/// path only: its methods share these names), answered
+/// synchronously in each slot's own result type.
+trait Slots {
+    fn add_usage_op(&self, op: OpId, bucket: &str, window: u64, d: &UsageDelta) -> OpResult<()>;
+    fn add_usage_batch(&self, op: OpId, cells: &[(&str, u64, UsageDelta)]) -> OpResult<()>;
+    fn add_metering_op(
+        &self,
+        op: OpId,
+        d: &busbar_contract::records::MeteringDelta,
+    ) -> OpResult<()>;
+    fn add_metering_batch(
+        &self,
+        op: OpId,
+        d: &[busbar_contract::records::MeteringDelta],
+    ) -> OpResult<()>;
+    fn append_audit_op(&self, op: OpId, e: &AuditRecord) -> OpResult<()>;
+    fn append_audit_batch(&self, op: OpId, e: &[AuditRecord]) -> OpResult<()>;
+    fn window_caps(&self, op: OpId, caps: &[Cap<'_>]) -> Result<(), CapsRefused>;
+    fn append_batch(&self, op: OpId, stream: &str, r: &[RecordBytes]) -> OpResult<Head>;
+    fn heads(&self) -> Result<Vec<(String, Head)>, String>;
+    fn session_put(&self, session: u64, node: &str, principal: &str) -> Result<(), String>;
+    fn session_remove(&self, session: u64) -> Result<(), String>;
+    fn sessions_for(&self, principal: &str) -> Result<Vec<(u64, String)>, String>;
+    fn record_put(&self, schema: &str, key: &[u8], value: &[u8]) -> Result<(), String>;
+    fn record_get(&self, schema: &str, key: &[u8]) -> Result<Option<RecordBytes>, String>;
+    fn record_scan(
+        &self,
+        schema: &str,
+        prefix: &[u8],
+        limit: u32,
+    ) -> Result<Vec<(Vec<u8>, RecordBytes)>, String>;
+    fn append_plane_record_op(
+        &self,
+        op: OpId,
+        r: busbar_contract::records::PlaneRecordRef<'_>,
+    ) -> OpResult<()>;
+}
+
+impl Slots for ValkeyStore {
+    fn add_usage_op(&self, op: OpId, bucket: &str, window: u64, d: &UsageDelta) -> OpResult<()> {
+        let cells = [(bucket, window, d.clone())];
+        call(
+            <ValkeyStore as busbar_contract::store_calls::StoreCalls>::add_usage_batch(
+                self, op, &cells,
+            ),
+        )
+    }
+    fn add_usage_batch(&self, op: OpId, cells: &[(&str, u64, UsageDelta)]) -> OpResult<()> {
+        call(
+            <ValkeyStore as busbar_contract::store_calls::StoreCalls>::add_usage_batch(
+                self, op, cells,
+            ),
+        )
+    }
+    fn add_metering_op(
+        &self,
+        op: OpId,
+        d: &busbar_contract::records::MeteringDelta,
+    ) -> OpResult<()> {
+        call(
+            <ValkeyStore as busbar_contract::store_calls::StoreCalls>::add_metering_batch(
+                self,
+                op,
+                std::slice::from_ref(d),
+            ),
+        )
+    }
+    fn add_metering_batch(
+        &self,
+        op: OpId,
+        d: &[busbar_contract::records::MeteringDelta],
+    ) -> OpResult<()> {
+        call(
+            <ValkeyStore as busbar_contract::store_calls::StoreCalls>::add_metering_batch(
+                self, op, d,
+            ),
+        )
+    }
+    fn append_audit_op(&self, op: OpId, e: &AuditRecord) -> OpResult<()> {
+        call(
+            <ValkeyStore as busbar_contract::store_calls::StoreCalls>::append_audit_batch(
+                self,
+                op,
+                std::slice::from_ref(e),
+            ),
+        )
+    }
+    fn append_audit_batch(&self, op: OpId, e: &[AuditRecord]) -> OpResult<()> {
+        call(
+            <ValkeyStore as busbar_contract::store_calls::StoreCalls>::append_audit_batch(
+                self, op, e,
+            ),
+        )
+    }
+    fn window_caps(&self, op: OpId, caps: &[Cap<'_>]) -> Result<(), CapsRefused> {
+        call(<ValkeyStore as busbar_contract::store_calls::StoreCalls>::window_caps(self, op, caps))
+    }
+    fn append_batch(&self, op: OpId, stream: &str, r: &[RecordBytes]) -> OpResult<Head> {
+        call(
+            <ValkeyStore as busbar_contract::store_calls::StoreCalls>::append_batch(
+                self, op, stream, r,
+            ),
+        )
+    }
+    fn heads(&self) -> Result<Vec<(String, Head)>, String> {
+        call(<ValkeyStore as busbar_contract::store_calls::StoreCalls>::heads(self))
+    }
+    fn session_put(&self, session: u64, node: &str, principal: &str) -> Result<(), String> {
+        call(
+            <ValkeyStore as busbar_contract::store_calls::StoreCalls>::session_put(
+                self, session, node, principal,
+            ),
+        )
+    }
+    fn session_remove(&self, session: u64) -> Result<(), String> {
+        call(
+            <ValkeyStore as busbar_contract::store_calls::StoreCalls>::session_remove(
+                self, session,
+            ),
+        )
+    }
+    fn sessions_for(&self, principal: &str) -> Result<Vec<(u64, String)>, String> {
+        call(
+            <ValkeyStore as busbar_contract::store_calls::StoreCalls>::sessions_for(
+                self, principal,
+            ),
+        )
+    }
+    fn record_put(&self, schema: &str, key: &[u8], value: &[u8]) -> Result<(), String> {
+        let value = RecordBytes::new(value.to_vec()).map_err(|n| format!("{n} bytes"))?;
+        call(
+            <ValkeyStore as busbar_contract::store_calls::StoreCalls>::record_put(
+                self, schema, key, &value,
+            ),
+        )
+    }
+    fn record_get(&self, schema: &str, key: &[u8]) -> Result<Option<RecordBytes>, String> {
+        call(
+            <ValkeyStore as busbar_contract::store_calls::StoreCalls>::record_get(
+                self, schema, key,
+            ),
+        )
+    }
+    fn record_scan(
+        &self,
+        schema: &str,
+        prefix: &[u8],
+        limit: u32,
+    ) -> Result<Vec<(Vec<u8>, RecordBytes)>, String> {
+        call(
+            <ValkeyStore as busbar_contract::store_calls::StoreCalls>::record_scan(
+                self, schema, prefix, limit,
+            ),
+        )
+    }
+    fn append_plane_record_op(
+        &self,
+        op: OpId,
+        r: busbar_contract::records::PlaneRecordRef<'_>,
+    ) -> OpResult<()> {
+        call(
+            <ValkeyStore as busbar_contract::store_calls::StoreCalls>::append_plane_record(
+                self, op, r,
+            ),
+        )
+    }
+}
 
 /// The epoch every draw here states (fixed at 0 until WIRE-STORE adds the advance).
 const EPOCH: u64 = 0;
@@ -58,15 +296,15 @@ fn reserve(
     epoch: u64,
     cells: &[Cell<'_>],
 ) -> Result<Vec<Grant>, ReserveRefused> {
-    let mut grants = Vec::new();
-    s.reserve(op, epoch, cells.iter().copied(), &mut grants)?;
-    Ok(grants)
+    call(<ValkeyStore as busbar_contract::store_calls::StoreCalls>::reserve(s, op, epoch, cells))
 }
 
 fn release(s: &ValkeyStore, op: OpId, items: &[(u64, u64)]) -> Result<Vec<u64>, OpRefused> {
-    let mut back = Vec::new();
-    s.slice_release(op, EPOCH, items.iter().copied(), &mut back)?;
-    Ok(back)
+    call(
+        <ValkeyStore as busbar_contract::store_calls::StoreCalls>::slice_release(
+            s, op, EPOCH, items,
+        ),
+    )
 }
 
 fn audit(seq: u64, action: &str) -> AuditRecord {
@@ -90,24 +328,23 @@ fn audit_base() -> u64 {
 #[test]
 fn the_statement_tail_is_a_durable_store_that_refuses_forks() {
     const {
-        assert!(!ValkeyStore::TAIL.ephemeral);
-        assert!(ValkeyStore::TAIL.durable_plane);
-        assert!(ValkeyStore::TAIL.fork_refusal);
+        assert!(!Door::TAIL.ephemeral);
+        assert!(Door::TAIL.durable_plane);
+        assert!(Door::TAIL.fork_refusal);
     }
 }
 
 /// The settings refusals are the 1.5.5 texts, through the door's `open`. No server needed.
 #[test]
 fn open_refuses_settings_it_cannot_run_in_its_own_words() {
-    let e = ValkeyStore::open(b"").err().expect("no url");
+    let e = Door::open(b"", None).expect_err("no url");
     assert!(e.contains("requires a \"url\""), "{e}");
-    let e = ValkeyStore::open(b"{}").err().expect("no url");
+    let e = Door::open(b"{}", None).expect_err("no url");
     assert!(e.contains("requires a \"url\""), "{e}");
-    let e = ValkeyStore::open(b"{ not json").err().expect("bad json");
+    let e = Door::open(b"{ not json", None).expect_err("bad json");
     assert!(e.contains("invalid valkey plugin config"), "{e}");
-    let e = ValkeyStore::open(br#"{"url":"not-a-valkey-url"}"#)
-        .err()
-        .expect("a url the driver refuses");
+    let e =
+        Door::open(br#"{"url":"not-a-valkey-url"}"#, None).expect_err("a url the driver refuses");
     assert!(e.contains("valkey plugin: failed to connect"), "{e}");
 }
 
