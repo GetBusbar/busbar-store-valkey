@@ -75,7 +75,7 @@
 //! The store reaches the server through the host's connector (the store SDK's `wire`): the host
 //! dials the URL's `host:port` (or, for a unix-socket URL, its path as `unix:<path>`) for the store's
 //! one declared `tcp` need (egress class operator-infrastructure), secures it for `rediss://` (the
-//! connector's TLS and trust), and the store sends `AUTH` / `SELECT` as the URL says, then its
+//! connector's TLS and trust; unverified for `#insecure`, as 1.5.5), and the store sends `AUTH` / `SELECT` as the URL says, then its
 //! commands; a read that has nothing yet PENDS on the op's ticket and is resumed on the connector's
 //! wake. Like 1.5.5's one mutex-guarded connection, the store KEEPS one connection across ops
 //! (`wire::Pool` of one, ARCHITECT ruling STORE-KEEP): the handshake runs once per connection, and
@@ -472,6 +472,10 @@ struct Target {
     host: String,
     /// `rediss://` / `valkeys://`: secure the connection before its first byte.
     tls: bool,
+    /// `#insecure` on a TLS URL: secure it WITHOUT verifying the server's certificate, as 1.5.5's
+    /// driver did (ARCHITECT ruling 2026-10-03 on Q-L16-4; the host honours it for this store's
+    /// operator-infrastructure need only, and logs a WARN naming the instance).
+    insecure: bool,
     /// `AUTH` (`user`, `password`), when the URL carries a password.
     auth: Option<(Option<String>, String)>,
     /// `SELECT`, when the URL names a database other than 0.
@@ -549,16 +553,17 @@ fn parse_url(input: &str) -> RedisResult<Target> {
     }
     let port = url.port().unwrap_or(6379);
     let tls = matches!(url.scheme(), "rediss" | "valkeys");
-    if tls {
+    let insecure = if tls {
         match url.fragment() {
-            // 1.5.5 skipped the certificate check here; through the host's connector every secured
-            // connection is verified against the connector's trust (no unverified TLS exists).
-            None | Some("insecure") => {}
+            None => false,
+            Some("insecure") => true,
             Some(_) => {
                 return Err(url_refused("only #insecure is supported as URL fragment"));
             }
         }
-    }
+    } else {
+        false
+    };
     check_protocol(&url)?;
     let db = match url.path().trim_matches('/') {
         "" => 0,
@@ -590,6 +595,7 @@ fn parse_url(input: &str) -> RedisResult<Target> {
         addr,
         host,
         tls,
+        insecure,
         auth: pass.map(|p| (user, p)),
         db,
     })
@@ -615,6 +621,7 @@ fn parse_unix(url: &url::Url) -> RedisResult<Target> {
         addr: format!("unix:{}", path.display()),
         host: String::new(),
         tls: false,
+        insecure: false,
         auth: pass.map(|p| (user, p)),
         db,
     })
@@ -743,14 +750,17 @@ impl ValkeyStore {
         Ok(c)
     }
 
-    /// A NEW connection's handshake: TLS for `rediss://` (before its first byte), `AUTH`, `SELECT`.
+    /// A NEW connection's handshake: TLS for `rediss://` (before its first byte; unverified for
+    /// `#insecure`, as 1.5.5), `AUTH`, `SELECT`.
     async fn handshake(&self, c: &mut Conn) -> RedisResult<()> {
         let t = &self.inner.target;
         if t.tls {
-            c.wire()
-                .upgrade_secure(Some(&t.host))
-                .await
-                .map_err(|e| RedisError::io(&e))?;
+            let secured = if t.insecure {
+                c.wire().upgrade_secure_unverified(Some(&t.host)).await
+            } else {
+                c.wire().upgrade_secure(Some(&t.host)).await
+            };
+            secured.map_err(|e| RedisError::io(&e))?;
         }
         if let Some((user, pass)) = &t.auth {
             let mut auth = cmd("AUTH");
