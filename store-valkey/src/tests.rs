@@ -2,7 +2,152 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 use super::*;
-use busbar_contract::records::{PlaneDisposition, SecretForm};
+use busbar_contract::records::{PlaneDisposition, RecordStore, SecretForm};
+#[allow(unused_imports)]
+use redis::Commands;
+use std::sync::OnceLock;
+
+use busbar_contract::abi::store::OpId;
+use busbar_plugin_loader::dispatch::kinds::store::Store;
+use busbar_plugin_loader::dispatch::{
+    load_linked, Bind, DispatchConfig, Dispatcher, LinkedRow, NoSink,
+};
+use busbar_plugin_loader::store_v3::LoadedStore;
+use busbar_plugin_loader::tcp_conns::TcpConns;
+
+/// THE STORE UNDER TEST is the store as the host opens it: its door through the loader
+/// (`load_linked`, `LoadedStore::open`), every op one connection through the host's connector path
+/// (the loader's test connection table over plain TCP). The name the tests always used stands for it.
+pub(crate) type ValkeyStore = LoadedStore;
+
+/// One dispatcher and one connection table for every store the tests open (the host has one each).
+fn host() -> &'static (
+    Arc<Dispatcher>,
+    Arc<dyn busbar_contract::conn::DeclaredConns>,
+) {
+    static HOST: OnceLock<(
+        Arc<Dispatcher>,
+        Arc<dyn busbar_contract::conn::DeclaredConns>,
+    )> = OnceLock::new();
+    HOST.get_or_init(|| {
+        let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
+        let conns: Arc<dyn busbar_contract::conn::DeclaredConns> =
+            Arc::new(TcpConns::new(d.conn_waker()));
+        (d, conns)
+    })
+}
+
+/// The node's `op_id` allocator for the bridge's writes: a node half no earlier run used (the
+/// dedupe is durable) and one counter.
+fn mint() -> OpId {
+    static NODE: OnceLock<u64> = OnceLock::new();
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let node = *NODE.get_or_init(|| {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        (t ^ (u64::from(std::process::id()) << 40)) | 1
+    });
+    OpId::from_parts(
+        node,
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+    )
+}
+
+/// The store's door opened on `settings`, as the host opens it.
+pub(crate) fn open_with(settings: &str) -> Result<LoadedStore, String> {
+    let (d, conns) = host();
+    let row = LinkedRow::of(crate::door).map_err(|e| e.to_string())?;
+    let p = load_linked::<Store>(
+        &row,
+        Bind {
+            instance: Arc::from("store-valkey-test"),
+            max_inflight_cap: 64,
+            sink: Arc::new(NoSink),
+            dispatcher: d.adopter(),
+            conns: Some(conns.clone()),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    LoadedStore::open(p, d.clone(), settings.as_bytes(), mint)
+}
+
+/// `ValkeyStore::connect(url)`, as the tests always spelled it: the door opened on `{"url": url}`.
+pub(crate) trait Connect: Sized {
+    fn connect(url: &str) -> Result<Self, String>;
+}
+
+impl Connect for LoadedStore {
+    fn connect(url: &str) -> Result<Self, String> {
+        open_with(&serde_json::json!({ "url": url }).to_string())
+    }
+}
+
+/// The tests' INDEPENDENT view of the live Valkey (the upstream client, never the store's own
+/// path): what landed, and the cleanup the `RecordStore` surface deliberately cannot do.
+pub(crate) trait Raw {
+    fn with_conn<T>(
+        &self,
+        f: impl FnOnce(&mut redis::Connection) -> redis::RedisResult<T>,
+    ) -> RecordStoreResult<T>;
+
+    /// Remove a key row and every index entry pointing at it, tombstone included.
+    fn purge_key_for_test(&self, id: &str) -> RecordStoreResult<()> {
+        self.with_conn(|c| {
+            redis::pipe()
+                .atomic()
+                .del(format!("{KEY_PREFIX}{id}"))
+                .ignore()
+                .srem(KEYS_INDEX, id)
+                .ignore()
+                .zrem(KEYS_BYREV, id)
+                .ignore()
+                .del(cred_ids_key(id))
+                .ignore()
+                .query(c)
+        })
+    }
+
+    /// Remove a credential's id pointer. The slot row itself goes with its owning key.
+    fn purge_credential_for_test(&self, id: &str) -> RecordStoreResult<()> {
+        self.with_conn(|c| {
+            redis::pipe()
+                .atomic()
+                .del(cred_id_key(id))
+                .ignore()
+                .query(c)
+        })
+    }
+
+    /// Remove whatever occupies one audit `seq`.
+    fn purge_audit_seq_for_test(&self, seq: u64) -> RecordStoreResult<()> {
+        let score = clamp(seq);
+        self.with_conn(|c| {
+            redis::pipe()
+                .atomic()
+                .cmd("ZREMRANGEBYSCORE")
+                .arg(AUDIT_ZSET)
+                .arg(score)
+                .arg(score)
+                .ignore()
+                .query(c)
+        })
+    }
+}
+
+impl Raw for LoadedStore {
+    fn with_conn<T>(
+        &self,
+        f: impl FnOnce(&mut redis::Connection) -> redis::RedisResult<T>,
+    ) -> RecordStoreResult<T> {
+        let url = std::env::var("VALKEY_URL").expect("the live tests run with VALKEY_URL");
+        let mut c = redis::Client::open(url.as_str())
+            .and_then(|c| c.get_connection())
+            .map_err(|e| RecordStoreError(format!("valkey connect: {e}")))?;
+        f(&mut c).map_err(|e| RecordStoreError(format!("valkey command: {e}")))
+    }
+}
 
 /// The password-scrub never lets the URL secret out in an error string, and the URL password
 /// extractor handles every URL shape.
@@ -52,7 +197,38 @@ fn password_scrub_and_extraction() {
 
 #[test]
 fn tls_url_scheme_is_accepted() {
-    assert!(redis::Client::open("rediss://:pw@localhost:6380/0").is_ok());
+    let t = parse_url("rediss://:pw@localhost:6380/0").expect("a rediss URL parses");
+    assert!(t.tls);
+    assert_eq!(t.addr, "localhost:6380");
+    assert_eq!(t.auth, Some((None, "pw".to_string())));
+}
+
+/// The URL reads as the upstream driver read it: user, percent-decoded password, port, database,
+/// IPv6 literals, and its refusals in its words.
+#[test]
+fn urls_parse_as_the_upstream_driver_read_them() {
+    let t = parse_url("redis://alice:p%40ss@db.internal:7000/3").unwrap();
+    assert_eq!(
+        (t.addr.as_str(), t.host.as_str(), t.tls, t.db),
+        ("db.internal:7000", "db.internal", false, 3)
+    );
+    assert_eq!(t.auth, Some((Some("alice".into()), "p@ss".into())));
+    let t = parse_url("valkey://[::1]/").unwrap();
+    assert_eq!(
+        (t.addr.as_str(), t.host.as_str(), t.db),
+        ("[::1]:6379", "::1", 0)
+    );
+    assert_eq!(parse_url("redis://h").unwrap().auth, None);
+    assert_eq!(
+        parse_url("not-a-valkey-url").unwrap_err().to_string(),
+        "Redis URL did not parse - InvalidClientConfig"
+    );
+    assert_eq!(
+        parse_url("redis://h/x").unwrap_err().to_string(),
+        "Invalid database number - InvalidClientConfig"
+    );
+    assert!(parse_url("http://h").is_err());
+    assert!(parse_url("redis+unix:///tmp/s").is_err());
 }
 
 #[test]
@@ -66,7 +242,7 @@ fn glob_escaping_covers_every_metacharacter() {
 
 /// End-to-end against a REAL Valkey, gated on `VALKEY_URL` (a docker service in CI). Skips
 /// cleanly when unset LOCALLY; under `CI` a missing URL is a HARD FAILURE, never a silent skip.
-fn live_store() -> Option<ValkeyStore> {
+pub(crate) fn live_store() -> Option<ValkeyStore> {
     let url = match std::env::var("VALKEY_URL") {
         Ok(url) => url,
         Err(_) if std::env::var_os("CI").is_some() => {
@@ -992,62 +1168,40 @@ fn reconnecting_to_an_already_migrated_namespace_does_not_wipe_existing_data() {
     );
 }
 
-/// Pins the `retry && is_connection_error(&e)` guard against a constant-true or `||` form. A
-/// deterministic NON-connection error (`WRONGTYPE`, from issuing `LPUSH` against a string-valued
-/// key) under `with_conn` (`retry: true`) must surface directly via the `"command"` error context, never
-/// silently retry — a retry would issue the exact same doomed command again and report it via the
-/// `"retry after reconnect"` context instead, which is what this test would see if the guard ever
-/// stopped checking `is_connection_error` at all.
+/// A deterministic NON-connection error (`WRONGTYPE`: a usage window that is not a hash) surfaces
+/// through the store op in the store's words (the `"command"` context), never as a connection
+/// failure. (1.5.5's one-shot reconnect-and-retry is gone with the connection it protected: every op
+/// is its own connection through the host's connector.)
 #[test]
-fn with_conn_does_not_retry_a_non_connection_error() {
+fn a_server_error_surfaces_through_the_op_in_the_stores_words() {
     let Some(store) = live_store() else { return };
     let id = uid("vk_wrongtype");
-    let k = format!("busbar:test:wrongtype:{id}");
+    let k = usage_key(&id, 60);
     store
-        .with_conn(|c| c.set::<_, _, ()>(&k, "not-a-list"))
+        .with_conn(|c| c.set::<_, _, ()>(&k, "not-a-hash"))
         .unwrap();
-
     let err = store
-        .with_conn(|c| redis::cmd("LPUSH").arg(&k).arg("x").query::<i64>(c))
-        .expect_err("LPUSH against a string-valued key must fail with WRONGTYPE");
+        .get_usage(&id, 60)
+        .expect_err("HGETALL against a string-valued key must fail with WRONGTYPE");
     assert!(
-        err.0.contains("valkey command:"),
-        "a non-connection (WRONGTYPE) error must surface via the 'command' context, never \
-         trigger the reconnect-and-retry path meant only for connection-level errors: {}",
+        err.0.contains("valkey command:") && err.0.contains("WRONGTYPE"),
+        "a server error must surface via the 'command' context: {}",
         err.0
     );
-
     store.with_conn(|c| c.del::<_, ()>(&k)).unwrap();
 }
 
-/// Pins the retry half of the guard: a genuine connection-level error (the server killing our
-/// connection out from under us, the real-world case `with_conn`'s reconnect-and-retry exists for)
-/// must be transparently recovered, not surfaced to the caller.
+/// Every op is ONE connection, closed when the op answers: the store leaves no connection of its
+/// own behind it, so there is nothing for a dropped connection to break between ops.
 #[test]
-fn with_conn_transparently_reconnects_after_the_connection_is_dropped() {
+fn an_op_leaves_no_connection_behind() {
     let Some(store) = live_store() else { return };
-    let url = std::env::var("VALKEY_URL").unwrap();
-
-    let my_id: i64 = store
-        .with_conn(|c| redis::cmd("CLIENT").arg("ID").query(c))
-        .unwrap();
-    let mut killer = redis::Client::open(url.as_str())
-        .unwrap()
-        .get_connection()
-        .unwrap();
-    let _: () = redis::cmd("CLIENT")
-        .arg("KILL")
-        .arg("ID")
-        .arg(my_id)
-        .query(&mut killer)
-        .expect("kill this store's own connection from an independent connection");
-
-    let id = uid("vk_after_kill");
-    store.put_key(&vk(&id)).expect(
-        "a connection-level error (a killed connection) must trigger transparent \
-         reconnect-and-retry, not surface as a caller-visible failure",
-    );
+    let id = uid("vk_noconn");
+    store.put_key(&vk(&id)).unwrap();
+    // A killed idle client is the 1.5.5 hazard; here an op after any other client's churn still
+    // starts on its own fresh connection and answers.
     assert!(store.get_key(&id).unwrap().is_some());
+    let _ = store.purge_key_for_test(&id);
 }
 
 // ── Denylist (unchanged shape, still real coverage) ─────────────────────────────────────────
@@ -1262,7 +1416,7 @@ mod slots_tests;
 
 mod conformance {
     use super::store_conformance::conf;
-    use super::{live_store, ValkeyStore};
+    use super::{live_store, Raw, ValkeyStore};
 
     fn ns(check: &str) -> String {
         format!("vk_c{}{}", std::process::id(), check)
@@ -3034,8 +3188,12 @@ fn v6_namespace_upgrades_in_place_to_v7() {
     let marker: i64 = upgraded.with_conn(|c| c.get(SCHEMA_KEY)).unwrap();
     assert_eq!(marker, SCHEMA_VERSION);
 
-    // Idempotent: a second pass over an already-upgraded namespace changes nothing.
-    crate::legacy::migrate_v6_to_v7(&upgraded).unwrap();
+    // Idempotent: a second pass over an already-upgraded namespace changes nothing (the marker set
+    // back to v6, the next open's connect step runs the upgrade again).
+    upgraded
+        .with_conn(|c| c.set::<_, _, ()>(SCHEMA_KEY, 6i64))
+        .unwrap();
+    let upgraded = ValkeyStore::connect(&url).expect("a second upgrade pass on open");
     assert_eq!(upgraded.list_task_events(&t).unwrap(), vec![e1, e2]);
 
     reset_tasks(&upgraded, &[&t, &done]);
