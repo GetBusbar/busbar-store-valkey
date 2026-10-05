@@ -5,13 +5,13 @@ version = "1.0.0"
 publish = false            # a first-party plugin crate; shipped linked into busbar or as a signed tarball
 edition = "2021"
 rust-version = "1.97"
-description = "The Valkey backend for busbar's durable governance store — the shared, multi-node db plugin over a KV data model. Implements busbar_contract::records::RecordStore on a mutex-guarded synchronous valkey connection."
+description = "The Valkey backend for busbar's durable governance store — the shared, multi-node db plugin over a KV data model. Serves the store v3 door over the host's connector (no socket of its own): RESP2 over one connection per op."
 license = "Apache-2.0"
 
 [lib]
-# rlib: THE LOGIC. It carries the store's ONE door registration (`export_store_plugin!(open)`) and its
-# `linked::STORE` row, so a busbar build can link it; the sibling `busbar-store-valkey-plugin` cdylib
-# re-exports it as the dropped-in door. One source, both doors (DECISIONS #2 rule (1)).
+# rlib: THE LOGIC, and the store's door (`store_door!` over its `StoreSlots`: `door`, the row a
+# busbar build that links this crate registers). The sibling `busbar-store-valkey-plugin` cdylib
+# exports the same `door` as the dropped-in door. One source, both doors (DECISIONS #2 rule (1)).
 crate-type = ["rlib"]
 
 [dependencies]
@@ -20,22 +20,26 @@ crate-type = ["rlib"]
 # build that links this crate `[patch]`es the busbar git source to its own tree, so ONE copy of the
 # contract links.
 busbar-contract = { workspace = true }
-# The upstream RESP client, SYNCHRONOUS only (no async runtime), with rustls-backed TLS for
-# rediss:// URLs. NOTE: this is the ONE name in this repo that is deliberately NOT "valkey" — it is
-# an upstream crates.io package still published under its pre-fork name, so it is not ours to
-# rename; the server it talks to is Valkey, and the RESP dialect is the same one Valkey speaks.
-# Trimming default-features keeps the dependency tree small and license-clean and avoids pulling a
-# second async stack into the plugin; the rustls backend reuses the single TLS stack busbar pins.
-# `script` for the server-side atomic plane-record and usage-floor steps (EVAL).
-redis = { workspace = true, features = ["tls-rustls"] }
-# The rediss:// TLS path builds its rustls config against the PROCESS default crypto provider; this
-# crate may live inside a plugin cdylib with its own rustls static state, so it installs the ring
-# provider explicitly at connect. ring only — the same single provider busbar pins.
-rustls = { workspace = true }
+# NO RESP CLIENT AND NO TLS STACK: the store speaks RESP2 itself (`src/resp.rs`) over the HOST'S
+# CONNECTOR (THE DESIGN, connections; ARCHITECT rulings 2026-10-03 on Q-L14-1 / Q-L16-2): every op is
+# one connection the host dials, secures and wakes; the plugin image holds no socket.
 serde_json = { workspace = true }
 # `derive` for the plane-record sidecar and the v6 -> v7 migration's legacy row shapes.
 serde = { workspace = true }
+# The upstream driver's URL reading (1.5.5 parsed the store's URL with it): pure parsing, no socket.
+url = { workspace = true }
 
-# NO busbar dev-dependency. The `RecordStore` contract conformance suite used to arrive here as
-# `busbar-plugin-testkit`; the owner ruled that crate DELETED on 2026-09-22 and #2/#31 forbid a shared
-# test util between plugins, so this crate owns its copy at `src/tests/store_conformance.rs`.
+[dev-dependencies]
+# The live tests open the store the way the host does: its door through the loader (`load_linked`,
+# `LoadedStore`), over the loader's test connection table (`TcpConns`, `test-support`), with a
+# runtime for the async `StoreCalls`. The upstream RESP client verifies what landed in Valkey
+# INDEPENDENTLY of the store (tests only; never in the shipped image).
+busbar-plugin-loader = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["rt"] }
+redis = { workspace = true }
+# The TLS proxy the TLS test puts in front of the live server (a self-signed CA), test-only.
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+rcgen = { workspace = true }
+# The `RecordStore` contract conformance suite is this crate's own copy at
+# `src/tests/store_conformance.rs` (#2/#31: no shared test util between plugins).
