@@ -2,16 +2,16 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The **Valkey** backend for busbar's durable governance store — the
-//! shared, multi-node `db` plugin over a KEY-VALUE data model. Implements
-//! [`busbar_contract::records::RecordStore`] on a mutex-guarded SYNCHRONOUS connection, depending only on
-//! the `busbar-contract` crate (plus the
-//! upstream RESP driver crate, which is still published on crates.io under its pre-fork name and is
-//! therefore the ONE spelling in this repo that is not ours to rename), never on the engine.
+//! shared, multi-node `db` plugin over a KEY-VALUE data model. It serves the store v3 door
+//! (`busbar_contract::abi::sdk::store`) over the HOST'S CONNECTOR, depending only on the
+//! `busbar-contract` crate, never on the engine: it speaks RESP2 itself ([`resp`]) and holds no
+//! socket, no TLS stack and no runtime of its own (ARCHITECT rulings 2026-10-03 on Q-L14-1 and
+//! Q-L16-2).
 //!
 //! Valkey is what busbar ships and documents: the Linux-Foundation-governed, BSD-licensed store the
-//! ecosystem standardized on. The only remnants of the pre-fork name anywhere in this crate are the
-//! upstream driver crate's own name/paths and the `url://` scheme strings that driver parses
-//! (`redis://` / `rediss://`) — both fixed by upstream, neither a busbar-owned identifier.
+//! ecosystem standardized on. The only remnants of the pre-fork name in this crate are the `url://`
+//! scheme strings operators already write (`redis://` / `rediss://`, with `valkey://` /
+//! `valkeys://` read the same) and the upstream driver the TESTS use to verify Valkey independently.
 //!
 //! ## Schema v5 — the generic-credentials redesign
 //!
@@ -48,7 +48,7 @@
 //!
 //! - **plane records** — busbar 1.6.0 replaced the protocol-named durable methods (`put_task`,
 //!   `append_mcp_call`, `put_mcp_demotion`, `redeem_ask_state`, …) with eight kind-tagged verbs over an
-//!   opaque [`PlaneRecord`] plus [`RecordStore::plane_token_live`]. ONE keyspace per kind holds every
+//!   opaque [`PlaneRecord`](busbar_contract::records::PlaneRecord) plus [`RecordStore::plane_token_live`]. ONE keyspace per kind holds every
 //!   kind's records (see [`plane`]); the store never decodes a body. The v6 typed task / task-event /
 //!   demotion / spent-approval keyspaces are copied into it in place on connect ([`legacy`]).
 //! - **usage** — the four reserved units keep their `m:<model>:<tier>` hash fields; every other
@@ -61,9 +61,9 @@
 //! ## Atomicity
 //!
 //! Every multi-key write cascade runs as ONE atomic `MULTI`/`EXEC` pipeline
-//! ([`redis::Pipeline::atomic`]), or — where a write's correctness depends on a value read
+//! ([`Pipeline::atomic`]), or — where a write's correctness depends on a value read
 //! immediately beforehand (credential slot occupancy, `delete_key`'s credential fan-out) — as an
-//! optimistic `WATCH`/`MULTI`/`EXEC` transaction ([`redis::transaction`]), so a concurrent mutation of
+//! optimistic `WATCH`/`MULTI`/`EXEC` transaction (`transaction!`, [`resp`]), so a concurrent mutation of
 //! the watched key aborts and retries the whole read+build+EXEC cycle against fresh state rather than
 //! racing. `delete_key`'s cascade (tombstone the key row, destroy every credential row + its
 //! reverse-lookup pointers, drop the credential-id index) is the highest-stakes of these: a mid-
@@ -72,10 +72,22 @@
 //!
 //! ## Connections, TLS, reconnect
 //!
-//! Unchanged from the prior schema: a single mutex-guarded synchronous connection, one-shot
-//! reconnect-and-retry for connection-level errors on READ/idempotent ops only (a non-idempotent
-//! HINCRBY write cascade never auto-retries — see `with_conn_no_retry`'s doc). `rediss://` URLs use
-//! TLS (rustls, ring provider, OS-native roots). Error strings are scrubbed of the URL password.
+//! The store reaches the server through the host's connector (the store SDK's `wire`): the host
+//! dials the URL's `host:port` (or, for a unix-socket URL, its path as `unix:<path>`) for the store's
+//! one declared `tcp` need (egress class operator-infrastructure), secures it for `rediss://` (the
+//! connector's TLS and trust; unverified for `#insecure`, as 1.5.5), and the store sends `AUTH` / `SELECT` as the URL says, then its
+//! commands; a read that has nothing yet PENDS on the op's ticket and is resumed on the connector's
+//! wake. Like 1.5.5's one mutex-guarded connection, the store KEEPS one connection across ops
+//! (`wire::Pool` of one, ARCHITECT ruling STORE-KEEP): the handshake runs once per connection, and
+//! ops queue for it. 1.5.5's reconnect-and-retry is kept call for call: a connection-level failure
+//! on a `with_conn!` call (reads and the idempotent writes, as 1.5.5's `with_conn`) closes the
+//! connection and re-runs that call ONCE on a fresh one; the `with_conn_no_retry!` calls (the
+//! non-idempotent writes 1.5.5 never replayed) fail instead, and the next op dials fresh.
+//! `connect_timeout_ms` bounds every new connection's dial and handshake (TLS, `AUTH`, `SELECT`)
+//! in all, the span 1.5.5's `get_connection_with_timeout` bounded. `open` parses the settings only; its connect step
+//! (`StoreSlots::connect`) makes the first connection, migrates the schema and checks `noeviction`,
+//! so an unreachable or misconfigured server still refuses the load at boot in the store's own
+//! words. Error strings are scrubbed of the URL password.
 //!
 //! ## Data growth (documented, deliberate)
 //!
@@ -84,14 +96,67 @@
 //! `purge_metering_before` are left at the trait's `Ok(0)` default (no obligation to self-bound);
 //! operators wanting bounded growth reap old `busbar:usage:*` keys on their own retention schedule.
 
+#![forbid(unsafe_code)]
+
+use busbar_contract::abi::sdk::store::wire::{Pool, Wire};
+use busbar_contract::records::MeteringDelta;
 use busbar_contract::records::{
-    AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
-    PlaneRecord, PlaneSelector, RecordStore, RecordStoreError, RecordStoreResult, UsageDelta,
-    UsageLedger, VirtualKey, RESERVED_UNITS,
+    AuditRecord, CredentialMeta, CredentialSecret, MeteringRow, ModelTokens, PlaneRecordRef,
+    PlaneSelector, RecordStoreError, RecordStoreResult, UsageDelta, UsageLedger, VirtualKey,
+    RESERVED_UNITS,
 };
-use redis::{Commands, Connection};
-use std::sync::Mutex;
+use resp::{cmd, pipe, Conn, ErrorKind, Pipeline, RedisError, RedisResult};
+use std::sync::Arc;
 use std::time::Duration;
+
+/// The RESP2 client over the host's connector (the store has no socket of its own).
+#[macro_use]
+mod resp;
+
+/// `self.with_conn(|c| EXPR)` over the blocking client, now: `EXPR` on the op's one connection
+/// `c`, its failure in the store's words (`valkey command: …`, the URL password scrubbed).
+///
+/// As 1.5.5's `with_conn`: a CONNECTION-LEVEL failure closes the connection and runs `EXPR` once
+/// more on a fresh one (its failure then reads `valkey reconnect after drop: …` /
+/// `valkey retry after reconnect: …`); any other failure clears a `WATCH` it left in force, as
+/// 1.5.5's did before the connection went back to the next caller.
+macro_rules! with_conn {
+    ($me:expr, |$c:ident| $e:expr $(,)?) => {
+        match $crate::resp::rr(async { $e }).await {
+            Ok(v) => Ok(v),
+            Err(err) if err.is_connection_error() => match $me.reconnect(&mut *$c).await {
+                Err(e2) => Err($me.err(e2, "reconnect after drop")),
+                Ok(()) => $crate::resp::rr(async { $e })
+                    .await
+                    .map_err(|e2| $me.err(e2, "retry after reconnect")),
+            },
+            Err(err) => {
+                if $c.watching() {
+                    let _ = $crate::resp::cmd("UNWATCH").exec(&mut *$c).await;
+                }
+                Err($me.err(err, "command"))
+            }
+        }
+    };
+}
+
+/// 1.5.5's `with_conn_no_retry`: `EXPR` once, never replayed (a non-idempotent write whose lost
+/// reply may have applied); a connection-level failure leaves the connection unfit, and the next op
+/// dials fresh.
+macro_rules! with_conn_no_retry {
+    ($me:expr, |$c:ident| $e:expr $(,)?) => {
+        match $crate::resp::rr(async { $e }).await {
+            Ok(v) => Ok(v),
+            Err(err) => {
+                if !err.is_connection_error() && $c.watching() {
+                    let _ = $crate::resp::cmd("UNWATCH").exec(&mut *$c).await;
+                }
+                Err($me.err(err, "command"))
+            }
+        }
+    };
+}
+
 /// Default connect timeout (`Client::open` + the initial `get_connection`): with no DSN-level
 /// escape hatch (unlike postgres's libpq `connect_timeout`), a blackholed/firewalled host would
 /// otherwise wedge engine boot indefinitely. `connect_with_timeout` lets a caller override this.
@@ -169,7 +234,7 @@ const FIRST_MIGRATED_SCHEMA: i64 = 6;
 
 /// Internal sentinel: `delete_key`'s outer retry loop uses this to distinguish "credential
 /// membership changed since our watch-set pre-read, restart with a fresh watch set" from a real
-/// terminal error. `redis::ErrorKind` has no built-in "retry me" variant, so this is carried in
+/// terminal error. `ErrorKind` has no built-in "retry me" variant, so this is carried in
 /// the error message rather than the kind.
 const DELETE_KEY_RETRY_SENTINEL: &str = "__internal_delete_key_retry__";
 
@@ -373,13 +438,6 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
     out
 }
 
-/// Is this a CONNECTION-LEVEL error worth one reconnect-and-retry (dropped socket, IO failure,
-/// server going away) as opposed to a command/data error that would fail identically on a fresh
-/// connection?
-fn is_connection_error(e: &redis::RedisError) -> bool {
-    e.is_io_error() || e.is_connection_dropped() || e.is_connection_refusal() || e.is_timeout()
-}
-
 /// ADD-THEN-FLOOR over one hash: `ARGV` is `field, delta` pairs; each field is `HINCRBY`'d and, if
 /// the result went below 0, pinned to 0. A counter a v6 build left negative (its unfloored HINCRBY)
 /// is read as the 0 it always reported before the add, so the add lands on what readers saw. The add
@@ -387,9 +445,10 @@ fn is_connection_error(e: &redis::RedisError) -> bool {
 /// counters past 2^53). One script, so the server runs every pair atomically — the
 /// same guarantee the v6 `MULTI` pipeline gave, plus the per-counter floor the contract's
 /// `UsageLedger::apply_delta` specifies.
-static ADD_FLOORED: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
-    redis::Script::new(
-        r"
+///
+/// The source is also queued as a plain `EVAL` inside an `op_id` write's `MULTI` (`slots`), where
+/// an `EVALSHA` could miss a flushed script cache after the transaction had begun.
+const ADD_FLOORED_LUA: &str = r"
         for i = 1, #ARGV, 2 do
             local cur = redis.call('HGET', KEYS[1], ARGV[i])
             if cur and tonumber(cur) < 0 then
@@ -401,53 +460,350 @@ static ADD_FLOORED: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::ne
             end
         end
         return 0
-        ",
-    )
-});
+        ";
 
-/// Valkey `RecordStore` backend (durable, shared across a cluster). A single
-/// mutex-guarded synchronous connection with one-shot reconnect - governance is off the request hot
-/// path, so serializing access is fine.
-pub struct ValkeyStore {
-    client: redis::Client,
-    /// The live connection, lazily (re)established. `None` after a detected drop.
-    conn: Mutex<Option<Connection>>,
-    /// The URL password (if any), scrubbed out of every error string this crate emits.
-    secret: Option<String>,
+/// What the store connects to, parsed once from its settings' URL.
+#[derive(Debug, Clone)]
+struct Target {
+    /// The connection's target on the host's connector: `host:port`, or `unix:<path>` for a
+    /// unix-socket URL.
+    addr: String,
+    /// The host name (for connection security's name check).
+    host: String,
+    /// `rediss://` / `valkeys://`: secure the connection before its first byte.
+    tls: bool,
+    /// `#insecure` on a TLS URL: secure it WITHOUT verifying the server's certificate, as 1.5.5's
+    /// driver did (ARCHITECT ruling 2026-10-03 on Q-L16-4; the host honours it for this store's
+    /// operator-infrastructure need only, and logs a WARN naming the instance).
+    insecure: bool,
+    /// `AUTH` (`user`, `password`), when the URL carries a password.
+    auth: Option<(Option<String>, String)>,
+    /// `SELECT`, when the URL names a database other than 0.
+    db: i64,
 }
 
+/// The upstream driver's refusal of a URL, word for word (the 1.5.5 boot refusal read so).
+fn url_refused(why: &'static str) -> RedisError {
+    RedisError::from((ErrorKind::InvalidClientConfig, why))
+}
+
+/// Percent-decode `s` as UTF-8 (the upstream driver's user/password reading); `None` when the
+/// decoded bytes are not UTF-8.
+fn percent_decode_utf8(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).ok()
+}
+
+/// The upstream driver's `protocol=` query check (`2`/`resp2`/`3`/`resp3`). The store speaks
+/// RESP2 whatever it says: every reply it reads converts the same either way.
+fn check_protocol(url: &url::Url) -> RedisResult<()> {
+    match url.query_pairs().find(|(k, _)| k == "protocol") {
+        None => Ok(()),
+        Some((_, p)) if matches!(p.as_ref(), "2" | "resp2" | "3" | "resp3") => Ok(()),
+        Some((_, p)) => Err(RedisError::from((
+            ErrorKind::InvalidClientConfig,
+            "Invalid protocol version",
+            p.into_owned(),
+        ))),
+    }
+}
+
+/// Parse a Valkey URL exactly as the upstream driver 1.5.5 linked read it (`redis` 1.7.1's
+/// `IntoConnectionInfo for &str`): `redis://[user[:password]@]host[:port][/db]`, `rediss://` for TLS
+/// (`#insecure` the one fragment it took), the `valkey://` / `valkeys://` spellings, and the
+/// unix-socket URLs `unix://`, `redis+unix://`, `valkey+unix://` (`?db=`, `?user=`, `?pass=`).
+fn parse_url(input: &str) -> RedisResult<Target> {
+    let url = url::Url::parse(input)
+        .ok()
+        .filter(|u| {
+            matches!(
+                u.scheme(),
+                "redis" | "rediss" | "valkey" | "valkeys" | "redis+unix" | "valkey+unix" | "unix"
+            )
+        })
+        .ok_or_else(|| url_refused("Redis URL did not parse"))?;
+    if matches!(url.scheme(), "unix" | "redis+unix" | "valkey+unix") {
+        return parse_unix(&url);
+    }
+    let host = match url.host() {
+        Some(url::Host::Domain(d)) => d.to_string(),
+        Some(url::Host::Ipv4(v4)) => v4.to_string(),
+        Some(url::Host::Ipv6(v6)) => v6.to_string(),
+        None => return Err(url_refused("Missing hostname")),
+    };
+    if host == "0.0.0.0" || host == "::" {
+        return Err(url_refused(
+            "Cannot connect to a wildcard address (0.0.0.0 or ::)",
+        ));
+    }
+    let port = url.port().unwrap_or(6379);
+    let tls = matches!(url.scheme(), "rediss" | "valkeys");
+    let insecure = if tls {
+        match url.fragment() {
+            None => false,
+            Some("insecure") => true,
+            Some(_) => {
+                return Err(url_refused("only #insecure is supported as URL fragment"));
+            }
+        }
+    } else {
+        false
+    };
+    check_protocol(&url)?;
+    let db = match url.path().trim_matches('/') {
+        "" => 0,
+        path => path
+            .parse::<i64>()
+            .map_err(|_| url_refused("Invalid database number"))?,
+    };
+    let user = if url.username().is_empty() {
+        None
+    } else {
+        Some(
+            percent_decode_utf8(url.username())
+                .ok_or_else(|| url_refused("Username is not valid UTF-8 string"))?,
+        )
+    };
+    let pass = match url.password() {
+        Some(pw) => Some(
+            percent_decode_utf8(pw)
+                .ok_or_else(|| url_refused("Password is not valid UTF-8 string"))?,
+        ),
+        None => None,
+    };
+    let addr = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    Ok(Target {
+        addr,
+        host,
+        tls,
+        insecure,
+        auth: pass.map(|p| (user, p)),
+        db,
+    })
+}
+
+/// A unix-socket URL, as the upstream driver read it: its path, and `db` / `user` / `pass` from
+/// the query.
+fn parse_unix(url: &url::Url) -> RedisResult<Target> {
+    let path = url
+        .to_file_path()
+        .map_err(|()| url_refused("Missing path"))?;
+    let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+    let db = match query.get("db") {
+        Some(db) => db
+            .parse::<i64>()
+            .map_err(|_| url_refused("Invalid database number"))?,
+        None => 0,
+    };
+    check_protocol(url)?;
+    let user = query.get("user").map(|u| u.to_string());
+    let pass = query.get("pass").map(|p| p.to_string());
+    Ok(Target {
+        addr: format!("unix:{}", path.display()),
+        host: String::new(),
+        tls: false,
+        insecure: false,
+        auth: pass.map(|p| (user, p)),
+        db,
+    })
+}
+
+/// Valkey `RecordStore` backend (durable, shared across a cluster), reached through the HOST'S
+/// CONNECTOR: one kept connection (dialled, secured, `AUTH`, `SELECT` once), every op on it in turn,
+/// as 1.5.5's one mutex-guarded connection; the store holds no socket and no TLS stack of its own.
+#[derive(Debug, Clone)]
+pub struct ValkeyStore {
+    inner: Arc<Inner>,
+}
+
+#[derive(Debug)]
+struct Inner {
+    target: Target,
+    /// The URL password (if any), scrubbed out of every error string this crate emits.
+    secret: Option<String>,
+    /// `connect_timeout_ms` (default [`DEFAULT_CONNECT_TIMEOUT`]): every dial's bound.
+    connect_timeout: Duration,
+    /// THE KEPT CONNECTION: 1.5.5 held ONE connection behind a mutex (no pool setting), so the set
+    /// holds one.
+    pool: Arc<Pool>,
+}
+
+/// How many connections the store keeps: 1.5.5's one (it had no pool setting).
+const KEPT_CONNECTIONS: usize = 1;
+
+/// The store's one outbound need: a `tcp` stream to the server the settings' URL names (the store
+/// names the target at each connect), governed as operator infrastructure (private, loopback and
+/// plaintext allowed). Its timeout bounds the dial (1.5.5's default connect timeout).
+pub const NEEDS: &[busbar_contract::abi::host::conn::connector::Need] = {
+    use busbar_contract::abi::host::conn::connector::{
+        Need, DIRECTION_OUTBOUND, EGRESS_OPERATOR_INFRASTRUCTURE, KEEP_NAMED,
+    };
+    use busbar_contract::abi::mechanism::call::{AbiStr, Blob, BLOB_ABSENT};
+    const NONE: AbiStr = AbiStr {
+        ptr: std::ptr::null(),
+        len: 0,
+    };
+    &[Need {
+        direction: DIRECTION_OUTBOUND,
+        egress_class: EGRESS_OPERATOR_INFRASTRUCTURE,
+        transport: busbar_contract::abi::sdk::door::abi_str("tcp"),
+        auth: NONE,
+        target_from: NONE,
+        trust_from: NONE,
+        details: Blob {
+            ptr: std::ptr::null(),
+            len: 0,
+            fmt: BLOB_ABSENT,
+            flags: 0,
+        },
+        keep_response_headers: std::ptr::null(),
+        keep_response_headers_len: 0,
+        timeout_ms: DEFAULT_CONNECT_TIMEOUT.as_millis() as u64,
+        keep_mode: KEEP_NAMED,
+        _reserved: 0,
+        deny_response_headers: std::ptr::null(),
+        deny_response_headers_len: 0,
+    }]
+};
+
+/// The need index of [`NEEDS`]' one entry.
+const NEED_TCP: u32 = 0;
+
 impl ValkeyStore {
-    /// Connect to Valkey with the given URL (e.g. `redis://:pass@host:6379/0`, or
-    /// `rediss://:pass@host:6380/0` for TLS via rustls + OS-native roots), using the
-    /// [`DEFAULT_CONNECT_TIMEOUT`]. See [`Self::connect_with_timeout`] for a caller-supplied
-    /// timeout.
-    pub fn connect(url: &str) -> RecordStoreResult<Self> {
-        Self::connect_with_timeout(url, DEFAULT_CONNECT_TIMEOUT)
+    /// The store for `url` (no connection is made here: `open`'s connect step makes the first,
+    /// through the host's connector), with [`DEFAULT_CONNECT_TIMEOUT`].
+    ///
+    /// # Errors
+    /// A URL the store cannot read, in the upstream driver's words.
+    pub fn new(url: &str) -> RecordStoreResult<Self> {
+        Self::with_timeout(url, DEFAULT_CONNECT_TIMEOUT)
     }
 
-    /// Like [`Self::connect`], but with an explicit connect timeout. Unlike postgres's libpq, the
-    /// upstream driver crate gives no DSN-level timeout escape hatch, so a blackholed/firewalled
-    /// host would otherwise hang `get_connection()` indefinitely and wedge engine boot; bounding
-    /// the initial TCP connect here fails fast instead.
-    pub fn connect_with_timeout(url: &str, timeout: Duration) -> RecordStoreResult<Self> {
+    /// As [`Self::new`], stating the connect timeout.
+    ///
+    /// # Errors
+    /// As [`Self::new`].
+    pub fn with_timeout(url: &str, timeout: Duration) -> RecordStoreResult<Self> {
         let secret = url_password(url);
-        if url.starts_with("rediss://") {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-        }
-        let client = redis::Client::open(url).map_err(|e| {
+        let target = parse_url(url).map_err(|e| {
             RecordStoreError(scrub(format!("valkey connect: {e}"), secret.as_deref()))
         })?;
-        let conn = client.get_connection_with_timeout(timeout).map_err(|e| {
-            RecordStoreError(scrub(format!("valkey connect: {e}"), secret.as_deref()))
-        })?;
-        let store = Self {
-            client,
-            conn: Mutex::new(Some(conn)),
-            secret,
+        Ok(Self {
+            inner: Arc::new(Inner {
+                target,
+                secret,
+                connect_timeout: timeout,
+                pool: Pool::new(KEPT_CONNECTIONS),
+            }),
+        })
+    }
+
+    /// The op's connection over `wire`: the kept one when it is idle (its handshake done), else a
+    /// fresh dial, secured for `rediss://`, `AUTH` and `SELECT` as the URL says — the dial AND the
+    /// handshake bounded by `connect_timeout_ms` in all, the span 1.5.5's
+    /// `get_connection_with_timeout` bounded. A failure reads `valkey {ctx}: …` (1.5.5's `connect`
+    /// at boot, `reconnect` when an op had to dial).
+    async fn conn(&self, wire: Wire, ctx: &str) -> RecordStoreResult<Conn> {
+        let failed = |e: String| {
+            RecordStoreError(scrub(
+                format!("valkey {ctx}: {e}"),
+                self.inner.secret.as_deref(),
+            ))
         };
-        store.migrate()?;
-        store.assert_noeviction()?;
-        Ok(store)
+        let ms = self.inner.connect_timeout.as_millis();
+        if ms == 0 {
+            // The upstream driver's TCP connect refused a zero timeout, in std's words.
+            return Err(failed("cannot set a 0 duration timeout".into()));
+        }
+        let ms = u32::try_from(ms).unwrap_or(u32::MAX);
+        wire.bound(ms);
+        let connected = wire
+            .connect_timed(NEED_TCP, Some(&self.inner.target.addr), ms)
+            .await;
+        let mut c = Conn::new(wire);
+        let ready = match connected {
+            Ok(()) if c.wire().reused() => Ok(()),
+            Ok(()) => self.handshake(&mut c).await.map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        c.wire().unbound();
+        ready.map_err(failed)?;
+        Ok(c)
+    }
+
+    /// A NEW connection's handshake: TLS for `rediss://` (before its first byte; unverified for
+    /// `#insecure`, as 1.5.5), `AUTH`, `SELECT`.
+    async fn handshake(&self, c: &mut Conn) -> RedisResult<()> {
+        let t = &self.inner.target;
+        if t.tls {
+            let secured = if t.insecure {
+                c.wire().upgrade_secure_unverified(Some(&t.host)).await
+            } else {
+                c.wire().upgrade_secure(Some(&t.host)).await
+            };
+            secured.map_err(|e| RedisError::io(&e))?;
+        }
+        if let Some((user, pass)) = &t.auth {
+            let mut auth = cmd("AUTH");
+            if let Some(u) = user {
+                auth.arg(u);
+            }
+            auth.arg(pass).exec(c).await?;
+        }
+        if t.db != 0 {
+            cmd("SELECT").arg(t.db).exec(c).await?;
+        }
+        Ok(())
+    }
+
+    /// 1.5.5's reconnect after a dropped connection: close it, dial a fresh one, handshake (the
+    /// dial and the handshake bounded by `connect_timeout_ms`, as every new connection is).
+    async fn reconnect(&self, c: &mut Conn) -> RedisResult<()> {
+        let ms = u32::try_from(self.inner.connect_timeout.as_millis()).unwrap_or(u32::MAX);
+        c.wire().bound(ms);
+        let r = match c.wire().reconnect().await {
+            Ok(()) => {
+                c.reset();
+                self.handshake(c).await
+            }
+            Err(e) => Err(RedisError::io(&e)),
+        };
+        c.wire().unbound();
+        r
+    }
+
+    /// The store's kept connection set.
+    pub(crate) fn pool(&self) -> &Arc<Pool> {
+        &self.inner.pool
+    }
+
+    /// `open`'s connect step: the first connection, the schema migration and the noeviction check,
+    /// exactly as 1.5.5's connect ran them (its failures are the load's refusal).
+    async fn connect_step(&self, wire: Wire) -> RecordStoreResult<()> {
+        let mut c = self.conn(wire, "connect").await?;
+        self.migrate(&mut c).await?;
+        let r = self.assert_noeviction(&mut c).await;
+        c.settle();
+        r
     }
 
     /// STARTUP ASSERTION, non-negotiable: `maxmemory-policy` must be `noeviction`. Under any eviction
@@ -457,12 +813,13 @@ impl ValkeyStore {
     /// there. Refuse to start rather than risk it. If `CONFIG GET` itself is disabled by an ACL
     /// (a legitimate hardened deployment), we cannot verify the policy either way — fail loud with a
     /// distinct message rather than silently assuming it's safe.
-    fn assert_noeviction(&self) -> RecordStoreResult<()> {
-        let pairs: Vec<(String, String)> = self.with_conn(|c| {
-            redis::cmd("CONFIG")
+    async fn assert_noeviction(&self, c: &mut Conn) -> RecordStoreResult<()> {
+        let pairs: Vec<(String, String)> = with_conn!(self, |c| {
+            cmd("CONFIG")
                 .arg("GET")
                 .arg("maxmemory-policy")
                 .query(c)
+                .await
         })?;
         let policy = pairs
             .iter()
@@ -492,127 +849,56 @@ impl ValkeyStore {
     /// untouched; a v6 namespace is upgraded IN PLACE ([`legacy::migrate_v6_to_v7`], idempotent, the
     /// marker written last so a crash mid-upgrade re-runs it on the next connect); a namespace older
     /// than v6 (a never-released 1.5.0 development build) is wiped and re-marked, as it always was.
-    fn migrate(&self) -> RecordStoreResult<()> {
-        let marker: Option<i64> = self.with_conn(|c| c.get::<_, Option<i64>>(SCHEMA_KEY))?;
+    async fn migrate(&self, c: &mut Conn) -> RecordStoreResult<()> {
+        let marker: Option<i64> = with_conn!(self, |c| c.get::<_, Option<i64>>(SCHEMA_KEY).await)?;
         let version = marker.unwrap_or(0);
         if version >= SCHEMA_VERSION {
             return Ok(());
         }
         if version >= FIRST_MIGRATED_SCHEMA {
-            legacy::migrate_v6_to_v7(self)?;
-            return self.with_conn(|c| c.set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION));
+            legacy::migrate_v6_to_v7(self, c).await?;
+            return with_conn!(self, |c| c
+                .set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION)
+                .await);
         }
-        let existing: Vec<String> = self.with_conn(|c| {
-            c.scan_match::<_, String>("busbar:*")?
+        let existing: Vec<String> = with_conn!(self, |c| {
+            c.scan_match::<_, String>("busbar:*")
+                .await?
                 .collect::<Result<Vec<String>, _>>()
         })?;
         if existing.is_empty() {
-            return self.with_conn(|c| c.set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION));
+            return with_conn!(self, |c| c
+                .set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION)
+                .await);
         }
         // A busbar:* namespace older than v6 (marker present-but-older, or a pre-marker legacy
         // namespace) is wiped: it was written by an unreleased 1.5.0 development build, so there is
         // no released data to preserve across this specific boundary.
-        self.with_conn(|c| {
-            let mut pipe = redis::pipe();
+        with_conn!(self, |c| {
+            let mut pipe = pipe();
             pipe.atomic();
             for k in &existing {
                 pipe.del(k).ignore();
             }
-            pipe.query::<()>(c)
+            pipe.query::<()>(c).await
         })?;
-        self.with_conn(|c| c.set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION))
+        with_conn!(self, |c| c
+            .set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION)
+            .await)
     }
 
-    /// Run `f` against the live connection, transparently reconnecting ONCE on a connection-level
-    /// error. Safe only for READ / idempotent ops.
-    fn with_conn<T>(
-        &self,
-        f: impl FnMut(&mut Connection) -> redis::RedisResult<T>,
-    ) -> RecordStoreResult<T> {
-        self.run(f, true)
-    }
-
-    /// Like `with_conn` but with NO reconnect-retry - for non-idempotent write cascades where a
-    /// lost-reply timeout must NOT be retried.
-    fn with_conn_no_retry<T>(
-        &self,
-        f: impl FnMut(&mut Connection) -> redis::RedisResult<T>,
-    ) -> RecordStoreResult<T> {
-        self.run(f, false)
-    }
-
-    fn run<T>(
-        &self,
-        mut f: impl FnMut(&mut Connection) -> redis::RedisResult<T>,
-        retry: bool,
-    ) -> RecordStoreResult<T> {
-        let mut guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        if guard.is_none() {
-            *guard = Some(
-                self.client
-                    .get_connection()
-                    .map_err(|e| self.err(e, "reconnect"))?,
-            );
-        }
-        let conn = guard.as_mut().expect("connection just ensured");
-        match f(conn) {
-            Ok(v) => Ok(v),
-            Err(e) if retry && is_connection_error(&e) => {
-                *guard = None;
-                let mut fresh = self
-                    .client
-                    .get_connection()
-                    .map_err(|e2| self.err(e2, "reconnect after drop"))?;
-                match f(&mut fresh) {
-                    Ok(v) => {
-                        *guard = Some(fresh);
-                        Ok(v)
-                    }
-                    Err(e2) => Err(self.err(e2, "retry after reconnect")),
-                }
-            }
-            Err(e) => {
-                if is_connection_error(&e) {
-                    *guard = None;
-                } else {
-                    // CLEAR ANY LEFTOVER WATCH before this connection is handed to the next caller.
-                    //
-                    // `redis::transaction` issues WATCH, runs the closure, and only UNWATCHes on the
-                    // success path — a closure returning `Err` propagates through its `?` and skips
-                    // the UNWATCH entirely. This store keeps ONE connection behind a mutex and reuses
-                    // it, so that stale WATCH survives into the NEXT operation on the same store.
-                    //
-                    // The damage is silent, which is why this is handled here rather than per call
-                    // site. Every plain `redis::pipe().atomic()...query(c)` write in this file
-                    // (`add_denylist`, `put_usage`, `add_usage`, `add_metering`) types its reply as
-                    // `()`, and `FromRedisValue for ()` accepts ANY value including the `Nil` that a
-                    // dirtied WATCH makes EXEC return. So the transaction is aborted, nothing is
-                    // written, and the call reports `Ok(())`. For `add_denylist` that means an
-                    // operator revokes a leaked signed token, the store says it worked, and the token
-                    // goes on authenticating.
-                    //
-                    // Deliberately covers every error path, not just the refusals this crate returns
-                    // from inside a transaction closure on purpose: a genuine command error mid
-                    // closure leaks the WATCH just as completely. UNWATCH on a connection that is not
-                    // watching anything is a no-op, and its own failure is ignored — if it fails the
-                    // connection is unusable anyway and the error being returned is the one worth
-                    // reporting.
-                    let _ = redis::cmd("UNWATCH").exec(conn);
-                }
-                Err(self.err(e, "command"))
-            }
-        }
-    }
-
-    fn err(&self, e: redis::RedisError, ctx: &str) -> RecordStoreError {
-        RecordStoreError(scrub(format!("valkey {ctx}: {e}"), self.secret.as_deref()))
+    fn err(&self, e: RedisError, ctx: &str) -> RecordStoreError {
+        RecordStoreError(scrub(
+            format!("valkey {ctx}: {e}"),
+            self.inner.secret.as_deref(),
+        ))
     }
 
     /// Allocate the next revision — a plain `INCR`. Called once per key/credential mutation, inside
     /// whatever pipe/transaction performs the write, so the stamped value and the write are never
     /// observed apart.
-    fn next_revision(&self, c: &mut Connection) -> redis::RedisResult<u64> {
-        let v: i64 = c.incr(REVISION_KEY, 1)?;
+    async fn next_revision(&self, c: &mut Conn) -> RedisResult<u64> {
+        let v: i64 = c.incr(REVISION_KEY, 1).await?;
         Ok(v.max(0) as u64)
     }
 }
@@ -620,11 +906,11 @@ impl ValkeyStore {
 /// `put_credential`'s owner precondition, read inside its WATCHed transaction: the key row named by
 /// `key_id` must exist and must not be tombstoned. An unparseable owner row is refused too — a
 /// credential cannot be attached to a key whose liveness cannot be established.
-fn owner_is_live(c: &mut Connection, key_row: &str, key_id: &str) -> redis::RedisResult<()> {
-    let raw: Option<String> = c.get(key_row)?;
+async fn owner_is_live(c: &mut Conn, key_row: &str, key_id: &str) -> RedisResult<()> {
+    let raw: Option<String> = c.get(key_row).await?;
     let refuse = |why: String| {
-        Err(redis::RedisError::from((
-            redis::ErrorKind::Client,
+        Err(RedisError::from((
+            ErrorKind::Client,
             "put_credential refused",
             why,
         )))
@@ -667,77 +953,106 @@ fn parse_slot_pointer(s: &str) -> Option<(String, String, u8)> {
     Some((key_id.to_string(), kind.to_string(), slot.parse().ok()?))
 }
 
-/// Test-only cleanup surface. The conformance suite runs against a SHARED live Valkey that is not
-/// flushed between tests, so it has to be able to remove exactly the rows it is about to write —
-/// and it cannot do that through the `Store` trait, since `delete_key` deliberately TOMBSTONES
-/// rather than removing. These delete the underlying entries outright. `#[cfg(test)]` so none of it
-/// exists in a shipped artifact.
-#[cfg(test)]
-impl ValkeyStore {
-    /// Remove a key row and every index entry pointing at it, tombstone included.
-    pub(crate) fn purge_key_for_test(&self, id: &str) -> RecordStoreResult<()> {
-        self.with_conn(|c| {
-            redis::pipe()
-                .atomic()
-                .del(format!("{KEY_PREFIX}{id}"))
-                .ignore()
-                .srem(KEYS_INDEX, id)
-                .ignore()
-                .zrem(KEYS_BYREV, id)
-                .ignore()
-                .del(cred_ids_key(id))
-                .ignore()
-                .query(c)
-        })
+/// The fields one usage delta adds, as `(hash field, delta)` pairs for [`ADD_FLOORED_LUA`]: the two
+/// request counters always, and every non-zero unit.
+fn usage_fields(delta: &UsageDelta) -> Vec<(String, i64)> {
+    let mut fields: Vec<(String, i64)> = vec![
+        ("requests".to_string(), delta.requests),
+        ("billable_requests".to_string(), delta.billable_requests),
+    ];
+    for m in &delta.models {
+        for (unit, d) in &m.usage_units {
+            if *d != 0 {
+                fields.push((usage_field(&m.model, unit), *d));
+            }
+        }
     }
-
-    /// Remove a credential's id pointer. The slot row itself goes with its owning key.
-    pub(crate) fn purge_credential_for_test(&self, id: &str) -> RecordStoreResult<()> {
-        self.with_conn(|c| {
-            redis::pipe()
-                .atomic()
-                .del(cred_id_key(id))
-                .ignore()
-                .query(c)
-        })
-    }
-
-    /// Remove whatever occupies one audit `seq`.
-    pub(crate) fn purge_audit_seq_for_test(&self, seq: u64) -> RecordStoreResult<()> {
-        let score = clamp(seq);
-        self.with_conn(|c| {
-            redis::pipe()
-                .atomic()
-                .cmd("ZREMRANGEBYSCORE")
-                .arg(AUDIT_ZSET)
-                .arg(score)
-                .arg(score)
-                .ignore()
-                .query(c)
-        })
-    }
+    fields
 }
 
-impl RecordStore for ValkeyStore {
-    fn put_key(&self, key: &VirtualKey) -> RecordStoreResult<()> {
+/// Queue one metering delta's writes on `pipe` (the caller makes it atomic): the row joins its
+/// bucket's set, every counter is an `HINCRBY`, the identity fields are set, and the attribution
+/// snapshot is first-write-wins.
+fn queue_metering(pipe: &mut Pipeline, d: &MeteringDelta) {
+    let row = metering_row(d.bucket, &d.key_id, &d.model, &d.provider, d.priced_from_ms);
+    pipe.sadd(metering_set(d.bucket), &row).ignore();
+    for (field, v) in [
+        ("tokens_input", d.tokens_input),
+        ("tokens_output", d.tokens_output),
+        ("tokens_cache_read", d.tokens_cache_read),
+        ("tokens_cache_write", d.tokens_cache_write),
+        ("requests", d.requests),
+        ("billable_requests", d.billable_requests),
+    ] {
+        pipe.cmd("HINCRBY")
+            .arg(&row)
+            .arg(field)
+            .arg(clamp(v))
+            .ignore();
+    }
+    for (class, v) in &d.usage_units {
+        pipe.cmd("HINCRBY")
+            .arg(&row)
+            .arg(format!("{METERING_UNIT_PREFIX}{class}"))
+            .arg(clamp(*v))
+            .ignore();
+    }
+    pipe.hset_multiple(
+        &row,
+        &[
+            ("key_id", d.key_id.as_str()),
+            ("model", d.model.as_str()),
+            ("provider", d.provider.as_str()),
+        ],
+    )
+    .ignore()
+    .hset(&row, "priced_from_ms", d.priced_from_ms.to_string())
+    .ignore()
+    // First-write-wins attribution snapshot: HSETNX only sets if the field is absent.
+    .cmd("HSETNX")
+    .arg(&row)
+    .arg("key_group_at_use")
+    .arg(&d.key_group_at_use)
+    .ignore()
+    .cmd("HSETNX")
+    .arg(&row)
+    .arg("pricing_version")
+    .arg(&d.pricing_version)
+    .ignore();
+}
+
+/// The refusal an audit append answers when `seq` already holds a DIFFERENT record.
+fn audit_fork(stored: &AuditRecord, entry: &AuditRecord) -> String {
+    format!(
+        "append_audit: seq {} already holds a DIFFERENT record; the audit chain has forked \
+         (stored action '{}', incoming '{}')",
+        entry.seq, stored.action, entry.action
+    )
+}
+
+/// THE 1.5.5 OP SET's bodies, each over the op's one connection `c` (the store door, `slots`,
+/// runs each as one op through the host's connector). The un-deduped 1.5.5 writes (`add_usage`,
+/// `add_metering`, `append_audit`, `append_plane_record`) reach the store as their `op_id` slots.
+impl ValkeyStore {
+    pub(crate) async fn put_key(&self, c: &mut Conn, key: &VirtualKey) -> RecordStoreResult<()> {
         let key = key.clone();
         let row_key = format!("{KEY_PREFIX}{}", key.id);
-        self.with_conn(|c| {
+        with_conn!(self, |c| {
             // TOMBSTONE PRECONDITION (see `Store::put_key`): a live-shaped write must not overwrite
             // a tombstoned row, which would reissue an id the contract says is never reissued and
             // revive every token minted before the delete. WATCHed rather than read-then-written, so
             // a `delete_key` committing between the read and the SET aborts and retries instead of
             // slipping through — the same TOCTOU the caller-side checks in core cannot close.
-            redis::transaction(c, &[row_key.as_str()], |c, pipe| {
+            transaction!(c, &[row_key.as_str()], |c, pipe| {
                 if key.deleted_at.is_none() {
-                    let existing: Option<String> = c.get(&row_key)?;
+                    let existing: Option<String> = c.get(&row_key).await?;
                     // A row that does not parse is left to the normal write path rather than being
                     // treated as a tombstone: refusing here would make a corrupt row permanently
                     // unwritable, and this method is not the one that should be adjudicating that.
                     if let Some(prior) = existing.as_deref().and_then(|r| key_from_json(r).ok()) {
                         if prior.deleted_at.is_some() {
-                            return Err(redis::RedisError::from((
-                                redis::ErrorKind::Client,
+                            return Err(RedisError::from((
+                                ErrorKind::Client,
                                 "put_key refused",
                                 format!(
                                     "put_key: '{}' is tombstoned and its id is never reissued; \
@@ -749,10 +1064,10 @@ impl RecordStore for ValkeyStore {
                     }
                 }
                 let mut key = key.clone();
-                let rev = self.next_revision(c)?;
+                let rev = self.next_revision(c).await?;
                 key.revision = rev;
                 let json = serde_json::to_string(&key)
-                    .map_err(|_e| redis::RedisError::from((redis::ErrorKind::Client, "encode")))?;
+                    .map_err(|_e| RedisError::from((ErrorKind::Client, "encode")))?;
                 pipe.atomic()
                     .set(&row_key, &json)
                     .ignore()
@@ -761,29 +1076,34 @@ impl RecordStore for ValkeyStore {
                     .zadd(KEYS_BYREV, &key.id, rev)
                     .ignore()
                     .query(c)
+                    .await
             })
         })
     }
 
-    fn get_key(&self, id: &str) -> RecordStoreResult<Option<VirtualKey>> {
-        let raw: Option<String> = self.with_conn(|c| c.get(format!("{KEY_PREFIX}{id}")))?;
+    pub(crate) async fn get_key(
+        &self,
+        c: &mut Conn,
+        id: &str,
+    ) -> RecordStoreResult<Option<VirtualKey>> {
+        let raw: Option<String> = with_conn!(self, |c| c.get(format!("{KEY_PREFIX}{id}")).await)?;
         raw.map(|r| key_from_json(&r)).transpose()
     }
 
-    fn list_keys(&self) -> RecordStoreResult<Vec<VirtualKey>> {
+    pub(crate) async fn list_keys(&self, c: &mut Conn) -> RecordStoreResult<Vec<VirtualKey>> {
         // Deliberately UNFILTERED — including tombstones. See the trait's own doc: this serves both
         // the admin-listing caller (which filters `is_live()` itself) and `list_keys_since`'s default
         // hydration fallback, which needs to SEE a tombstone to evict cached credentials.
-        let ids: Vec<String> = self.with_conn(|c| c.smembers(KEYS_INDEX))?;
+        let ids: Vec<String> = with_conn!(self, |c| c.smembers(KEYS_INDEX).await)?;
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let raws: Vec<Option<String>> = self.with_conn(|c| {
-            let mut pipe = redis::pipe();
+        let raws: Vec<Option<String>> = with_conn!(self, |c| {
+            let mut pipe = pipe();
             for id in &ids {
                 pipe.get(format!("{KEY_PREFIX}{id}"));
             }
-            pipe.query(c)
+            pipe.query(c).await
         })?;
         let mut out = Vec::with_capacity(ids.len());
         for raw in raws.into_iter().flatten() {
@@ -797,20 +1117,25 @@ impl RecordStore for ValkeyStore {
         Ok(out)
     }
 
-    fn list_keys_since(&self, since: u64) -> RecordStoreResult<Vec<VirtualKey>> {
+    pub(crate) async fn list_keys_since(
+        &self,
+        c: &mut Conn,
+        since: u64,
+    ) -> RecordStoreResult<Vec<VirtualKey>> {
         // Real delta-fetch: ZRANGEBYSCORE the byrev index, not a full scan-and-filter — the whole
         // point of maintaining `keys:byrev`.
-        let ids: Vec<String> =
-            self.with_conn(|c| c.zrangebyscore(KEYS_BYREV, format!("({since}"), "+inf"))?;
+        let ids: Vec<String> = with_conn!(self, |c| c
+            .zrangebyscore(KEYS_BYREV, format!("({since}"), "+inf")
+            .await)?;
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let raws: Vec<Option<String>> = self.with_conn(|c| {
-            let mut pipe = redis::pipe();
+        let raws: Vec<Option<String>> = with_conn!(self, |c| {
+            let mut pipe = pipe();
             for id in &ids {
                 pipe.get(format!("{KEY_PREFIX}{id}"));
             }
-            pipe.query(c)
+            pipe.query(c).await
         })?;
         let mut out = Vec::with_capacity(ids.len());
         for raw in raws.into_iter().flatten() {
@@ -819,7 +1144,7 @@ impl RecordStore for ValkeyStore {
         Ok(out)
     }
 
-    fn delete_key(&self, id: &str) -> RecordStoreResult<()> {
+    pub(crate) async fn delete_key(&self, c: &mut Conn, id: &str) -> RecordStoreResult<()> {
         let ids_key = cred_ids_key(id);
         let key_row = format!("{KEY_PREFIX}{id}");
         // Usage windows: a non-blocking SCAN outside the transaction (mirrors the crate's prior
@@ -828,8 +1153,9 @@ impl RecordStore for ValkeyStore {
         // add_usage/put_usage racing a new window into existence between this SCAN and the EXEC is an
         // acceptable, already-documented gap (stale data, not an identity/auth issue).
         let pattern = format!("busbar:usage:{}:*", escape_glob(id));
-        let usage_keys: Vec<String> = self.with_conn(|c| {
-            c.scan_match::<_, String>(&pattern)?
+        let usage_keys: Vec<String> = with_conn!(self, |c| {
+            c.scan_match::<_, String>(&pattern)
+                .await?
                 .collect::<Result<Vec<String>, _>>()
         })?;
         // WATCH the key row, its credential-id index, AND every current member's own credential
@@ -841,8 +1167,8 @@ impl RecordStore for ValkeyStore {
         // depends on `ids_key`'s membership, and membership can also change between our pre-read
         // and the transaction's WATCH, this loops: any membership change aborts (ids_key is
         // watched) and we recompute the watch set from scratch against fresh state.
-        self.with_conn(|c| loop {
-            let members: Vec<String> = c.smembers(&ids_key)?;
+        with_conn!(self, |c| loop {
+            let members: Vec<String> = c.smembers(&ids_key).await?;
             let row_keys: Vec<String> = members
                 .iter()
                 .filter_map(|m| parse_slot_pointer(&format!("{id}:{m}")))
@@ -851,49 +1177,47 @@ impl RecordStore for ValkeyStore {
             let mut watch_keys: Vec<&str> = vec![key_row.as_str(), ids_key.as_str()];
             watch_keys.extend(row_keys.iter().map(String::as_str));
 
-            let outcome = redis::transaction(c, &watch_keys, |c, pipe| {
-                let raw: Option<String> = c.get(&key_row)?;
+            let outcome = transaction!(c, &watch_keys, |c, pipe| {
+                let raw: Option<String> = c.get(&key_row).await?;
                 let Some(raw) = raw else {
                     // Unknown id (never existed): a real error, matching the SQL backends'
                     // `delete_key`-on-unknown-id contract — distinct from "already tombstoned",
                     // which IS an idempotent no-op (see below).
-                    return Err(redis::RedisError::from((
-                        redis::ErrorKind::Client,
+                    return Err(RedisError::from((
+                        ErrorKind::Client,
                         "delete_key: unknown id",
                     )));
                 };
-                let mut key: VirtualKey = serde_json::from_str(&raw).map_err(|_| {
-                    redis::RedisError::from((redis::ErrorKind::Client, "key decode"))
-                })?;
+                let mut key: VirtualKey = serde_json::from_str(&raw)
+                    .map_err(|_| RedisError::from((ErrorKind::Client, "key decode")))?;
                 if key.deleted_at.is_some() {
                     // Already tombstoned: idempotent no-op (do not re-bump revision or re-destroy
                     // credentials that are already gone).
                     pipe.atomic();
-                    return pipe.query(c);
+                    return pipe.query(c).await;
                 }
-                // `redis::transaction`'s own internal WATCH-abort retry reruns this closure with
+                // `transaction!`'s own internal WATCH-abort retry reruns this body with
                 // the SAME fixed `watch_keys` computed above -- it can't recompute which row keys
                 // to watch. So re-read membership fresh here and compare against the outer
                 // pre-read: if it changed, `ids_key` (which IS watched) will already have aborted
                 // this EXEC, but we still need to bail out to the OUTER loop to rebuild `watch_keys`
                 // against the new members' rows, rather than silently proceeding against the stale
                 // set.
-                let fresh_members: Vec<String> = c.smembers(&ids_key)?;
+                let fresh_members: Vec<String> = c.smembers(&ids_key).await?;
                 if fresh_members.len() != members.len()
                     || !fresh_members.iter().all(|m| members.contains(m))
                 {
-                    return Err(redis::RedisError::from((
-                        redis::ErrorKind::Client,
+                    return Err(RedisError::from((
+                        ErrorKind::Client,
                         DELETE_KEY_RETRY_SENTINEL,
                     )));
                 }
-                let rev = self.next_revision(c)?;
+                let rev = self.next_revision(c).await?;
                 key.enabled = false;
                 key.deleted_at = Some(crate::now());
                 key.revision = rev;
-                let key_json = serde_json::to_string(&key).map_err(|_| {
-                    redis::RedisError::from((redis::ErrorKind::Client, "key encode"))
-                })?;
+                let key_json = serde_json::to_string(&key)
+                    .map_err(|_| RedisError::from((ErrorKind::Client, "key encode")))?;
 
                 pipe.atomic();
                 pipe.set(&key_row, &key_json).ignore();
@@ -921,10 +1245,10 @@ impl RecordStore for ValkeyStore {
                     // credential row + pointers" contract. Every other decode path in this file
                     // (key_from_json, cred_from_json, list_metering) propagates a corrupt value as
                     // an error rather than silently under-delivering; this matches that.
-                    if let Some(raw) = c.get::<_, Option<String>>(&row_key)? {
+                    if let Some(raw) = c.get::<_, Option<String>>(&row_key).await? {
                         let cred: CredentialSecret = serde_json::from_str(&raw).map_err(|_| {
-                            redis::RedisError::from((
-                                redis::ErrorKind::Client,
+                            RedisError::from((
+                                ErrorKind::Client,
                                 "delete_key: corrupt credential row",
                             ))
                         })?;
@@ -934,7 +1258,7 @@ impl RecordStore for ValkeyStore {
                     pipe.del(&row_key).ignore();
                 }
                 pipe.del(&ids_key).ignore();
-                pipe.query(c)
+                pipe.query(c).await
             });
 
             match outcome {
@@ -944,44 +1268,47 @@ impl RecordStore for ValkeyStore {
         })
     }
 
-    fn scrub_key(&self, id: &str) -> RecordStoreResult<()> {
+    pub(crate) async fn scrub_key(&self, c: &mut Conn, id: &str) -> RecordStoreResult<()> {
         let key_row = format!("{KEY_PREFIX}{id}");
-        self.with_conn(|c| {
-            redis::transaction(c, &[key_row.as_str()], |c, pipe| {
-                let raw: Option<String> = c.get(&key_row)?;
+        with_conn!(self, |c| {
+            transaction!(c, &[key_row.as_str()], |c, pipe| {
+                let raw: Option<String> = c.get(&key_row).await?;
                 let Some(raw) = raw else {
-                    return Err(redis::RedisError::from((
-                        redis::ErrorKind::Client,
+                    return Err(RedisError::from((
+                        ErrorKind::Client,
                         "scrub_key: unknown id",
                     )));
                 };
-                let mut key: VirtualKey = serde_json::from_str(&raw).map_err(|_| {
-                    redis::RedisError::from((redis::ErrorKind::Client, "key decode"))
-                })?;
+                let mut key: VirtualKey = serde_json::from_str(&raw)
+                    .map_err(|_| RedisError::from((ErrorKind::Client, "key decode")))?;
                 if key.deleted_at.is_none() {
-                    return Err(redis::RedisError::from((
-                        redis::ErrorKind::Client,
+                    return Err(RedisError::from((
+                        ErrorKind::Client,
                         "scrub_key: key is not tombstoned — delete_key it first",
                     )));
                 }
-                let rev = self.next_revision(c)?;
+                let rev = self.next_revision(c).await?;
                 key.name = String::new();
                 key.labels.clear();
                 key.revision = rev;
-                let json = serde_json::to_string(&key).map_err(|_| {
-                    redis::RedisError::from((redis::ErrorKind::Client, "key encode"))
-                })?;
+                let json = serde_json::to_string(&key)
+                    .map_err(|_| RedisError::from((ErrorKind::Client, "key encode")))?;
                 pipe.atomic();
                 pipe.set(&key_row, &json).ignore();
                 pipe.zadd(KEYS_BYREV, id, rev).ignore();
-                pipe.query(c)
+                pipe.query(c).await
             })
         })
     }
 
-    fn get_usage(&self, bucket_id: &str, window_start: u64) -> RecordStoreResult<UsageLedger> {
+    pub(crate) async fn get_usage(
+        &self,
+        c: &mut Conn,
+        bucket_id: &str,
+        window_start: u64,
+    ) -> RecordStoreResult<UsageLedger> {
         let k = usage_key(bucket_id, window_start);
-        let fields: Vec<(String, i64)> = self.with_conn(|c| c.hgetall(&k))?;
+        let fields: Vec<(String, i64)> = with_conn!(self, |c| c.hgetall(&k).await)?;
         if fields.is_empty() {
             return Ok(UsageLedger::default());
         }
@@ -1019,15 +1346,16 @@ impl RecordStore for ValkeyStore {
         Ok(ledger)
     }
 
-    fn put_usage(
+    pub(crate) async fn put_usage(
         &self,
+        c: &mut Conn,
         bucket_id: &str,
         window_start: u64,
         ledger: &UsageLedger,
     ) -> RecordStoreResult<()> {
         let k = usage_key(bucket_id, window_start);
-        self.with_conn(|c| {
-            let mut pipe = redis::pipe();
+        with_conn!(self, |c| {
+            let mut pipe = pipe();
             pipe.atomic();
             pipe.del(&k).ignore();
             pipe.hset(&k, "requests", clamp(ledger.requests)).ignore();
@@ -1039,107 +1367,26 @@ impl RecordStore for ValkeyStore {
                         .ignore();
                 }
             }
-            pipe.query(c)
+            pipe.query(c).await
         })
     }
 
-    fn add_usage(
+    pub(crate) async fn list_metering(
         &self,
-        bucket_id: &str,
-        window_start: u64,
-        delta: &UsageDelta,
-    ) -> RecordStoreResult<()> {
-        // The FLEET-HONEST flush: every counter is an atomic server-side add, so N nodes' deltas sum.
-        // Each counter is FLOORED AT 0 as its delta lands (the contract's `apply_delta`: a refund can
-        // never drive a durable counter negative), which a bare HINCRBY cannot do — a refund larger
-        // than the counter would leave it negative and the NEXT accrual would be swallowed paying
-        // that debt back. So the add-then-floor runs as ONE script the server executes atomically.
-        let k = usage_key(bucket_id, window_start);
-        let mut fields: Vec<(String, i64)> = vec![
-            ("requests".to_string(), delta.requests),
-            ("billable_requests".to_string(), delta.billable_requests),
-        ];
-        for m in &delta.models {
-            for (unit, d) in &m.usage_units {
-                if *d != 0 {
-                    fields.push((usage_field(&m.model, unit), *d));
-                }
-            }
-        }
-        self.with_conn_no_retry(|c| {
-            let mut inv = ADD_FLOORED.key(&k);
-            for (f, d) in &fields {
-                inv.arg(f).arg(*d);
-            }
-            inv.invoke::<()>(c)
-        })
-    }
-
-    fn add_metering(&self, d: &MeteringDelta) -> RecordStoreResult<()> {
-        let row = metering_row(d.bucket, &d.key_id, &d.model, &d.provider, d.priced_from_ms);
-        let set = metering_set(d.bucket);
-        self.with_conn_no_retry(|c| {
-            let mut pipe = redis::pipe();
-            pipe.atomic().sadd(&set, &row).ignore();
-            for (field, v) in [
-                ("tokens_input", d.tokens_input),
-                ("tokens_output", d.tokens_output),
-                ("tokens_cache_read", d.tokens_cache_read),
-                ("tokens_cache_write", d.tokens_cache_write),
-                ("requests", d.requests),
-                ("billable_requests", d.billable_requests),
-            ] {
-                pipe.cmd("HINCRBY")
-                    .arg(&row)
-                    .arg(field)
-                    .arg(clamp(v))
-                    .ignore();
-            }
-            for (class, v) in &d.usage_units {
-                pipe.cmd("HINCRBY")
-                    .arg(&row)
-                    .arg(format!("{METERING_UNIT_PREFIX}{class}"))
-                    .arg(clamp(*v))
-                    .ignore();
-            }
-            pipe.hset_multiple(
-                &row,
-                &[
-                    ("key_id", d.key_id.as_str()),
-                    ("model", d.model.as_str()),
-                    ("provider", d.provider.as_str()),
-                ],
-            )
-            .ignore()
-            .hset(&row, "priced_from_ms", d.priced_from_ms.to_string())
-            .ignore()
-            // First-write-wins attribution snapshot: HSETNX only sets if the field is absent.
-            .cmd("HSETNX")
-            .arg(&row)
-            .arg("key_group_at_use")
-            .arg(&d.key_group_at_use)
-            .ignore()
-            .cmd("HSETNX")
-            .arg(&row)
-            .arg("pricing_version")
-            .arg(&d.pricing_version)
-            .ignore()
-            .query(c)
-        })
-    }
-
-    fn list_metering(&self, bucket: u64) -> RecordStoreResult<Vec<MeteringRow>> {
+        c: &mut Conn,
+        bucket: u64,
+    ) -> RecordStoreResult<Vec<MeteringRow>> {
         let set = metering_set(bucket);
-        let row_keys: Vec<String> = self.with_conn(|c| c.smembers(&set))?;
+        let row_keys: Vec<String> = with_conn!(self, |c| c.smembers(&set).await)?;
         if row_keys.is_empty() {
             return Ok(Vec::new());
         }
-        let all_fields: Vec<Vec<(String, String)>> = self.with_conn(|c| {
-            let mut pipe = redis::pipe();
+        let all_fields: Vec<Vec<(String, String)>> = with_conn!(self, |c| {
+            let mut pipe = pipe();
             for row_key in &row_keys {
                 pipe.hgetall(row_key);
             }
-            pipe.query(c)
+            pipe.query(c).await
         })?;
         let mut out = Vec::with_capacity(row_keys.len());
         for fields in all_fields {
@@ -1211,7 +1458,11 @@ impl RecordStore for ValkeyStore {
         Ok(out)
     }
 
-    fn put_credential(&self, secret: &CredentialSecret) -> RecordStoreResult<()> {
+    pub(crate) async fn put_credential(
+        &self,
+        c: &mut Conn,
+        secret: &CredentialSecret,
+    ) -> RecordStoreResult<()> {
         let row_key = cred_row_key(&secret.meta.key_id, &secret.meta.kind, secret.meta.slot);
         let ids_key = cred_ids_key(&secret.meta.key_id);
         let pub_key = cred_pub_key(&secret.meta.kind, &secret.meta.public_id);
@@ -1222,7 +1473,7 @@ impl RecordStore for ValkeyStore {
             "{}:{}:{}",
             secret.meta.key_id, secret.meta.kind, secret.meta.slot
         );
-        self.with_conn(|c| {
+        with_conn!(self, |c| {
             // WATCH the OWNING KEY's row too: a credential must hang off a real, live key, and a
             // `delete_key` committing between that check and the write must abort this, never slip
             // under it (the tombstone cascade would otherwise be undone through this door).
@@ -1234,15 +1485,14 @@ impl RecordStore for ValkeyStore {
             // concurrent writer claiming this public_id between the read and EXEC touches the
             // watched `pub_key`, aborting and retrying this whole closure against fresh state.
             let watched = [row_key.as_str(), pub_key.as_str(), key_row.as_str()];
-            redis::transaction(c, &watched, |c, pipe| {
-                owner_is_live(c, &key_row, &secret.meta.key_id)?;
-                let existing: Option<String> = c.get(&row_key)?;
+            transaction!(c, &watched, |c, pipe| {
+                owner_is_live(c, &key_row, &secret.meta.key_id).await?;
+                let existing: Option<String> = c.get(&row_key).await?;
                 let mut old_pub: Option<String> = None;
                 let mut old_id: Option<String> = None;
                 if let Some(raw) = &existing {
-                    let cur: CredentialSecret = serde_json::from_str(raw).map_err(|_| {
-                        redis::RedisError::from((redis::ErrorKind::Client, "cred decode"))
-                    })?;
+                    let cur: CredentialSecret = serde_json::from_str(raw)
+                        .map_err(|_| RedisError::from((ErrorKind::Client, "cred decode")))?;
                     if cur.meta.revoked_at.is_none() {
                         if cur.meta.id == secret.meta.id {
                             // Retry-safe no-op: the slot already holds THIS SAME credential
@@ -1253,13 +1503,13 @@ impl RecordStore for ValkeyStore {
                             // server-side. Erroring here would report failure for a write that, in
                             // fact, already fully succeeded.
                             pipe.atomic();
-                            return pipe.query(c);
+                            return pipe.query(c).await;
                         }
                         // Slot occupied by a DIFFERENT live credential — an explicit mint into it
                         // would silently destroy a working credential mid-overlap-window. Fail
                         // loud.
-                        return Err(redis::RedisError::from((
-                            redis::ErrorKind::Client,
+                        return Err(RedisError::from((
+                            ErrorKind::Client,
                             "put_credential: slot holds a live credential; revoke it first",
                         )));
                     }
@@ -1270,20 +1520,19 @@ impl RecordStore for ValkeyStore {
                 // SETNX): if some OTHER slot already holds this public_id, reject before writing
                 // anything. Reclaiming the SAME slot's own previous public_id is fine (that case is
                 // `old_pub == Some(secret.meta.public_id)` and is not a collision).
-                let pub_holder: Option<String> = c.get(&pub_key)?;
+                let pub_holder: Option<String> = c.get(&pub_key).await?;
                 if let Some(holder) = &pub_holder {
                     if *holder != slot_ptr {
-                        return Err(redis::RedisError::from((
-                            redis::ErrorKind::Client,
+                        return Err(RedisError::from((
+                            ErrorKind::Client,
                             "put_credential: public_id already claimed by a different credential",
                         )));
                     }
                 }
-                let rev = self.next_revision(c)?;
+                let rev = self.next_revision(c).await?;
                 secret.meta.revision = rev;
-                let json = cred_to_json(&secret).map_err(|_| {
-                    redis::RedisError::from((redis::ErrorKind::Client, "cred encode"))
-                })?;
+                let json = cred_to_json(&secret)
+                    .map_err(|_| RedisError::from((ErrorKind::Client, "cred encode")))?;
 
                 pipe.atomic();
                 if let Some(old_pub) = &old_pub {
@@ -1313,13 +1562,14 @@ impl RecordStore for ValkeyStore {
                 )
                 .ignore();
                 pipe.zadd(CREDS_BYREV, &slot_ptr, rev).ignore();
-                pipe.query(c)
+                pipe.query(c).await
             })
         })
     }
 
-    fn put_key_with_credential(
+    pub(crate) async fn put_key_with_credential(
         &self,
+        c: &mut Conn,
         key: &VirtualKey,
         secret: &CredentialSecret,
     ) -> RecordStoreResult<()> {
@@ -1344,25 +1594,25 @@ impl RecordStore for ValkeyStore {
             "{}:{}:{}",
             secret.meta.key_id, secret.meta.kind, secret.meta.slot
         );
-        self.with_conn(|c| {
+        with_conn!(self, |c| {
             // WATCH the key row, the credential's own row, AND the public_id pointer — a fresh
             // mint's public_id must not already be claimed (real check, not a discarded SETNX; see
             // `put_credential`'s identical reasoning).
-            redis::transaction(
+            transaction!(
                 c,
                 &[key_row.as_str(), row_key.as_str(), pub_key.as_str()],
                 |c, pipe| {
                     // The tombstone precondition `put_key` enforces, on the atomic mint too: a
                     // live-shaped key must not clear a stored tombstone.
                     if key.deleted_at.is_none() {
-                        let prior: Option<String> = c.get(&key_row)?;
+                        let prior: Option<String> = c.get(&key_row).await?;
                         if prior
                             .as_deref()
                             .and_then(|r| key_from_json(r).ok())
                             .is_some_and(|k| k.deleted_at.is_some())
                         {
-                            return Err(redis::RedisError::from((
-                                redis::ErrorKind::Client,
+                            return Err(RedisError::from((
+                                ErrorKind::Client,
                                 "put_key_with_credential refused",
                                 format!(
                                     "put_key_with_credential: '{}' is tombstoned and its id is \
@@ -1372,7 +1622,7 @@ impl RecordStore for ValkeyStore {
                             )));
                         }
                     }
-                    let pub_holder: Option<String> = c.get(&pub_key)?;
+                    let pub_holder: Option<String> = c.get(&pub_key).await?;
                     if let Some(holder) = &pub_holder {
                         if *holder == slot_ptr {
                             // Possibly retry-safe: the public_id already points at THIS slot. This
@@ -1381,31 +1631,29 @@ impl RecordStore for ValkeyStore {
                             // connection blip dropped the reply for an EXEC that had already
                             // committed server-side — so confirm by id before treating it as a
                             // no-op rather than a real collision.
-                            let existing_row: Option<String> = c.get(&row_key)?;
+                            let existing_row: Option<String> = c.get(&row_key).await?;
                             let same = existing_row
                                 .as_deref()
                                 .and_then(|r| serde_json::from_str::<CredentialSecret>(r).ok())
                                 .is_some_and(|cur| cur.meta.id == secret.meta.id);
                             if same {
                                 pipe.atomic();
-                                return pipe.query(c);
+                                return pipe.query(c).await;
                             }
                         }
-                        return Err(redis::RedisError::from((
-                            redis::ErrorKind::Client,
+                        return Err(RedisError::from((
+                            ErrorKind::Client,
                             "put_key_with_credential: public_id already claimed",
                         )));
                     }
-                    let key_rev = self.next_revision(c)?;
-                    let cred_rev = self.next_revision(c)?;
+                    let key_rev = self.next_revision(c).await?;
+                    let cred_rev = self.next_revision(c).await?;
                     key.revision = key_rev;
                     secret.meta.revision = cred_rev;
-                    let key_json = serde_json::to_string(&key).map_err(|_| {
-                        redis::RedisError::from((redis::ErrorKind::Client, "key encode"))
-                    })?;
-                    let cred_json = cred_to_json(&secret).map_err(|_| {
-                        redis::RedisError::from((redis::ErrorKind::Client, "cred encode"))
-                    })?;
+                    let key_json = serde_json::to_string(&key)
+                        .map_err(|_| RedisError::from((ErrorKind::Client, "key encode")))?;
+                    let cred_json = cred_to_json(&secret)
+                        .map_err(|_| RedisError::from((ErrorKind::Client, "cred encode")))?;
                     pipe.atomic();
                     pipe.set(&key_row, &key_json).ignore();
                     pipe.sadd(KEYS_INDEX, &key.id).ignore();
@@ -1419,14 +1667,18 @@ impl RecordStore for ValkeyStore {
                     )
                     .ignore();
                     pipe.zadd(CREDS_BYREV, &slot_ptr, cred_rev).ignore();
-                    pipe.query(c)
+                    pipe.query(c).await
                 },
             )
         })
     }
 
-    fn list_credentials(&self, key_id: &str) -> RecordStoreResult<Vec<CredentialMeta>> {
-        let members: Vec<String> = self.with_conn(|c| c.smembers(cred_ids_key(key_id)))?;
+    pub(crate) async fn list_credentials(
+        &self,
+        c: &mut Conn,
+        key_id: &str,
+    ) -> RecordStoreResult<Vec<CredentialMeta>> {
+        let members: Vec<String> = with_conn!(self, |c| c.smembers(cred_ids_key(key_id)).await)?;
         if members.is_empty() {
             return Ok(Vec::new());
         }
@@ -1437,12 +1689,12 @@ impl RecordStore for ValkeyStore {
                 Some(cred_row_key(key_id, kind, slot.parse().ok()?))
             })
             .collect();
-        let raws: Vec<Option<String>> = self.with_conn(|c| {
-            let mut pipe = redis::pipe();
+        let raws: Vec<Option<String>> = with_conn!(self, |c| {
+            let mut pipe = pipe();
             for k in &row_keys {
                 pipe.get(k);
             }
-            pipe.query(c)
+            pipe.query(c).await
         })?;
         let mut out = Vec::with_capacity(raws.len());
         for raw in raws.into_iter().flatten() {
@@ -1454,34 +1706,41 @@ impl RecordStore for ValkeyStore {
         Ok(out)
     }
 
-    fn lookup_credential_secret(
+    pub(crate) async fn lookup_credential_secret(
         &self,
+        c: &mut Conn,
         kind: &str,
         public_id: &str,
     ) -> RecordStoreResult<Option<CredentialSecret>> {
-        let ptr: Option<String> = self.with_conn(|c| c.get(cred_pub_key(kind, public_id)))?;
+        let ptr: Option<String> = with_conn!(self, |c| c.get(cred_pub_key(kind, public_id)).await)?;
         let Some(ptr) = ptr else {
             return Ok(None);
         };
         let Some((key_id, kind, slot)) = parse_slot_pointer(&ptr) else {
             return Ok(None);
         };
-        let raw: Option<String> = self.with_conn(|c| c.get(cred_row_key(&key_id, &kind, slot)))?;
+        let raw: Option<String> =
+            with_conn!(self, |c| c.get(cred_row_key(&key_id, &kind, slot)).await)?;
         raw.map(|r| cred_from_json(&r)).transpose()
     }
 
-    fn revoke_credential(&self, id: &str, reason: &str) -> RecordStoreResult<()> {
+    pub(crate) async fn revoke_credential(
+        &self,
+        c: &mut Conn,
+        id: &str,
+        reason: &str,
+    ) -> RecordStoreResult<()> {
         let id_key = cred_id_key(id);
-        self.with_conn(|c| {
-            redis::transaction(c, &[id_key.as_str()], |c, pipe| {
-                let ptr: Option<String> = c.get(&id_key)?;
+        with_conn!(self, |c| {
+            transaction!(c, &[id_key.as_str()], |c, pipe| {
+                let ptr: Option<String> = c.get(&id_key).await?;
                 let Some(ptr) = ptr else {
                     // Unknown credential id: an ERROR. The trait's "idempotent" covers revoking an
                     // ALREADY-REVOKED id, not an id that names nothing — a silent no-op here lets
                     // an operator responding to a leak believe the credential is dead while it is
                     // still live and still authenticating.
-                    return Err(redis::RedisError::from((
-                        redis::ErrorKind::Client,
+                    return Err(RedisError::from((
+                        ErrorKind::Client,
                         "revoke_credential refused",
                         format!("revoke_credential: unknown id '{id}'"),
                     )));
@@ -1492,48 +1751,51 @@ impl RecordStore for ValkeyStore {
                 // while the audit trail says it was revoked. `delete_key` already fails loud on
                 // the sibling case (see `delete_key_fails_loud_on_a_corrupt_credential_row`).
                 let Some((key_id, kind, slot)) = parse_slot_pointer(&ptr) else {
-                    return Err(redis::RedisError::from((
-                        redis::ErrorKind::Client,
+                    return Err(RedisError::from((
+                        ErrorKind::Client,
                         "corrupt credential pointer",
                         format!("busbar:cred:id:{id} does not parse as <key_id>:<kind>:<slot>"),
                     )));
                 };
                 let row_key = cred_row_key(&key_id, &kind, slot);
-                let raw: Option<String> = c.get(&row_key)?;
+                let raw: Option<String> = c.get(&row_key).await?;
                 let Some(raw) = raw else {
                     pipe.atomic();
-                    return pipe.query(c);
+                    return pipe.query(c).await;
                 };
-                let mut cred: CredentialSecret = serde_json::from_str(&raw).map_err(|_| {
-                    redis::RedisError::from((redis::ErrorKind::Client, "cred decode"))
-                })?;
+                let mut cred: CredentialSecret = serde_json::from_str(&raw)
+                    .map_err(|_| RedisError::from((ErrorKind::Client, "cred decode")))?;
                 if cred.meta.revoked_at.is_some() {
                     // Already revoked: idempotent no-op.
                     pipe.atomic();
-                    return pipe.query(c);
+                    return pipe.query(c).await;
                 }
-                let rev = self.next_revision(c)?;
+                let rev = self.next_revision(c).await?;
                 cred.meta.revoked_at = Some(crate::now());
                 cred.meta.revoke_reason = Some(reason.to_string());
                 cred.meta.revision = rev;
                 // Destroy the secret material on revoke — defense in depth: a revoked credential's
                 // plaintext has no further legitimate reader, so there is no reason to retain it.
                 cred.secret = String::new();
-                let json = cred_to_json(&cred).map_err(|_| {
-                    redis::RedisError::from((redis::ErrorKind::Client, "cred encode"))
-                })?;
+                let json = cred_to_json(&cred)
+                    .map_err(|_| RedisError::from((ErrorKind::Client, "cred encode")))?;
                 pipe.atomic();
                 pipe.set(&row_key, &json).ignore();
                 pipe.zadd(CREDS_BYREV, format!("{key_id}:{kind}:{slot}"), rev)
                     .ignore();
-                pipe.query(c)
+                pipe.query(c).await
             })
         })
     }
 
-    fn list_credentials_since(&self, since: u64) -> RecordStoreResult<Vec<CredentialSecret>> {
-        let members: Vec<String> =
-            self.with_conn(|c| c.zrangebyscore(CREDS_BYREV, format!("({since}"), "+inf"))?;
+    pub(crate) async fn list_credentials_since(
+        &self,
+        c: &mut Conn,
+        since: u64,
+    ) -> RecordStoreResult<Vec<CredentialSecret>> {
+        let members: Vec<String> = with_conn!(self, |c| c
+            .zrangebyscore(CREDS_BYREV, format!("({since}"), "+inf")
+            .await)?;
         if members.is_empty() {
             return Ok(Vec::new());
         }
@@ -1544,12 +1806,12 @@ impl RecordStore for ValkeyStore {
                 Some(cred_row_key(&key_id, &kind, slot))
             })
             .collect();
-        let raws: Vec<Option<String>> = self.with_conn(|c| {
-            let mut pipe = redis::pipe();
+        let raws: Vec<Option<String>> = with_conn!(self, |c| {
+            let mut pipe = pipe();
             for k in &row_keys {
                 pipe.get(k);
             }
-            pipe.query(c)
+            pipe.query(c).await
         })?;
         // A row that will not decode is SKIPPED, not propagated as an error for the whole call.
         //
@@ -1589,55 +1851,8 @@ impl RecordStore for ValkeyStore {
         Ok(out)
     }
 
-    fn append_audit(&self, entry: &AuditRecord) -> RecordStoreResult<()> {
-        let json = serde_json::to_string(entry)
-            .map_err(|e| RecordStoreError(format!("audit encode failed: {e}")))?;
-        let score = clamp(entry.seq);
-        self.with_conn(|c| {
-            // This used to ZREMRANGEBYSCORE the score then ZADD, i.e. OVERWRITE, last writer wins.
-            // That is the one outcome the trait rules out outright ("a store never rewrites or
-            // recomputes the digest"): it destroys the evidence in exactly the case that matters
-            // most, a second record claiming an occupied chain position.
-            //
-            // Compare instead, under WATCH so a concurrent append cannot land between the read and
-            // the write:
-            //   nothing there -> append.
-            //   identical     -> the write-through retrying after a lost ACK. Benign, Ok, no write.
-            //   different     -> a forked or tampered chain. Error, and the stored record stands.
-            redis::transaction(c, &[AUDIT_ZSET], |c, pipe| {
-                let existing: Vec<String> = c.zrangebyscore(AUDIT_ZSET, score, score)?;
-                if let Some(raw) = existing.first() {
-                    let stored: AuditRecord = serde_json::from_str(raw).map_err(|e| {
-                        redis::RedisError::from((
-                            redis::ErrorKind::Client,
-                            "audit decode failed",
-                            e.to_string(),
-                        ))
-                    })?;
-                    if stored == *entry {
-                        // No write at all: re-adding the identical member would be a no-op anyway,
-                        // and skipping it keeps this path free of any rewrite.
-                        pipe.atomic();
-                        return pipe.query(c);
-                    }
-                    return Err(redis::RedisError::from((
-                        redis::ErrorKind::Client,
-                        "append_audit refused",
-                        format!(
-                            "append_audit: seq {} already holds a DIFFERENT record; the audit \
-                             chain has forked (stored action '{}', incoming '{}')",
-                            entry.seq, stored.action, entry.action
-                        ),
-                    )));
-                }
-                pipe.atomic().zadd(AUDIT_ZSET, &json, score).ignore();
-                pipe.query(c)
-            })
-        })
-    }
-
-    fn list_audit(&self) -> RecordStoreResult<Vec<AuditRecord>> {
-        let members: Vec<String> = self.with_conn(|c| c.zrange(AUDIT_ZSET, 0, -1))?;
+    pub(crate) async fn list_audit(&self, c: &mut Conn) -> RecordStoreResult<Vec<AuditRecord>> {
+        let members: Vec<String> = with_conn!(self, |c| c.zrange(AUDIT_ZSET, 0, -1).await)?;
         let mut out = Vec::with_capacity(members.len());
         for m in members {
             let rec: AuditRecord = serde_json::from_str(&m)
@@ -1647,9 +1862,13 @@ impl RecordStore for ValkeyStore {
         Ok(out)
     }
 
-    fn list_audit_tail(&self, limit: u64) -> RecordStoreResult<Vec<AuditRecord>> {
+    pub(crate) async fn list_audit_tail(
+        &self,
+        c: &mut Conn,
+        limit: u64,
+    ) -> RecordStoreResult<Vec<AuditRecord>> {
         let start: isize = isize::try_from(limit).map(|n| -n).unwrap_or(isize::MIN);
-        let members: Vec<String> = self.with_conn(|c| c.zrange(AUDIT_ZSET, start, -1))?;
+        let members: Vec<String> = with_conn!(self, |c| c.zrange(AUDIT_ZSET, start, -1).await)?;
         let mut out = Vec::with_capacity(members.len());
         for m in members {
             let rec: AuditRecord = serde_json::from_str(&m)
@@ -1659,20 +1878,26 @@ impl RecordStore for ValkeyStore {
         Ok(out)
     }
 
-    fn add_denylist(&self, sub: &str, reason: &str) -> RecordStoreResult<()> {
-        self.with_conn(|c| {
-            redis::pipe()
+    pub(crate) async fn add_denylist(
+        &self,
+        c: &mut Conn,
+        sub: &str,
+        reason: &str,
+    ) -> RecordStoreResult<()> {
+        with_conn!(self, |c| {
+            pipe()
                 .atomic()
                 .set(format!("{DENYLIST_PREFIX}{sub}"), reason)
                 .ignore()
                 .sadd(DENYLIST_INDEX, sub)
                 .ignore()
                 .query(c)
+                .await
         })
     }
 
-    fn list_denylist(&self) -> RecordStoreResult<Vec<String>> {
-        self.with_conn(|c| c.smembers(DENYLIST_INDEX))
+    pub(crate) async fn list_denylist(&self, c: &mut Conn) -> RecordStoreResult<Vec<String>> {
+        with_conn!(self, |c| c.smembers(DENYLIST_INDEX).await)
     }
 
     // ── THE NEUTRAL KIND-TAGGED PLANE-RECORD VERBS (1.6.0) ─────────────────────────────────────
@@ -1680,56 +1905,78 @@ impl RecordStore for ValkeyStore {
     // One keyspace per kind, for every kind; the store never decodes a body. See [`plane`] for the
     // layout and for why each step is a server-side script.
 
-    fn upsert_plane_record(&self, record: &PlaneRecord) -> RecordStoreResult<()> {
-        plane::upsert(self, record)
-    }
-
-    fn get_plane_record(&self, kind: &str, id: &str) -> RecordStoreResult<Option<Vec<u8>>> {
-        plane::get(self, kind, id)
-    }
-
-    fn append_plane_record(&self, record: &PlaneRecord) -> RecordStoreResult<()> {
-        plane::append(self, record)
-    }
-
-    fn list_plane_records(
+    pub(crate) async fn upsert_plane_record(
         &self,
+        c: &mut Conn,
+        record: PlaneRecordRef<'_>,
+    ) -> RecordStoreResult<()> {
+        plane::upsert(self, c, record).await
+    }
+
+    pub(crate) async fn get_plane_record(
+        &self,
+        c: &mut Conn,
         kind: &str,
-        selector: &PlaneSelector,
+        id: &str,
+    ) -> RecordStoreResult<Option<Vec<u8>>> {
+        plane::get(self, c, kind, id).await
+    }
+
+    pub(crate) async fn list_plane_records(
+        &self,
+        c: &mut Conn,
+        kind: &str,
+        selector: &PlaneSelector<'_>,
     ) -> RecordStoreResult<Vec<Vec<u8>>> {
-        plane::list(self, kind, selector)
+        plane::list(self, c, kind, selector).await
     }
 
-    fn list_plane_record_parents(&self, kind: &str) -> RecordStoreResult<Vec<String>> {
-        plane::parents(self, kind)
-    }
-
-    fn purge_plane_records_before(&self, kind: &str, before: u64) -> RecordStoreResult<u64> {
-        plane::purge_before(self, kind, before)
-    }
-
-    fn delete_plane_record(&self, kind: &str, id: &str) -> RecordStoreResult<()> {
-        plane::delete(self, kind, id)
-    }
-
-    fn redeem_plane_token(
+    pub(crate) async fn list_plane_record_parents(
         &self,
+        c: &mut Conn,
+        kind: &str,
+    ) -> RecordStoreResult<Vec<String>> {
+        plane::parents(self, c, kind).await
+    }
+
+    pub(crate) async fn purge_plane_records_before(
+        &self,
+        c: &mut Conn,
+        kind: &str,
+        before: u64,
+    ) -> RecordStoreResult<u64> {
+        plane::purge_before(self, c, kind, before).await
+    }
+
+    pub(crate) async fn delete_plane_record(
+        &self,
+        c: &mut Conn,
+        kind: &str,
+        id: &str,
+    ) -> RecordStoreResult<()> {
+        plane::delete(self, c, kind, id).await
+    }
+
+    pub(crate) async fn redeem_plane_token(
+        &self,
+        c: &mut Conn,
         kind: &str,
         token: &str,
         expires_at: u64,
         now: u64,
     ) -> RecordStoreResult<bool> {
-        plane::redeem_token(self, kind, token, expires_at, now)
+        plane::redeem_token(self, c, kind, token, expires_at, now).await
     }
 
-    fn plane_token_live(
+    pub(crate) async fn plane_token_live(
         &self,
+        c: &mut Conn,
         kind: &str,
         token: &str,
         expires_at: u64,
         now: u64,
     ) -> RecordStoreResult<bool> {
-        plane::token_live(self, kind, token, expires_at, now)
+        plane::token_live(self, c, kind, token, expires_at, now).await
     }
 }
 
@@ -1744,52 +1991,57 @@ fn now() -> u64 {
 }
 
 // ── THE DOOR (DECISIONS #2 rule (1): compiled in or dropped in, one contract, one loading path) ──
+//
+// The store's door lives HERE, in the logic crate (`slots`: `store_door!` over this store's
+// `StoreSlots`): a busbar build that links this crate registers `door` as its compiled-in row
+// (`LinkedRow::of(door)`), and the sibling `busbar-store-valkey-plugin` cdylib exports the same
+// `door` as the image's one symbol (`export_door!`). One source, both doors.
 
-/// The store's registry name, and the alias `store.module: valkey` selects it by.
+/// The store's package name: the name its Statement states and its signed tarball carries.
 pub const NAME: &str = "busbar-store-valkey";
-/// The alias an operator names in `store.module`.
-pub const ALIAS: &str = "valkey";
 
-/// Construct a Valkey-protocol store from the JSON config the engine passes through `open`:
-///
-/// ```json
-/// { "url": "redis://:password@host:6379/0", "connect_timeout_ms": 10000 }
-/// ```
-///
-/// The engine passes `store.settings` verbatim as this JSON config (see the boot store-load),
-/// mirroring how the Postgres plugin receives its libpq URL. `connect_timeout_ms` is optional
-/// (defaults to [`DEFAULT_CONNECT_TIMEOUT`], currently 10s); it bounds the initial connect so a
-/// blackholed/firewalled instance fails fast at boot instead of wedging it indefinitely.
-pub fn open(cfg: &str) -> Result<Box<dyn RecordStore>, String> {
-    let v: serde_json::Value = if cfg.trim().is_empty() {
-        serde_json::Value::Object(Default::default())
-    } else {
-        serde_json::from_str(cfg).map_err(|e| format!("invalid valkey plugin config: {e}"))?
-    };
-    let url = v.get("url").and_then(|x| x.as_str()).ok_or_else(|| {
-        "valkey plugin config requires a \"url\" (a redis:// connection string)".to_string()
-    })?;
-    let store = match v.get("connect_timeout_ms").and_then(|x| x.as_u64()) {
-        Some(ms) => ValkeyStore::connect_with_timeout(url, Duration::from_millis(ms)),
-        None => ValkeyStore::connect(url),
+impl ValkeyStore {
+    /// Construct a Valkey-protocol store from the settings JSON the host hands `validate` and
+    /// `open`:
+    ///
+    /// ```json
+    /// { "url": "redis://:password@host:6379/0", "connect_timeout_ms": 10000 }
+    /// ```
+    ///
+    /// It PARSES and connects to nothing: the first connection is `open`'s connect step
+    /// ([`StoreSlots::connect`](busbar_contract::abi::sdk::store::StoreSlots::connect)), through the
+    /// host's connector. `connect_timeout_ms` is optional (default [`DEFAULT_CONNECT_TIMEOUT`]).
+    ///
+    /// # Errors
+    /// A text naming why the settings do not open a store (1.5.5's words).
+    pub fn from_settings(settings: &[u8]) -> Result<Self, String> {
+        let v: serde_json::Value = if settings.iter().all(u8::is_ascii_whitespace) {
+            serde_json::Value::Object(Default::default())
+        } else {
+            serde_json::from_slice(settings)
+                .map_err(|e| format!("invalid valkey plugin config: {e}"))?
+        };
+        let url = v.get("url").and_then(|x| x.as_str()).ok_or_else(|| {
+            "valkey plugin config requires a \"url\" (a redis:// connection string)".to_string()
+        })?;
+        match v.get("connect_timeout_ms").and_then(|x| x.as_u64()) {
+            Some(ms) => ValkeyStore::with_timeout(url, Duration::from_millis(ms)),
+            None => ValkeyStore::new(url),
+        }
+        .map_err(|e| failed_to_connect(&e))
     }
-    .map_err(|e| format!("valkey plugin: failed to connect: {}", e.0))?;
-    Ok(Box::new(store))
 }
 
-// The image's ONE door registration. The frozen symbols the loader looks up in the
-// `busbar-store-valkey-plugin` cdylib are the contract SDK's, and they answer through this entry; a
-// busbar build that links this crate hands the loader `BUSBAR_COLD_ENTRY` instead.
-busbar_contract::abi::sdk::export_store_plugin!(open);
-
-/// THE LINKED ENTRY: what a build that links this store registers onto the cold-kind axis — the same
-/// row a dropped-in tarball of this store states, opened through the same boundary.
-pub mod linked {
-    /// `(name, alias, boundary)` — the row's statement and the boundary the one cold load runs over,
-    /// exactly what the dropped-in tarball states and exports.
-    pub const STORE: (&str, &str, &busbar_contract::abi::sdk::ColdEntry) =
-        (super::NAME, super::ALIAS, &super::BUSBAR_COLD_ENTRY);
+/// The load's refusal for a store that does not connect, in 1.5.5's words.
+fn failed_to_connect(e: &RecordStoreError) -> String {
+    format!("valkey plugin: failed to connect: {}", e.0)
 }
+
+mod slots;
+
+/// THE STORE DOOR (store v3, `busbar_contract::abi::store`): every slot of the store v3 table over
+/// [`ValkeyStore`], through the contract's store SDK.
+pub use slots::door;
 
 #[cfg(test)]
 mod tests;
