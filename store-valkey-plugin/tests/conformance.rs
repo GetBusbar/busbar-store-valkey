@@ -36,6 +36,132 @@
 //! FAILURE under `CI` without it. A missing cdylib is always a failure, never a skip: this test IS
 //! the dropped-in door's proof.
 
+// THE PUBLISHED SUITE (busbar-plugin-loader's `conformance` feature, at the pin): the linked door and
+// the built cdylib, each through the one loader, driven by the store kind's script over the live
+// Valkey `conformance.json` names; exact crossing counts, the two folds equal, its RED arms.
+//
+// THE HOST (ARCHITECT Q-P4-9): the store's `tcp` need is served by busbar's own connector, composed
+// as the root composes it (`conformance_host`, rendered by the fleet template), and the store asks
+// for TLS (`rediss://`): the suite's TLS front answers, its certificate chaining to the suite's test
+// CA, the anchors only the HOST's TLS is handed (`tls:`); the front carries the secured connection to
+// the live Valkey. So every fold proves the store's connection is secured by the host, verified
+// against the anchors.
+//
+// EACH FOLD'S KEYSPACE (Q-P4-8): the store's keys are fixed (`busbar:*`) and its settings name no key
+// prefix, and a fold namespace is no database number, so `{fold}` has nowhere to go in the url. The
+// suite's folds therefore run in a database of their own (`/14`; this repo's other live tests use the
+// url's `/0` and the admin end-to-end test `/15`), one fold at a time: the namespace hooks below take
+// that database for the fold and flush it before the fold opens, and flush it and hand it on when
+// the fold ends, on an independent connection of the `redis` client. Every fold starts on an empty
+// keyspace and leaves none; nothing in the store's behaviour changes.
+#[path = "support/conformance_host.rs"]
+mod conformance_host;
+
+busbar_plugin_loader::conformance_suite! {
+    door: busbar_store_valkey::door,
+    cdylib: "busbar_store_valkey_plugin",
+    inputs: include_str!("conformance.json"),
+    host: host,
+    tls: conformance_host::anchors(),
+    namespace: (take_fold_keyspace, drop_fold_keyspace),
+}
+
+/// The live Valkey's address (`VALKEY_URL`'s authority; the service's default when unset).
+fn upstream() -> &'static str {
+    static AT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    AT.get_or_init(|| {
+        let url = std::env::var("VALKEY_URL").unwrap_or_default();
+        url.split_once("://")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.rsplit_once('@').map_or(Some(rest), |(_, at)| Some(at)))
+            .and_then(|at| at.split(['/', '?']).next())
+            .filter(|at| !at.is_empty())
+            .unwrap_or("127.0.0.1:6379")
+            .to_owned()
+    })
+}
+
+/// `rediss://` negotiates nothing in the clear: the TLS handshake is the connection's first byte.
+fn no_preamble(_: &mut std::net::TcpStream) -> bool {
+    true
+}
+
+/// The host the suite binds the store over, with the TLS front its settings name already listening.
+fn host(
+    wake: std::sync::Arc<dyn Fn(u64) + Send + Sync>,
+    anchors: Option<&str>,
+) -> std::sync::Arc<dyn busbar_contract::conn::DeclaredConns> {
+    conformance_host::tls_front(no_preamble, upstream());
+    conformance_host::host(wake, anchors)
+}
+
+/// The fold's database on the live server, on a connection of the `redis` client's own: straight to
+/// the server, in the clear (the TLS front is the store's, not this client's).
+fn fold_client(settings: &[u8]) -> redis::RedisResult<redis::Connection> {
+    let v: serde_json::Value =
+        serde_json::from_slice(settings).expect("conformance.json's settings are JSON");
+    let url = v["url"]
+        .as_str()
+        .expect("conformance.json's settings name a url")
+        .replace(
+            &format!("rediss://{}", conformance_host::FAR_END),
+            &format!("redis://{}", upstream()),
+        );
+    redis::Client::open(url.as_str())?.get_connection()
+}
+
+fn flush_fold_keyspace(settings: &[u8]) -> redis::RedisResult<()> {
+    redis::cmd("FLUSHDB").query::<()>(&mut fold_client(settings)?)
+}
+
+/// The suite's database, held by one fold at a time: the namespace of the fold holding it.
+fn fold_gate() -> &'static (std::sync::Mutex<Option<String>>, std::sync::Condvar) {
+    static GATE: std::sync::OnceLock<(std::sync::Mutex<Option<String>>, std::sync::Condvar)> =
+        std::sync::OnceLock::new();
+    GATE.get_or_init(Default::default)
+}
+
+/// Hand the suite's database on (the fold that held it is over).
+fn release_fold_keyspace(namespace: &str) {
+    let (held, freed) = fold_gate();
+    let mut held = held
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if held.as_deref() == Some(namespace) {
+        *held = None;
+    }
+    freed.notify_all();
+}
+
+/// The suite's namespace hook, before the fold's open: the fold takes the suite's database (waiting
+/// while another fold holds it) and it is flushed, so the fold opens on an empty keyspace.
+fn take_fold_keyspace(namespace: &str, settings: &[u8]) {
+    let (held, freed) = fold_gate();
+    let mut slot = held
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while slot.is_some() {
+        slot = freed
+            .wait(slot)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    *slot = Some(namespace.to_owned());
+    drop(slot);
+    if let Err(e) = flush_fold_keyspace(settings) {
+        // No fold runs, so no drop hook will hand the database on: hand it on here.
+        release_fold_keyspace(namespace);
+        panic!("the fold's keyspace is not flushed before its open: {e}");
+    }
+}
+
+/// The suite's namespace hook, after the fold (its failure included): everything the store wrote in
+/// the fold is flushed, and the database is handed to the next fold.
+fn drop_fold_keyspace(namespace: &str, settings: &[u8]) {
+    let flushed = flush_fold_keyspace(settings);
+    release_fold_keyspace(namespace);
+    flushed.unwrap_or_else(|e| panic!("the fold's keyspace is not flushed after the fold: {e}"));
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
