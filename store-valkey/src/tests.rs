@@ -66,7 +66,7 @@ pub(crate) fn open_with(settings: &str) -> Result<LoadedStore, String> {
             max_inflight_cap: 64,
             sink: Arc::new(NoSink),
             dispatcher: d.adopter(),
-            conns: Some(conns.clone()),
+            conns: busbar_plugin_loader::dispatch::ConnTable::Host(conns.clone()),
         },
     )
     .map_err(|e| e.to_string())?;
@@ -3444,7 +3444,7 @@ fn open_on_dispatcher(
             max_inflight_cap: 64,
             sink: Arc::new(NoSink),
             dispatcher: d.adopter(),
-            conns: Some(conns),
+            conns: busbar_plugin_loader::dispatch::ConnTable::Host(conns),
         },
     )
     .expect("the door loads");
@@ -3453,6 +3453,145 @@ fn open_on_dispatcher(
 
 fn plain(d: &Dispatcher) -> TcpConns {
     TcpConns::new(d.conn_waker())
+}
+
+/// A table whose TLS trusts no root: a verifying handshake refuses every certificate, and only an
+/// operator-infrastructure need's verify-off (`#insecure`) secures a stream.
+fn trusting_nothing(d: &Dispatcher) -> TcpConns {
+    TcpConns::with_tls(d.conn_waker(), Arc::new(TestTls::default()))
+}
+
+/// THE TEST TABLE'S TLS (the loader's `SecureDial`; TLS itself is the connector's, which the
+/// loader's test table cannot name): rustls trusting exactly the roots a test hands it, or, on
+/// `verify_off`, checking no certificate, only the handshake's signature. As the loader's own test
+/// table secured a stream before TLS left it (busbar 0db7ee2ea0 `TcpConns::with_roots`).
+#[derive(Default)]
+struct TestTls {
+    roots: Option<Vec<u8>>,
+}
+
+impl TestTls {
+    fn trusting(ca_der: &[u8]) -> Self {
+        Self {
+            roots: Some(ca_der.to_vec()),
+        }
+    }
+
+    fn config(&self, verify_off: bool) -> Arc<rustls::ClientConfig> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .expect("the default protocol versions");
+        let config = if verify_off {
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AnyCertificate(provider)))
+                .with_no_client_auth()
+        } else {
+            let mut roots = rustls::RootCertStore::empty();
+            if let Some(ca) = &self.roots {
+                roots
+                    .add(rustls_pki_types::CertificateDer::from(ca.clone()))
+                    .expect("the test CA is a root certificate");
+            }
+            builder.with_root_certificates(roots).with_no_client_auth()
+        };
+        Arc::new(config)
+    }
+}
+
+impl busbar_plugin_loader::tcp_conns::SecureDial for TestTls {
+    fn secure(
+        &self,
+        server: &str,
+        verify_off: bool,
+        mut tcp: std::net::TcpStream,
+    ) -> std::io::Result<Box<dyn busbar_plugin_loader::tcp_conns::SecuredSock>> {
+        let invalid = |e: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, e);
+        let name = rustls_pki_types::ServerName::try_from(server.to_owned())
+            .map_err(|e| invalid(e.to_string()))?;
+        let mut tls = rustls::ClientConnection::new(self.config(verify_off), name)
+            .map_err(|e| invalid(e.to_string()))?;
+        while tls.is_handshaking() {
+            tls.complete_io(&mut tcp)?;
+        }
+        Ok(Box::new(TestTlsStream(rustls::StreamOwned::new(tls, tcp))))
+    }
+}
+
+/// A stream [`TestTls`] secured.
+struct TestTlsStream(rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>);
+
+impl std::io::Read for TestTlsStream {
+    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(b)
+    }
+}
+
+impl std::io::Write for TestTlsStream {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.write(b)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl busbar_plugin_loader::tcp_conns::SecuredSock for TestTlsStream {
+    fn tcp(&self) -> &std::net::TcpStream {
+        self.0.get_ref()
+    }
+    fn close(&mut self) {
+        self.0.conn.send_close_notify();
+        let _ = std::io::Write::flush(&mut self.0);
+        let _ = self.0.sock.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// A verifier that checks no certificate, only the handshake's signature (`#insecure`).
+#[derive(Debug)]
+struct AnyCertificate(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AnyCertificate {
+    fn verify_server_cert(
+        &self,
+        _: &rustls_pki_types::CertificateDer<'_>,
+        _: &[rustls_pki_types::CertificateDer<'_>],
+        _: &rustls_pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
 }
 
 fn settings_for(url: &str) -> String {
@@ -3645,7 +3784,7 @@ fn a_rediss_url_is_secured_through_the_hosts_connector() {
     let (_, db, userinfo) = live_parts();
     let url = format!("rediss://{userinfo}127.0.0.1:{port}/{db}");
     let (store, _) = open_on(&settings_for(&url), |d| {
-        TcpConns::with_roots(d.conn_waker(), &ca)
+        TcpConns::with_tls(d.conn_waker(), Arc::new(TestTls::trusting(&ca)))
     });
     let store = store.expect("opens over TLS");
     let id = uid("vk_tls");
@@ -3762,6 +3901,52 @@ impl busbar_contract::services::HostServices for ClockOnly {
     ) -> busbar_contract::services::Ran {
         refused_now()
     }
+    fn unit_nest(
+        &self,
+        _: &busbar_contract::services::Caller,
+        _: Option<u64>,
+        _: busbar_contract::services::NestAsk,
+        _: busbar_contract::services::Later,
+    ) -> busbar_contract::services::Ran {
+        refused_now()
+    }
+    fn work_open(
+        &self,
+        _: &busbar_contract::services::Caller,
+        _: Option<u64>,
+        _: &str,
+        _: &[u8],
+        _: busbar_contract::services::Later,
+    ) -> busbar_contract::services::Ran {
+        refused_now()
+    }
+    fn work_find(
+        &self,
+        _: &busbar_contract::services::Caller,
+        _: Option<u64>,
+        _: &[u8],
+        _: busbar_contract::services::Later,
+    ) -> busbar_contract::services::Ran {
+        refused_now()
+    }
+    fn work_settle(
+        &self,
+        _: &busbar_contract::services::Caller,
+        _: u64,
+        _: &[u8],
+        _: busbar_contract::services::Later,
+    ) -> busbar_contract::services::Ran {
+        refused_now()
+    }
+    fn work_resume(
+        &self,
+        _: &busbar_contract::services::Caller,
+        _: Option<u64>,
+        _: u64,
+        _: busbar_contract::services::Later,
+    ) -> busbar_contract::services::Ran {
+        refused_now()
+    }
 }
 
 fn refused_now() -> busbar_contract::services::Ran {
@@ -3844,7 +4029,7 @@ fn rediss_insecure_skips_certificate_verification() {
     let port = proxy.at.rsplit_once(':').unwrap().1.to_string();
     let (_, db, userinfo) = live_parts();
     let verified = format!("rediss://{userinfo}127.0.0.1:{port}/{db}");
-    let (refused, _) = open_on(&settings_for(&verified), plain);
+    let (refused, _) = open_on(&settings_for(&verified), trusting_nothing);
     let err = refused.expect_err("a self-signed certificate is not trusted");
     assert!(
         err.starts_with(
@@ -3853,7 +4038,10 @@ fn rediss_insecure_skips_certificate_verification() {
         ),
         "{err}"
     );
-    let (store, _) = open_on(&settings_for(&format!("{verified}#insecure")), plain);
+    let (store, _) = open_on(
+        &settings_for(&format!("{verified}#insecure")),
+        trusting_nothing,
+    );
     let store = store.expect("#insecure accepts the self-signed certificate");
     let id = uid("vk_insecure");
     store.put_key(&vk(&id)).unwrap();
