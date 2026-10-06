@@ -93,7 +93,7 @@ fn host(instance: &str) -> (Arc<Dispatcher>, Bind) {
         max_inflight_cap: 64,
         sink: Arc::new(NoSink),
         dispatcher: dispatcher.adopter(),
-        conns: Some(conns),
+        conns: busbar_plugin_loader::dispatch::ConnTable::Host(conns),
     };
     (dispatcher, bind)
 }
