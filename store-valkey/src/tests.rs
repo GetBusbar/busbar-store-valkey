@@ -66,7 +66,7 @@ pub(crate) fn open_with(settings: &str) -> Result<LoadedStore, String> {
             max_inflight_cap: 64,
             sink: Arc::new(NoSink),
             dispatcher: d.adopter(),
-            conns: Some(conns.clone()),
+            conns: busbar_plugin_loader::dispatch::ConnTable::Host(conns.clone()),
         },
     )
     .map_err(|e| e.to_string())?;
@@ -3444,7 +3444,7 @@ fn open_on_dispatcher(
             max_inflight_cap: 64,
             sink: Arc::new(NoSink),
             dispatcher: d.adopter(),
-            conns: Some(conns),
+            conns: busbar_plugin_loader::dispatch::ConnTable::Host(conns),
         },
     )
     .expect("the door loads");
