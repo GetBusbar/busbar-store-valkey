@@ -93,7 +93,7 @@ fn host(instance: &str) -> (Arc<Dispatcher>, Bind) {
         max_inflight_cap: 64,
         sink: Arc::new(NoSink),
         dispatcher: dispatcher.adopter(),
-        conns: Some(conns),
+        conns: busbar_plugin_loader::dispatch::ConnTable::Host(conns),
     };
     (dispatcher, bind)
 }
@@ -813,8 +813,9 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
         "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n  api_key_env: MOCK_KEY\n",
     )
     .unwrap();
-    // No `store:` block at first boot — proves the plugin isn't already active some other way;
-    // the whole point of this test is the RUNTIME install path. `admin_auth` grants Full scope
+    // The compiled-in `memory` store at first boot (`store: {module: memory}`: busbar 1.6.0 refuses
+    // a config without a `store:` block, BUSBAR-9007) — proves the plugin isn't already active some
+    // other way; the whole point of this test is the RUNTIME install path. `admin_auth` grants Full scope
     // via a static bearer token (mirrors CI's INSTALL-AND-SERVE step exactly).
     //
     // 1.5.3 GRAMMAR: the operator token provider is DEFINED ONCE under the top-level
@@ -836,7 +837,8 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
              auth:\n  chain: [keys]\n  signing_key: {{ env: BUSBAR_SIGNING_KEY }}\n  admin_auth: [admin-tokens]\n\
              plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
              providers:\n  mock:\n    api_key: {{ env: MOCK_KEY }}\n\
-             models:\n  test-model:\n    provider: mock\n",
+             models:\n  test-model:\n    provider: mock\n\
+             store:\n  module: memory\n",
             plugins_dir.display()
         ),
     )
