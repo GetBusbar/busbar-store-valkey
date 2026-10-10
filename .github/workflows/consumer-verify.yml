@@ -1,4 +1,4 @@
-# RENDERED by `busbar-release plugin sync busbar-store-valkey` from GetBusbar/busbar-release template/; a hand
+# RENDERED by `busbar-release plugin heal busbar-store-valkey` from GetBusbar/busbar-release template/; a hand
 # edit is overwritten by the next sync. Daily: does the newest
 # PUBLISHED release still work for a user (busbar's plugin-consumer-verify.yml)? A publish-time check
 # cannot see an artifact that rots afterwards; release.yml verifies each release as it publishes.
@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   consumer:
-    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@7c6d8b4b4d0e352dc57777c04f49571ec5b5be23
+    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@7356bbfb6baeb0e9245a59dc74f8b4bfadb2c5a4
     with:
       version: ${{ inputs.version || '' }}
       asset_prefix: busbar-store-valkey
