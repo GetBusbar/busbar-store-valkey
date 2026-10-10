@@ -1,4 +1,4 @@
-# RENDERED by `busbar-release plugin sync busbar-store-valkey` from GetBusbar/busbar-release template/; a hand
+# RENDERED by `busbar-release plugin heal busbar-store-valkey` from GetBusbar/busbar-release template/; a hand
 # edit is overwritten by the next sync. THIS REPO TESTS ITSELF AGAINST BUSBAR with the fleet's ONE
 # harness: busbar's reusable plugin-ci.yml, taken at the busbar commit this repo pins (.busbar-ref), so
 # the CI logic, the gates (busbar scripts/fleet/plugin-gates.py), the dependency policy
@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   ci:
-    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@7c6d8b4b4d0e352dc57777c04f49571ec5b5be23
+    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@7356bbfb6baeb0e9245a59dc74f8b4bfadb2c5a4
     with:
       service: valkey
       busbar_checkout: true
