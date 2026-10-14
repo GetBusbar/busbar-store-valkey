@@ -3918,3 +3918,295 @@ fn rediss_insecure_skips_certificate_verification() {
     );
     let _ = store.purge_key_for_test(&id);
 }
+
+// MIGRATION CONFORMANCE (busbar 1.6.0 #33 / M5): keys the PUBLISHED 1.5.5 binary wrote through the
+// published store-valkey v1.0.7 plugin read back through this build's `migrate`. The fixture in
+// `tests/fixtures/1.5.5/` was RECORDED by busbar's `scripts/store-migration-fixture.sh` driving the
+// v1.5.5 binary and the v1.0.7 plugin against valkey/valkey:8@sha256:495e4fec... (the image plugin-ci
+// runs); the binary, plugin and image digests and every file's sha256 are in its `MANIFEST.tsv`.
+// `keys.json` (= `rows.json`) is every key 1.5.5 wrote: `{key: {type, value, has_ttl}}`, hashes as
+// field -> value maps, zsets as [[member, score], ...]. Destructive (it clears `busbar:*`), so
+// `#[ignore]`d like the other namespace-wiping tests and run by plugin-ci's `--ignored` pass.
+const FIXTURE_KEYS_1_5_5: &str = include_str!("../tests/fixtures/1.5.5/keys.json");
+
+/// A TTL comfortably longer than any test run, as 1.5.5 gave its metering rows.
+const FIXTURE_TTL_SECS: u64 = 31 * 24 * 3600;
+
+fn fixture_keys() -> serde_json::Map<String, serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(FIXTURE_KEYS_1_5_5)
+        .unwrap()
+        .as_object()
+        .unwrap_or_else(|| panic!("keys.json is an object"))
+        .clone()
+}
+
+fn fx_text(v: &serde_json::Value) -> String {
+    v.as_str()
+        .unwrap_or_else(|| panic!("{v} is not a string"))
+        .to_string()
+}
+
+fn fx_num(v: &serde_json::Value) -> u64 {
+    fx_text(v)
+        .parse()
+        .unwrap_or_else(|_| panic!("{v} is not an unsigned integer"))
+}
+
+/// Clear `busbar:*`, then write every key of `keys.json` with the crate's own test client.
+fn replay_1_5_5(store: &ValkeyStore) {
+    store
+        .with_conn(|c| {
+            let existing: Vec<String> = redis::cmd("KEYS").arg("busbar:*").query(c)?;
+            for k in &existing {
+                redis::cmd("DEL").arg(k).query::<()>(c)?;
+            }
+            for (key, row) in fixture_keys() {
+                let value = &row["value"];
+                match row["type"].as_str().unwrap() {
+                    "string" => redis::cmd("SET")
+                        .arg(&key)
+                        .arg(fx_text(value))
+                        .query::<()>(c)?,
+                    "hash" => {
+                        for (f, v) in value.as_object().unwrap() {
+                            redis::cmd("HSET")
+                                .arg(&key)
+                                .arg(f)
+                                .arg(fx_text(v))
+                                .query::<()>(c)?;
+                        }
+                    }
+                    "set" => {
+                        for m in value.as_array().unwrap() {
+                            redis::cmd("SADD")
+                                .arg(&key)
+                                .arg(fx_text(m))
+                                .query::<()>(c)?;
+                        }
+                    }
+                    "zset" => {
+                        for pair in value.as_array().unwrap() {
+                            let score: f64 = fx_text(&pair[1]).parse().unwrap();
+                            redis::cmd("ZADD")
+                                .arg(&key)
+                                .arg(score)
+                                .arg(fx_text(&pair[0]))
+                                .query::<()>(c)?;
+                        }
+                    }
+                    "list" => {
+                        for m in value.as_array().unwrap() {
+                            redis::cmd("RPUSH")
+                                .arg(&key)
+                                .arg(fx_text(m))
+                                .query::<()>(c)?;
+                        }
+                    }
+                    other => panic!("{key}: unknown fixture type {other}"),
+                }
+                if row["has_ttl"].as_bool().unwrap() {
+                    redis::cmd("EXPIRE")
+                        .arg(&key)
+                        .arg(FIXTURE_TTL_SECS)
+                        .query::<()>(c)?;
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn schema_marker(store: &ValkeyStore) -> i64 {
+    store.with_conn(|c| c.get("busbar:schema")).unwrap()
+}
+
+/// The 1.6.0 surface read back, against values derived from `keys.json` here and now.
+fn assert_1_5_5_keys_read_back(store: &ValkeyStore) {
+    let fx = fixture_keys();
+
+    // METERING: every `busbar:metering:<bucket>:<key>|<model>|<provider>` hash, per bucket, and no extra.
+    let mut buckets = std::collections::BTreeSet::new();
+    for key in fx.keys() {
+        if let Some(rest) = key.strip_prefix("busbar:metering:") {
+            buckets.insert(rest.split(':').next().unwrap().parse::<u64>().unwrap());
+        }
+    }
+    assert!(!buckets.is_empty(), "the fixture carries metering rows");
+    let mut seen = 0;
+    for bucket in &buckets {
+        let prefix = format!("busbar:metering:{bucket}:");
+        let want: Vec<&serde_json::Value> = fx
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(_, v)| &v["value"])
+            .collect();
+        let got = store.list_metering(*bucket).unwrap();
+        assert_eq!(got.len(), want.len(), "metering rows in bucket {bucket}");
+        for w in want {
+            let row = got
+                .iter()
+                .find(|g| {
+                    g.key_id == fx_text(&w["key_id"])
+                        && g.model == fx_text(&w["model"])
+                        && g.provider == fx_text(&w["provider"])
+                })
+                .unwrap_or_else(|| panic!("metering row missing after migrate: {w}"));
+            assert_eq!(row.requests, fx_num(&w["requests"]), "{w}");
+            assert_eq!(
+                row.billable_requests,
+                fx_num(&w["billable_requests"]),
+                "{w}"
+            );
+            assert_eq!(row.key_group_at_use, fx_text(&w["key_group_at_use"]), "{w}");
+            assert_eq!(row.pricing_version, fx_text(&w["pricing_version"]), "{w}");
+            assert_eq!(row.tokens_input, fx_num(&w["tokens_input"]), "{w}");
+            assert_eq!(row.tokens_output, fx_num(&w["tokens_output"]), "{w}");
+            assert_eq!(
+                row.tokens_cache_read,
+                fx_num(&w["tokens_cache_read"]),
+                "{w}"
+            );
+            assert_eq!(
+                row.tokens_cache_write,
+                fx_num(&w["tokens_cache_write"]),
+                "{w}"
+            );
+            seen += 1;
+        }
+    }
+    assert!(seen > 0);
+
+    // USAGE WINDOWS: `busbar:usage:<bucket>:<window_start>` — the counts and each model's tokens.
+    let mut windows = 0;
+    for (key, row) in &fx {
+        let Some(rest) = key.strip_prefix("busbar:usage:") else {
+            continue;
+        };
+        let (bucket, start) = rest.rsplit_once(':').unwrap();
+        let start: u64 = start.parse().unwrap();
+        let mut requests = 0;
+        let mut billable = 0;
+        let mut models: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, u64>,
+        > = Default::default();
+        for (field, v) in row["value"].as_object().unwrap() {
+            match field.as_str() {
+                "requests" => requests = fx_num(v),
+                "billable_requests" => billable = fx_num(v),
+                _ => {
+                    let (model, unit) = field.strip_prefix("m:").unwrap().rsplit_once(':').unwrap();
+                    models
+                        .entry(model.to_string())
+                        .or_default()
+                        .insert(unit.to_string(), fx_num(v));
+                }
+            }
+        }
+        let got = store.get_usage(bucket, start).unwrap();
+        assert_eq!(got.requests, requests, "{key}");
+        assert_eq!(got.billable_requests, billable, "{key}");
+        let have: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> = got
+            .models
+            .iter()
+            .map(|m| (m.model.clone(), m.usage_units.clone()))
+            .collect();
+        assert_eq!(have, models, "per-model tokens of {key}");
+        windows += 1;
+    }
+    assert!(windows > 0, "the fixture carries usage windows");
+
+    // KEYS: name, group, enabled; and no extra key.
+    let mut key_rows = 0;
+    for (key, row) in &fx {
+        let Some(id) = key.strip_prefix("busbar:key:") else {
+            continue;
+        };
+        let want: serde_json::Value = serde_json::from_str(&fx_text(&row["value"])).unwrap();
+        let got = store
+            .get_key(id)
+            .unwrap()
+            .unwrap_or_else(|| panic!("key missing after migrate: {id}"));
+        assert_eq!(got.name, fx_text(&want["name"]), "{id}");
+        assert_eq!(got.group.as_deref(), want["group"].as_str(), "{id}");
+        assert_eq!(got.enabled, want["enabled"].as_bool().unwrap(), "{id}");
+        key_rows += 1;
+    }
+    assert!(key_rows > 0, "the fixture carries keys");
+    assert_eq!(store.list_keys().unwrap().len(), key_rows);
+
+    // AUDIT: the hash chain, verbatim and in order (the zset's own order).
+    let want: Vec<serde_json::Value> = fx["busbar:audit"]["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pair| serde_json::from_str(&fx_text(&pair[0])).unwrap())
+        .collect();
+    assert!(!want.is_empty(), "the fixture carries audit rows");
+    let got = store.list_audit().unwrap();
+    assert_eq!(got.len(), want.len());
+    for (g, w) in got.iter().zip(&want) {
+        assert_eq!(g.seq, w["seq"].as_u64().unwrap(), "{w}");
+        assert_eq!(g.ts, w["ts"].as_u64().unwrap(), "{w}");
+        assert_eq!(g.action, fx_text(&w["action"]), "{w}");
+        assert_eq!(g.resource, fx_text(&w["resource"]), "{w}");
+        assert_eq!(g.outcome, fx_text(&w["outcome"]), "{w}");
+        assert_eq!(g.principal, fx_text(&w["principal"]), "{w}");
+        assert_eq!(g.prev_hash, fx_text(&w["prev_hash"]), "{w}");
+        assert_eq!(g.hash, fx_text(&w["hash"]), "{w}");
+    }
+}
+
+/// Every read the assertions above make, as text, so two opens compare whole.
+fn read_everything_1_5_5(store: &ValkeyStore) -> Vec<String> {
+    let mut out = vec![
+        format!("{:?}", store.list_keys().unwrap()),
+        format!("{:?}", store.list_audit().unwrap()),
+    ];
+    for key in fixture_keys().keys() {
+        if let Some(rest) = key.strip_prefix("busbar:metering:") {
+            if let Ok(bucket) = rest.parse::<u64>() {
+                out.push(format!("{:?}", store.list_metering(bucket).unwrap()));
+            }
+        } else if let Some(rest) = key.strip_prefix("busbar:usage:") {
+            let (bucket, start) = rest.rsplit_once(':').unwrap();
+            out.push(format!(
+                "{:?}",
+                store.get_usage(bucket, start.parse().unwrap()).unwrap()
+            ));
+        }
+    }
+    out
+}
+
+/// Keys written by the 1.5.5 binary read back through this build's migrate, field for field.
+#[test]
+#[ignore]
+fn the_1_5_5_binarys_rows_read_back_through_migrate() {
+    let Some(setup) = live_store() else { return };
+    replay_1_5_5(&setup);
+    assert_eq!(schema_marker(&setup), 6, "the replayed marker is 1.5.5's");
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let store = ValkeyStore::connect(&url).expect("this build opens the 1.5.5 keyspace");
+    assert_eq!(schema_marker(&store), SCHEMA_VERSION);
+    assert_1_5_5_keys_read_back(&store);
+}
+
+/// A second open over the migrated 1.5.5 keyspace changes nothing.
+#[test]
+#[ignore]
+fn migrate_over_the_1_5_5_rows_is_idempotent() {
+    let Some(setup) = live_store() else { return };
+    replay_1_5_5(&setup);
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let first = {
+        let store = ValkeyStore::connect(&url).expect("first open");
+        assert_eq!(schema_marker(&store), SCHEMA_VERSION);
+        assert_1_5_5_keys_read_back(&store);
+        read_everything_1_5_5(&store)
+    };
+    let store = ValkeyStore::connect(&url).expect("second open");
+    assert_eq!(schema_marker(&store), SCHEMA_VERSION);
+    assert_1_5_5_keys_read_back(&store);
+    assert_eq!(read_everything_1_5_5(&store), first);
+}

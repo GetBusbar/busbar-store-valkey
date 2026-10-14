@@ -1,0 +1,10 @@
+{
+  "budget_period": "total",
+  "group": null,
+  "id": "vk_86f7030e07da9fc22bd60ab1d7c5dd46",
+  "rate_headroom": null,
+  "requests": 2,
+  "spend_cents": 470,
+  "tokens": 36,
+  "window_start": 0
+}
