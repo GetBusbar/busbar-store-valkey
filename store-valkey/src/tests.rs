@@ -3805,152 +3805,17 @@ fn a_rediss_url_is_secured_through_the_hosts_connector() {
 }
 
 /// Host services offering the clock alone (the dispatcher's own timebase), refusing the rest: the
-/// host clock a wire's bound runs on.
+/// host clock a wire's bound runs on. Every other service answers as busbar's shared test double
+/// (`busbar_contract::services::double`) answers an unserved one: REFUSED, at once.
 struct ClockOnly;
 
-impl busbar_contract::services::HostServices for ClockOnly {
+impl busbar_contract::services::double::ServicesDouble for ClockOnly {
     fn now(&self) -> busbar_contract::services::Reading {
         busbar_contract::services::Reading {
             wall_ns: 0,
             mono_ns: busbar_plugin_loader::dispatch::now_ns(),
         }
     }
-    fn dest_judge(
-        &self,
-        _: &str,
-        _: u32,
-        _: bool,
-        _: Option<busbar_contract::services::Later>,
-    ) -> busbar_contract::services::Ran {
-        refused_now()
-    }
-    fn records_get(
-        &self,
-        _: &busbar_contract::services::Caller,
-        _: &str,
-        _: &[u8],
-        _: busbar_contract::services::Later,
-    ) -> busbar_contract::services::Ran {
-        refused_now()
-    }
-    fn records_list(
-        &self,
-        _: &busbar_contract::services::Caller,
-        _: busbar_contract::services::RecordsList,
-        _: busbar_contract::services::Later,
-    ) -> busbar_contract::services::Ran {
-        refused_now()
-    }
-    fn records_claim(
-        &self,
-        _: &busbar_contract::services::Caller,
-        _: &str,
-        _: &[u8],
-        _: u64,
-        _: busbar_contract::services::Later,
-    ) -> busbar_contract::services::Ran {
-        refused_now()
-    }
-    fn sign(
-        &self,
-        _: &busbar_contract::services::Caller,
-        _: &[u8],
-    ) -> busbar_contract::services::Stored {
-        busbar_contract::services::Stored::refused("no")
-    }
-    fn trust_sight(
-        &self,
-        _: &busbar_contract::services::Caller,
-        _: &str,
-        _: &str,
-        _: busbar_contract::services::Later,
-    ) -> busbar_contract::services::Ran {
-        refused_now()
-    }
-    fn trust_due(
-        &self,
-        _: &busbar_contract::services::Caller,
-    ) -> busbar_contract::services::Stored {
-        busbar_contract::services::Stored::refused("no")
-    }
-    fn trust_verify(
-        &self,
-        _: &busbar_contract::services::Caller,
-        _: &str,
-        _: &[u8],
-        _: &[u8],
-    ) -> busbar_contract::services::Stored {
-        busbar_contract::services::Stored::refused("no")
-    }
-    fn entitlement_check(
-        &self,
-        _: &busbar_contract::services::Caller,
-        _: Option<u64>,
-        _: &str,
-    ) -> busbar_contract::services::Stored {
-        busbar_contract::services::Stored::refused("no")
-    }
-    fn random_fill(&self, _: u64) -> busbar_contract::services::Stored {
-        busbar_contract::services::Stored::refused("no")
-    }
-    fn records_secret(
-        &self,
-        _: &str,
-        _: &str,
-        _: busbar_contract::services::Later,
-    ) -> busbar_contract::services::Ran {
-        refused_now()
-    }
-    fn unit_nest(
-        &self,
-        _: &busbar_contract::services::Caller,
-        _: Option<u64>,
-        _: busbar_contract::services::NestAsk,
-        _: busbar_contract::services::Later,
-    ) -> busbar_contract::services::Ran {
-        refused_now()
-    }
-    fn work_open(
-        &self,
-        _: &busbar_contract::services::Caller,
-        _: Option<u64>,
-        _: &str,
-        _: &[u8],
-        _: busbar_contract::services::Later,
-    ) -> busbar_contract::services::Ran {
-        refused_now()
-    }
-    fn work_find(
-        &self,
-        _: &busbar_contract::services::Caller,
-        _: Option<u64>,
-        _: &[u8],
-        _: busbar_contract::services::Later,
-    ) -> busbar_contract::services::Ran {
-        refused_now()
-    }
-    fn work_settle(
-        &self,
-        _: &busbar_contract::services::Caller,
-        _: u64,
-        _: &[u8],
-        _: busbar_contract::services::Later,
-    ) -> busbar_contract::services::Ran {
-        refused_now()
-    }
-    fn work_resume(
-        &self,
-        _: &busbar_contract::services::Caller,
-        _: Option<u64>,
-        _: u64,
-        _: busbar_contract::services::Later,
-    ) -> busbar_contract::services::Ran {
-        refused_now()
-    }
-}
-
-fn refused_now() -> busbar_contract::services::Ran {
-    busbar_contract::services::Ran::Now(busbar_contract::services::Stored::refused("no"))
 }
 
 /// VALKEY-TIMEOUT over the whole span 1.5.5's `get_connection_with_timeout` bounded: a server that
