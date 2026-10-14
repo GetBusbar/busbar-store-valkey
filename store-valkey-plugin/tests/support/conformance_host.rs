@@ -61,15 +61,14 @@ use busbar_contract::conn::{
     ConnError, ConnId, DeclaredConns, InstanceId, NeedId, OpenDesc, PieceKind, NO_TICKET,
 };
 use busbar_contract::transport::EgressTrust;
-use busbar_core_connector::carrier::{Carry, Side};
 use busbar_core_connector::framer::{Call, Crossed, DoorFacts, FramerDoor};
 use busbar_core_connector::registry::{Entry, Transports};
 use busbar_core_connector::test_support::{private_ca, ServerTls, StdServerSession, TestCa};
 use busbar_core_connector::{Connector, Judged, Verdict};
 use busbar_plugin_loader::dispatch::kinds::transport::{Transport, TransportFacts};
 use busbar_plugin_loader::dispatch::{
-    load_linked, Bind, ConnTable, DispatchConfig, Dispatcher, Frame, InFrame, InlineTicket,
-    LinkedRow, NoSink, OutFrame, Plugin,
+    load_linked, Bind, ConnTable, DispatchConfig, Dispatcher, Frame, InFrame, LinkedRow, NoSink,
+    OutFrame, Plugin,
 };
 
 /// Where [`far_end`] listens: loopback, a port of this repo's own.
@@ -163,7 +162,7 @@ fn pem_certs(pem: &str) -> Vec<Vec<u8>> {
     certs
 }
 
-/// The dispatcher the host's transport doors are adopted by, as the root's: its workers run inside
+/// The dispatcher the host's transport doors are adopted by. As the root's: its workers run inside
 /// the connector's I/O runtime, and a CARRIER door moves its bytes over the process's one host I/O
 /// (`io.*`, `busbar_core_connector::hostio::process`), the connector's.
 fn transport_dispatcher() -> &'static Dispatcher {
@@ -262,9 +261,9 @@ fn go<I: InFrame, O: OutFrame>(p: &Plugin<Transport>, s: u32, i: &mut I, o: &mut
 
 /// One side of a carried connection: an inline ticket of the transport dispatcher, the one every
 /// transport door is adopted by (its wakes route there), as the root's.
-struct InlineSide(InlineTicket);
+struct InlineSide(busbar_plugin_loader::dispatch::InlineTicket);
 
-impl Side for InlineSide {
+impl busbar_core_connector::carrier::Side for InlineSide {
     fn ticket(&self) -> busbar_contract::abi::mechanism::ticket::Ticket {
         self.0.ticket()
     }
@@ -299,16 +298,22 @@ impl FramerDoor for Opened {
         &self.facts
     }
 
-    fn side(&self) -> Option<Box<dyn Side>> {
+    fn side(&self) -> Option<Box<dyn busbar_core_connector::carrier::Side>> {
         if self.facts.role != busbar_contract::abi::transport::ROLE_CARRIER {
             return None;
         }
         transport_dispatcher()
             .inline_ticket()
-            .map(|t| Box::new(InlineSide(t)) as Box<dyn Side>)
+            .map(|t| Box::new(InlineSide(t)) as Box<dyn busbar_core_connector::carrier::Side>)
     }
 
-    fn carry(&self, side: &dyn Side, resume: bool, call: Carry<'_>) -> Crossed {
+    fn carry(
+        &self,
+        side: &dyn busbar_core_connector::carrier::Side,
+        resume: bool,
+        call: busbar_core_connector::carrier::Carry<'_>,
+    ) -> Crossed {
+        use busbar_core_connector::carrier::Carry;
         let (p, t) = (&self.plugin, side.ticket());
         match call {
             Carry::Listen(i, o) => go_inline(p, t, resume, slot::LISTEN, i, o),

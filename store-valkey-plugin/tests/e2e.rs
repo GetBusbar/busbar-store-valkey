@@ -917,10 +917,11 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
         }))
         .send()
         .expect("PUT /api/v1/admin/config/settings");
+    let settings_status = settings_resp.status();
+    let settings_body = settings_resp.text().unwrap_or_default();
     assert!(
-        settings_resp.status().is_success(),
-        "PUT /api/v1/admin/config/settings must succeed: {}",
-        settings_resp.status()
+        settings_status.is_success(),
+        "PUT /api/v1/admin/config/settings must succeed: {settings_status}: {settings_body}"
     );
 
     let _ = client
