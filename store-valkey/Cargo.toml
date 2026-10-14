@@ -35,6 +35,9 @@ url = { workspace = true }
 # runtime for the async `StoreCalls`. The upstream RESP client verifies what landed in Valkey
 # INDEPENDENTLY of the store (tests only; never in the shipped image).
 busbar-plugin-loader = { workspace = true, features = ["test-support"] }
+# The shared host-services test double (`busbar_contract::services::double`, dev-only feature):
+# the unit tests' clock-only host overrides the clock and answers every other service unserved.
+busbar-contract = { workspace = true, features = ["services-double"] }
 tokio = { workspace = true, features = ["rt"] }
 redis = { workspace = true }
 # The TLS proxy the TLS test puts in front of the live server (a self-signed CA), test-only.
