@@ -654,11 +654,21 @@ fn busbar_root() -> PathBuf {
 
 /// Build (once, cached by cargo) the real `busbar` binary and the real `busbar-plugin-pack` tool
 /// from that checkout — never a fixture, never a stub. The pack tool is a feature-gated bin of
-/// `busbar-plugin-loader` in busbar 1.6.0.
+/// `busbar-plugin-loader` in busbar 1.6.0. busbar is the `test-harness` build, the one that takes a
+/// test's first-party key ([`HARNESS_FIRST_PARTY_KEY_ENV`]); no release build reads it.
 fn build_real_binaries() -> (PathBuf, PathBuf) {
     let root = busbar_root();
     for args in [
-        &["build", "--release", "-p", "busbar", "--bin", "busbar"][..],
+        &[
+            "build",
+            "--release",
+            "-p",
+            "busbar",
+            "--features",
+            "test-harness",
+            "--bin",
+            "busbar",
+        ][..],
         &[
             "build",
             "--release",
@@ -695,6 +705,33 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
 /// A placeholder provider credential: busbar 1.6.0 refuses to boot on an unresolvable provider
 /// credential (BUSBAR-9007), and the mock provider is never dialled.
 const SECRET_PLACEHOLDER: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+
+/// THE FIRST-PARTY KEY THIS TEST SIGNS THE PLUGIN WITH (its ed25519 secret, 64 hex): the store's
+/// `tcp` need sits in the `operator-infrastructure` egress class, which the host grants to a
+/// FIRST-PARTY plugin only (`BUSBAR-1.6.0.md` §5), and no test holds the embedded release key's
+/// private half. So the pack tool signs with this key (`BUSBAR_SIGN_KEY`), and the child busbar, a
+/// `test-harness` build, takes its public half as its first-party key through the harness seam
+/// ([`HARNESS_FIRST_PARTY_KEY_ENV`], ARCHITECT ruling busbar #700), as busbar's own end-to-end
+/// battery admits a first-party plugin it signed.
+const HARNESS_SIGN_KEY: &str = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
+
+/// The variable a `test-harness` busbar reads its first-party key from (busbar's
+/// `root::boot::HARNESS_FIRST_PARTY_KEY_ENV`).
+const HARNESS_FIRST_PARTY_KEY_ENV: &str = "BUSBAR_TEST_HARNESS_FIRST_PARTY_KEY";
+
+/// The public half of [`HARNESS_SIGN_KEY`], 64 hex: what the child trusts as first-party.
+fn harness_public_key() -> String {
+    let mut secret = [0_u8; 32];
+    for (i, b) in secret.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&HARNESS_SIGN_KEY[2 * i..2 * i + 2], 16).expect("hex");
+    }
+    busbar_plugin_loader::sign::SigningKey::from_bytes(&secret)
+        .verifying_key()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
 
 /// A free-at-the-moment localhost port (bind-then-drop; a TOCTOU race is possible in principle
 /// but is the standard, accepted pattern for test port allocation and hasn't been a problem for
@@ -764,8 +801,8 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
     let plugins_dir = work.join("plugins");
     std::fs::create_dir_all(&plugins_dir).unwrap();
 
-    // Pack the real cdylib into a real signed-shape tarball, exactly as CI's own SIGNOFF step
-    // does — unsigned locally, same fallback CI's release jobs use without BUSBAR_SIGN_KEY.
+    // Pack the real cdylib into a real SIGNED tarball, exactly as CI's own SIGNOFF step does, under
+    // the test's first-party key ([`HARNESS_SIGN_KEY`]).
     let tarball = work.join("store-valkey.tar.gz");
     let status = Command::new(&pack_bin)
         .args([
@@ -790,8 +827,8 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
             "Apache-2.0",
             "--out",
             tarball.to_str().unwrap(),
-            "--allow-unsigned",
         ])
+        .env("BUSBAR_SIGN_KEY", HARNESS_SIGN_KEY)
         .status()
         .expect("run busbar-plugin-pack");
     assert!(status.success(), "packing the plugin must succeed");
@@ -863,6 +900,7 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
             .env("MOCK_KEY", SECRET_PLACEHOLDER)
             .env("BUSBAR_STATE_FILE", "")
             .env("BUSBAR_CONFIG_OVERLAY", &overlay)
+            .env(HARNESS_FIRST_PARTY_KEY_ENV, harness_public_key())
             .stdout(Stdio::from(log.try_clone().expect("clone log fd")))
             .stderr(Stdio::from(log));
         cmd.spawn().expect("spawn a real busbar boot")
