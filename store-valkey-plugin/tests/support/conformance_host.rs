@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 //
-// RENDERED by `busbar-release plugin sync busbar-store-valkey` from GetBusbar/busbar-release
+// RENDERED by `busbar-release plugin heal busbar-store-valkey` from GetBusbar/busbar-release
 // template/conformance-host/, because this repo's declares file states network needs (`needs`:
 // `tcp`); a hand edit is overwritten by the next sync.
 
@@ -225,7 +225,15 @@ impl Opened {
         let facts = DoorFacts {
             name: plugin.name().to_owned(),
             claims: stated.claims,
+            role: stated.role,
             composes_over: stated.composes_over,
+            status_rows: stated.status_rows,
+            duplex: stated
+                .upgrades
+                .iter()
+                .chain(&stated.sessions)
+                .copied()
+                .collect(),
         };
         Self { plugin, facts }
     }
