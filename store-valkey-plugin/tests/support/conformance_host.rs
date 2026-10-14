@@ -61,14 +61,15 @@ use busbar_contract::conn::{
     ConnError, ConnId, DeclaredConns, InstanceId, NeedId, OpenDesc, PieceKind, NO_TICKET,
 };
 use busbar_contract::transport::EgressTrust;
+use busbar_core_connector::carrier::{Carry, Side};
 use busbar_core_connector::framer::{Call, Crossed, DoorFacts, FramerDoor};
 use busbar_core_connector::registry::{Entry, Transports};
 use busbar_core_connector::test_support::{private_ca, ServerTls, StdServerSession, TestCa};
 use busbar_core_connector::{Connector, Judged, Verdict};
 use busbar_plugin_loader::dispatch::kinds::transport::{Transport, TransportFacts};
 use busbar_plugin_loader::dispatch::{
-    load_linked, Bind, ConnTable, DispatchConfig, Dispatcher, Frame, InFrame, LinkedRow, NoSink,
-    OutFrame, Plugin,
+    load_linked, Bind, ConnTable, DispatchConfig, Dispatcher, Frame, InFrame, InlineTicket,
+    LinkedRow, NoSink, OutFrame, Plugin,
 };
 
 /// Where [`far_end`] listens: loopback, a port of this repo's own.
@@ -162,10 +163,17 @@ fn pem_certs(pem: &str) -> Vec<Vec<u8>> {
     certs
 }
 
-/// The dispatcher the host's transport doors are adopted by.
+/// The dispatcher the host's transport doors are adopted by, as the root's: its workers run inside
+/// the connector's I/O runtime, and a CARRIER door moves its bytes over the process's one host I/O
+/// (`io.*`, `busbar_core_connector::hostio::process`), the connector's.
 fn transport_dispatcher() -> &'static Dispatcher {
     static ONE: OnceLock<Dispatcher> = OnceLock::new();
-    ONE.get_or_init(|| Dispatcher::new(DispatchConfig::default()))
+    ONE.get_or_init(|| {
+        let d = Dispatcher::new(DispatchConfig::default());
+        d.install_runtime(io_reactor());
+        d.install_io(busbar_core_connector::hostio::process());
+        d
+    })
 }
 
 /// The framer entries: each door loaded through the one loader and opened with no settings, as
@@ -227,6 +235,7 @@ impl Opened {
             claims: stated.claims,
             role: stated.role,
             composes_over: stated.composes_over,
+            ported: stated.ported,
             status_rows: stated.status_rows,
             duplex: stated
                 .upgrades
@@ -251,9 +260,68 @@ fn go<I: InFrame, O: OutFrame>(p: &Plugin<Transport>, s: u32, i: &mut I, o: &mut
     }
 }
 
+/// One side of a carried connection: an inline ticket of the transport dispatcher, the one every
+/// transport door is adopted by (its wakes route there), as the root's.
+struct InlineSide(InlineTicket);
+
+impl Side for InlineSide {
+    fn ticket(&self) -> busbar_contract::abi::mechanism::ticket::Ticket {
+        self.0.ticket()
+    }
+
+    fn register(&self, waker: &std::task::Waker) {
+        self.0.register(waker);
+    }
+}
+
+/// One INLINE crossing on `ticket` (a RESUME when `resume`): the host's `in`/`out` copied in, the
+/// answer copied back.
+fn go_inline<I: InFrame, O: OutFrame>(
+    p: &Plugin<Transport>,
+    ticket: busbar_contract::abi::mechanism::ticket::Ticket,
+    resume: bool,
+    s: u32,
+    i: &mut I,
+    o: &mut O,
+) -> Crossed {
+    let mut f = Frame::new(*i, *o);
+    let c = p.call_inline(ticket, resume, s, &mut f);
+    *i = f.input;
+    *o = f.out;
+    Crossed {
+        outcome: c.outcome,
+        error: c.error,
+    }
+}
+
 impl FramerDoor for Opened {
     fn facts(&self) -> &DoorFacts {
         &self.facts
+    }
+
+    fn side(&self) -> Option<Box<dyn Side>> {
+        if self.facts.role != busbar_contract::abi::transport::ROLE_CARRIER {
+            return None;
+        }
+        transport_dispatcher()
+            .inline_ticket()
+            .map(|t| Box::new(InlineSide(t)) as Box<dyn Side>)
+    }
+
+    fn carry(&self, side: &dyn Side, resume: bool, call: Carry<'_>) -> Crossed {
+        let (p, t) = (&self.plugin, side.ticket());
+        match call {
+            Carry::Listen(i, o) => go_inline(p, t, resume, slot::LISTEN, i, o),
+            Carry::Accept(i, o) => go_inline(p, t, resume, slot::ACCEPT, i, o),
+            Carry::Dial(i, o) => go_inline(p, t, resume, slot::DIAL, i, o),
+            Carry::Read(i, o) => go_inline(p, t, resume, slot::READ, i, o),
+            Carry::Write(i, o) => go_inline(p, t, resume, slot::WRITE, i, o),
+            Carry::Flush(i, o) => go_inline(p, t, resume, slot::FLUSH, i, o),
+            Carry::Shut(i, o) => go_inline(p, t, resume, slot::SHUT, i, o),
+            Carry::Arrival(i, o) => go_inline(p, t, resume, slot::ARRIVAL, i, o),
+            // `cancel` is made on no ticket: the ticket it cancels rides its `in`.
+            Carry::Cancel(i, o) => go(p, life::CANCEL, i, o),
+        }
     }
 
     fn cross(&self, call: Call<'_>) -> Crossed {
