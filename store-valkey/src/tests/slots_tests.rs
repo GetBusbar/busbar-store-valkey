@@ -328,7 +328,7 @@ fn audit_base() -> u64 {
 #[test]
 fn the_statement_tail_is_a_durable_store_that_refuses_forks() {
     const {
-        assert!(!Door::TAIL.ephemeral);
+        assert!(Door::TAIL.durable == busbar_contract::abi::sdk::store::DURABLE_CLAIMED);
         assert!(Door::TAIL.durable_plane);
         assert!(Door::TAIL.fork_refusal);
     }

@@ -62,13 +62,14 @@ use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::store::wire::drive_kept;
 use busbar_contract::abi::sdk::store::{
     Cap, CapsRefused, Cell, CellKey, Dimension, Grant, Op, OpRefused, OpResult, ReserveRefused,
-    Scanned, Step, StoreSlots, Tail,
+    Scanned, Step, StoreSlots, Tail, DURABLE_CLAIMED,
 };
 use busbar_contract::abi::store::{OpId, OP_ID_RETENTION_SECS};
 use busbar_contract::kinds::{Head, RecordBytes};
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, PlaneRecordRef,
-    PlaneSelector, RecordStoreError, RecordStoreResult, UsageDelta, UsageLedger, VirtualKey,
+    PlaneSelector, RecordStoreError, RecordStoreResult, Retention, UsageDelta, UsageLedger,
+    VirtualKey,
 };
 
 use crate::resp::{cmd, pipe, Conn, ErrorKind, RedisError, RedisResult};
@@ -797,7 +798,7 @@ fn usage_adds<'a>(
 
 impl StoreSlots for ValkeyStore {
     const TAIL: Tail = Tail {
-        ephemeral: false,
+        durable: DURABLE_CLAIMED,
         durable_plane: true,
         fork_refusal: true,
     };
@@ -1279,15 +1280,16 @@ impl StoreSlots for ValkeyStore {
             .await)
     }
 
-    fn purge_plane_records_before(
+    fn purge_plane_records(
         &self,
         cx: &mut Op<'_>,
         kind: &str,
         before: u64,
+        retention: Retention,
     ) -> Step<RecordStoreResult<u64>> {
         let kind = kind.to_string();
         op!(cx, self, Err, |me, c| me
-            .purge_plane_records_before(c, &kind, before)
+            .purge_plane_records(c, &kind, before, retention)
             .await)
     }
 

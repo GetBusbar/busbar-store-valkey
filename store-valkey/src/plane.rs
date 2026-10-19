@@ -42,7 +42,7 @@ use crate::{clamp, hex, ValkeyStore};
 use busbar_contract::abi::sdk::store::{OpRefused, OpResult};
 use busbar_contract::abi::store::OP_ID_RETENTION_SECS;
 use busbar_contract::records::{
-    PlaneDisposition, PlaneRecordRef, PlaneSelector, RecordStoreError, RecordStoreResult,
+    PlaneDisposition, PlaneRecordRef, PlaneSelector, RecordStoreError, RecordStoreResult, Retention,
 };
 
 /// The kind a purge of which CASCADES: a purged `task` takes its `task_event` chain with it, and only
@@ -479,20 +479,25 @@ pub(crate) async fn parents(
     Ok(out)
 }
 
-/// `purge_plane_records_before`: STRICTLY older than the cutoff, and the count actually performed.
-/// WHICH rows go is the kind's own contract, read off the typed disposition, never out of the body:
-/// `task` drops only TERMINAL rows (an interrupted task waiting on a human is exactly the row that
-/// legitimately sits still longest) and takes each purged task's `task_event` chain with it; every
-/// other kind drops every row older than `before`.
+/// `purge_plane_records`: STRICTLY older than the cutoff, and the count actually performed.
+/// WHICH rows go is the rule the host passes, read off the typed disposition, never out of the body:
+/// `TerminalOnly` (the `task` kind's) drops only TERMINAL rows (an interrupted task waiting on a
+/// human is exactly the row that legitimately sits still longest), and a purged `task` takes its
+/// `task_event` chain with it; `Age` drops every row older than `before`.
 pub(crate) async fn purge_before(
     store: &ValkeyStore,
     c: &mut Conn,
     kind: &str,
     before: u64,
+    retention: Retention,
 ) -> RecordStoreResult<u64> {
     let keys = Keys::of(kind);
     let cascade = (kind == CASCADING_KIND).then(|| Keys::of(CASCADED_KIND));
-    let terminal_only = if kind == CASCADING_KIND { "1" } else { "0" };
+    let terminal_only = if retention == Retention::TerminalOnly {
+        "1"
+    } else {
+        "0"
+    };
     let removed: i64 = with_conn_no_retry!(store, |c| {
         let mut inv = PURGE.key(&keys.rec);
         inv.key(&keys.body).key(&keys.byts).key(&keys.pcount);

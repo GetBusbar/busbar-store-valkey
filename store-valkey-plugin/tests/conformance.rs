@@ -528,7 +528,7 @@ fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
     ));
     t.push(format!(
         "purge:{}",
-        store.purge_plane_records_before(&kind, 25).unwrap()
+        store.purge_plane_records(&kind, 25).unwrap()
     ));
     t.push(format!(
         "after-purge:{:?}",
