@@ -102,8 +102,8 @@ use busbar_contract::abi::sdk::store::wire::{Pool, Wire};
 use busbar_contract::records::MeteringDelta;
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringRow, ModelTokens, PlaneRecordRef,
-    PlaneSelector, RecordStoreError, RecordStoreResult, UsageDelta, UsageLedger, VirtualKey,
-    RESERVED_UNITS,
+    PlaneSelector, RecordStoreError, RecordStoreResult, Retention, UsageDelta, UsageLedger,
+    VirtualKey, RESERVED_UNITS,
 };
 use resp::{cmd, pipe, Conn, ErrorKind, Pipeline, RedisError, RedisResult};
 use std::sync::Arc;
@@ -1939,13 +1939,14 @@ impl ValkeyStore {
         plane::parents(self, c, kind).await
     }
 
-    pub(crate) async fn purge_plane_records_before(
+    pub(crate) async fn purge_plane_records(
         &self,
         c: &mut Conn,
         kind: &str,
         before: u64,
+        retention: Retention,
     ) -> RecordStoreResult<u64> {
-        plane::purge_before(self, c, kind, before).await
+        plane::purge_before(self, c, kind, before, retention).await
     }
 
     pub(crate) async fn delete_plane_record(

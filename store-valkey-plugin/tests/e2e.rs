@@ -343,7 +343,7 @@ trait Vocab: RecordStore {
             .collect())
     }
     fn purge_tasks_before(&self, before: u64) -> RecordStoreResult<u64> {
-        self.purge_plane_records_before("task", before)
+        self.purge_plane_records("task", before)
     }
     fn append_task_event(&self, e: &TaskEventRow) -> RecordStoreResult<()> {
         self.append_plane_record(
@@ -391,7 +391,7 @@ trait Vocab: RecordStore {
         self.list_plane_record_parents("call")
     }
     fn purge_mcp_calls_before(&self, before: u64) -> RecordStoreResult<u64> {
-        self.purge_plane_records_before("call", before)
+        self.purge_plane_records("call", before)
     }
     fn put_mcp_demotion(&self, d: &DemotionRow) -> RecordStoreResult<()> {
         self.upsert_plane_record(

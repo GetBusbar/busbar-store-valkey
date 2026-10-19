@@ -1789,7 +1789,11 @@ trait Vocab: RecordStore {
             .collect())
     }
     fn purge_tasks_before(&self, before: u64) -> RecordStoreResult<u64> {
-        self.purge_plane_records_before("task", before)
+        self.purge_plane_records(
+            "task",
+            before,
+            busbar_contract::records::Retention::TerminalOnly,
+        )
     }
     fn append_task_event(&self, e: &TaskEventRow) -> RecordStoreResult<()> {
         self.append_plane_record(
@@ -1837,7 +1841,7 @@ trait Vocab: RecordStore {
         self.list_plane_record_parents("call")
     }
     fn purge_mcp_calls_before(&self, before: u64) -> RecordStoreResult<u64> {
-        self.purge_plane_records_before("call", before)
+        self.purge_plane_records("call", before, busbar_contract::records::Retention::Age)
     }
     fn put_mcp_demotion(&self, d: &DemotionRow) -> RecordStoreResult<()> {
         self.upsert_plane_record(
@@ -1870,7 +1874,7 @@ trait Vocab: RecordStore {
 
 impl Vocab for ValkeyStore {}
 
-/// Serialises EVERY test that purges a plane kind. `purge_plane_records_before(kind, before)` has no
+/// Serialises EVERY test that purges a plane kind. `purge_plane_records(kind, before)` has no
 /// namespace: against the SHARED live Valkey one test's sweep deletes another's rows whenever their
 /// timestamps sit under the same cutoff, so a per-test `uid()` isolates nothing here. The ported
 /// retention tests sweep up to ~1_000_001_000 and the conformance suite's own purge checks sweep
