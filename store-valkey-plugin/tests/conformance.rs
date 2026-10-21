@@ -58,7 +58,7 @@
 mod conformance_host;
 
 busbar_plugin_loader::conformance_suite! {
-    door: busbar_store_valkey::door,
+    door: busbar_store_valkey::MACRO_DOOR,
     cdylib: "busbar_store_valkey_plugin",
     inputs: include_str!("conformance.json"),
     host: host,
@@ -257,7 +257,8 @@ type Loaded = (Plugin<Store>, Arc<Dispatcher>);
 /// THE LINKED DOOR: the row a busbar build that compiles this store in registers.
 fn linked() -> Loaded {
     let d = dispatcher();
-    let row = LinkedRow::of(busbar_store_valkey::door).expect("the door states its Statement");
+    let row = LinkedRow::of_macro(busbar_store_valkey::MACRO_DOOR)
+        .expect("the door states its Statement");
     let p = load_linked::<Store>(&row, bind(&d)).expect("the linked door loads");
     (p, d)
 }
@@ -710,7 +711,7 @@ fn the_linked_and_the_dropped_in_valkey_store_are_one_store() {
     let stated = packed_rendering(&lib);
     assert_eq!(
         stated,
-        LinkedRow::of(busbar_store_valkey::door)
+        LinkedRow::of_macro(busbar_store_valkey::MACRO_DOOR)
             .expect("the linked row")
             .statement,
         "the dropped-in library states the linked door's Statement byte for byte"

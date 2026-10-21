@@ -657,31 +657,14 @@ pub const NEEDS: &[busbar_contract::abi::host::conn::connector::Need] = {
     use busbar_contract::abi::host::conn::connector::{
         Need, DIRECTION_OUTBOUND, EGRESS_OPERATOR_INFRASTRUCTURE, KEEP_NAMED,
     };
-    use busbar_contract::abi::mechanism::call::{AbiStr, Blob, BLOB_ABSENT};
-    const NONE: AbiStr = AbiStr {
-        ptr: std::ptr::null(),
-        len: 0,
-    };
-    &[Need {
-        direction: DIRECTION_OUTBOUND,
-        egress_class: EGRESS_OPERATOR_INFRASTRUCTURE,
-        transport: busbar_contract::abi::sdk::door::abi_str("tcp"),
-        auth: NONE,
-        target_from: NONE,
-        trust_from: NONE,
-        details: Blob {
-            ptr: std::ptr::null(),
-            len: 0,
-            fmt: BLOB_ABSENT,
-            flags: 0,
-        },
-        keep_response_headers: std::ptr::null(),
-        keep_response_headers_len: 0,
-        timeout_ms: DEFAULT_CONNECT_TIMEOUT.as_millis() as u64,
-        keep_mode: KEEP_NAMED,
-        _reserved: 0,
-        deny_response_headers: std::ptr::null(),
-        deny_response_headers_len: 0,
+    &[{
+        let mut n = Need::EMPTY;
+        n.direction = DIRECTION_OUTBOUND;
+        n.egress_class = EGRESS_OPERATOR_INFRASTRUCTURE;
+        n.transport = busbar_contract::abi::sdk::door::abi_str("tcp");
+        n.timeout_ms = DEFAULT_CONNECT_TIMEOUT.as_millis() as u64;
+        n.keep_mode = KEEP_NAMED;
+        n
     }]
 };
 
@@ -2041,7 +2024,7 @@ mod slots;
 
 /// THE STORE DOOR (store v3, `busbar_contract::abi::store`): every slot of the store v3 table over
 /// [`ValkeyStore`], through the contract's store SDK.
-pub use slots::door;
+pub use slots::{door, MACRO_DOOR};
 
 #[cfg(test)]
 mod tests;
