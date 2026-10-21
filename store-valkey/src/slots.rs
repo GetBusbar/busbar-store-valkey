@@ -745,8 +745,10 @@ impl ValkeyStore {
                 // hash at `left` 0 until `OP_ID_RETENTION_SECS` lapses it, so another release of
                 // it answers 0 rather than failing as a slice never granted. On a rolling window
                 // a partial release leaves the rest open.
-                let window_zero =
-                    cap.rsplit_once(':').and_then(|(_, w)| w.parse::<u64>().ok()) == Some(0);
+                let window_zero = cap
+                    .rsplit_once(':')
+                    .and_then(|(_, w)| w.parse::<u64>().ok())
+                    == Some(0);
                 if *left == 0 || window_zero {
                     pipe.hset(slice_key(*id), "left", "0")
                         .ignore()
