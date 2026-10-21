@@ -577,6 +577,23 @@ fn load_and_exercise_valkey_plugin_persists_to_real_valkey_across_reopen() {
         raw_key_row.contains(vk_id) && raw_key_row.contains("e2e-dlopen-key"),
         "the raw Valkey row must hold the written key's own id and name: {raw_key_row}"
     );
+    // The usage-ledger entry too, at the store's key format: `busbar:usage:{bucket}:{window_start}`,
+    // a hash with `requests`, `billable_requests` and one `m:{model}:{unit}` field per reserved unit.
+    let usage_key = format!("busbar:usage:{vk_id}:200");
+    let raw_requests: Option<i64> =
+        redis::Commands::hget(&mut raw, &usage_key, "requests").unwrap();
+    assert_eq!(
+        raw_requests,
+        Some(5),
+        "{usage_key} must be physically present in Valkey with the written request count"
+    );
+    let raw_input: Option<i64> =
+        redis::Commands::hget(&mut raw, &usage_key, "m:gpt-5:input").unwrap();
+    assert_eq!(
+        raw_input,
+        Some(20),
+        "the raw usage hash must hold the written model's input tokens"
+    );
 
     let _ = RecordStore::delete_key(&direct, vk_id);
 }
