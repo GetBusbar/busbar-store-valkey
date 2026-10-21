@@ -180,7 +180,7 @@ const AUDIT_ZSET: &str = "busbar:audit";
 // `busbar:mcp:demotions`, `busbar:askstate:*`) are copied in on connect by [`legacy`]; the v6 MCP
 // tool-call log (`busbar:mcp:*`) is left in place, unread (see `legacy`'s doc for why).
 mod legacy;
-pub mod plane;
+mod plane;
 
 /// The signed-token REVOCATION denylist (1.5.0). `busbar:denylist:<sub>` holds the operator reason
 /// (a plain string), and `busbar:denylist` is a SET indexing every denied sub so `list_denylist` is
@@ -631,7 +631,7 @@ fn parse_unix(url: &url::Url) -> RedisResult<Target> {
 /// CONNECTOR: one kept connection (dialled, secured, `AUTH`, `SELECT` once), every op on it in turn,
 /// as 1.5.5's one mutex-guarded connection; the store holds no socket and no TLS stack of its own.
 #[derive(Debug, Clone)]
-pub struct ValkeyStore {
+struct ValkeyStore {
     inner: Arc<Inner>,
 }
 
@@ -653,35 +653,18 @@ const KEPT_CONNECTIONS: usize = 1;
 /// The store's one outbound need: a `tcp` stream to the server the settings' URL names (the store
 /// names the target at each connect), governed as operator infrastructure (private, loopback and
 /// plaintext allowed). Its timeout bounds the dial (1.5.5's default connect timeout).
-pub const NEEDS: &[busbar_contract::abi::host::conn::connector::Need] = {
+const NEEDS: &[busbar_contract::abi::host::conn::connector::Need] = {
     use busbar_contract::abi::host::conn::connector::{
         Need, DIRECTION_OUTBOUND, EGRESS_OPERATOR_INFRASTRUCTURE, KEEP_NAMED,
     };
-    use busbar_contract::abi::mechanism::call::{AbiStr, Blob, BLOB_ABSENT};
-    const NONE: AbiStr = AbiStr {
-        ptr: std::ptr::null(),
-        len: 0,
-    };
-    &[Need {
-        direction: DIRECTION_OUTBOUND,
-        egress_class: EGRESS_OPERATOR_INFRASTRUCTURE,
-        transport: busbar_contract::abi::sdk::door::abi_str("tcp"),
-        auth: NONE,
-        target_from: NONE,
-        trust_from: NONE,
-        details: Blob {
-            ptr: std::ptr::null(),
-            len: 0,
-            fmt: BLOB_ABSENT,
-            flags: 0,
-        },
-        keep_response_headers: std::ptr::null(),
-        keep_response_headers_len: 0,
-        timeout_ms: DEFAULT_CONNECT_TIMEOUT.as_millis() as u64,
-        keep_mode: KEEP_NAMED,
-        _reserved: 0,
-        deny_response_headers: std::ptr::null(),
-        deny_response_headers_len: 0,
+    &[{
+        let mut n = Need::EMPTY;
+        n.direction = DIRECTION_OUTBOUND;
+        n.egress_class = EGRESS_OPERATOR_INFRASTRUCTURE;
+        n.transport = busbar_contract::abi::sdk::door::abi_str("tcp");
+        n.timeout_ms = DEFAULT_CONNECT_TIMEOUT.as_millis() as u64;
+        n.keep_mode = KEEP_NAMED;
+        n
     }]
 };
 
@@ -1994,11 +1977,11 @@ fn now() -> u64 {
 //
 // The store's door lives HERE, in the logic crate (`slots`: `store_door!` over this store's
 // `StoreSlots`): a busbar build that links this crate registers `door` as its compiled-in row
-// (`LinkedRow::of(door)`), and the sibling `busbar-store-valkey-plugin` cdylib exports the same
+// (`LinkedRow::of_loaded(LoadedDoor::from_raw(door))`), and the sibling `busbar-store-valkey-plugin` cdylib exports the same
 // `door` as the image's one symbol (`export_door!`). One source, both doors.
 
 /// The store's package name: the name its Statement states and its signed tarball carries.
-pub const NAME: &str = "busbar-store-valkey";
+const NAME: &str = "busbar-store-valkey";
 
 impl ValkeyStore {
     /// Construct a Valkey-protocol store from the settings JSON the host hands `validate` and

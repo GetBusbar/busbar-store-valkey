@@ -8,8 +8,8 @@
 //! budgets, usage, and audit across the cluster.
 //!
 //! All the store lives in the `busbar-store-valkey` crate, including its door
-//! (`busbar_store_valkey::door`, `store_door!`). This crate re-exports the logic crate and exports
-//! that door as the image's ONE symbol, `busbar_plugin_door` (`export_door!`, unconditionally),
+//! (`busbar_store_valkey::door`, `store_door!`). The logic crate's one public item is that door, and this
+//! crate exports it as the image's ONE symbol, `busbar_plugin_door` (`export_door!`, unconditionally),
 //! so the library carries exactly the code a busbar build that links the store runs
 //! — one source, both doors (DECISIONS #2 rule (1)).
 //!
@@ -17,8 +17,6 @@
 //! reviewed exemption (a `forbid` cannot be lifted for it). No other `unsafe` exists here.
 
 #![deny(unsafe_code)]
-
-pub use busbar_store_valkey::*;
 
 /// The exported door: the macro's `#[no_mangle]` symbol is the one exemption.
 #[allow(unsafe_code)]

@@ -13,9 +13,11 @@
 //!
 //!   1. `dlopen` the plugin, write a key + usage ledger through it over the memory ABI, then DROP it
 //!      (which runs the door's `close`, closing the plugin's own Valkey connection).
-//!   2. Independently connect to the SAME Valkey instance via the plain `busbar-store-valkey`
-//!      library crate — a code path that never touches the cdylib, the memory ABI, or the loader at
-//!      all — and confirm the data is genuinely present.
+//!   2. Connect to the SAME Valkey instance through the plain `busbar-store-valkey` library crate's
+//!      compiled-in door — a code path that never touches the cdylib, the memory ABI, or the loader,
+//!      but is the SAME code as the plugin under test — and confirm the data is genuinely present.
+//!   3. Read the key's row back with a RAW `redis::Client` GET, which is independent of all of
+//!      `busbar-store-valkey`'s code.
 //!
 //! If the plugin's `put_key`/`put_usage` over the ABI were silent no-ops (or wrote to some
 //! in-process cache rather than Valkey), step 2 would come back empty even though a same-session
@@ -98,14 +100,22 @@ fn host(instance: &str) -> (Arc<Dispatcher>, Bind) {
     (dispatcher, bind)
 }
 
-/// The store through its COMPILED-IN door (`busbar_store_valkey::door`, never the cdylib): the
-/// independent leg the dropped-in store's writes are read back and cleaned up through.
+/// This crate's own door, as the loader names a compiled-in one.
+#[allow(unused_unsafe)]
+fn loaded() -> busbar_plugin_loader::dispatch::LoadedDoor {
+    // SAFETY: `door` is this crate's own `store_door!` entry.
+    unsafe { busbar_plugin_loader::dispatch::LoadedDoor::from_raw(busbar_store_valkey::door) }
+}
+
+/// The store through its COMPILED-IN door (`busbar_store_valkey::door`, never the cdylib): the leg
+/// the dropped-in store's writes are read back and cleaned up through. It is the same code as the
+/// plugin under test, so it is not an independent check of it; a raw `redis::Client` is.
 struct ValkeyStore;
 
 impl ValkeyStore {
     fn connect(url: &str) -> Result<LoadedStore, String> {
         let (dispatcher, bind) = host("store-valkey-e2e-direct");
-        let row = busbar_plugin_loader::dispatch::LinkedRow::of(busbar_store_valkey::door)
+        let row = busbar_plugin_loader::dispatch::LinkedRow::of_loaded(loaded())
             .map_err(|e| e.to_string())?;
         let plugin = busbar_plugin_loader::dispatch::load_linked::<Store>(&row, bind)
             .map_err(|e| e.to_string())?;
@@ -456,15 +466,15 @@ fn ledger() -> UsageLedger {
 
 /// END-TO-END PERSISTENCE: dlopen the real valkey plugin against a REAL, live Valkey, write a key +
 /// usage through it over the memory ABI, drop the plugin (closing its connection: dropping the `LoadedStore`
-/// runs the door's `close`), then verify the data actually landed in Valkey two
-/// independent ways:
+/// runs the door's `close`), then verify the data actually landed in Valkey three ways:
 ///   1. re-dlopen the SAME cdylib against the SAME `VALKEY_URL` — a fresh door `open`/fresh
 ///      `LoadedStore` instance, proving the plugin itself doesn't just hold an in-memory cache
 ///      across calls.
-///   2. connect to the SAME Valkey with `busbar_store_valkey::ValkeyStore::connect` directly — a
-///      totally independent code path that never goes through the cdylib, the memory ABI, or the
-///      loader at all — proving the plugin actually wrote real Valkey keys, not just satisfying
-///      its own in-process round-trip.
+///   2. connect to the SAME Valkey with this file's `ValkeyStore::connect` (the compiled-in door) — a
+///      second instance that never goes through the cdylib, but is the same code as the plugin —
+///      proving the plugin actually wrote real Valkey keys, not just satisfying its own in-process
+///      round-trip.
+///   3. a RAW `redis::Client` GET of the key's row, independent of `busbar-store-valkey`'s code.
 ///
 /// This is the proof that `store: valkey` operations over the ABI aren't silently no-ops.
 #[test]
@@ -538,8 +548,9 @@ fn load_and_exercise_valkey_plugin_persists_to_real_valkey_across_reopen() {
     assert_eq!((m.tier("input"), m.tier("output")), (20, 8));
     drop(reopened);
 
-    // (2) Read back through a TOTALLY INDEPENDENT connection — the plain `ValkeyStore`, used
-    // directly, never touching the cdylib, the memory ABI, or `busbar-plugin-loader` at all. If the
+    // (2) Read back through the plain `ValkeyStore`, used directly (the compiled-in door), never
+    // touching the cdylib, the memory ABI, or `busbar-plugin-loader` at all. It is the same code as
+    // the plugin, so (3) below is the check independent of it. If the
     // plugin's `put_key`/`put_usage` over the ABI were silent no-ops (or wrote somewhere other
     // than the configured Valkey), this independent reader would come back empty even though the
     // reopen-via-plugin check above passed.
@@ -553,6 +564,35 @@ fn load_and_exercise_valkey_plugin_persists_to_real_valkey_across_reopen() {
     assert_eq!(
         direct_usage.requests, 5,
         "usage must be physically present in Valkey, not just cached in-process by the plugin"
+    );
+
+    // (3) A RAW `redis::Client` GET of the exact row: no store code, no plugin, no ABI.
+    let mut raw = redis::Client::open(url.as_str())
+        .and_then(|c| c.get_connection())
+        .expect("raw valkey connection for the independent read-back");
+    let raw_key_row: Option<String> =
+        redis::Commands::get(&mut raw, format!("busbar:key:{vk_id}")).unwrap();
+    let raw_key_row = raw_key_row.expect("busbar:key:<id> must be physically present in Valkey");
+    assert!(
+        raw_key_row.contains(vk_id) && raw_key_row.contains("e2e-dlopen-key"),
+        "the raw Valkey row must hold the written key's own id and name: {raw_key_row}"
+    );
+    // The usage-ledger entry too, at the store's key format: `busbar:usage:{bucket}:{window_start}`,
+    // a hash with `requests`, `billable_requests` and one `m:{model}:{unit}` field per reserved unit.
+    let usage_key = format!("busbar:usage:{vk_id}:200");
+    let raw_requests: Option<i64> =
+        redis::Commands::hget(&mut raw, &usage_key, "requests").unwrap();
+    assert_eq!(
+        raw_requests,
+        Some(5),
+        "{usage_key} must be physically present in Valkey with the written request count"
+    );
+    let raw_input: Option<i64> =
+        redis::Commands::hget(&mut raw, &usage_key, "m:gpt-5:input").unwrap();
+    assert_eq!(
+        raw_input,
+        Some(20),
+        "the raw usage hash must hold the written model's input tokens"
     );
 
     let _ = RecordStore::delete_key(&direct, vk_id);
@@ -1060,9 +1100,10 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
     drop(guard2);
     drop(guard);
 
-    // INDEPENDENT VERIFICATION #1: the typed Store trait, via the plain busbar-store-valkey crate
-    // — a code path that never touches the plugin cdylib, the memory ABI, the loader, or the admin
-    // HTTP surface at all.
+    // VERIFICATION #1: the typed Store trait, via the plain busbar-store-valkey crate (the
+    // compiled-in door) — a code path that never touches the plugin cdylib, the memory ABI, the
+    // loader, or the admin HTTP surface, but is the same code as the plugin; #2 is the check
+    // independent of it.
     let vk = RecordStore::get_key(&direct, &key_id)
         .expect("get_key via the direct connection")
         .expect("the virtual key minted through the real admin API must be physically in Valkey");

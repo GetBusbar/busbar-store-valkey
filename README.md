@@ -77,7 +77,7 @@ It is a `cdylib` that implements busbar's store v3 table (`RecordStore` plus the
 `busbar_contract::abi::sdk::store`) and is loaded in-process by busbar over the memory ABI —
 `dlopen`'d, not spawned as a separate process. The logic crate states the store's one door
 (`store_door!`, `busbar_store_valkey::door`); the cdylib exports it (`export_door!`), and a busbar
-build can LINK the same door (`LinkedRow::of(door)`). Both doors run the same code, and
+build can LINK the same door (`LinkedRow::of_loaded(LoadedDoor::from_raw(door))`). Both doors run the same code, and
 [`tests/conformance.rs`](store-valkey-plugin/tests/conformance.rs) proves they behave as one store.
 
 The store v3 additions are durable in Valkey: every `op_id` write is deduped by a record

@@ -58,7 +58,7 @@ fn mint() -> OpId {
 /// The store's door opened on `settings`, as the host opens it.
 pub(crate) fn open_with(settings: &str) -> Result<LoadedStore, String> {
     let (d, conns) = host();
-    let row = LinkedRow::of(crate::door).map_err(|e| e.to_string())?;
+    let row = LinkedRow::of_macro(crate::slots::MACRO_DOOR).map_err(|e| e.to_string())?;
     let p = load_linked::<Store>(
         &row,
         Bind {
@@ -3084,6 +3084,27 @@ fn a_key_round_trips_its_attribution_and_every_scope_kind() {
     assert_eq!(back.minted_by.as_deref(), Some("vk_admin"));
 }
 
+/// THE MINTING PROVIDER (Q128 u31, busbar `VirtualKey::idp_provider`): kernel-only provenance that
+/// rides the key's JSON with the row. It survives a write and a read, and the GREEN twin, a key
+/// minted without one, reads `None`.
+#[test]
+fn a_key_round_trips_its_minting_provider() {
+    let Some(store) = live_store() else { return };
+    let id = uid("vk_prov");
+    let key = VirtualKey {
+        idp_provider: Some("okta-prod".into()),
+        ..vk(&id)
+    };
+    store.put_key(&key).unwrap();
+    assert_eq!(
+        store.get_key(&id).unwrap().unwrap().idp_provider.as_deref(),
+        Some("okta-prod")
+    );
+    let plain = uid("vk_noprov");
+    store.put_key(&vk(&plain)).unwrap();
+    assert_eq!(store.get_key(&plain).unwrap().unwrap().idp_provider, None);
+}
+
 // ── THE v6 -> v7 UPGRADE, IN PLACE ────────────────────────────────────────────────────────────
 
 /// A v6 namespace's typed task / task-event / demotion / spent-approval keys, written the way v6
@@ -3436,7 +3457,7 @@ fn open_on_dispatcher(
 ) -> (Result<LoadedStore, String>, Arc<TcpConns>) {
     let t = Arc::new(table(&d));
     let conns: Arc<dyn busbar_contract::conn::DeclaredConns> = t.clone();
-    let row = LinkedRow::of(crate::door).expect("the door");
+    let row = LinkedRow::of_macro(crate::slots::MACRO_DOOR).expect("the door");
     let p = load_linked::<Store>(
         &row,
         Bind {
