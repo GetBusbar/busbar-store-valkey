@@ -12,7 +12,8 @@
 //! - `busbar:cap:<slot>`                HASH `cap`, `gen` (the `config_gen`), `used` (drawn), each a
 //!   decimal `u64`. `<slot>` is `<hex bucket>:<pool>:<dimension>:<hex class>:<window_start>`, the
 //!   pool `-` for every pool or `p<hex pool>`: hex has no `:`, so two slots never share a key.
-//! - `busbar:slice:<id>`                HASH `cap` (its slot's key), `left` (what it still holds).
+//! - `busbar:slice:<id>`                HASH `cap` (its slot's key), `left` (what it still holds);
+//!   a CLOSED slice keeps `left` 0 and lapses after `OP_ID_RETENTION_SECS`.
 //! - `busbar:slices`                    STRING, the last slice id handed out (`INCRBY`; never reused).
 //! - `busbar:journal:<hex stream>`      LIST of records, oldest first: a record's `seq` is its
 //!   position from 1, so the stream's head is its length. `busbar:journal:streams` SET names them.
@@ -737,9 +738,20 @@ impl ValkeyStore {
                 *by_cap.entry(cap.clone()).or_default() += back;
                 back_all.push(back);
             }
-            for (id, (_, left)) in &held {
-                if *left == 0 {
-                    pipe.del(slice_key(*id)).ignore();
+            for (id, (cap, left)) in &held {
+                // A slice closes when nothing is left, and a RELEASE ON WINDOW 0 IS FINAL
+                // (`abi::store::money` slice life (e)): window 0 never rolls, so its slice closes
+                // now and the spent rest stays counted against the cap. A closed slice keeps its
+                // hash at `left` 0 until `OP_ID_RETENTION_SECS` lapses it, so another release of
+                // it answers 0 rather than failing as a slice never granted. On a rolling window
+                // a partial release leaves the rest open.
+                let window_zero =
+                    cap.rsplit_once(':').and_then(|(_, w)| w.parse::<u64>().ok()) == Some(0);
+                if *left == 0 || window_zero {
+                    pipe.hset(slice_key(*id), "left", "0")
+                        .ignore()
+                        .expire(slice_key(*id), OP_ID_RETENTION_SECS as i64)
+                        .ignore();
                 } else {
                     pipe.hset(slice_key(*id), "left", left.to_string()).ignore();
                 }
