@@ -542,10 +542,16 @@ fn reserve_needs_a_cap_grants_whole_cells_and_refuses_past_the_cap() {
     );
     assert_eq!(
         release(&s, op(8), &[(g[1].slice_id, 1)]),
+        Ok(vec![0]),
+        "a closed slice answers 0"
+    );
+    assert_eq!(
+        release(&s, op(12), &[(u64::MAX, 1)]),
         Err(OpRefused::Failed(format!(
             "slice_release: slice {} is not held",
-            g[1].slice_id
-        )))
+            u64::MAX
+        ))),
+        "a slice never granted fails the release"
     );
     reserve(&s, op(9), EPOCH, &[cell(3)]).expect("the released 3 can be drawn again");
     assert_eq!(
@@ -553,6 +559,61 @@ fn reserve_needs_a_cap_grants_whole_cells_and_refuses_past_the_cap() {
         Err(ReserveRefused::Exhausted { cell: 0 }),
         "the replayed release freed nothing twice"
     );
+}
+
+/// A RELEASE ON WINDOW 0 IS FINAL (`abi::store::money` slice life (e)): the release takes back
+/// the unspent it names, the slice closes (another release answers 0), and the spent rest stays
+/// counted against the cap. A rolling window keeps the partial-release rule.
+#[test]
+fn a_release_on_window_zero_is_final() {
+    let Some(s) = live_store() else { return };
+    let bucket = fresh("window-0");
+    let zero = CellKey {
+        bucket: &bucket,
+        pool: None,
+        dimension: Dimension::NanoUnits,
+        window_start: 0,
+    };
+    s.window_caps(
+        op(30),
+        &[Cap {
+            key: zero,
+            cap: 10,
+            config_gen: 1,
+        }],
+    )
+    .expect("cap");
+    let draw = |amount| [Cell { key: zero, amount }];
+    let g = reserve(&s, op(31), EPOCH, &draw(6)).expect("6 of 10");
+    let id = g[0].slice_id;
+    assert_eq!(release(&s, op(32), &[(id, 2)]), Ok(vec![2]));
+    assert_eq!(
+        release(&s, op(33), &[(id, 4)]),
+        Ok(vec![0]),
+        "a window-0 slice stayed open after its release"
+    );
+    reserve(&s, op(34), EPOCH, &draw(6)).expect("the returned 2 are drawable");
+    assert_eq!(
+        reserve(&s, op(35), EPOCH, &draw(1)),
+        Err(ReserveRefused::Exhausted { cell: 0 }),
+        "the spent 4 stay counted"
+    );
+
+    // The control: on a rolling window a partial release leaves the rest open.
+    let rolling = fresh("rolling");
+    let k = key(&rolling, 60);
+    s.window_caps(
+        op(36),
+        &[Cap {
+            key: k,
+            cap: 10,
+            config_gen: 1,
+        }],
+    )
+    .expect("cap");
+    let g = reserve(&s, op(37), EPOCH, &[Cell { key: k, amount: 6 }]).expect("draw");
+    assert_eq!(release(&s, op(38), &[(g[0].slice_id, 2)]), Ok(vec![2]));
+    assert_eq!(release(&s, op(39), &[(g[0].slice_id, 4)]), Ok(vec![4]));
 }
 
 /// A draw is all or nothing: a refused cell leaves every earlier cell undrawn.
@@ -728,6 +789,58 @@ fn sessions_upsert_list_by_principal_and_remove() {
         vec![(base + 2, "node-b".to_string())]
     );
     s.session_remove(base + 2).expect("remove");
+}
+
+/// AN EMPTY PUT REMOVES THE ROW (slot 40's rule, ARCHITECT 2026-10-21): the host writes every
+/// strike as an empty `record_put` and reads empty as absent, so the key LEAVES both the ordered key
+/// set and the values hash: `record_get` answers `None`, `record_scan` never returns it, and both
+/// shrink. Removing a row that is not there is `Ok`.
+#[test]
+fn an_empty_put_removes_the_row() {
+    let Some(s) = live_store() else { return };
+    let schema = fresh("schema");
+    let p = format!("busbar:records:{}", crate::hex(schema.as_bytes()));
+    let held = || -> (u64, u64) {
+        s.with_conn(|c| {
+            let keys: u64 = redis::cmd("ZCARD").arg(format!("{p}:k")).query(c)?;
+            let values: u64 = redis::cmd("HLEN").arg(format!("{p}:v")).query(c)?;
+            Ok((keys, values))
+        })
+        .expect("count")
+    };
+    s.record_put(&schema, b"a/1", b"one").expect("put");
+    s.record_put(&schema, b"a/2", b"two").expect("put");
+    assert_eq!(held(), (2, 2));
+
+    s.record_put(&schema, b"a/1", b"").expect("strike");
+    assert_eq!(
+        held(),
+        (1, 1),
+        "the struck row left the key set and the values"
+    );
+    assert_eq!(s.record_get(&schema, b"a/1").expect("get"), None);
+    let scan: Vec<(Vec<u8>, Vec<u8>)> = s
+        .record_scan(&schema, b"a/", 10)
+        .expect("scan")
+        .into_iter()
+        .map(|(k, v)| (k, v.as_slice().to_vec()))
+        .collect();
+    assert_eq!(
+        scan,
+        vec![(b"a/2".to_vec(), b"two".to_vec())],
+        "a scan never returns a struck row"
+    );
+
+    s.record_put(&schema, b"a/9", b"")
+        .expect("a strike of nothing is Ok");
+    assert_eq!(held(), (1, 1));
+    s.record_put(&schema, b"a/1", b"again").expect("put again");
+    assert_eq!(
+        s.record_get(&schema, b"a/1")
+            .expect("get")
+            .map(|r| r.as_slice().to_vec()),
+        Some(b"again".to_vec())
+    );
 }
 
 #[test]
