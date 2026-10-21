@@ -3084,6 +3084,27 @@ fn a_key_round_trips_its_attribution_and_every_scope_kind() {
     assert_eq!(back.minted_by.as_deref(), Some("vk_admin"));
 }
 
+/// THE MINTING PROVIDER (Q128 u31, busbar `VirtualKey::idp_provider`): kernel-only provenance that
+/// rides the key's JSON with the row. It survives a write and a read, and the GREEN twin, a key
+/// minted without one, reads `None`.
+#[test]
+fn a_key_round_trips_its_minting_provider() {
+    let Some(store) = live_store() else { return };
+    let id = uid("vk_prov");
+    let key = VirtualKey {
+        idp_provider: Some("okta-prod".into()),
+        ..vk(&id)
+    };
+    store.put_key(&key).unwrap();
+    assert_eq!(
+        store.get_key(&id).unwrap().unwrap().idp_provider.as_deref(),
+        Some("okta-prod")
+    );
+    let plain = uid("vk_noprov");
+    store.put_key(&vk(&plain)).unwrap();
+    assert_eq!(store.get_key(&plain).unwrap().unwrap().idp_provider, None);
+}
+
 // ── THE v6 -> v7 UPGRADE, IN PLACE ────────────────────────────────────────────────────────────
 
 /// A v6 namespace's typed task / task-event / demotion / spent-approval keys, written the way v6
