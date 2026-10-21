@@ -98,6 +98,13 @@ fn host(instance: &str) -> (Arc<Dispatcher>, Bind) {
     (dispatcher, bind)
 }
 
+/// This crate's own door, as the loader names a compiled-in one.
+#[allow(unused_unsafe)]
+fn loaded() -> busbar_plugin_loader::dispatch::LoadedDoor {
+    // SAFETY: `door` is this crate's own `store_door!` entry.
+    unsafe { busbar_plugin_loader::dispatch::LoadedDoor::from_raw(busbar_store_valkey::door) }
+}
+
 /// The store through its COMPILED-IN door (`busbar_store_valkey::door`, never the cdylib): the
 /// independent leg the dropped-in store's writes are read back and cleaned up through.
 struct ValkeyStore;
@@ -105,9 +112,8 @@ struct ValkeyStore;
 impl ValkeyStore {
     fn connect(url: &str) -> Result<LoadedStore, String> {
         let (dispatcher, bind) = host("store-valkey-e2e-direct");
-        let row =
-            busbar_plugin_loader::dispatch::LinkedRow::of_macro(busbar_store_valkey::MACRO_DOOR)
-                .map_err(|e| e.to_string())?;
+        let row = busbar_plugin_loader::dispatch::LinkedRow::of_loaded(loaded())
+            .map_err(|e| e.to_string())?;
         let plugin = busbar_plugin_loader::dispatch::load_linked::<Store>(&row, bind)
             .map_err(|e| e.to_string())?;
         let cfg = format!("{{\"url\":{}}}", serde_json::Value::String(url.to_string()));
@@ -462,9 +468,8 @@ fn ledger() -> UsageLedger {
 ///   1. re-dlopen the SAME cdylib against the SAME `VALKEY_URL` — a fresh door `open`/fresh
 ///      `LoadedStore` instance, proving the plugin itself doesn't just hold an in-memory cache
 ///      across calls.
-///   2. connect to the SAME Valkey with `busbar_store_valkey::ValkeyStore::connect` directly — a
-///      totally independent code path that never goes through the cdylib, the memory ABI, or the
-///      loader at all — proving the plugin actually wrote real Valkey keys, not just satisfying
+///   2. connect to the SAME Valkey with this file's `ValkeyStore::connect` (the compiled-in door) — a
+///      second instance that never goes through the cdylib — proving the plugin actually wrote real Valkey keys, not just satisfying
 ///      its own in-process round-trip.
 ///
 /// This is the proof that `store: valkey` operations over the ABI aren't silently no-ops.

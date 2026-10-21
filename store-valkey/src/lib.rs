@@ -180,7 +180,7 @@ const AUDIT_ZSET: &str = "busbar:audit";
 // `busbar:mcp:demotions`, `busbar:askstate:*`) are copied in on connect by [`legacy`]; the v6 MCP
 // tool-call log (`busbar:mcp:*`) is left in place, unread (see `legacy`'s doc for why).
 mod legacy;
-pub mod plane;
+mod plane;
 
 /// The signed-token REVOCATION denylist (1.5.0). `busbar:denylist:<sub>` holds the operator reason
 /// (a plain string), and `busbar:denylist` is a SET indexing every denied sub so `list_denylist` is
@@ -631,7 +631,7 @@ fn parse_unix(url: &url::Url) -> RedisResult<Target> {
 /// CONNECTOR: one kept connection (dialled, secured, `AUTH`, `SELECT` once), every op on it in turn,
 /// as 1.5.5's one mutex-guarded connection; the store holds no socket and no TLS stack of its own.
 #[derive(Debug, Clone)]
-pub struct ValkeyStore {
+struct ValkeyStore {
     inner: Arc<Inner>,
 }
 
@@ -653,7 +653,7 @@ const KEPT_CONNECTIONS: usize = 1;
 /// The store's one outbound need: a `tcp` stream to the server the settings' URL names (the store
 /// names the target at each connect), governed as operator infrastructure (private, loopback and
 /// plaintext allowed). Its timeout bounds the dial (1.5.5's default connect timeout).
-pub const NEEDS: &[busbar_contract::abi::host::conn::connector::Need] = {
+const NEEDS: &[busbar_contract::abi::host::conn::connector::Need] = {
     use busbar_contract::abi::host::conn::connector::{
         Need, DIRECTION_OUTBOUND, EGRESS_OPERATOR_INFRASTRUCTURE, KEEP_NAMED,
     };
@@ -1981,7 +1981,7 @@ fn now() -> u64 {
 // `door` as the image's one symbol (`export_door!`). One source, both doors.
 
 /// The store's package name: the name its Statement states and its signed tarball carries.
-pub const NAME: &str = "busbar-store-valkey";
+const NAME: &str = "busbar-store-valkey";
 
 impl ValkeyStore {
     /// Construct a Valkey-protocol store from the settings JSON the host hands `validate` and
@@ -2024,7 +2024,7 @@ mod slots;
 
 /// THE STORE DOOR (store v3, `busbar_contract::abi::store`): every slot of the store v3 table over
 /// [`ValkeyStore`], through the contract's store SDK.
-pub use slots::{door, MACRO_DOOR};
+pub use slots::door;
 
 #[cfg(test)]
 mod tests;

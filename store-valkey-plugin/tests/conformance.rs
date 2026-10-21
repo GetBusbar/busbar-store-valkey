@@ -58,7 +58,7 @@
 mod conformance_host;
 
 busbar_plugin_loader::conformance_suite! {
-    door: busbar_store_valkey::MACRO_DOOR,
+    loaded: loaded(),
     cdylib: "busbar_store_valkey_plugin",
     inputs: include_str!("conformance.json"),
     host: host,
@@ -177,9 +177,16 @@ use busbar_plugin_loader::dispatch::kinds::secret::Secret;
 use busbar_plugin_loader::dispatch::kinds::store::Store;
 use busbar_plugin_loader::dispatch::{
     load_dropped, load_linked, rendering_of_library, Bind, ConnTable, DispatchConfig, Dispatcher,
-    LinkedRow, NoSink, Plugin,
+    LinkedRow, LoadedDoor, NoSink, Plugin,
 };
 use busbar_plugin_loader::store_v3::LoadedStore;
+
+/// This crate's own door, as the loader names a compiled-in one.
+#[allow(unused_unsafe)]
+fn loaded() -> LoadedDoor {
+    // SAFETY: `door` is this crate's own `store_door!` entry.
+    unsafe { LoadedDoor::from_raw(busbar_store_valkey::door) }
+}
 
 /// The live server, per this repo's gate.
 fn valkey_url() -> Option<String> {
@@ -257,8 +264,7 @@ type Loaded = (Plugin<Store>, Arc<Dispatcher>);
 /// THE LINKED DOOR: the row a busbar build that compiles this store in registers.
 fn linked() -> Loaded {
     let d = dispatcher();
-    let row = LinkedRow::of_macro(busbar_store_valkey::MACRO_DOOR)
-        .expect("the door states its Statement");
+    let row = LinkedRow::of_loaded(loaded()).expect("the door states its Statement");
     let p = load_linked::<Store>(&row, bind(&d)).expect("the linked door loads");
     (p, d)
 }
@@ -711,7 +717,7 @@ fn the_linked_and_the_dropped_in_valkey_store_are_one_store() {
     let stated = packed_rendering(&lib);
     assert_eq!(
         stated,
-        LinkedRow::of_macro(busbar_store_valkey::MACRO_DOOR)
+        LinkedRow::of_loaded(loaded())
             .expect("the linked row")
             .statement,
         "the dropped-in library states the linked door's Statement byte for byte"
@@ -729,7 +735,7 @@ fn the_linked_and_the_dropped_in_valkey_store_are_one_store() {
         |_, _| {},
     );
     same(&linked, &dropped_in);
-    assert_eq!(linked[0], format!("name = {}", busbar_store_valkey::NAME));
+    assert_eq!(linked[0], "name = busbar-store-valkey");
 
     // The transcript is about the store, not about nothing: the refusals are the store's own words,
     // and (live) the scenario did what a governance store is for.
@@ -883,4 +889,14 @@ fn a_statement_one_byte_off_is_refused() {
         Err(e) => e.to_string(),
     };
     assert!(e.contains("repack the plugin"), "{e}");
+}
+
+#[test]
+fn the_statement_carries_the_declares_document() {
+    let row = LinkedRow::of_loaded(loaded()).expect("the door states itself");
+    let read = busbar_contract::abi::mechanism::rendering::read(&row.statement).unwrap();
+    assert_eq!(
+        busbar_contract::abi::mechanism::extensions::declares(&read.extensions.bytes),
+        Some(&include_bytes!("../../store-valkey/declares.json")[..]),
+    );
 }

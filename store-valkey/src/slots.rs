@@ -77,7 +77,22 @@ use crate::{
     AUDIT_ZSET, NAME, NEEDS,
 };
 
-busbar_contract::store_door!(ValkeyStore, NAME, env!("CARGO_PKG_VERSION"), 64, needs: NEEDS);
+busbar_contract::statement_extensions!(
+    /// The Statement's extensions: this plugin's whole `declares` document (BUSBAR-1.6.0.md l.246).
+    EXTENSIONS: [(
+        busbar_contract::abi::mechanism::extensions::EXT_DECLARES,
+        include_bytes!("../declares.json"),
+    )]
+);
+
+busbar_contract::store_door!(
+    ValkeyStore,
+    NAME,
+    env!("CARGO_PKG_VERSION"),
+    64,
+    needs: NEEDS,
+    extensions: EXTENSIONS
+);
 
 const SLICE_SEQ: &str = "busbar:slices";
 const JOURNAL_STREAMS: &str = "busbar:journal:streams";
