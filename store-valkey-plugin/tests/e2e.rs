@@ -105,8 +105,9 @@ struct ValkeyStore;
 impl ValkeyStore {
     fn connect(url: &str) -> Result<LoadedStore, String> {
         let (dispatcher, bind) = host("store-valkey-e2e-direct");
-        let row = busbar_plugin_loader::dispatch::LinkedRow::of(busbar_store_valkey::door)
-            .map_err(|e| e.to_string())?;
+        let row =
+            busbar_plugin_loader::dispatch::LinkedRow::of_macro(busbar_store_valkey::MACRO_DOOR)
+                .map_err(|e| e.to_string())?;
         let plugin = busbar_plugin_loader::dispatch::load_linked::<Store>(&row, bind)
             .map_err(|e| e.to_string())?;
         let cfg = format!("{{\"url\":{}}}", serde_json::Value::String(url.to_string()));

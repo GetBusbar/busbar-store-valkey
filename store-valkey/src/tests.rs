@@ -58,7 +58,7 @@ fn mint() -> OpId {
 /// The store's door opened on `settings`, as the host opens it.
 pub(crate) fn open_with(settings: &str) -> Result<LoadedStore, String> {
     let (d, conns) = host();
-    let row = LinkedRow::of(crate::door).map_err(|e| e.to_string())?;
+    let row = LinkedRow::of_macro(crate::MACRO_DOOR).map_err(|e| e.to_string())?;
     let p = load_linked::<Store>(
         &row,
         Bind {
@@ -3436,7 +3436,7 @@ fn open_on_dispatcher(
 ) -> (Result<LoadedStore, String>, Arc<TcpConns>) {
     let t = Arc::new(table(&d));
     let conns: Arc<dyn busbar_contract::conn::DeclaredConns> = t.clone();
-    let row = LinkedRow::of(crate::door).expect("the door");
+    let row = LinkedRow::of_macro(crate::MACRO_DOOR).expect("the door");
     let p = load_linked::<Store>(
         &row,
         Bind {
