@@ -813,7 +813,11 @@ fn an_empty_put_removes_the_row() {
     assert_eq!(held(), (2, 2));
 
     s.record_put(&schema, b"a/1", b"").expect("strike");
-    assert_eq!(held(), (1, 1), "the struck row left the key set and the values");
+    assert_eq!(
+        held(),
+        (1, 1),
+        "the struck row left the key set and the values"
+    );
     assert_eq!(s.record_get(&schema, b"a/1").expect("get"), None);
     let scan: Vec<(Vec<u8>, Vec<u8>)> = s
         .record_scan(&schema, b"a/", 10)
@@ -827,7 +831,8 @@ fn an_empty_put_removes_the_row() {
         "a scan never returns a struck row"
     );
 
-    s.record_put(&schema, b"a/9", b"").expect("a strike of nothing is Ok");
+    s.record_put(&schema, b"a/9", b"")
+        .expect("a strike of nothing is Ok");
     assert_eq!(held(), (1, 1));
     s.record_put(&schema, b"a/1", b"again").expect("put again");
     assert_eq!(
