@@ -3084,6 +3084,20 @@ fn a_key_round_trips_its_attribution_and_every_scope_kind() {
     assert_eq!(back.minted_by.as_deref(), Some("vk_admin"));
 }
 
+/// `idp_provider` is persisted with the row and read back.
+#[test]
+fn a_key_round_trips_its_idp_provider() {
+    let Some(store) = live_store() else { return };
+    let id = uid("vk_idp");
+    let key = VirtualKey {
+        idp_provider: Some("github".into()),
+        ..vk(&id)
+    };
+    store.put_key(&key).unwrap();
+    let back = store.get_key(&id).unwrap().unwrap();
+    assert_eq!(back.idp_provider.as_deref(), Some("github"));
+}
+
 // ── THE v6 -> v7 UPGRADE, IN PLACE ────────────────────────────────────────────────────────────
 
 /// A v6 namespace's typed task / task-event / demotion / spent-approval keys, written the way v6
