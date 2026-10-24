@@ -555,6 +555,62 @@ fn reserve_needs_a_cap_grants_whole_cells_and_refuses_past_the_cap() {
     );
 }
 
+/// RED before slice life (e): a release on window 0 is final. The holder of a 6-unit window-0 slice
+/// spent 4 and hands back 2; the slice closes, so a second release returns 0, the 4 spent stay
+/// counted (6 more fill the cap of 10) and nothing past the cap is granted. A slice on a rolling
+/// window keeps the partial-release rule.
+#[test]
+fn a_release_on_window_0_is_final() {
+    let Some(s) = live_store() else { return };
+    let bucket = fresh("w0-final");
+    let zero = key(&bucket, 0);
+    s.window_caps(
+        op(60),
+        &[Cap {
+            key: zero,
+            cap: 10,
+            config_gen: 1,
+        }],
+    )
+    .expect("the window-0 cap");
+    let draw = |n: u64, amount: u64| reserve(&s, op(n), EPOCH, &[Cell { key: zero, amount }]);
+    let g = draw(61, 6).expect("a window-0 draw within its cap");
+    assert_eq!(release(&s, op(62), &[(g[0].slice_id, 2)]), Ok(vec![2]));
+    assert_eq!(
+        release(&s, op(63), &[(g[0].slice_id, 4)]),
+        Ok(vec![0]),
+        "a window-0 slice stayed open after its release"
+    );
+    assert_eq!(
+        draw(64, 6).expect("the returned 2 are drawable")[0].granted,
+        6
+    );
+    assert_eq!(
+        draw(65, 1),
+        Err(ReserveRefused::Exhausted { cell: 0 }),
+        "the spent part of a released window-0 slice was not counted"
+    );
+
+    let rolling = fresh("w0-rolling");
+    let k = key(&rolling, 120);
+    s.window_caps(
+        op(66),
+        &[Cap {
+            key: k,
+            cap: 10,
+            config_gen: 1,
+        }],
+    )
+    .expect("the rolling cap");
+    let g = reserve(&s, op(67), EPOCH, &[Cell { key: k, amount: 6 }]).expect("a rolling draw");
+    assert_eq!(release(&s, op(68), &[(g[0].slice_id, 2)]), Ok(vec![2]));
+    assert_eq!(
+        release(&s, op(69), &[(g[0].slice_id, 4)]),
+        Ok(vec![4]),
+        "a rolling-window slice keeps what it still holds for a later release"
+    );
+}
+
 /// A draw is all or nothing: a refused cell leaves every earlier cell undrawn.
 #[test]
 fn a_refused_draw_applies_none_of_its_cells() {

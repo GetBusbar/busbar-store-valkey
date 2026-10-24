@@ -713,6 +713,13 @@ impl ValkeyStore {
                 let (cap, left) = held.get_mut(id).expect("every item's slice is held");
                 let back = (*unspent).min(*left);
                 *left -= back;
+                // A release on window 0 is final (`abi::store` slice life (e)): window 0 never
+                // rolls, so a slice on it has no window close to end it. It closes at its first
+                // release; the spent rest stays counted against the cap. The slot key ends in
+                // `:<window_start>`.
+                if cap.rsplit(':').next() == Some("0") {
+                    *left = 0;
+                }
                 *by_cap.entry(cap.clone()).or_default() += back;
                 back_all.push(back);
             }
