@@ -56,7 +56,7 @@
 //! may PEND (the op answers PENDING and is resumed on the connector's wake), handed back when the op
 //! answers. The body is the blocking client's body, `async`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::store::wire::drive_kept;
