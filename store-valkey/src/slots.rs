@@ -709,6 +709,7 @@ impl ValkeyStore {
             // of this call emptied takes back 0.
             let mut back_all = Vec::with_capacity(items.len());
             let mut by_cap: BTreeMap<String, u64> = BTreeMap::new();
+            let mut closed_on_zero: BTreeSet<u64> = BTreeSet::new();
             for (id, unspent) in items {
                 let (cap, left) = held.get_mut(id).expect("every item's slice is held");
                 let back = (*unspent).min(*left);
@@ -719,12 +720,16 @@ impl ValkeyStore {
                 // `:<window_start>`.
                 if cap.rsplit(':').next() == Some("0") {
                     *left = 0;
+                    closed_on_zero.insert(*id);
                 }
                 *by_cap.entry(cap.clone()).or_default() += back;
                 back_all.push(back);
             }
             for (id, (_, left)) in &held {
-                if *left == 0 {
+                if closed_on_zero.contains(id) {
+                    // Closed, not deleted: another release of it answers 0, not "not held".
+                    pipe.hset(slice_key(*id), "left", "0").ignore();
+                } else if *left == 0 {
                     pipe.del(slice_key(*id)).ignore();
                 } else {
                     pipe.hset(slice_key(*id), "left", left.to_string()).ignore();
