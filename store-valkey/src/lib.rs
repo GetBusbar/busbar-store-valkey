@@ -194,7 +194,7 @@ const REVISION_KEY: &str = "busbar:revision";
 /// generic-credentials redesign: `AwsCredential` -> kind-polymorphic `CredentialMeta`/`CredentialSecret`,
 /// `VirtualKey` gains `deleted_at`/`revision`, `delete_key` becomes a tombstone, metering gains
 /// `billable_requests`/`key_group_at_use`/`pricing_version` and renames `tokens_cache_creation` to
-/// `tokens_cache_write`. A pre-v5 namespace is WIPED on connect (1.5.0 unreleased: bump, not migrate).
+/// `tokens_cache_write`. A namespace marked below v6 is REFUSED on connect, never wiped (it used to be wiped).
 ///
 /// v6 closes a real billing bug in busbarAI core's `GovState::hydrate_budgets`: that function used
 /// to infer "legacy pre-split row, needs `billable_requests` seeded from `requests`" from the value
@@ -203,33 +203,28 @@ const REVISION_KEY: &str = "busbar:revision";
 /// never `requests`, by design), so a restart could silently re-bill correctly-refunded fees. Fixed
 /// by removing the value-based guess from `hydrate_budgets` entirely and doing the one-time cutover
 /// HERE instead, at a real schema-version boundary, which by construction happens exactly once ever
-/// per store. v6 wipes any pre-v6 namespace the SAME way the v5 bump did (1.5.0 is STILL unreleased
-/// as of this bump — no real customer has run any pre-v6 build in production, so there is no
-/// genuinely-ambiguous refunded-vs-legacy data anywhere to lose). This is a ONE-TIME safe window: the
-/// NEXT schema bump after 1.5.0 actually ships must NOT reuse this wipe-on-bump shortcut, since real
-/// customer usage/billing history would exist by then and wiping it would itself be a real bug.
+/// per store. v6 originally wiped any pre-v6 namespace; that wipe was only ever safe while 1.5.0 was
+/// unreleased, and `migrate()` now REFUSES such a namespace (see its doc) instead.
 /// The durable MCP tool-call log, the durable A2A TASK STORE and the durable TRUST STATE (the MCP
 /// demotion record and the spent-approval ledger) all landed WITHOUT bumping this, and that is a
 /// deliberate decision rather than an oversight. Each is a PURELY ADDITIVE keyspace
 /// (`busbar:mcp:*`, `busbar:task:*`/`busbar:tasks*`, `busbar:askstate:*`): nothing that already
 /// exists changes shape, so
 /// there is nothing for a migration to do, and a bump here does not mean "migrate" — `migrate()`
-/// handles any `version < SCHEMA_VERSION` by SCANning `busbar:*` and DELETING EVERYTHING. Bumping to
-/// mark an addition that needs no migration would therefore wipe every operator's virtual keys,
-/// credentials, budgets, usage ledgers and audit records on next connect, which is the recorded
-/// hazard on this file ("`migrate()` is a wipe, and its safety argument has expired": that wipe's own
-/// justification is "1.5.0 is unreleased", and 1.5.0, 1.5.1 and 1.5.2 have all shipped). The version
-/// marker moves again only when a migrate-in-place path exists to move it for.
+/// handles a `version < SCHEMA_VERSION` namespace only through an in-place path. Bumping to
+/// mark an addition that needs no migration would leave operators' existing namespaces unable to
+/// connect (refused) until a migrate-in-place path exists. The version marker moves again only when
+/// such a path exists to move it for.
 ///
 /// v7 (busbar 1.6.0) is that path: the typed task / task-event / demotion / spent-approval keyspaces
 /// are copied IN PLACE into the kind-neutral plane-record keyspace ([`legacy::migrate_v6_to_v7`]).
 /// Nothing a v6 namespace holds is wiped: keys, credentials, usage, metering, audit and the denylist
-/// read back unchanged under v7, and the v6 MCP call log stays where it is. Only a namespace OLDER
-/// than v6 (a 1.5.0 development build, never released) still takes the wipe below.
+/// read back unchanged under v7, and the v6 MCP call log stays where it is. A namespace OLDER
+/// than v6 (plugin v1.0.0, which wrote 5, or a 1.5.0 development build) is refused, not wiped.
 const SCHEMA_KEY: &str = "busbar:schema";
 const SCHEMA_VERSION: i64 = 7;
-/// The last schema that is WIPED rather than migrated when found: anything below it predates the
-/// first release. v6 and later are always migrated in place.
+/// The oldest schema `migrate()` can upgrade in place: a namespace with data below it is REFUSED
+/// (never wiped). v6 and later are always migrated in place.
 const FIRST_MIGRATED_SCHEMA: i64 = 6;
 
 /// Internal sentinel: `delete_key`'s outer retry loop uses this to distinguish "credential
@@ -845,46 +840,86 @@ impl ValkeyStore {
     }
 
     /// SCHEMA MIGRATION (currently v7; see `SCHEMA_VERSION`'s own doc for what each version did).
-    /// A fresh namespace is simply marked; one already at the current version passes through
-    /// untouched; a v6 namespace is upgraded IN PLACE ([`legacy::migrate_v6_to_v7`], idempotent, the
-    /// marker written last so a crash mid-upgrade re-runs it on the next connect); a namespace older
-    /// than v6 (a never-released 1.5.0 development build) is wiped and re-marked, as it always was.
+    /// A fresh namespace (no `busbar:*` keys) is simply marked; one already at the current version
+    /// passes through untouched; a v6 namespace is upgraded IN PLACE ([`legacy::migrate_v6_to_v7`],
+    /// idempotent, the marker written last so a crash mid-upgrade re-runs it on the next connect).
+    ///
+    /// NOTHING IS EVER WIPED. A namespace with `busbar:*` keys whose marker is absent or older than
+    /// v6 is REFUSED with an explained error and left byte-for-byte as found: a missing marker is
+    /// indistinguishable from a live v6/v7 namespace whose marker was lost (operator `DEL`, partial
+    /// restore), and two nodes first-booting on an empty server must not wipe each other. Before
+    /// refusing, the marker is re-read once, so a peer that marked the namespace in the meantime is
+    /// honoured rather than refused.
     async fn migrate(&self, c: &mut Conn) -> RecordStoreResult<()> {
-        let marker: Option<i64> = with_conn!(self, |c| c.get::<_, Option<i64>>(SCHEMA_KEY).await)?;
-        let version = marker.unwrap_or(0);
-        if version >= SCHEMA_VERSION {
-            return Ok(());
-        }
-        if version >= FIRST_MIGRATED_SCHEMA {
-            legacy::migrate_v6_to_v7(self, c).await?;
-            return with_conn!(self, |c| c
-                .set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION)
-                .await);
-        }
-        let existing: Vec<String> = with_conn!(self, |c| {
-            c.scan_match::<_, String>("busbar:*")
-                .await?
-                .collect::<Result<Vec<String>, _>>()
-        })?;
-        if existing.is_empty() {
-            return with_conn!(self, |c| c
-                .set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION)
-                .await);
-        }
-        // A busbar:* namespace older than v6 (marker present-but-older, or a pre-marker legacy
-        // namespace) is wiped: it was written by an unreleased 1.5.0 development build, so there is
-        // no released data to preserve across this specific boundary.
-        with_conn!(self, |c| {
-            let mut pipe = pipe();
-            pipe.atomic();
-            for k in &existing {
-                pipe.del(k).ignore();
+        let mut marker: Option<i64> =
+            with_conn!(self, |c| c.get::<_, Option<i64>>(SCHEMA_KEY).await)?;
+        let mut rechecked = false;
+        loop {
+            let version = marker.unwrap_or(0);
+            if version >= SCHEMA_VERSION {
+                return Ok(());
             }
-            pipe.query::<()>(c).await
-        })?;
-        with_conn!(self, |c| c
-            .set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION)
-            .await)
+            if version >= FIRST_MIGRATED_SCHEMA {
+                legacy::migrate_v6_to_v7(self, c).await?;
+                return with_conn!(self, |c| c
+                    .set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION)
+                    .await);
+            }
+            let existing: Vec<String> = with_conn!(self, |c| {
+                c.scan_match::<_, String>("busbar:*")
+                    .await?
+                    .collect::<Result<Vec<String>, _>>()
+            })?;
+            let others: Vec<&String> = existing.iter().filter(|k| *k != SCHEMA_KEY).collect();
+            if others.is_empty() {
+                return with_conn!(self, |c| c
+                    .set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION)
+                    .await);
+            }
+            if !rechecked {
+                // A peer may have marked the namespace between our read and the SCAN.
+                rechecked = true;
+                let again: Option<i64> =
+                    with_conn!(self, |c| c.get::<_, Option<i64>>(SCHEMA_KEY).await)?;
+                if again.is_some_and(|v| v >= FIRST_MIGRATED_SCHEMA) {
+                    marker = again;
+                    continue;
+                }
+            }
+            let found = match marker {
+                None => "the `busbar:schema` marker is missing".to_string(),
+                Some(v) => format!("the `busbar:schema` marker is {v}"),
+            };
+            // Key PREFIXES only (first two `:`-segments + `*`): full names can carry a credential's
+            // public id.
+            let mut sample: Vec<String> = others
+                .iter()
+                .map(|k| {
+                    let mut seg = k.splitn(3, ':');
+                    match (seg.next(), seg.next(), seg.next()) {
+                        (Some(a), Some(b), Some(_)) => format!("{a}:{b}:*"),
+                        _ => k.to_string(),
+                    }
+                })
+                .collect();
+            sample.sort_unstable();
+            sample.dedup();
+            sample.truncate(3);
+            return Err(RecordStoreError(format!(
+                "valkey schema check: {found} (a version below {FIRST_MIGRATED_SCHEMA} cannot be \
+                 upgraded in place) but the namespace holds {} other `busbar:*` key(s), key prefixes e.g. [{}]. \
+                 Refusing to start. NOTHING was changed: no key was deleted and no marker written. \
+                 If this is a current namespace whose marker was lost, restore it with \
+                 `SET {SCHEMA_KEY} {FIRST_MIGRATED_SCHEMA}` and restart ({FIRST_MIGRATED_SCHEMA} is safe \
+                 either way: the v6->v7 copy is append-if-absent and does nothing on a namespace already \
+                 at v7, whereas {SCHEMA_VERSION} on a namespace last run by a v6 build would skip the copy \
+                 and strand its task and ask-state data). If it was written by plugin v1.0.0 or an earlier 1.5.0 \
+                 development build, it cannot be migrated: back it up if needed, delete the \
+                 `busbar:*` keys, and restart to start a fresh namespace.",
+                others.len(),
+                sample.join(", ")
+            )));
+        }
     }
 
     fn err(&self, e: RedisError, ctx: &str) -> RecordStoreError {
