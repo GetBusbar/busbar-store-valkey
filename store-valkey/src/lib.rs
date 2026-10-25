@@ -89,12 +89,17 @@
 //! so an unreachable or misconfigured server still refuses the load at boot in the store's own
 //! words. Error strings are scrubbed of the URL password.
 //!
-//! ## Data growth (documented, deliberate)
+//! ## Data growth (documented, bounded by explicit purge)
 //!
 //! Rows are written WITHOUT a TTL: usage windows, metering buckets, and audit entries accumulate
-//! unboundedly by design — the store is the durable system of record. `purge_windows_before`/
-//! `purge_metering_before` are left at the trait's `Ok(0)` default (no obligation to self-bound);
-//! operators wanting bounded growth reap old `busbar:usage:*` keys on their own retention schedule.
+//! until purged - the store is the durable system of record. The two retention ops really purge,
+//! as every sibling store does: `purge_windows_before(before)` drops the usage-window hashes
+//! (`busbar:usage:<bucket>:<window_start>`) whose window started before `before` and returns the
+//! count; with no per-window index it is a non-blocking `SCAN` with `MATCH busbar:usage:*`, which
+//! is acceptable because the engine's sweeper calls it off the request path.
+//! `purge_metering_before(bucket)` drops one metering bucket (a billing-evidence op: operator
+//! action only) through that bucket's index set - no scan - and returns the row count; a bucket that
+//! is not an integer is refused.
 
 #![forbid(unsafe_code)]
 
@@ -221,8 +226,21 @@ const REVISION_KEY: &str = "busbar:revision";
 /// Nothing a v6 namespace holds is wiped: keys, credentials, usage, metering, audit and the denylist
 /// read back unchanged under v7, and the v6 MCP call log stays where it is. A namespace OLDER
 /// than v6 (plugin v1.0.0, which wrote 5, or a 1.5.0 development build) is refused, not wiped.
+///
+/// v8 (store kind epoch and slice life, `abi::store::money` rules (a)-(c)), ADDITIVE: `busbar:epoch`
+/// (the ONE fleet epoch `reserve` fences with; written `0` by the upgrade and by a fresh namespace's
+/// first boot, `SET NX` so an epoch already raised is never lowered, and read as `0` when absent),
+/// each slice hash's `until` (its `valid_until_ms`, on the server's clock) and `busbar:open:<slot>`
+/// (the slot's open slices by `until`, the index a `reserve` reclaims expired slices from without a
+/// SCAN). Slices a v7 build left open (granted `u64::MAX`, never expiring) are stamped by
+/// [`crate::slots::stamp_open_slices`] to expire one `SLICE_TTL_MS` after the upgrade on the
+/// server's clock, and indexed, so money a crashed node stranded under the old never-expires grant
+/// is returned rather than held forever. The step is idempotent (a slice already stamped keeps its
+/// `until`) and safe on a concurrent first boot; the marker is written last. A namespace marked
+/// NEWER than this build is refused at open: a v7 build on a v8 namespace would ignore the epoch
+/// fence and grant slices that never expire.
 const SCHEMA_KEY: &str = "busbar:schema";
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 /// The oldest schema `migrate()` can upgrade in place: a namespace with data below it is REFUSED
 /// (never wiped). v6 and later are always migrated in place.
 const FIRST_MIGRATED_SCHEMA: i64 = 6;
@@ -381,28 +399,31 @@ fn read_u64(v: i64) -> u64 {
     v.max(0) as u64
 }
 
-/// Extract the PASSWORD component from a valkey URL (`redis://user:pass@host/...` or
-/// `redis://:pass@host/...`, or a unix-socket URL's `?pass=`), if any - the secret that must never
-/// appear in an error string. The raw (as-written) form; [`scrub`] also redacts its decoding.
+/// Extract the PASSWORD from a valkey URL, if any - the secret that must never appear in an error
+/// string or a Debug print. Two forms carry one: the userinfo (`redis://user:pass@host/...`,
+/// `redis://:pass@host/...`) and the query (`valkey+unix:///path?pass=secret`, or `password=`),
+/// which is how a unix-socket URL states it ([`parse_unix`]). The value is returned as written in
+/// the URL (percent-escapes intact); [`scrub`] redacts it in both that and its decoded form.
 fn url_password(url: &str) -> Option<String> {
-    let (scheme, rest) = url.split_once("://")?;
-    if matches!(scheme, "unix" | "redis+unix" | "valkey+unix") {
-        let query = rest.split_once('?')?.1;
-        let query = query.split_once('#').map_or(query, |(q, _)| q);
-        return query
-            .split('&')
-            .filter_map(|pair| pair.split_once('='))
-            .filter(|(k, _)| *k == "pass")
-            .map(|(_, v)| v)
-            .find(|v| !v.is_empty())
-            .map(str::to_string);
-    }
-    let userinfo = rest.rsplit_once('@').map(|(u, _)| u)?;
-    let pass = match userinfo.split_once(':') {
-        Some((_, p)) => p,
-        None => return None, // user only, no password
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let (before_query, query) = match rest.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (rest, None),
     };
-    (!pass.is_empty()).then(|| pass.to_string())
+    // The userinfo lives in the authority only (up to the first `/`), never in the path or query.
+    let authority = before_query.split('/').next().unwrap_or("");
+    if let Some((userinfo, _)) = authority.rsplit_once('@') {
+        if let Some((_, pass)) = userinfo.split_once(':') {
+            if !pass.is_empty() {
+                return Some(pass.to_string());
+            }
+        }
+    }
+    query?
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, v)| matches!(*k, "pass" | "password") && !v.is_empty())
+        .map(|(_, v)| v.to_string())
 }
 
 /// Percent-DECODE a URL component (`%40` -> `@`, `%25` -> `%`). A malformed escape is left verbatim.
@@ -538,6 +559,24 @@ fn percent_decode_utf8(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// Every query parameter a URL form reads is named in `known`; any other one is REFUSED (the
+/// upstream driver ignored it silently, which would leave an operator believing a setting applied).
+/// The parameter's name is echoed only when the URL carries no password: a password written
+/// unencoded can split at `?` and arrive here as a "name" (one holding the `@` that ended it).
+fn check_query(url: &url::Url, known: &[&str], has_secret: bool) -> RedisResult<()> {
+    match url.query_pairs().find(|(k, _)| !known.contains(&k.as_ref())) {
+        None => Ok(()),
+        Some((k, _)) if has_secret || k.contains('@') => Err(url_refused(
+            "an unknown URL parameter is not supported (its name is withheld: the URL carries a password)",
+        )),
+        Some((k, _)) => Err(RedisError::from((
+            ErrorKind::InvalidClientConfig,
+            "URL parameter is not supported by this store",
+            k.into_owned(),
+        ))),
+    }
+}
+
 /// The upstream driver's `protocol=` query check (`2`/`resp2`/`3`/`resp3`). The store speaks
 /// RESP2 whatever it says: every reply it reads converts the same either way.
 fn check_protocol(url: &url::Url) -> RedisResult<()> {
@@ -594,6 +633,7 @@ fn parse_url(input: &str) -> RedisResult<Target> {
         false
     };
     check_protocol(&url)?;
+    check_query(&url, &["protocol"], url_password(input).is_some())?;
     let db = match url.path().trim_matches('/') {
         "" => 0,
         path => path
@@ -644,6 +684,11 @@ fn parse_unix(url: &url::Url) -> RedisResult<Target> {
         None => 0,
     };
     check_protocol(url)?;
+    check_query(
+        url,
+        &["db", "user", "pass", "protocol"],
+        query.contains_key("pass") || query.contains_key("password"),
+    )?;
     let user = query.get("user").map(|u| u.to_string());
     let pass = query.get("pass").map(|p| p.to_string());
     Ok(Target {
@@ -753,14 +798,19 @@ impl ValkeyStore {
         let target = parse_url(url).map_err(|e| {
             RecordStoreError(scrub(format!("valkey connect: {e}"), secret.as_deref()))
         })?;
-        Ok(Self {
+        Ok(Self::from_parts(target, secret, timeout))
+    }
+
+    /// The store over an already-parsed target.
+    fn from_parts(target: Target, secret: Option<String>, connect_timeout: Duration) -> Self {
+        Self {
             inner: Arc::new(Inner {
                 target,
                 secret,
-                connect_timeout: timeout,
+                connect_timeout,
                 pool: Pool::new(KEPT_CONNECTIONS),
             }),
-        })
+        }
     }
 
     /// The op's connection over `wire`: the kept one when it is idle (its handshake done), else a
@@ -890,10 +940,12 @@ impl ValkeyStore {
         }
     }
 
-    /// SCHEMA MIGRATION (currently v7; see `SCHEMA_VERSION`'s own doc for what each version did).
-    /// A fresh namespace (no `busbar:*` keys) is simply marked; one already at the current version
-    /// passes through untouched; a v6 namespace is upgraded IN PLACE ([`legacy::migrate_v6_to_v7`],
-    /// idempotent, the marker written last so a crash mid-upgrade re-runs it on the next connect).
+    /// SCHEMA MIGRATION (currently v8; see `SCHEMA_VERSION`'s own doc for what each version did).
+    /// A fresh namespace (no `busbar:*` keys) is simply marked (its epoch created at 0); one already
+    /// at the current version passes through untouched; one NEWER than this build is refused; a v6
+    /// namespace is upgraded IN PLACE ([`legacy::migrate_v6_to_v7`]) and a v6 or v7 one then gets
+    /// the v8 step ([`crate::slots::stamp_open_slices`]), each idempotent, the marker written last
+    /// so a crash mid-upgrade re-runs it on the next connect.
     ///
     /// NOTHING IS EVER WIPED. A namespace with `busbar:*` keys whose marker is absent or older than
     /// v6 is REFUSED with an explained error and left byte-for-byte as found: a missing marker is
@@ -907,11 +959,23 @@ impl ValkeyStore {
         let mut rechecked = false;
         loop {
             let version = marker.unwrap_or(0);
-            if version >= SCHEMA_VERSION {
+            if version > SCHEMA_VERSION {
+                return Err(RecordStoreError(format!(
+                    "valkey schema check: schema v{version} is newer than this build \
+                     (v{SCHEMA_VERSION}); refusing to open. NOTHING was changed. An older build \
+                     on a newer namespace would ignore what the newer schema keeps (a v7 build on \
+                     a v8 namespace ignores the fleet epoch's fence and grants slices that never \
+                     expire): run a build of v{version} or later."
+                )));
+            }
+            if version == SCHEMA_VERSION {
                 return Ok(());
             }
             if version >= FIRST_MIGRATED_SCHEMA {
-                legacy::migrate_v6_to_v7(self, c).await?;
+                if version < 7 {
+                    legacy::migrate_v6_to_v7(self, c).await?;
+                }
+                crate::slots::stamp_open_slices(self, c).await?;
                 return with_conn!(self, |c| c
                     .set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION)
                     .await);
@@ -923,9 +987,13 @@ impl ValkeyStore {
             })?;
             let others: Vec<&String> = existing.iter().filter(|k| *k != SCHEMA_KEY).collect();
             if others.is_empty() {
-                return with_conn!(self, |c| c
+                // The marker first: a peer first-booting beside us that SCANs between the two
+                // writes must find the marker, not an unmarked epoch key it would refuse. A crash
+                // between them leaves no epoch key, which reads as 0.
+                with_conn!(self, |c| c
                     .set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION)
-                    .await);
+                    .await)?;
+                return crate::slots::create_epoch(self, c).await;
             }
             if !rechecked {
                 // A peer may have marked the namespace between our read and the SCAN.
@@ -962,8 +1030,8 @@ impl ValkeyStore {
                  Refusing to start. NOTHING was changed: no key was deleted and no marker written. \
                  If this is a current namespace whose marker was lost, restore it with \
                  `SET {SCHEMA_KEY} {FIRST_MIGRATED_SCHEMA}` and restart ({FIRST_MIGRATED_SCHEMA} is safe \
-                 either way: the v6->v7 copy is append-if-absent and does nothing on a namespace already \
-                 at v7, whereas {SCHEMA_VERSION} on a namespace last run by a v6 build would skip the copy \
+                 either way: the v6->v7 copy is append-if-absent and the v7->v8 stamp keeps a stamp already made, \
+                 so both do nothing on a namespace already past them, whereas {SCHEMA_VERSION} on a namespace last run by a v6 build would skip the copy \
                  and strand its task and ask-state data). If it was written by plugin v1.0.0 or an earlier 1.5.0 \
                  development build, it cannot be migrated: back it up if needed, delete the \
                  `busbar:*` keys, and restart to start a fresh namespace.",
@@ -994,13 +1062,7 @@ impl ValkeyStore {
 /// credential cannot be attached to a key whose liveness cannot be established.
 async fn owner_is_live(c: &mut Conn, key_row: &str, key_id: &str) -> RedisResult<()> {
     let raw: Option<String> = c.get(key_row).await?;
-    let refuse = |why: String| {
-        Err(RedisError::from((
-            ErrorKind::Client,
-            "put_credential refused",
-            why,
-        )))
-    };
+    let refuse = |why: String| Err(RedisError::refused(why));
     let Some(raw) = raw else {
         return refuse(format!(
             "put_credential: key '{key_id}' does not exist; a credential must hang off a real key"
@@ -1137,14 +1199,10 @@ impl ValkeyStore {
                     // unwritable, and this method is not the one that should be adjudicating that.
                     if let Some(prior) = existing.as_deref().and_then(|r| key_from_json(r).ok()) {
                         if prior.deleted_at.is_some() {
-                            return Err(RedisError::from((
-                                ErrorKind::Client,
-                                "put_key refused",
-                                format!(
-                                    "put_key: '{}' is tombstoned and its id is never reissued; \
+                            return Err(RedisError::refused(format!(
+                                "put_key: '{}' is tombstoned and its id is never reissued; \
                                      refusing to clear the tombstone",
-                                    key.id
-                                ),
+                                key.id
                             )));
                         }
                     }
@@ -1269,9 +1327,8 @@ impl ValkeyStore {
                     // Unknown id (never existed): a real error, matching the SQL backends'
                     // `delete_key`-on-unknown-id contract — distinct from "already tombstoned",
                     // which IS an idempotent no-op (see below).
-                    return Err(RedisError::from((
-                        ErrorKind::Client,
-                        "delete_key: unknown id",
+                    return Err(RedisError::refused(format!(
+                        "delete_key: unknown id '{id}'"
                     )));
                 };
                 let mut key: VirtualKey = serde_json::from_str(&raw)
@@ -1360,10 +1417,7 @@ impl ValkeyStore {
             transaction!(c, &[key_row.as_str()], |c, pipe| {
                 let raw: Option<String> = c.get(&key_row).await?;
                 let Some(raw) = raw else {
-                    return Err(RedisError::from((
-                        ErrorKind::Client,
-                        "scrub_key: unknown id",
-                    )));
+                    return Err(RedisError::refused(format!("scrub_key: unknown id '{id}'")));
                 };
                 let mut key: VirtualKey = serde_json::from_str(&raw)
                     .map_err(|_| RedisError::from((ErrorKind::Client, "key decode")))?;
@@ -1455,6 +1509,72 @@ impl ValkeyStore {
             }
             pipe.query(c).await
         })
+    }
+
+    /// Retention purge of usage windows: drop every `busbar:usage:<bucket>:<window_start>` hash whose
+    /// `window_start` is before `before`; returns how many windows went. There is no per-window
+    /// index (a window is one hash, written by `add_usage`/`put_usage`), so this is a SCAN with
+    /// MATCH on the documented `busbar:usage:` prefix - acceptable because the purge runs from the
+    /// engine's sweeper, never the request path. Non-blocking (SCAN, not KEYS); the `window_start` is
+    /// the key's last `:` component (a bucket id may itself contain `:`).
+    pub(crate) async fn purge_windows_before(
+        &self,
+        c: &mut Conn,
+        before: u64,
+    ) -> RecordStoreResult<u64> {
+        let keys: Vec<String> = with_conn!(self, |c| {
+            c.scan_match::<_, String>("busbar:usage:*")
+                .await?
+                .collect::<Result<Vec<String>, _>>()
+        })?;
+        let old: Vec<String> = keys
+            .into_iter()
+            .filter(|k| {
+                k.rsplit_once(':')
+                    .and_then(|(_, w)| w.parse::<u64>().ok())
+                    .is_some_and(|w| w < before)
+            })
+            .collect();
+        let mut purged = 0u64;
+        for chunk in old.chunks(500) {
+            let gone: Vec<i64> = with_conn!(self, |c| {
+                let mut pipe = pipe();
+                for k in chunk {
+                    pipe.del(k);
+                }
+                pipe.query(c).await
+            })?;
+            purged += gone.iter().map(|n| read_u64(*n)).sum::<u64>();
+        }
+        Ok(purged)
+    }
+
+    /// Retention purge of one metering bucket: drop every row the bucket's index set names, and the
+    /// set; returns the row count. The bucket's set (`busbar:metering:<bucket>`) is the index, so no
+    /// keyspace scan is needed. `bucket` is an integer in text (the trait's string form); anything
+    /// else is refused in the siblings' words.
+    pub(crate) async fn purge_metering_before(
+        &self,
+        c: &mut Conn,
+        bucket: &str,
+    ) -> RecordStoreResult<u64> {
+        let b: u64 = bucket.parse().map_err(|_| {
+            RecordStoreError(format!(
+                "purge_metering_before: invalid bucket {bucket:?}, expected an integer"
+            ))
+        })?;
+        let set = metering_set(b);
+        let gone: Vec<i64> = with_conn!(self, |c| {
+            transaction!(c, &[set.as_str()], |c, pipe| {
+                let rows: Vec<String> = c.smembers(&set).await?;
+                for row in &rows {
+                    pipe.del(row);
+                }
+                pipe.del(&set).ignore();
+                pipe.query::<Option<Vec<i64>>>(c).await
+            })
+        })?;
+        Ok(gone.iter().map(|n| read_u64(*n)).sum())
     }
 
     pub(crate) async fn list_metering(
@@ -1601,14 +1721,10 @@ impl ValkeyStore {
                     }
                     if cur.meta.id == secret.meta.id {
                         // A replayed mint must never un-revoke a revoked credential.
-                        return Err(RedisError::from((
-                            ErrorKind::Client,
-                            "put_credential refused",
-                            format!(
-                                "put_credential: credential {} is revoked; a revoked credential \
+                        return Err(RedisError::refused(format!(
+                            "put_credential: credential {} is revoked; a revoked credential \
                                  is never re-minted",
-                                secret.meta.id
-                            ),
+                            secret.meta.id
                         )));
                     }
                     old_pub = Some(cur.meta.public_id);
@@ -1709,14 +1825,10 @@ impl ValkeyStore {
                             .and_then(|r| key_from_json(r).ok())
                             .is_some_and(|k| k.deleted_at.is_some())
                         {
-                            return Err(RedisError::from((
-                                ErrorKind::Client,
-                                "put_key_with_credential refused",
-                                format!(
-                                    "put_key_with_credential: '{}' is tombstoned and its id is \
+                            return Err(RedisError::refused(format!(
+                                "put_key_with_credential: '{}' is tombstoned and its id is \
                                      never reissued",
-                                    key.id
-                                ),
+                                key.id
                             )));
                         }
                     }
@@ -1742,14 +1854,10 @@ impl ValkeyStore {
                         }
                         if cur.meta.id == secret.meta.id {
                             // A replayed mint must never un-revoke a revoked credential.
-                            return Err(RedisError::from((
-                                ErrorKind::Client,
-                                "put_key_with_credential refused",
-                                format!(
-                                    "put_key_with_credential: credential {} is revoked; a \
+                            return Err(RedisError::refused(format!(
+                                "put_key_with_credential: credential {} is revoked; a \
                                      revoked credential is never re-minted",
-                                    secret.meta.id
-                                ),
+                                secret.meta.id
                             )));
                         }
                         old_pub = Some(cur.meta.public_id);
@@ -1868,10 +1976,8 @@ impl ValkeyStore {
                     // ALREADY-REVOKED id, not an id that names nothing — a silent no-op here lets
                     // an operator responding to a leak believe the credential is dead while it is
                     // still live and still authenticating.
-                    return Err(RedisError::from((
-                        ErrorKind::Client,
-                        "revoke_credential refused",
-                        format!("revoke_credential: unknown id '{id}'"),
+                    return Err(RedisError::refused(format!(
+                        "revoke_credential: unknown id '{id}'"
                     )));
                 };
                 // A pointer that exists but does not parse is CORRUPTION, not an unknown id.
@@ -1958,17 +2064,16 @@ impl ValkeyStore {
         // continuing would orphan that row's reverse-lookup pointers, so silence would leave the
         // store inconsistent. Here nothing is written and nothing is left inconsistent.
         //
-        // Reported on stderr because a plugin's `tracing` output does not reach the host (a cdylib
-        // links its own dispatcher and nothing bridges them) — the same local workaround auth-oidc
-        // and webrequest-hook already use. The row key names `key_id:kind:slot` and carries no
-        // secret.
+        // Reported through `tracing`: the door's trampoline captures every event a slot body raises
+        // into the plugin's own log (`busbar_contract::abi::sdk::capture`), compiled in or dropped
+        // in. The row key names `key_id:kind:slot` and carries no secret.
         let mut out = Vec::with_capacity(raws.len());
         for (i, raw) in raws.into_iter().enumerate() {
             let Some(raw) = raw else { continue };
             match cred_from_json(&raw) {
                 Ok(cred) => out.push(cred),
                 Err(e) => {
-                    eprintln!(
+                    tracing::warn!(
                         "busbar-store-valkey: skipping undecodable credential row {} in the \
                          hydration delta ({e}); that credential cannot authenticate until the row \
                          is repaired, and the rest of the delta is unaffected",
@@ -2154,14 +2259,44 @@ impl ValkeyStore {
             serde_json::from_slice(settings)
                 .map_err(|e| format!("invalid valkey plugin config: {e}"))?
         };
-        let url = v.get("url").and_then(|x| x.as_str()).ok_or_else(|| {
-            "valkey plugin config requires a \"url\" (a redis:// connection string)".to_string()
-        })?;
-        match v.get("connect_timeout_ms").and_then(|x| x.as_u64()) {
-            Some(ms) => ValkeyStore::with_timeout(url, Duration::from_millis(ms)),
-            None => ValkeyStore::new(url),
+        const BAD: &str = "invalid valkey plugin config";
+        // A top-level key this plugin does not read is a typo or a setting for another backend; it
+        // must not be swallowed into quietly opening with the defaults.
+        if let Some(unknown) = v.as_object().and_then(|o| {
+            o.keys()
+                .find(|k| !matches!(k.as_str(), "url" | "connect_timeout_ms"))
+        }) {
+            return Err(format!(
+                "{BAD}: unknown setting `{unknown}` (accepted: url, connect_timeout_ms)"
+            ));
         }
-        .map_err(|e| failed_to_connect(&e))
+        let url = match v.get("url") {
+            None => {
+                return Err(
+                    "valkey plugin config requires a \"url\" (a redis:// connection string)"
+                        .to_string(),
+                )
+            }
+            Some(serde_json::Value::String(s)) if !s.trim().is_empty() => s.as_str(),
+            Some(_) => return Err(format!("{BAD}: `url` must be a non-empty string")),
+        };
+        let timeout = match v.get("connect_timeout_ms") {
+            None => DEFAULT_CONNECT_TIMEOUT,
+            Some(x) => match x.as_u64().filter(|ms| *ms > 0) {
+                Some(ms) => Duration::from_millis(ms),
+                None => {
+                    return Err(format!(
+                        "{BAD}: `connect_timeout_ms` must be a positive integer (milliseconds), \
+                         got {x}"
+                    ))
+                }
+            },
+        };
+        // A URL that does not parse is a settings refusal: nothing was connected.
+        let secret = url_password(url);
+        let target =
+            parse_url(url).map_err(|e| scrub(format!("{BAD}: url: {e}"), secret.as_deref()))?;
+        Ok(Self::from_parts(target, secret, timeout))
     }
 }
 
