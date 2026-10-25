@@ -12,7 +12,7 @@ The Valkey store as a droppable busbar plugin: a cdylib exporting the store C AB
 
 ## What it is for
 
-**This plugin's version: v1.0.5.** (Independently versioned from busbar
+**This plugin's version: v1.6.0.** (Independently versioned from busbar
 itself — see [Versioning](#versioning) below.)
 
 [![CI](https://github.com/GetBusbar/busbar-store-valkey/actions/workflows/ci.yml/badge.svg)](https://github.com/GetBusbar/busbar-store-valkey/actions/workflows/ci.yml)
@@ -165,9 +165,9 @@ in busbar for the full reference. In short:
 BUSBAR_SIGN_KEY=<signing key> busbar-plugin-pack pack \
     --lib target/release/libbusbar_store_valkey_plugin.so \
     --name busbar-store-valkey-plugin --alias valkey --kind store \
-    --version 1.0.5 --publisher busbar \
+    --version 1.6.0 --publisher busbar \
     --license Apache-2.0 \
-    --out busbar-store-valkey-1.0.5-x86_64-unknown-linux-gnu.tar.gz
+    --out busbar-store-valkey-1.6.0-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 For local development without a signing key, `busbar-plugin-pack pack
