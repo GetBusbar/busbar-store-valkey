@@ -773,12 +773,6 @@ macro_rules! pipe_cmd {
 }
 
 impl Pipeline {
-    /// A new pipeline.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Run the commands as one transaction (`MULTI`/`EXEC`).
     pub fn atomic(&mut self) -> &mut Self {
         self.atomic = true;
@@ -988,7 +982,7 @@ macro_rules! transaction {
                     .arg(__keys)
                     .exec(&mut *$c)
                     .await?;
-                let mut __pipe = $crate::resp::Pipeline::new();
+                let mut __pipe = $crate::resp::pipe();
                 __pipe.atomic();
                 let __ran: $crate::resp::RedisResult<Option<_>> = $crate::resp::rr(async {
                     let $pipe = &mut __pipe;
