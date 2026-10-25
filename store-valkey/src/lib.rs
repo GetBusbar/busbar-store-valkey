@@ -221,8 +221,21 @@ const REVISION_KEY: &str = "busbar:revision";
 /// Nothing a v6 namespace holds is wiped: keys, credentials, usage, metering, audit and the denylist
 /// read back unchanged under v7, and the v6 MCP call log stays where it is. A namespace OLDER
 /// than v6 (plugin v1.0.0, which wrote 5, or a 1.5.0 development build) is refused, not wiped.
+///
+/// v8 (store kind epoch and slice life, `abi::store::money` rules (a)-(c)), ADDITIVE: `busbar:epoch`
+/// (the ONE fleet epoch `reserve` fences with; written `0` by the upgrade and by a fresh namespace's
+/// first boot, `SET NX` so an epoch already raised is never lowered, and read as `0` when absent),
+/// each slice hash's `until` (its `valid_until_ms`, on the server's clock) and `busbar:open:<slot>`
+/// (the slot's open slices by `until`, the index a `reserve` reclaims expired slices from without a
+/// SCAN). Slices a v7 build left open (granted `u64::MAX`, never expiring) are stamped by
+/// [`crate::slots::stamp_open_slices`] to expire one `SLICE_TTL_MS` after the upgrade on the
+/// server's clock, and indexed, so money a crashed node stranded under the old never-expires grant
+/// is returned rather than held forever. The step is idempotent (a slice already stamped keeps its
+/// `until`) and safe on a concurrent first boot; the marker is written last. A namespace marked
+/// NEWER than this build is refused at open: a v7 build on a v8 namespace would ignore the epoch
+/// fence and grant slices that never expire.
 const SCHEMA_KEY: &str = "busbar:schema";
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 /// The oldest schema `migrate()` can upgrade in place: a namespace with data below it is REFUSED
 /// (never wiped). v6 and later are always migrated in place.
 const FIRST_MIGRATED_SCHEMA: i64 = 6;
@@ -873,10 +886,12 @@ impl ValkeyStore {
         }
     }
 
-    /// SCHEMA MIGRATION (currently v7; see `SCHEMA_VERSION`'s own doc for what each version did).
-    /// A fresh namespace (no `busbar:*` keys) is simply marked; one already at the current version
-    /// passes through untouched; a v6 namespace is upgraded IN PLACE ([`legacy::migrate_v6_to_v7`],
-    /// idempotent, the marker written last so a crash mid-upgrade re-runs it on the next connect).
+    /// SCHEMA MIGRATION (currently v8; see `SCHEMA_VERSION`'s own doc for what each version did).
+    /// A fresh namespace (no `busbar:*` keys) is simply marked (its epoch created at 0); one already
+    /// at the current version passes through untouched; one NEWER than this build is refused; a v6
+    /// namespace is upgraded IN PLACE ([`legacy::migrate_v6_to_v7`]) and a v6 or v7 one then gets
+    /// the v8 step ([`crate::slots::stamp_open_slices`]), each idempotent, the marker written last
+    /// so a crash mid-upgrade re-runs it on the next connect.
     ///
     /// NOTHING IS EVER WIPED. A namespace with `busbar:*` keys whose marker is absent or older than
     /// v6 is REFUSED with an explained error and left byte-for-byte as found: a missing marker is
@@ -890,11 +905,23 @@ impl ValkeyStore {
         let mut rechecked = false;
         loop {
             let version = marker.unwrap_or(0);
-            if version >= SCHEMA_VERSION {
+            if version > SCHEMA_VERSION {
+                return Err(RecordStoreError(format!(
+                    "valkey schema check: schema v{version} is newer than this build \
+                     (v{SCHEMA_VERSION}); refusing to open. NOTHING was changed. An older build \
+                     on a newer namespace would ignore what the newer schema keeps (a v7 build on \
+                     a v8 namespace ignores the fleet epoch's fence and grants slices that never \
+                     expire): run a build of v{version} or later."
+                )));
+            }
+            if version == SCHEMA_VERSION {
                 return Ok(());
             }
             if version >= FIRST_MIGRATED_SCHEMA {
-                legacy::migrate_v6_to_v7(self, c).await?;
+                if version < 7 {
+                    legacy::migrate_v6_to_v7(self, c).await?;
+                }
+                crate::slots::stamp_open_slices(self, c).await?;
                 return with_conn!(self, |c| c
                     .set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION)
                     .await);
@@ -906,9 +933,13 @@ impl ValkeyStore {
             })?;
             let others: Vec<&String> = existing.iter().filter(|k| *k != SCHEMA_KEY).collect();
             if others.is_empty() {
-                return with_conn!(self, |c| c
+                // The marker first: a peer first-booting beside us that SCANs between the two
+                // writes must find the marker, not an unmarked epoch key it would refuse. A crash
+                // between them leaves no epoch key, which reads as 0.
+                with_conn!(self, |c| c
                     .set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION)
-                    .await);
+                    .await)?;
+                return crate::slots::create_epoch(self, c).await;
             }
             if !rechecked {
                 // A peer may have marked the namespace between our read and the SCAN.
@@ -945,8 +976,8 @@ impl ValkeyStore {
                  Refusing to start. NOTHING was changed: no key was deleted and no marker written. \
                  If this is a current namespace whose marker was lost, restore it with \
                  `SET {SCHEMA_KEY} {FIRST_MIGRATED_SCHEMA}` and restart ({FIRST_MIGRATED_SCHEMA} is safe \
-                 either way: the v6->v7 copy is append-if-absent and does nothing on a namespace already \
-                 at v7, whereas {SCHEMA_VERSION} on a namespace last run by a v6 build would skip the copy \
+                 either way: the v6->v7 copy is append-if-absent and the v7->v8 stamp keeps a stamp already made, \
+                 so both do nothing on a namespace already past them, whereas {SCHEMA_VERSION} on a namespace last run by a v6 build would skip the copy \
                  and strand its task and ask-state data). If it was written by plugin v1.0.0 or an earlier 1.5.0 \
                  development build, it cannot be migrated: back it up if needed, delete the \
                  `busbar:*` keys, and restart to start a fresh namespace.",
@@ -1941,17 +1972,16 @@ impl ValkeyStore {
         // continuing would orphan that row's reverse-lookup pointers, so silence would leave the
         // store inconsistent. Here nothing is written and nothing is left inconsistent.
         //
-        // Reported on stderr because a plugin's `tracing` output does not reach the host (a cdylib
-        // links its own dispatcher and nothing bridges them) — the same local workaround auth-oidc
-        // and webrequest-hook already use. The row key names `key_id:kind:slot` and carries no
-        // secret.
+        // Reported through `tracing`: the door's trampoline captures every event a slot body raises
+        // into the plugin's own log (`busbar_contract::abi::sdk::capture`), compiled in or dropped
+        // in. The row key names `key_id:kind:slot` and carries no secret.
         let mut out = Vec::with_capacity(raws.len());
         for (i, raw) in raws.into_iter().enumerate() {
             let Some(raw) = raw else { continue };
             match cred_from_json(&raw) {
                 Ok(cred) => out.push(cred),
                 Err(e) => {
-                    eprintln!(
+                    tracing::warn!(
                         "busbar-store-valkey: skipping undecodable credential row {} in the \
                          hydration delta ({e}); that credential cannot authenticate until the row \
                          is repaired, and the rest of the delta is unaffected",
