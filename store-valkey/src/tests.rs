@@ -4431,3 +4431,25 @@ fn a_malformed_reply_discards_the_kept_connection() {
     );
     let _ = store.purge_key_for_test(&id);
 }
+
+/// A replayed `put_credential` of a REVOKED credential must not un-revoke it.
+#[test]
+fn put_credential_never_remints_a_revoked_credential() {
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_pc_unrev");
+    let p1 = uid("AKIA_PC_UNREV");
+    store.put_key(&vk(&key_id)).unwrap();
+    let c1 = cred(&key_id, &p1, 0);
+    store.put_credential(&c1).unwrap();
+    store.revoke_credential(&c1.meta.id, "rotated").unwrap();
+    let again = store.put_credential(&c1);
+    assert!(
+        again.is_err(),
+        "re-minting a revoked credential must fail: {again:?}"
+    );
+    let row = store.lookup_credential_secret("sigv4", &p1).unwrap();
+    assert!(
+        row.is_none_or(|r| r.meta.revoked_at.is_some()),
+        "the credential must stay revoked"
+    );
+}
