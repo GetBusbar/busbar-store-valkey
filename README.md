@@ -82,9 +82,16 @@ build can LINK the same door (`LinkedRow::of(door)`). Both doors run the same co
 
 The store v3 additions are durable in Valkey: every `op_id` write is deduped by a record
 (`busbar:op:*`, kept 24 h) written in the same atomic step as its effect (`WATCH`/`MULTI`/`EXEC`,
-or one server-side script for the plane append), and the money slots (`busbar:cap:*`,
-`busbar:slice:*`), the journal (`busbar:journal:*`), sessions (`busbar:session*`) and the
-kernel's records (`busbar:records:*`) are additive keyspaces beside the v7 ones.
+or one server-side script for the plane append), and the kernel's records (`busbar:records:*`)
+are an additive keyspace beside the v7 ones. The store keeps ledger counts, not money: busbar
+derives money from the counts and its rate card.
+
+Schema v9 deletes what the deleted store slots kept: on the first connect of a v6, v7 or v8
+namespace it removes the money keys (`busbar:cap:*`, `busbar:slice:*`, `busbar:open:*`,
+`busbar:slices`, `busbar:epoch`), the journal (`busbar:journal:*`) and the sessions
+(`busbar:session:*`, `busbar:sessions:*`) with `SCAN` and `UNLINK`, and the `busbar:op:*` dedupe
+hashes of the deleted slots. The dedupe hash of a kept slot is untouched, so a retry across the
+upgrade still answers its original. A namespace newer than the build is refused.
 
 
 - **Multi-node deployments**: a fleet of busbar nodes sharing one Valkey

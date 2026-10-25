@@ -89,17 +89,12 @@
 //! so an unreachable or misconfigured server still refuses the load at boot in the store's own
 //! words. Error strings are scrubbed of the URL password.
 //!
-//! ## Data growth (documented, bounded by explicit purge)
+//! ## Data growth (documented)
 //!
-//! Rows are written WITHOUT a TTL: usage windows, metering buckets, and audit entries accumulate
-//! until purged - the store is the durable system of record. The two retention ops really purge,
-//! as every sibling store does: `purge_windows_before(before)` drops the usage-window hashes
-//! (`busbar:usage:<bucket>:<window_start>`) whose window started before `before` and returns the
-//! count; with no per-window index it is a non-blocking `SCAN` with `MATCH busbar:usage:*`, which
-//! is acceptable because the engine's sweeper calls it off the request path.
-//! `purge_metering_before(bucket)` drops one metering bucket (a billing-evidence op: operator
-//! action only) through that bucket's index set - no scan - and returns the row count; a bucket that
-//! is not an integer is refused.
+//! Rows are written WITHOUT a TTL: usage windows, metering buckets, and audit entries accumulate;
+//! the store is the durable system of record. Retention is the engine's to apply: the store keeps
+//! ledger counts and records, not money, and no longer carries a purge op for usage windows or
+//! metering buckets.
 
 #![forbid(unsafe_code)]
 
@@ -227,20 +222,28 @@ const REVISION_KEY: &str = "busbar:revision";
 /// read back unchanged under v7, and the v6 MCP call log stays where it is. A namespace OLDER
 /// than v6 (plugin v1.0.0, which wrote 5, or a 1.5.0 development build) is refused, not wiped.
 ///
-/// v8 (store kind epoch and slice life, `abi::store::money` rules (a)-(c)), ADDITIVE: `busbar:epoch`
-/// (the ONE fleet epoch `reserve` fences with; written `0` by the upgrade and by a fresh namespace's
-/// first boot, `SET NX` so an epoch already raised is never lowered, and read as `0` when absent),
-/// each slice hash's `until` (its `valid_until_ms`, on the server's clock) and `busbar:open:<slot>`
-/// (the slot's open slices by `until`, the index a `reserve` reclaims expired slices from without a
-/// SCAN). Slices a v7 build left open (granted `u64::MAX`, never expiring) are stamped by
-/// [`crate::slots::stamp_open_slices`] to expire one `SLICE_TTL_MS` after the upgrade on the
-/// server's clock, and indexed, so money a crashed node stranded under the old never-expires grant
-/// is returned rather than held forever. The step is idempotent (a slice already stamped keeps its
-/// `until`) and safe on a concurrent first boot; the marker is written last. A namespace marked
-/// NEWER than this build is refused at open: a v7 build on a v8 namespace would ignore the epoch
-/// fence and grant slices that never expire.
+/// v8 (store kind epoch and slice life), ADDITIVE: `busbar:epoch` (the ONE fleet epoch `reserve`
+/// fenced with), each slice hash's `until` (its `valid_until_ms`) and `busbar:open:<slot>` (the
+/// slot's open slices by `until`). Superseded by v9, which deletes them; v8 never shipped in a
+/// release.
+///
+/// v9 (money is a view on ledger x rate card), SUBTRACTIVE: the store keeps only ledger counts
+/// (usage windows and metering rows) and the records the kernel puts. The keys of the deleted slots
+/// go: the money keys (`busbar:cap:*`, `busbar:slice:*`, `busbar:open:*`, `busbar:slices`,
+/// `busbar:epoch`), the journal (`busbar:journal:*`) and the sessions (`busbar:session:*`,
+/// `busbar:sessions:*`), removed by `SCAN` + `UNLINK` in [`ValkeyStore::drop_dead_slot_keys`], and so
+/// are the `busbar:op:*` dedupe hashes of the deleted slots. The hash of a kept slot is untouched,
+/// so a retry across the upgrade still answers its original. The marker is written last. A namespace
+/// marked NEWER than this build is refused at open.
 const SCHEMA_KEY: &str = "busbar:schema";
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
+/// The names (the first `:`-segment of an op's value fields) of the slots whose `busbar:op:*`
+/// dedupe hashes survive the v9 upgrade.
+const KEPT_OP_SLOTS: [&str; 3] = [
+    "add_usage_batch",
+    "add_metering_batch",
+    "append_plane_record",
+];
 /// The oldest schema `migrate()` can upgrade in place: a namespace with data below it is REFUSED
 /// (never wiped). v6 and later are always migrated in place.
 const FIRST_MIGRATED_SCHEMA: i64 = 6;
@@ -940,11 +943,11 @@ impl ValkeyStore {
         }
     }
 
-    /// SCHEMA MIGRATION (currently v8; see `SCHEMA_VERSION`'s own doc for what each version did).
-    /// A fresh namespace (no `busbar:*` keys) is simply marked (its epoch created at 0); one already
+    /// SCHEMA MIGRATION (currently v9; see `SCHEMA_VERSION`'s own doc for what each version did).
+    /// A fresh namespace (no `busbar:*` keys) is simply marked ; one already
     /// at the current version passes through untouched; one NEWER than this build is refused; a v6
-    /// namespace is upgraded IN PLACE ([`legacy::migrate_v6_to_v7`]) and a v6 or v7 one then gets
-    /// the v8 step ([`crate::slots::stamp_open_slices`]), each idempotent, the marker written last
+    /// namespace is upgraded IN PLACE ([`legacy::migrate_v6_to_v7`]) and a v6, v7 or v8 one then gets
+    /// the v9 step ([`ValkeyStore::drop_dead_slot_keys`]), each idempotent, the marker written last
     /// so a crash mid-upgrade re-runs it on the next connect.
     ///
     /// NOTHING IS EVER WIPED. A namespace with `busbar:*` keys whose marker is absent or older than
@@ -963,9 +966,7 @@ impl ValkeyStore {
                 return Err(RecordStoreError(format!(
                     "valkey schema check: schema v{version} is newer than this build \
                      (v{SCHEMA_VERSION}); refusing to open. NOTHING was changed. An older build \
-                     on a newer namespace would ignore what the newer schema keeps (a v7 build on \
-                     a v8 namespace ignores the fleet epoch's fence and grants slices that never \
-                     expire): run a build of v{version} or later."
+                     on a newer namespace would not know what the newer schema did to the namespace: run a build of v{version} or later."
                 )));
             }
             if version == SCHEMA_VERSION {
@@ -975,7 +976,7 @@ impl ValkeyStore {
                 if version < 7 {
                     legacy::migrate_v6_to_v7(self, c).await?;
                 }
-                crate::slots::stamp_open_slices(self, c).await?;
+                self.drop_dead_slot_keys(c).await?;
                 return with_conn!(self, |c| c
                     .set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION)
                     .await);
@@ -987,13 +988,9 @@ impl ValkeyStore {
             })?;
             let others: Vec<&String> = existing.iter().filter(|k| *k != SCHEMA_KEY).collect();
             if others.is_empty() {
-                // The marker first: a peer first-booting beside us that SCANs between the two
-                // writes must find the marker, not an unmarked epoch key it would refuse. A crash
-                // between them leaves no epoch key, which reads as 0.
-                with_conn!(self, |c| c
+                return with_conn!(self, |c| c
                     .set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION)
-                    .await)?;
-                return crate::slots::create_epoch(self, c).await;
+                    .await);
             }
             if !rechecked {
                 // A peer may have marked the namespace between our read and the SCAN.
@@ -1030,8 +1027,8 @@ impl ValkeyStore {
                  Refusing to start. NOTHING was changed: no key was deleted and no marker written. \
                  If this is a current namespace whose marker was lost, restore it with \
                  `SET {SCHEMA_KEY} {FIRST_MIGRATED_SCHEMA}` and restart ({FIRST_MIGRATED_SCHEMA} is safe \
-                 either way: the v6->v7 copy is append-if-absent and the v7->v8 stamp keeps a stamp already made, \
-                 so both do nothing on a namespace already past them, whereas {SCHEMA_VERSION} on a namespace last run by a v6 build would skip the copy \
+                 either way: the v6->v7 copy is append-if-absent and the v9 step deletes keys a v6/v7 namespace already lacks or no longer reads, \
+                 so both are safe on a namespace already past them, whereas {SCHEMA_VERSION} on a namespace last run by a v6 build would skip the copy \
                  and strand its task and ask-state data). If it was written by plugin v1.0.0 or an earlier 1.5.0 \
                  development build, it cannot be migrated: back it up if needed, delete the \
                  `busbar:*` keys, and restart to start a fresh namespace.",
@@ -1039,6 +1036,67 @@ impl ValkeyStore {
                 sample.join(", ")
             )));
         }
+    }
+
+    /// THE v9 STEP (`SCHEMA_VERSION`): delete what the deleted slots kept. The key families go
+    /// by `SCAN` + `UNLINK` (never `KEYS`, never a blocking `DEL`), once, at the upgrade: the
+    /// money keys (`busbar:cap:*`, `busbar:slice:*`, `busbar:open:*`, `busbar:slices`,
+    /// `busbar:epoch`), the journal (`busbar:journal:*`, its `streams` set included) and the
+    /// sessions (`busbar:session:*`, `busbar:sessions:*`). The `busbar:op:*` dedupe hashes of the
+    /// deleted slots go too, told apart by the op's value fields (`b`), which start with the
+    /// slot's name; the hashes of the kept slots (`add_usage_batch`, `add_metering_batch`,
+    /// `append_plane_record`) are untouched, so a retry across the upgrade still answers its
+    /// original. Idempotent (a re-run finds nothing more), so a crash before the marker is
+    /// written re-runs it and two nodes upgrading at once land in the same place.
+    async fn drop_dead_slot_keys(&self, c: &mut Conn) -> RecordStoreResult<()> {
+        for pattern in [
+            "busbar:cap:*",
+            "busbar:slice:*",
+            "busbar:open:*",
+            "busbar:slices",
+            "busbar:epoch",
+            "busbar:journal:*",
+            "busbar:session:*",
+            "busbar:sessions:*",
+        ] {
+            let keys: Vec<String> = with_conn!(self, |c| {
+                c.scan_match::<_, String>(pattern)
+                    .await?
+                    .collect::<Result<Vec<String>, _>>()
+            })?;
+            self.unlink_all(c, &keys).await?;
+        }
+        let ops: Vec<String> = with_conn!(self, |c| {
+            c.scan_match::<_, String>("busbar:op:*")
+                .await?
+                .collect::<Result<Vec<String>, _>>()
+        })?;
+        let mut dead = Vec::new();
+        for chunk in ops.chunks(500) {
+            let bodies: Vec<Option<Vec<u8>>> = with_conn!(self, |c| {
+                let mut pipe = pipe();
+                for k in chunk {
+                    pipe.cmd("HGET").arg(k).arg("b");
+                }
+                pipe.query(c).await
+            })?;
+            for (key, body) in chunk.iter().zip(bodies) {
+                let Some(body) = body else { continue };
+                let name = body.split(|b| *b == b':').next().unwrap_or_default();
+                if !KEPT_OP_SLOTS.iter().any(|k| k.as_bytes() == name) {
+                    dead.push(key.clone());
+                }
+            }
+        }
+        self.unlink_all(c, &dead).await
+    }
+
+    /// `UNLINK` `keys`, a chunk at a time.
+    async fn unlink_all(&self, c: &mut Conn, keys: &[String]) -> RecordStoreResult<()> {
+        for chunk in keys.chunks(500) {
+            with_conn!(self, |c| cmd("UNLINK").arg(chunk).query::<i64>(c).await)?;
+        }
+        Ok(())
     }
 
     fn err(&self, e: RedisError, ctx: &str) -> RecordStoreError {
@@ -1169,18 +1227,9 @@ fn queue_metering(pipe: &mut Pipeline, d: &MeteringDelta) {
     .ignore();
 }
 
-/// The refusal an audit append answers when `seq` already holds a DIFFERENT record.
-fn audit_fork(stored: &AuditRecord, entry: &AuditRecord) -> String {
-    format!(
-        "append_audit: seq {} already holds a DIFFERENT record; the audit chain has forked \
-         (stored action '{}', incoming '{}')",
-        entry.seq, stored.action, entry.action
-    )
-}
-
 /// THE 1.5.5 OP SET's bodies, each over the op's one connection `c` (the store door, `slots`,
 /// runs each as one op through the host's connector). The un-deduped 1.5.5 writes (`add_usage`,
-/// `add_metering`, `append_audit`, `append_plane_record`) reach the store as their `op_id` slots.
+/// `add_metering`, `append_plane_record`) reach the store as their `op_id` slots.
 impl ValkeyStore {
     pub(crate) async fn put_key(&self, c: &mut Conn, key: &VirtualKey) -> RecordStoreResult<()> {
         let key = key.clone();
@@ -1411,36 +1460,6 @@ impl ValkeyStore {
         })
     }
 
-    pub(crate) async fn scrub_key(&self, c: &mut Conn, id: &str) -> RecordStoreResult<()> {
-        let key_row = format!("{KEY_PREFIX}{id}");
-        with_conn!(self, |c| {
-            transaction!(c, &[key_row.as_str()], |c, pipe| {
-                let raw: Option<String> = c.get(&key_row).await?;
-                let Some(raw) = raw else {
-                    return Err(RedisError::refused(format!("scrub_key: unknown id '{id}'")));
-                };
-                let mut key: VirtualKey = serde_json::from_str(&raw)
-                    .map_err(|_| RedisError::from((ErrorKind::Client, "key decode")))?;
-                if key.deleted_at.is_none() {
-                    return Err(RedisError::from((
-                        ErrorKind::Client,
-                        "scrub_key: key is not tombstoned — delete_key it first",
-                    )));
-                }
-                let rev = self.next_revision(c).await?;
-                key.name = String::new();
-                key.labels.clear();
-                key.revision = rev;
-                let json = serde_json::to_string(&key)
-                    .map_err(|_| RedisError::from((ErrorKind::Client, "key encode")))?;
-                pipe.atomic();
-                pipe.set(&key_row, &json).ignore();
-                pipe.zadd(KEYS_BYREV, id, rev).ignore();
-                pipe.query(c).await
-            })
-        })
-    }
-
     pub(crate) async fn get_usage(
         &self,
         c: &mut Conn,
@@ -1509,72 +1528,6 @@ impl ValkeyStore {
             }
             pipe.query(c).await
         })
-    }
-
-    /// Retention purge of usage windows: drop every `busbar:usage:<bucket>:<window_start>` hash whose
-    /// `window_start` is before `before`; returns how many windows went. There is no per-window
-    /// index (a window is one hash, written by `add_usage`/`put_usage`), so this is a SCAN with
-    /// MATCH on the documented `busbar:usage:` prefix - acceptable because the purge runs from the
-    /// engine's sweeper, never the request path. Non-blocking (SCAN, not KEYS); the `window_start` is
-    /// the key's last `:` component (a bucket id may itself contain `:`).
-    pub(crate) async fn purge_windows_before(
-        &self,
-        c: &mut Conn,
-        before: u64,
-    ) -> RecordStoreResult<u64> {
-        let keys: Vec<String> = with_conn!(self, |c| {
-            c.scan_match::<_, String>("busbar:usage:*")
-                .await?
-                .collect::<Result<Vec<String>, _>>()
-        })?;
-        let old: Vec<String> = keys
-            .into_iter()
-            .filter(|k| {
-                k.rsplit_once(':')
-                    .and_then(|(_, w)| w.parse::<u64>().ok())
-                    .is_some_and(|w| w < before)
-            })
-            .collect();
-        let mut purged = 0u64;
-        for chunk in old.chunks(500) {
-            let gone: Vec<i64> = with_conn!(self, |c| {
-                let mut pipe = pipe();
-                for k in chunk {
-                    pipe.del(k);
-                }
-                pipe.query(c).await
-            })?;
-            purged += gone.iter().map(|n| read_u64(*n)).sum::<u64>();
-        }
-        Ok(purged)
-    }
-
-    /// Retention purge of one metering bucket: drop every row the bucket's index set names, and the
-    /// set; returns the row count. The bucket's set (`busbar:metering:<bucket>`) is the index, so no
-    /// keyspace scan is needed. `bucket` is an integer in text (the trait's string form); anything
-    /// else is refused in the siblings' words.
-    pub(crate) async fn purge_metering_before(
-        &self,
-        c: &mut Conn,
-        bucket: &str,
-    ) -> RecordStoreResult<u64> {
-        let b: u64 = bucket.parse().map_err(|_| {
-            RecordStoreError(format!(
-                "purge_metering_before: invalid bucket {bucket:?}, expected an integer"
-            ))
-        })?;
-        let set = metering_set(b);
-        let gone: Vec<i64> = with_conn!(self, |c| {
-            transaction!(c, &[set.as_str()], |c, pipe| {
-                let rows: Vec<String> = c.smembers(&set).await?;
-                for row in &rows {
-                    pipe.del(row);
-                }
-                pipe.del(&set).ignore();
-                pipe.query::<Option<Vec<i64>>>(c).await
-            })
-        })?;
-        Ok(gone.iter().map(|n| read_u64(*n)).sum())
     }
 
     pub(crate) async fn list_metering(
@@ -1941,24 +1894,6 @@ impl ValkeyStore {
             out.push(cred_from_json(&raw)?.meta);
         }
         Ok(out)
-    }
-
-    pub(crate) async fn lookup_credential_secret(
-        &self,
-        c: &mut Conn,
-        kind: &str,
-        public_id: &str,
-    ) -> RecordStoreResult<Option<CredentialSecret>> {
-        let ptr: Option<String> = with_conn!(self, |c| c.get(cred_pub_key(kind, public_id)).await)?;
-        let Some(ptr) = ptr else {
-            return Ok(None);
-        };
-        let Some((key_id, kind, slot)) = parse_slot_pointer(&ptr) else {
-            return Ok(None);
-        };
-        let raw: Option<String> =
-            with_conn!(self, |c| c.get(cred_row_key(&key_id, &kind, slot)).await)?;
-        raw.map(|r| cred_from_json(&r)).transpose()
     }
 
     pub(crate) async fn revoke_credential(
