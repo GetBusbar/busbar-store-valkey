@@ -12,7 +12,9 @@
 //! - `busbar:cap:<slot>`                HASH `cap`, `gen` (the `config_gen`), `used` (drawn), each a
 //!   decimal `u64`. `<slot>` is `<hex bucket>:<pool>:<dimension>:<hex class>:<window_start>`, the
 //!   pool `-` for every pool or `p<hex pool>`: hex has no `:`, so two slots never share a key.
-//! - `busbar:slice:<id>`                HASH `cap` (its slot's key), `left` (what it still holds).
+//! - `busbar:slice:<id>`                HASH `cap` (its slot's key), `left` (what it still holds). Deleted
+//!   when the slice closes (its `left` reaches 0, or any release on window 0); a closed id is told
+//!   from a never-granted one by `busbar:slices`.
 //! - `busbar:slices`                    STRING, the last slice id handed out (`INCRBY`; never reused).
 //! - `busbar:journal:<hex stream>`      LIST of records, oldest first: a record's `seq` is its
 //!   position from 1, so the stream's head is its length. `busbar:journal:streams` SET names them.
@@ -683,8 +685,15 @@ impl ValkeyStore {
         ids.dedup();
         let watch: Vec<String> = ids.iter().map(|id| slice_key(*id)).collect();
         let answer = deduped!(self, c, op, body, watch, OpRefused, |c, pipe| {
-            // Every named slice must be held, or the whole call is refused.
+            // Every named slice must have been granted, or the whole call is refused. A slice with
+            // no hash is either closed (its hash is deleted at close: it was handed out, so its id
+            // is within the counter) or never granted. The counter is a plain GET, not WATCHed
+            // (every reserve INCRs it), and read at most once per step. Accepted weakness: an id in
+            // a gap left by an aborted or lost draw (never handed to anyone) answers 0 rather than
+            // Failed; only a buggy caller could name one, and 0 moves no money.
             let mut held: BTreeMap<u64, (String, u64)> = BTreeMap::new();
+            let mut closed: BTreeSet<u64> = BTreeSet::new();
+            let mut counter: Option<u64> = None;
             for id in &ids {
                 let (cap, left): (Option<String>, Option<String>) = cmd("HMGET")
                     .arg(slice_key(*id))
@@ -693,8 +702,21 @@ impl ValkeyStore {
                     .query(c)
                     .await?;
                 let Some(cap) = cap else {
+                    let last = match counter {
+                        Some(last) => last,
+                        None => {
+                            let got: Option<String> = cmd("GET").arg(SLICE_SEQ).query(c).await?;
+                            let last = num(got, "the slice counter")?;
+                            counter = Some(last);
+                            last
+                        }
+                    };
+                    if *id >= 1 && *id <= last {
+                        closed.insert(*id);
+                        continue;
+                    }
                     return Ok(Err(OpRefused::Failed(format!(
-                        "slice_release: slice {id} is not held"
+                        "slice_release: slice {id} was never granted"
                     ))));
                 };
                 held.insert(*id, (cap, num(left, "a slice's holding")?));
@@ -711,6 +733,10 @@ impl ValkeyStore {
             let mut by_cap: BTreeMap<String, u64> = BTreeMap::new();
             let mut closed_on_zero: BTreeSet<u64> = BTreeSet::new();
             for (id, unspent) in items {
+                if closed.contains(id) {
+                    back_all.push(0);
+                    continue;
+                }
                 let (cap, left) = held.get_mut(id).expect("every item's slice is held");
                 let back = (*unspent).min(*left);
                 *left -= back;
@@ -726,10 +752,9 @@ impl ValkeyStore {
                 back_all.push(back);
             }
             for (id, (_, left)) in &held {
-                if closed_on_zero.contains(id) {
-                    // Closed, not deleted: another release of it answers 0, not "not held".
-                    pipe.hset(slice_key(*id), "left", "0").ignore();
-                } else if *left == 0 {
+                // A slice that closed (window 0 at its first release, a rolling window at 0) is
+                // deleted.
+                if closed_on_zero.contains(id) || *left == 0 {
                     pipe.del(slice_key(*id)).ignore();
                 } else {
                     pipe.hset(slice_key(*id), "left", left.to_string()).ignore();
