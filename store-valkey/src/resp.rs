@@ -510,7 +510,17 @@ impl Conn {
                     i.drain(..n);
                     v
                 }))
-            })?;
+            });
+            let got = match got {
+                Ok(got) => got,
+                Err(e) => {
+                    // A reply that does not parse leaves the stream out of step with the commands
+                    // sent (the rest of that reply, or a late one, would be read as a LATER op's
+                    // reply): this connection is never kept.
+                    self.wire.discard();
+                    return Err(e);
+                }
+            };
             if let Some(v) = got {
                 return Ok(v);
             }
