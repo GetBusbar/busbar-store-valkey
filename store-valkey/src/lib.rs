@@ -382,9 +382,21 @@ fn read_u64(v: i64) -> u64 {
 }
 
 /// Extract the PASSWORD component from a valkey URL (`redis://user:pass@host/...` or
-/// `redis://:pass@host/...`), if any - the secret that must never appear in an error string.
+/// `redis://:pass@host/...`, or a unix-socket URL's `?pass=`), if any - the secret that must never
+/// appear in an error string. The raw (as-written) form; [`scrub`] also redacts its decoding.
 fn url_password(url: &str) -> Option<String> {
-    let rest = url.split("://").nth(1)?;
+    let (scheme, rest) = url.split_once("://")?;
+    if matches!(scheme, "unix" | "redis+unix" | "valkey+unix") {
+        let query = rest.split_once('?')?.1;
+        let query = query.split_once('#').map_or(query, |(q, _)| q);
+        return query
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .filter(|(k, _)| *k == "pass")
+            .map(|(_, v)| v)
+            .find(|v| !v.is_empty())
+            .map(str::to_string);
+    }
     let userinfo = rest.rsplit_once('@').map(|(u, _)| u)?;
     let pass = match userinfo.split_once(':') {
         Some((_, p)) => p,
@@ -429,6 +441,11 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
     let decoded = percent_decode(s);
     if decoded != s && !decoded.is_empty() && out.contains(&decoded) {
         out = out.replace(&decoded, "<redacted>");
+    }
+    // A query value's `+` reads as a space (form encoding: the unix URL's `?pass=`).
+    let spaced = percent_decode(&s.replace('+', " "));
+    if spaced != decoded && !spaced.is_empty() && out.contains(&spaced) {
+        out = out.replace(&spaced, "<redacted>");
     }
     out
 }
