@@ -4353,3 +4353,232 @@ fn migrate_over_the_1_5_5_rows_is_idempotent() {
     assert_1_5_5_keys_read_back(&store);
     assert_eq!(read_everything_1_5_5(&store), first);
 }
+
+/// `list_audit_tail(0)` is the contract's empty tail, not the whole chain.
+#[test]
+fn list_audit_tail_zero_is_empty() {
+    let _serialised = audit_seq_guard();
+    let Some(store) = live_store() else { return };
+    let top = store
+        .list_audit()
+        .unwrap()
+        .iter()
+        .map(|r| r.seq)
+        .max()
+        .unwrap_or(0)
+        + 1_000;
+    store
+        .append_audit(&AuditRecord {
+            seq: top,
+            ts: 1000,
+            action: "key.mint".to_string(),
+            resource: "key:vk_tail0".to_string(),
+            outcome: "applied".to_string(),
+            principal: "admin".to_string(),
+            prev_hash: String::new(),
+            hash: format!("h{top}"),
+        })
+        .unwrap();
+    let tail = store.list_audit_tail(0).unwrap();
+    let _ = store.purge_audit_seq_for_test(top);
+    assert!(tail.is_empty(), "limit 0 must be empty, got {}", tail.len());
+}
+
+/// The URL password never reaches `Debug` output.
+#[test]
+fn debug_output_redacts_the_url_password() {
+    let url = "redis://user:s3cr3t@host:6379/0";
+    let store = crate::ValkeyStore::new(url).unwrap();
+    let t = parse_url(url).unwrap();
+    for out in [format!("{store:?}"), format!("{t:?}")] {
+        assert!(!out.contains("s3cr3t"), "password leaked: {out}");
+        assert!(out.contains("<redacted>"), "no redaction marker: {out}");
+    }
+}
+
+/// `put_key_with_credential` into a slot holding a DIFFERENT LIVE credential is refused, and the
+/// live credential's pointers still resolve to it.
+#[test]
+fn put_key_with_credential_refuses_an_occupied_live_slot() {
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_kwc_occ");
+    let p1 = uid("AKIA_KWC_OCC1");
+    let p2 = uid("AKIA_KWC_OCC2");
+    let key = vk(&key_id);
+    let c1 = cred(&key_id, &p1, 0);
+    let c2 = cred(&key_id, &p2, 0);
+    store.put_key_with_credential(&key, &c1).unwrap();
+    let err = store.put_key_with_credential(&key, &c2);
+    assert!(
+        err.is_err(),
+        "minting into an occupied LIVE slot must fail: {err:?}"
+    );
+    let live = store
+        .lookup_credential_secret("sigv4", &p1)
+        .unwrap()
+        .expect("C1 must still resolve");
+    assert_eq!(live.meta.id, c1.meta.id);
+    assert!(store
+        .lookup_credential_secret("sigv4", &p2)
+        .unwrap()
+        .is_none());
+}
+
+/// After the occupant is revoked, the slot can be re-minted and the old public_id stops resolving.
+#[test]
+fn put_key_with_credential_reclaims_a_revoked_slot_and_drops_old_pointers() {
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_kwc_recl");
+    let p1 = uid("AKIA_KWC_RECL1");
+    let p2 = uid("AKIA_KWC_RECL2");
+    let key = vk(&key_id);
+    let c1 = cred(&key_id, &p1, 0);
+    let c2 = cred(&key_id, &p2, 0);
+    store.put_key_with_credential(&key, &c1).unwrap();
+    store.revoke_credential(&c1.meta.id, "rotated").unwrap();
+    store.put_key_with_credential(&key, &c2).unwrap();
+    assert!(store
+        .lookup_credential_secret("sigv4", &p1)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store
+            .lookup_credential_secret("sigv4", &p2)
+            .unwrap()
+            .expect("C2 resolves")
+            .meta
+            .id,
+        c2.meta.id
+    );
+    // C1's old id pointer is gone: revoking it must not touch C2.
+    let _ = store.revoke_credential(&c1.meta.id, "late retry");
+    assert!(
+        store
+            .lookup_credential_secret("sigv4", &p2)
+            .unwrap()
+            .expect("C2 resolves")
+            .meta
+            .revoked_at
+            .is_none(),
+        "revoking C1's old id must leave C2 un-revoked"
+    );
+}
+
+/// A replayed mint of a REVOKED credential must not un-revoke it.
+#[test]
+fn put_key_with_credential_never_remints_a_revoked_credential() {
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_kwc_unrev");
+    let p1 = uid("AKIA_KWC_UNREV");
+    let key = vk(&key_id);
+    let c1 = cred(&key_id, &p1, 0);
+    store.put_key_with_credential(&key, &c1).unwrap();
+    store.revoke_credential(&c1.meta.id, "rotated").unwrap();
+    let again = store.put_key_with_credential(&key, &c1);
+    assert!(
+        again.is_err(),
+        "re-minting a revoked credential must fail: {again:?}"
+    );
+    let row = store.lookup_credential_secret("sigv4", &p1).unwrap();
+    assert!(
+        row.is_none_or(|r| r.meta.revoked_at.is_some()),
+        "the credential must stay revoked"
+    );
+}
+
+/// A RESP parse error leaves the bad bytes buffered on the kept connection, so the connection must
+/// be discarded: the op AFTER the malformed reply succeeds (on a fresh connection) instead of
+/// failing on the same buffered bytes forever.
+#[test]
+fn a_malformed_reply_discards_the_kept_connection() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    if live_store().is_none() {
+        return;
+    }
+    let (backend, db, userinfo) = live_parts();
+    let poison = Arc::new(AtomicBool::new(false));
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let at = l.local_addr().unwrap().to_string();
+    let flag = poison.clone();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(s) = s else { return };
+            let b = std::net::TcpStream::connect(&backend).expect("the live server");
+            let (s2, b2) = (s.try_clone().unwrap(), b.try_clone().unwrap());
+            std::thread::spawn(move || pump(s, b));
+            let flag = flag.clone();
+            std::thread::spawn(move || {
+                let (mut from, mut to) = (b2, s2);
+                let mut buf = [0_u8; 16 * 1024];
+                loop {
+                    match from.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            if flag.swap(false, Ordering::SeqCst) {
+                                // The malformed reply now; the REAL reply late, as a slow
+                                // (not gone) server would deliver it.
+                                if to.write_all(b"!bad\r\n").is_err() {
+                                    return;
+                                }
+                                let (mut late, stale) =
+                                    (to.try_clone().unwrap(), buf[..n].to_vec());
+                                std::thread::spawn(move || {
+                                    std::thread::sleep(std::time::Duration::from_millis(300));
+                                    let _ = late.write_all(&stale);
+                                });
+                                continue;
+                            }
+                            if to.write_all(&buf[..n]).is_err() || to.flush().is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let (store, _) = open_on(
+        &settings_for(&format!("redis://{userinfo}{at}/{db}")),
+        plain,
+    );
+    let store = store.expect("opens through the proxy");
+    let id = uid("vk_malformed");
+    store.put_key(&vk(&id)).unwrap();
+    poison.store(true, Ordering::SeqCst);
+    assert!(
+        store.list_denylist().is_err(),
+        "the malformed reply is refused"
+    );
+    // The late real reply to the refused op lands on the old connection after this wait; it must
+    // not be read as the reply to a LATER op.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let got = store.get_key(&id);
+    assert!(
+        matches!(&got, Ok(Some(k)) if k.id == id),
+        "the op after a malformed reply must not run on the poisoned kept connection: {got:?}"
+    );
+    let _ = store.purge_key_for_test(&id);
+}
+
+/// A replayed `put_credential` of a REVOKED credential must not un-revoke it.
+#[test]
+fn put_credential_never_remints_a_revoked_credential() {
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_pc_unrev");
+    let p1 = uid("AKIA_PC_UNREV");
+    store.put_key(&vk(&key_id)).unwrap();
+    let c1 = cred(&key_id, &p1, 0);
+    store.put_credential(&c1).unwrap();
+    store.revoke_credential(&c1.meta.id, "rotated").unwrap();
+    let again = store.put_credential(&c1);
+    assert!(
+        again.is_err(),
+        "re-minting a revoked credential must fail: {again:?}"
+    );
+    let row = store.lookup_credential_secret("sigv4", &p1).unwrap();
+    assert!(
+        row.is_none_or(|r| r.meta.revoked_at.is_some()),
+        "the credential must stay revoked"
+    );
+}
