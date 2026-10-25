@@ -675,11 +675,6 @@ impl Conn {
         cmd("INCRBY").arg(key).arg(delta).query(self).await
     }
 
-    /// `LLEN`.
-    pub async fn llen<K: ToArgs, RV: FromValue>(&mut self, key: K) -> RedisResult<RV> {
-        cmd("LLEN").arg(key).query(self).await
-    }
-
     /// Every key matching `pattern` (`SCAN ... MATCH`, followed to the end), as the upstream
     /// driver's iterator of results.
     pub async fn scan_match<P: ToArgs, RV: FromValue>(
@@ -820,9 +815,6 @@ impl Pipeline {
         /// `SADD`.
         sadd(k: K, m: M) => "SADD");
     pipe_cmd!(
-        /// `SREM`.
-        srem(k: K, m: M) => "SREM");
-    pipe_cmd!(
         /// `HSET key field value`.
         hset(k: K, f: F, v: V) => "HSET");
     /// `HSET key field value ...` (every pair).
@@ -836,12 +828,6 @@ impl Pipeline {
     pipe_cmd!(
         /// `HGETALL`.
         hgetall(k: K) => "HGETALL");
-    pipe_cmd!(
-        /// `RPUSH key value ...`.
-        rpush(k: K, v: V) => "RPUSH");
-    pipe_cmd!(
-        /// `LLEN`.
-        llen(k: K) => "LLEN");
     pipe_cmd!(
         /// `EXPIRE key seconds`.
         expire(k: K, s: S) => "EXPIRE");

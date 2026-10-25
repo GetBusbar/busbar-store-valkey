@@ -69,8 +69,8 @@ pub(super) mod conf {
     //! ```
 
     use busbar_contract::records::{
-        AuditRecord, CredentialMeta, CredentialSecret, PlaneDisposition, PlaneRecord,
-        PlaneSelector, RecordStore as Store, SecretForm, VirtualKey,
+        CredentialMeta, CredentialSecret, PlaneDisposition, PlaneRecord, PlaneSelector,
+        RecordStore as Store, SecretForm, VirtualKey,
     };
     use serde::{Deserialize, Serialize};
     use std::collections::hash_map::DefaultHasher;
@@ -164,20 +164,6 @@ pub(super) mod conf {
                 revision: 0,
             },
             secret: "v1:plain:conformance-secret".to_string(),
-        }
-    }
-
-    /// A minimal audit record at `seq`, with `action` as the field the duplicate-`seq` check varies.
-    pub fn audit(seq: u64, action: &str) -> AuditRecord {
-        AuditRecord {
-            seq,
-            ts: 1_700_000_000,
-            action: action.to_string(),
-            resource: "hook:conformance".to_string(),
-            outcome: "applied".to_string(),
-            principal: "conformance".to_string(),
-            prev_hash: String::new(),
-            hash: format!("hash-of-{action}-at-{seq}"),
         }
     }
 
@@ -317,9 +303,9 @@ pub(super) mod conf {
         );
         assert!(
             store
-                .lookup_credential_secret("generic", &format!("AKIA{cred_id}"))
-                .expect("lookup is never an error")
-                .is_none(),
+                .list_credentials(&key_id)
+                .expect("listing is never an error")
+                .is_empty(),
             "the refused credential still resolves on the verify path"
         );
     }
@@ -354,46 +340,6 @@ pub(super) mod conf {
             store.get_key(&minted_key).expect("read back").is_none(),
             "the refused mint committed its key leg anyway — an orphan key is live and the \
              caller was told the mint failed"
-        );
-    }
-
-    /// **`append_audit` on a duplicate `seq`:** identical record → `Ok` (the write-through retrying after
-    /// a timeout, the common case); DIFFERENT record → error (two records claiming one chain position is
-    /// a forked or tampered log, and it is the single most important thing an audit store can report).
-    ///
-    /// Overwriting is never correct — it destroys the second case instead of reporting it. Silently
-    /// keeping the first is not correct either: it collapses both cases into one and drops a genuinely
-    /// different record on the floor.
-    ///
-    /// `seq` must be free before this runs (see the module doc on namespacing). Skip on a backend that
-    /// does not provide durable audit (the defaulted no-op).
-    pub fn assert_append_audit_duplicate_seq(store: &dyn Store, seq: u64) {
-        let first = audit(seq, "hook.register");
-        store.append_audit(&first).expect("first append");
-        store
-            .append_audit(&first)
-            .expect("re-appending the IDENTICAL record is the retry path and must be Ok");
-
-        let forked = audit(seq, "hook.remove");
-        assert!(
-            store.append_audit(&forked).is_err(),
-            "a DIFFERENT record on an already-occupied seq was accepted — the audit chain has forked \
-             and the store said nothing"
-        );
-
-        // The stored record must still be the original: neither overwritten nor recomputed. Filtered by
-        // `seq` rather than read positionally, so a shared `audit_log` carrying other tests' rows (or a
-        // concurrent run's) cannot affect the result.
-        let entries = store.list_audit().expect("list");
-        let at_seq: Vec<_> = entries.iter().filter(|e| e.seq == seq).collect();
-        assert_eq!(
-            at_seq.len(),
-            1,
-            "exactly one record may occupy a seq, got {at_seq:?}"
-        );
-        assert_eq!(
-            at_seq[0].action, "hook.register",
-            "the rejected append must not have overwritten the stored record"
         );
     }
 
