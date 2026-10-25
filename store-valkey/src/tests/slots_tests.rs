@@ -346,7 +346,8 @@ fn open_refuses_settings_it_cannot_run_in_its_own_words() {
     assert!(e.contains("invalid valkey plugin config"), "{e}");
     let e =
         Door::open(br#"{"url":"not-a-valkey-url"}"#, None).expect_err("a url the driver refuses");
-    assert!(e.contains("valkey plugin: failed to connect"), "{e}");
+    assert!(e.contains("invalid valkey plugin config: url: "), "{e}");
+    assert!(!e.contains("failed to connect"), "{e}");
 }
 
 /// S1/S2/S3/S4: a replay applies nothing and answers the original, a different body is a conflict

@@ -1363,14 +1363,17 @@ impl StoreSlots for ValkeyStore {
         op!(cx, self, Err, |me, c| me.list_metering(c, bucket).await)
     }
 
-    /// Left at the 1.5.5 trait's `Ok(0)` (module doc, DATA GROWTH): no connection is made.
-    fn purge_windows_before(&self, _: &mut Op<'_>, _: u64) -> Step<RecordStoreResult<u64>> {
-        Step::Ready(Ok(0))
+    fn purge_windows_before(&self, cx: &mut Op<'_>, before: u64) -> Step<RecordStoreResult<u64>> {
+        op!(cx, self, Err, |me, c| me
+            .purge_windows_before(c, before)
+            .await)
     }
 
-    /// Left at the 1.5.5 trait's `Ok(0)` (module doc, DATA GROWTH): no connection is made.
-    fn purge_metering_before(&self, _: &mut Op<'_>, _: &str) -> Step<RecordStoreResult<u64>> {
-        Step::Ready(Ok(0))
+    fn purge_metering_before(&self, cx: &mut Op<'_>, bucket: &str) -> Step<RecordStoreResult<u64>> {
+        let bucket = bucket.to_string();
+        op!(cx, self, Err, |me, c| me
+            .purge_metering_before(c, &bucket)
+            .await)
     }
 
     fn put_credential(

@@ -2,11 +2,14 @@
 [package]
 name = "busbar-store-valkey-plugin"
 version = "1.6.0"
-publish = false            # first-party store plugin cdylib, shipped as a packed/signed tarball, not to crates.io
-edition = "2021"
-rust-version = "1.97"
+publish.workspace = true  # first-party store plugin cdylib, shipped as a packed/signed tarball, not to crates.io
+edition.workspace = true
+rust-version.workspace = true
 description = "The Valkey store as a droppable busbar plugin — a cdylib exporting the store C ABI. Drop it in the plugins folder and set store.module: valkey. One Valkey behind a fleet of busbar nodes means shared virtual keys, budgets, usage, and audit across the cluster."
-license = "Apache-2.0"
+license.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 # cdylib: the DROPPED-IN door (a signed tarball in `plugins/`). `rlib` is REQUIRED for `cargo test` to

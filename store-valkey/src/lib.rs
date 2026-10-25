@@ -89,12 +89,17 @@
 //! so an unreachable or misconfigured server still refuses the load at boot in the store's own
 //! words. Error strings are scrubbed of the URL password.
 //!
-//! ## Data growth (documented, deliberate)
+//! ## Data growth (documented, bounded by explicit purge)
 //!
 //! Rows are written WITHOUT a TTL: usage windows, metering buckets, and audit entries accumulate
-//! unboundedly by design — the store is the durable system of record. `purge_windows_before`/
-//! `purge_metering_before` are left at the trait's `Ok(0)` default (no obligation to self-bound);
-//! operators wanting bounded growth reap old `busbar:usage:*` keys on their own retention schedule.
+//! until purged - the store is the durable system of record. The two retention ops really purge,
+//! as every sibling store does: `purge_windows_before(before)` drops the usage-window hashes
+//! (`busbar:usage:<bucket>:<window_start>`) whose window started before `before` and returns the
+//! count; with no per-window index it is a non-blocking `SCAN` with `MATCH busbar:usage:*`, which
+//! is acceptable because the engine's sweeper calls it off the request path.
+//! `purge_metering_before(bucket)` drops one metering bucket (a billing-evidence op: operator
+//! action only) through that bucket's index set - no scan - and returns the row count; a bucket that
+//! is not an integer is refused.
 
 #![forbid(unsafe_code)]
 
@@ -394,16 +399,31 @@ fn read_u64(v: i64) -> u64 {
     v.max(0) as u64
 }
 
-/// Extract the PASSWORD component from a valkey URL (`redis://user:pass@host/...` or
-/// `redis://:pass@host/...`), if any - the secret that must never appear in an error string.
+/// Extract the PASSWORD from a valkey URL, if any - the secret that must never appear in an error
+/// string or a Debug print. Two forms carry one: the userinfo (`redis://user:pass@host/...`,
+/// `redis://:pass@host/...`) and the query (`valkey+unix:///path?pass=secret`, or `password=`),
+/// which is how a unix-socket URL states it ([`parse_unix`]). The value is returned as written in
+/// the URL (percent-escapes intact); [`scrub`] redacts it in both that and its decoded form.
 fn url_password(url: &str) -> Option<String> {
-    let rest = url.split("://").nth(1)?;
-    let userinfo = rest.rsplit_once('@').map(|(u, _)| u)?;
-    let pass = match userinfo.split_once(':') {
-        Some((_, p)) => p,
-        None => return None, // user only, no password
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let (before_query, query) = match rest.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (rest, None),
     };
-    (!pass.is_empty()).then(|| pass.to_string())
+    // The userinfo lives in the authority only (up to the first `/`), never in the path or query.
+    let authority = before_query.split('/').next().unwrap_or("");
+    if let Some((userinfo, _)) = authority.rsplit_once('@') {
+        if let Some((_, pass)) = userinfo.split_once(':') {
+            if !pass.is_empty() {
+                return Some(pass.to_string());
+            }
+        }
+    }
+    query?
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, v)| matches!(*k, "pass" | "password") && !v.is_empty())
+        .map(|(_, v)| v.to_string())
 }
 
 /// Percent-DECODE a URL component (`%40` -> `@`, `%25` -> `%`). A malformed escape is left verbatim.
@@ -749,14 +769,19 @@ impl ValkeyStore {
         let target = parse_url(url).map_err(|e| {
             RecordStoreError(scrub(format!("valkey connect: {e}"), secret.as_deref()))
         })?;
-        Ok(Self {
+        Ok(Self::from_parts(target, secret, timeout))
+    }
+
+    /// The store over an already-parsed target.
+    fn from_parts(target: Target, secret: Option<String>, connect_timeout: Duration) -> Self {
+        Self {
             inner: Arc::new(Inner {
                 target,
                 secret,
-                connect_timeout: timeout,
+                connect_timeout,
                 pool: Pool::new(KEPT_CONNECTIONS),
             }),
-        })
+        }
     }
 
     /// The op's connection over `wire`: the kept one when it is idle (its handshake done), else a
@@ -1008,13 +1033,7 @@ impl ValkeyStore {
 /// credential cannot be attached to a key whose liveness cannot be established.
 async fn owner_is_live(c: &mut Conn, key_row: &str, key_id: &str) -> RedisResult<()> {
     let raw: Option<String> = c.get(key_row).await?;
-    let refuse = |why: String| {
-        Err(RedisError::from((
-            ErrorKind::Client,
-            "put_credential refused",
-            why,
-        )))
-    };
+    let refuse = |why: String| Err(RedisError::refused(why));
     let Some(raw) = raw else {
         return refuse(format!(
             "put_credential: key '{key_id}' does not exist; a credential must hang off a real key"
@@ -1151,14 +1170,10 @@ impl ValkeyStore {
                     // unwritable, and this method is not the one that should be adjudicating that.
                     if let Some(prior) = existing.as_deref().and_then(|r| key_from_json(r).ok()) {
                         if prior.deleted_at.is_some() {
-                            return Err(RedisError::from((
-                                ErrorKind::Client,
-                                "put_key refused",
-                                format!(
-                                    "put_key: '{}' is tombstoned and its id is never reissued; \
+                            return Err(RedisError::refused(format!(
+                                "put_key: '{}' is tombstoned and its id is never reissued; \
                                      refusing to clear the tombstone",
-                                    key.id
-                                ),
+                                key.id
                             )));
                         }
                     }
@@ -1283,9 +1298,8 @@ impl ValkeyStore {
                     // Unknown id (never existed): a real error, matching the SQL backends'
                     // `delete_key`-on-unknown-id contract — distinct from "already tombstoned",
                     // which IS an idempotent no-op (see below).
-                    return Err(RedisError::from((
-                        ErrorKind::Client,
-                        "delete_key: unknown id",
+                    return Err(RedisError::refused(format!(
+                        "delete_key: unknown id '{id}'"
                     )));
                 };
                 let mut key: VirtualKey = serde_json::from_str(&raw)
@@ -1374,10 +1388,7 @@ impl ValkeyStore {
             transaction!(c, &[key_row.as_str()], |c, pipe| {
                 let raw: Option<String> = c.get(&key_row).await?;
                 let Some(raw) = raw else {
-                    return Err(RedisError::from((
-                        ErrorKind::Client,
-                        "scrub_key: unknown id",
-                    )));
+                    return Err(RedisError::refused(format!("scrub_key: unknown id '{id}'")));
                 };
                 let mut key: VirtualKey = serde_json::from_str(&raw)
                     .map_err(|_| RedisError::from((ErrorKind::Client, "key decode")))?;
@@ -1469,6 +1480,72 @@ impl ValkeyStore {
             }
             pipe.query(c).await
         })
+    }
+
+    /// Retention purge of usage windows: drop every `busbar:usage:<bucket>:<window_start>` hash whose
+    /// `window_start` is before `before`; returns how many windows went. There is no per-window
+    /// index (a window is one hash, written by `add_usage`/`put_usage`), so this is a SCAN with
+    /// MATCH on the documented `busbar:usage:` prefix - acceptable because the purge runs from the
+    /// engine's sweeper, never the request path. Non-blocking (SCAN, not KEYS); the `window_start` is
+    /// the key's last `:` component (a bucket id may itself contain `:`).
+    pub(crate) async fn purge_windows_before(
+        &self,
+        c: &mut Conn,
+        before: u64,
+    ) -> RecordStoreResult<u64> {
+        let keys: Vec<String> = with_conn!(self, |c| {
+            c.scan_match::<_, String>("busbar:usage:*")
+                .await?
+                .collect::<Result<Vec<String>, _>>()
+        })?;
+        let old: Vec<String> = keys
+            .into_iter()
+            .filter(|k| {
+                k.rsplit_once(':')
+                    .and_then(|(_, w)| w.parse::<u64>().ok())
+                    .is_some_and(|w| w < before)
+            })
+            .collect();
+        let mut purged = 0u64;
+        for chunk in old.chunks(500) {
+            let gone: Vec<i64> = with_conn!(self, |c| {
+                let mut pipe = pipe();
+                for k in chunk {
+                    pipe.del(k);
+                }
+                pipe.query(c).await
+            })?;
+            purged += gone.iter().map(|n| read_u64(*n)).sum::<u64>();
+        }
+        Ok(purged)
+    }
+
+    /// Retention purge of one metering bucket: drop every row the bucket's index set names, and the
+    /// set; returns the row count. The bucket's set (`busbar:metering:<bucket>`) is the index, so no
+    /// keyspace scan is needed. `bucket` is an integer in text (the trait's string form); anything
+    /// else is refused in the siblings' words.
+    pub(crate) async fn purge_metering_before(
+        &self,
+        c: &mut Conn,
+        bucket: &str,
+    ) -> RecordStoreResult<u64> {
+        let b: u64 = bucket.parse().map_err(|_| {
+            RecordStoreError(format!(
+                "purge_metering_before: invalid bucket {bucket:?}, expected an integer"
+            ))
+        })?;
+        let set = metering_set(b);
+        let gone: Vec<i64> = with_conn!(self, |c| {
+            transaction!(c, &[set.as_str()], |c, pipe| {
+                let rows: Vec<String> = c.smembers(&set).await?;
+                for row in &rows {
+                    pipe.del(row);
+                }
+                pipe.del(&set).ignore();
+                pipe.query::<Option<Vec<i64>>>(c).await
+            })
+        })?;
+        Ok(gone.iter().map(|n| read_u64(*n)).sum())
     }
 
     pub(crate) async fn list_metering(
@@ -1615,14 +1692,10 @@ impl ValkeyStore {
                     }
                     if cur.meta.id == secret.meta.id {
                         // A replayed mint must never un-revoke a revoked credential.
-                        return Err(RedisError::from((
-                            ErrorKind::Client,
-                            "put_credential refused",
-                            format!(
-                                "put_credential: credential {} is revoked; a revoked credential \
+                        return Err(RedisError::refused(format!(
+                            "put_credential: credential {} is revoked; a revoked credential \
                                  is never re-minted",
-                                secret.meta.id
-                            ),
+                            secret.meta.id
                         )));
                     }
                     old_pub = Some(cur.meta.public_id);
@@ -1723,14 +1796,10 @@ impl ValkeyStore {
                             .and_then(|r| key_from_json(r).ok())
                             .is_some_and(|k| k.deleted_at.is_some())
                         {
-                            return Err(RedisError::from((
-                                ErrorKind::Client,
-                                "put_key_with_credential refused",
-                                format!(
-                                    "put_key_with_credential: '{}' is tombstoned and its id is \
+                            return Err(RedisError::refused(format!(
+                                "put_key_with_credential: '{}' is tombstoned and its id is \
                                      never reissued",
-                                    key.id
-                                ),
+                                key.id
                             )));
                         }
                     }
@@ -1756,14 +1825,10 @@ impl ValkeyStore {
                         }
                         if cur.meta.id == secret.meta.id {
                             // A replayed mint must never un-revoke a revoked credential.
-                            return Err(RedisError::from((
-                                ErrorKind::Client,
-                                "put_key_with_credential refused",
-                                format!(
-                                    "put_key_with_credential: credential {} is revoked; a \
+                            return Err(RedisError::refused(format!(
+                                "put_key_with_credential: credential {} is revoked; a \
                                      revoked credential is never re-minted",
-                                    secret.meta.id
-                                ),
+                                secret.meta.id
                             )));
                         }
                         old_pub = Some(cur.meta.public_id);
@@ -1882,10 +1947,8 @@ impl ValkeyStore {
                     // ALREADY-REVOKED id, not an id that names nothing — a silent no-op here lets
                     // an operator responding to a leak believe the credential is dead while it is
                     // still live and still authenticating.
-                    return Err(RedisError::from((
-                        ErrorKind::Client,
-                        "revoke_credential refused",
-                        format!("revoke_credential: unknown id '{id}'"),
+                    return Err(RedisError::refused(format!(
+                        "revoke_credential: unknown id '{id}'"
                     )));
                 };
                 // A pointer that exists but does not parse is CORRUPTION, not an unknown id.
@@ -2167,14 +2230,44 @@ impl ValkeyStore {
             serde_json::from_slice(settings)
                 .map_err(|e| format!("invalid valkey plugin config: {e}"))?
         };
-        let url = v.get("url").and_then(|x| x.as_str()).ok_or_else(|| {
-            "valkey plugin config requires a \"url\" (a redis:// connection string)".to_string()
-        })?;
-        match v.get("connect_timeout_ms").and_then(|x| x.as_u64()) {
-            Some(ms) => ValkeyStore::with_timeout(url, Duration::from_millis(ms)),
-            None => ValkeyStore::new(url),
+        const BAD: &str = "invalid valkey plugin config";
+        // A top-level key this plugin does not read is a typo or a setting for another backend; it
+        // must not be swallowed into quietly opening with the defaults.
+        if let Some(unknown) = v.as_object().and_then(|o| {
+            o.keys()
+                .find(|k| !matches!(k.as_str(), "url" | "connect_timeout_ms"))
+        }) {
+            return Err(format!(
+                "{BAD}: unknown setting `{unknown}` (accepted: url, connect_timeout_ms)"
+            ));
         }
-        .map_err(|e| failed_to_connect(&e))
+        let url = match v.get("url") {
+            None => {
+                return Err(
+                    "valkey plugin config requires a \"url\" (a redis:// connection string)"
+                        .to_string(),
+                )
+            }
+            Some(serde_json::Value::String(s)) if !s.trim().is_empty() => s.as_str(),
+            Some(_) => return Err(format!("{BAD}: `url` must be a non-empty string")),
+        };
+        let timeout = match v.get("connect_timeout_ms") {
+            None => DEFAULT_CONNECT_TIMEOUT,
+            Some(x) => match x.as_u64().filter(|ms| *ms > 0) {
+                Some(ms) => Duration::from_millis(ms),
+                None => {
+                    return Err(format!(
+                        "{BAD}: `connect_timeout_ms` must be a positive integer (milliseconds), \
+                         got {x}"
+                    ))
+                }
+            },
+        };
+        // A URL that does not parse is a settings refusal: nothing was connected.
+        let secret = url_password(url);
+        let target =
+            parse_url(url).map_err(|e| scrub(format!("{BAD}: url: {e}"), secret.as_deref()))?;
+        Ok(Self::from_parts(target, secret, timeout))
     }
 }
 

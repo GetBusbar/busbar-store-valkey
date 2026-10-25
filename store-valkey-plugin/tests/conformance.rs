@@ -742,7 +742,8 @@ fn the_linked_and_the_dropped_in_valkey_store_are_one_store() {
         "{linked:#?}"
     );
     assert!(
-        linked[3].contains("valkey plugin: failed to connect"),
+        linked[3].contains("invalid valkey plugin config: url: ")
+            && !linked[3].contains("failed to connect"),
         "{linked:#?}"
     );
     assert!(

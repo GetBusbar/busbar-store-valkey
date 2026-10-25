@@ -2,11 +2,14 @@
 [package]
 name = "busbar-store-valkey"
 version = "1.6.0"
-publish = false            # a first-party plugin crate; shipped linked into busbar or as a signed tarball
-edition = "2021"
-rust-version = "1.97"
+publish.workspace = true  # a first-party plugin crate; shipped linked into busbar or as a signed tarball
+edition.workspace = true
+rust-version.workspace = true
 description = "The Valkey backend for busbar's durable governance store — the shared, multi-node db plugin over a KV data model. Serves the store v3 door over the host's connector (no socket of its own): RESP2 over one connection per op."
-license = "Apache-2.0"
+license.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 # rlib: THE LOGIC, and the store's door (`store_door!` over its `StoreSlots`: `door`, the row a
