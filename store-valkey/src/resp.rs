@@ -36,6 +36,8 @@ enum Repr {
     General(ErrorKind, &'static str, Option<String>),
     Server(String),
     Io(String),
+    /// The store's own refusal, its text verbatim (no `- Kind` suffix).
+    Refused(String),
 }
 
 /// A command's failure. Its text is the upstream driver's shape (`desc - Kind: detail`), so the
@@ -60,6 +62,15 @@ impl RedisError {
     #[must_use]
     pub fn is_connection_error(&self) -> bool {
         matches!(self.repr, Repr::Io(_))
+    }
+
+    /// The store's own refusal of an op (an unknown id, a tombstoned id): `text` reads verbatim,
+    /// with no ` - Client` suffix, in the siblings' `<op>: <reason>` shape.
+    #[must_use]
+    pub fn refused(text: impl Into<String>) -> Self {
+        Self {
+            repr: Repr::Refused(text.into()),
+        }
     }
 
     fn server(text: String) -> Self {
@@ -103,7 +114,7 @@ impl fmt::Display for RedisError {
                     None => Ok(()),
                 }
             }
-            Repr::Server(t) | Repr::Io(t) => f.write_str(t),
+            Repr::Server(t) | Repr::Io(t) | Repr::Refused(t) => f.write_str(t),
         }
     }
 }
@@ -1100,7 +1111,8 @@ mod tests {
     fn errors_read_as_the_upstream_driver_wrote_them() {
         let e = RedisError::from((ErrorKind::Client, "put_key refused", "why".to_string()));
         assert_eq!(e.to_string(), "put_key refused - Client: why");
-        let e = RedisError::from((ErrorKind::Client, "delete_key: unknown id"));
-        assert_eq!(e.to_string(), "delete_key: unknown id - Client");
+        let e = RedisError::refused("delete_key: unknown id 'vk_x'");
+        assert_eq!(e.to_string(), "delete_key: unknown id 'vk_x'");
+        assert!(!e.is_connection_error());
     }
 }

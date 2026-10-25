@@ -50,7 +50,8 @@
 // EACH FOLD'S KEYSPACE (Q-P4-8): the store's keys are fixed (`busbar:*`) and its settings name no key
 // prefix, and a fold namespace is no database number, so `{fold}` has nowhere to go in the url. The
 // suite's folds therefore run in a database of their own (`/14`; this repo's other live tests use the
-// url's `/0`, the admin end-to-end test `/15`, and store-valkey's schema-refusal tests `/12` and `/13`), one fold at a time: the namespace hooks below take
+// url's `/0`, the admin end-to-end test `/15`, store-valkey's schema-refusal tests `/11` to `/13` and
+// its fleet-epoch tests `/1` to `/10`), one fold at a time: the namespace hooks below take
 // that database for the fold and flush it before the fold opens, and flush it and hand it on when
 // the fold ends, on an independent connection of the `redis` client. Every fold starts on an empty
 // keyspace and leaves none; nothing in the store's behaviour changes.
@@ -593,7 +594,10 @@ fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
             "reserve = {:?}",
             grants.as_ref().map(|g| g
                 .iter()
-                .map(|g| (g.granted, g.valid_until_ms))
+                // Whether the grant expires (`abi::store::money` rule (c): never `u64::MAX` in a
+                // store a fleet shares), not its instant, which is the server's clock at the draw
+                // and so differs between the two folds.
+                .map(|g| (g.granted, g.valid_until_ms != u64::MAX))
                 .collect::<Vec<_>>())
         ));
         let replay = StoreCalls::reserve(loaded, id, 0, &cells).await;
@@ -738,7 +742,8 @@ fn the_linked_and_the_dropped_in_valkey_store_are_one_store() {
         "{linked:#?}"
     );
     assert!(
-        linked[3].contains("valkey plugin: failed to connect"),
+        linked[3].contains("invalid valkey plugin config: url: ")
+            && !linked[3].contains("failed to connect"),
         "{linked:#?}"
     );
     assert!(
@@ -776,10 +781,7 @@ fn the_linked_and_the_dropped_in_valkey_store_are_one_store() {
         assert!(has("redeem:[true, false]"), "{linked:#?}");
         assert!(has("metering:[(0, 2, 6"), "{linked:#?}");
         assert!(find("reserve, no cap").contains("NoCap"), "{linked:#?}");
-        assert_eq!(
-            find("reserve ="),
-            format!("reserve = Ok([(2, {m}), (1, {m})])", m = u64::MAX)
-        );
+        assert_eq!(find("reserve ="), "reserve = Ok([(2, true), (1, true)])");
         assert!(find("replay").ends_with("true"), "{linked:#?}");
         assert!(find("reserve past").contains("Exhausted"), "{linked:#?}");
         assert_eq!(find("release"), "release = Ok([2])");

@@ -5,16 +5,20 @@
 //! the 1.5.5 op set ([`StoreSlots`]): the `op_id`-carrying writes, the journal, sessions, the
 //! kernel's records, the money slots and `window_caps`.
 //!
-//! ## Layout (additive: no key an earlier schema wrote changes, so the schema marker stays at 7)
+//! ## Layout (schema v8, `crate::SCHEMA_VERSION`: the v7 keys plus the epoch, `until` and the index)
 //!
 //! - `busbar:op:<hex op_id>`            HASH `b` = the op's value fields, `a` = its answer; expires
 //!   [`OP_ID_RETENTION_SECS`] after it is written (S4).
 //! - `busbar:cap:<slot>`                HASH `cap`, `gen` (the `config_gen`), `used` (drawn), each a
 //!   decimal `u64`. `<slot>` is `<hex bucket>:<pool>:<dimension>:<hex class>:<window_start>`, the
 //!   pool `-` for every pool or `p<hex pool>`: hex has no `:`, so two slots never share a key.
-//! - `busbar:slice:<id>`                HASH `cap` (its slot's key), `left` (what it still holds). Deleted
-//!   when the slice closes (its `left` reaches 0, or any release on window 0); a closed id is told
-//!   from a never-granted one by `busbar:slices`.
+//! - `busbar:slice:<id>`                HASH `cap` (its slot's key), `left` (what it still holds),
+//!   `until` (its `valid_until_ms`). Deleted when the slice closes (its `left` reaches 0, any release
+//!   on window 0, or its expiry reclaimed); a closed id is told from a never-granted one by
+//!   `busbar:slices`.
+//! - `busbar:open:<slot>`               ZSET of the slot's open slice ids, each scored by its `until`:
+//!   the index the expiry reclaim reads (`ZRANGEBYSCORE -inf now`), so no SCAN on the hot path.
+//! - `busbar:epoch`                     STRING, the fleet's ONE epoch (decimal `u64`; absent reads 0).
 //! - `busbar:slices`                    STRING, the last slice id handed out (`INCRBY`; never reused).
 //! - `busbar:journal:<hex stream>`      LIST of records, oldest first: a record's `seq` is its
 //!   position from 1, so the stream's head is its length. `busbar:journal:streams` SET names them.
@@ -40,12 +44,22 @@
 //! value fields are a conflict and apply nothing; a refused or failed op writes nothing, its
 //! record included (S3).
 //!
-//! EPOCH (ARCHITECT 2026-10-02): fixed at 0. No store ABI operation advances the epoch yet, so a
-//! `reserve` or `slice_release` is never refused for the epoch it states and every head states 0.
-//! When WIRE-STORE adds the advance, the store persists the epoch and refuses stale writers.
-//!
-//! GRANT LIFETIME: `reserve` carries no requested lifetime (`ReserveIn`, `UnitCell`), so a grant
-//! never expires (`valid_until_ms = u64::MAX`): a slice holds its draw until it is released.
+//! EPOCH AND SLICE LIFE (`abi::store::money`, rules (a)-(c); this store is shared by a fleet): the
+//! fleet's ONE epoch is `busbar:epoch`. A `reserve` presenting a higher epoch raises it in its own
+//! `EXEC`, atomically with its draw; one presenting a lower epoch is `StaleEpoch`, applies nothing
+//! and records nothing under its `op_id`; nothing lowers it, and it survives a restart. The epoch key
+//! is WATCHed by every `reserve`, so a raise aborts every draw of the old epoch still in flight (it
+//! re-runs and is refused), and a draw of the old epoch that commits first is ordered before the
+//! raise. Every slice is granted `valid_until_ms = now + SLICE_TTL_MS` on the SERVER's clock
+//! (`TIME`: one clock for the fleet, not each node's), a concurrency gauge's slice included. A
+//! `reserve` returns the unreturned part of the expired slices of its slots (from each slot's
+//! `busbar:open:` index) to their windows' headroom before it tests them, and a `slice_release`
+//! does the same for its slices' slots first, so an expired slice answers 0 to a release (its money
+//! already went back at expiry) and a node that crashed holding a slice strands nothing past one TTL.
+//! A `slice_release` always applies, whatever the epoch. The heads (`append_batch`, `heads`) state
+//! epoch 0, as busbar-store-postgres's do: the journal is not fenced by the money epoch. Do not run
+//! a v7 build against a v8 namespace: a v7 build refuses nothing newer than itself, and its slices
+//! carry no `until` and no index entry, so they never expire (a v8 build refuses a newer marker).
 //!
 //! The money arithmetic is exact `u64` in Rust, never in Lua (whose numbers are doubles): the cap
 //! rows are read under `WATCH` and written back whole.
@@ -66,7 +80,7 @@ use busbar_contract::abi::sdk::store::{
     Cap, CapsRefused, Cell, CellKey, Dimension, Grant, Op, OpRefused, OpResult, ReserveRefused,
     Scanned, Step, StoreSlots, Tail,
 };
-use busbar_contract::abi::store::{OpId, OP_ID_RETENTION_SECS};
+use busbar_contract::abi::store::{OpId, OP_ID_RETENTION_SECS, SLICE_TTL_MS};
 use busbar_contract::kinds::{Head, RecordBytes};
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, PlaneRecordRef,
@@ -82,6 +96,10 @@ use crate::{
 busbar_contract::store_door!(ValkeyStore, NAME, env!("CARGO_PKG_VERSION"), 64, needs: NEEDS);
 
 const SLICE_SEQ: &str = "busbar:slices";
+/// The fleet's ONE epoch (module doc, EPOCH AND SLICE LIFE).
+const EPOCH_KEY: &str = "busbar:epoch";
+/// Where a slot's key starts: `busbar:cap:<slot>`.
+const CAP_PREFIX: &str = "busbar:cap:";
 const JOURNAL_STREAMS: &str = "busbar:journal:streams";
 
 /// The record of one `op_id`.
@@ -114,6 +132,77 @@ fn cap_key(k: &CellKey<'_>) -> (String, u32) {
 
 fn slice_key(id: u64) -> String {
     format!("busbar:slice:{id}")
+}
+
+/// The open-slice index of the slot whose cap key is `cap`: `busbar:open:<slot>`.
+fn open_key(cap: &str) -> String {
+    format!(
+        "busbar:open:{}",
+        cap.strip_prefix(CAP_PREFIX).unwrap_or(cap)
+    )
+}
+
+/// The server's clock in ms (`TIME`): the fleet's one clock.
+async fn server_now_ms(c: &mut Conn) -> RedisResult<u64> {
+    let (secs, micros): (String, String) = cmd("TIME").query(c).await?;
+    let secs = num(Some(secs), "TIME's seconds")?;
+    let micros = num(Some(micros), "TIME's microseconds")?;
+    Ok(secs.saturating_mul(1000).saturating_add(micros / 1000))
+}
+
+/// The v7 -> v8 stamp of ONE slice hash (`KEYS[1]`): a slice still open with no `until` gets
+/// `ARGV[1]` and joins its slot's open-slice index as id `ARGV[2]`. A slice already stamped keeps its
+/// `until`, and a key that is no longer a slice (closed meanwhile) is left absent, so the stamp is
+/// idempotent and never resurrects a closed slice. `busbar:cap:` is 11 bytes.
+const STAMP_LUA: &str = r#"
+local cap = redis.call('HGET', KEYS[1], 'cap')
+if not cap then return 0 end
+if redis.call('HEXISTS', KEYS[1], 'until') == 1 then return 0 end
+redis.call('HSET', KEYS[1], 'until', ARGV[1])
+redis.call('ZADD', 'busbar:open:' .. string.sub(cap, 12), ARGV[1], ARGV[2])
+return 1
+"#;
+
+/// Create the fleet epoch at 0 where there is none (`SET NX`: an epoch already raised stays).
+pub(crate) async fn create_epoch(me: &ValkeyStore, c: &mut Conn) -> RecordStoreResult<()> {
+    with_conn!(me, |c| cmd("SET")
+        .arg(EPOCH_KEY)
+        .arg("0")
+        .arg("NX")
+        .query::<Option<String>>(c)
+        .await)
+    .map(drop)
+}
+
+/// THE v7 -> v8 STEP (`crate::SCHEMA_VERSION`): the epoch created at 0, and every slice a v7 build
+/// left open stamped to expire one `SLICE_TTL_MS` from the server's clock and indexed for reclaim.
+/// The SCAN runs once, at the upgrade, never on the hot path. Idempotent (see [`STAMP_LUA`]), so a
+/// crash re-runs it and two nodes first-booting at once land in the same place.
+pub(crate) async fn stamp_open_slices(me: &ValkeyStore, c: &mut Conn) -> RecordStoreResult<()> {
+    create_epoch(me, c).await?;
+    let until = with_conn!(me, |c| server_now_ms(c).await)?.saturating_add(SLICE_TTL_MS);
+    let keys: Vec<String> = with_conn!(me, |c| {
+        c.scan_match::<_, String>("busbar:slice:*")
+            .await?
+            .collect::<Result<Vec<String>, _>>()
+    })?;
+    for key in keys {
+        let Some(id) = key
+            .strip_prefix("busbar:slice:")
+            .and_then(|id| id.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        with_conn!(me, |c| cmd("EVAL")
+            .arg(STAMP_LUA)
+            .arg(1)
+            .arg(&key)
+            .arg(until.to_string())
+            .arg(id.to_string())
+            .query::<i64>(c)
+            .await)?;
+    }
+    Ok(())
 }
 
 fn journal_key(stream: &str) -> String {
@@ -171,7 +260,9 @@ impl Refusal for ReserveRefused {
     fn conflict() -> Self {
         ReserveRefused::Conflict
     }
-    fn backend(_: String) -> Self {
+    fn backend(text: String) -> Self {
+        // The ABI carries no text for Unavailable: the reason goes to the plugin's log.
+        tracing::warn!("busbar-store-valkey: reserve unavailable: {text}");
         ReserveRefused::Unavailable
     }
 }
@@ -387,6 +478,57 @@ impl ValkeyStore {
             Ok(Ok(String::new()))
         })
         .map(drop)
+    }
+
+    /// SLICE LIFE (c): queue the reclaim of every slice of the slots `caps` that has expired by
+    /// `now` (its `until <= now`), from each slot's open-slice index: the slice hash is deleted, its
+    /// index entry removed, and its unreturned `left` taken off its slot's `used` in `rows`. The
+    /// caller has `caps` and their indexes watched; the expired slice keys are watched here before
+    /// they are read. Answers the reclaimed ids and the slots whose `used` changed (the caller
+    /// writes those).
+    async fn reclaim(
+        c: &mut Conn,
+        pipe: &mut crate::resp::Pipeline,
+        caps: &[String],
+        now: u64,
+        rows: &mut BTreeMap<String, Option<CapRow>>,
+    ) -> RedisResult<(BTreeSet<u64>, BTreeSet<String>)> {
+        let mut reclaimed = BTreeSet::new();
+        let mut dirty = BTreeSet::new();
+        for cap in caps {
+            let index = open_key(cap);
+            let ids: Vec<String> = c.zrangebyscore(&index, "-inf", now).await?;
+            if ids.is_empty() {
+                continue;
+            }
+            let ids: Vec<u64> = ids
+                .into_iter()
+                .map(|id| num(Some(id), "an open slice id"))
+                .collect::<RedisResult<_>>()?;
+            let keys: Vec<String> = ids.iter().map(|id| slice_key(*id)).collect();
+            cmd("WATCH").arg(&keys).exec(c).await?;
+            for (id, key) in ids.into_iter().zip(keys) {
+                let (held, left): (Option<String>, Option<String>) = cmd("HMGET")
+                    .arg(&key)
+                    .arg("cap")
+                    .arg("left")
+                    .query(c)
+                    .await?;
+                pipe.cmd("ZREM").arg(&index).arg(id).ignore();
+                if held.is_none() {
+                    // An index entry whose slice already closed: only the entry goes.
+                    continue;
+                }
+                let left = num(left, "a slice's holding")?;
+                pipe.del(&key).ignore();
+                if let Some(Some((_, _, used))) = rows.get_mut(cap) {
+                    *used = used.saturating_sub(left);
+                    dirty.insert(cap.clone());
+                }
+                reclaimed.insert(id);
+            }
+        }
+        Ok((reclaimed, dirty))
     }
 
     /// The cap row of each key in `keys`: `(cap, config_gen, used)`, or `None` where no cap was
@@ -622,12 +764,28 @@ impl ValkeyStore {
         c: &mut Conn,
         op: OpId,
         body: &str,
+        epoch: u64,
         slots: &[(String, u32)],
         amounts: &[u64],
     ) -> Result<Vec<Grant>, ReserveRefused> {
-        let watch = distinct(slots.iter().map(|(k, _)| k.clone()));
+        let caps = distinct(slots.iter().map(|(k, _)| k.clone()));
+        // The epoch, the slots and their open-slice indexes are watched: a raise, a draw, a
+        // release or a reclaim of any of them aborts this step and it re-runs on fresh state.
+        let mut watch = distinct(caps.iter().flat_map(|k| [k.clone(), open_key(k)]));
+        watch.push(EPOCH_KEY.to_string());
         let answer = deduped!(self, c, op, body, watch, ReserveRefused, |c, pipe| {
-            let held = Self::read_caps(c, &watch).await?;
+            // THE EPOCH FENCE (rules (a), (b)): a stale epoch applies and records nothing.
+            let stored: Option<String> = c.get(EPOCH_KEY).await?;
+            let stored = num(stored, "the fleet epoch")?;
+            if stored > epoch {
+                return Ok(Err(ReserveRefused::StaleEpoch));
+            }
+            let now = server_now_ms(c).await?;
+            let valid_until = now.saturating_add(SLICE_TTL_MS);
+            let mut held = Self::read_caps(c, &caps).await?;
+            // Slice life (c): the expired slices' unreturned part goes back to the headroom
+            // before the cells are tested.
+            let (_, dirty) = Self::reclaim(c, pipe, &caps, now, &mut held).await?;
             // The chain draw is all or nothing: test every cell against what the cells before it
             // in THIS draw add, and apply only when every cell passes.
             let mut drawn: BTreeMap<&str, u64> = BTreeMap::new();
@@ -641,10 +799,19 @@ impl ValkeyStore {
                 }
                 *drawn.entry(key.as_str()).or_default() += *amount;
             }
-            for (key, amount) in &drawn {
-                let used = held[*key].map_or(0, |(_, _, used)| used);
-                pipe.hset(*key, "used", used.saturating_add(*amount).to_string())
+            let changed: BTreeSet<&str> = drawn
+                .keys()
+                .copied()
+                .chain(dirty.iter().map(String::as_str))
+                .collect();
+            for key in changed {
+                let used = held[key].map_or(0, |(_, _, used)| used);
+                let add = drawn.get(key).copied().unwrap_or(0);
+                pipe.hset(key, "used", used.saturating_add(add).to_string())
                     .ignore();
+            }
+            if epoch > stored {
+                pipe.set(EPOCH_KEY, epoch.to_string()).ignore();
             }
             // Slice ids are taken outside the transaction: an aborted or refused draw leaves a gap,
             // never a reused id.
@@ -654,10 +821,15 @@ impl ValkeyStore {
             for ((amount, (key, _)), id) in amounts.iter().zip(slots).zip(first..) {
                 pipe.hset_multiple(
                     slice_key(id),
-                    &[("cap", key.clone()), ("left", amount.to_string())],
+                    &[
+                        ("cap", key.clone()),
+                        ("left", amount.to_string()),
+                        ("until", valid_until.to_string()),
+                    ],
                 )
                 .ignore();
-                granted.push((id, *amount, u64::MAX));
+                pipe.zadd(open_key(key), id, valid_until).ignore();
+                granted.push((id, *amount, valid_until));
             }
             Ok(Ok(serde_json::to_string(&granted).unwrap_or_default()))
         })?;
@@ -721,12 +893,28 @@ impl ValkeyStore {
                 };
                 held.insert(*id, (cap, num(left, "a slice's holding")?));
             }
-            // The slices' caps join the watch before they are read.
+            // The slices' caps and their open-slice indexes join the watch before they are read.
             let caps = distinct(held.values().map(|(cap, _)| cap.clone()));
             if !caps.is_empty() {
-                cmd("WATCH").arg(&caps).exec(c).await?;
+                let watch: Vec<String> =
+                    caps.iter().flat_map(|k| [k.clone(), open_key(k)]).collect();
+                cmd("WATCH").arg(&watch).exec(c).await?;
             }
-            let rows = Self::read_caps(c, &caps).await?;
+            let mut rows = Self::read_caps(c, &caps).await?;
+            // Slice life (c) first: the expired slices of these slots are reclaimed as a reserve
+            // would, so a release of an expired slice answers 0 (its money went back at expiry).
+            let dirty = if caps.is_empty() {
+                BTreeSet::new()
+            } else {
+                let now = server_now_ms(c).await?;
+                let (reclaimed, dirty) = Self::reclaim(c, pipe, &caps, now, &mut rows).await?;
+                for id in reclaimed {
+                    if held.remove(&id).is_some() {
+                        closed.insert(id);
+                    }
+                }
+                dirty
+            };
             // Clamp each item to what its slice has left: an item naming a slice an EARLIER item
             // of this call emptied takes back 0.
             let mut back_all = Vec::with_capacity(items.len());
@@ -751,22 +939,25 @@ impl ValkeyStore {
                 *by_cap.entry(cap.clone()).or_default() += back;
                 back_all.push(back);
             }
-            for (id, (_, left)) in &held {
+            for (id, (cap, left)) in &held {
                 // A slice that closed (window 0 at its first release, a rolling window at 0) is
                 // deleted.
                 if closed_on_zero.contains(id) || *left == 0 {
                     pipe.del(slice_key(*id)).ignore();
+                    pipe.cmd("ZREM").arg(open_key(cap)).arg(*id).ignore();
                 } else {
                     pipe.hset(slice_key(*id), "left", left.to_string()).ignore();
                 }
             }
-            for (cap, back) in &by_cap {
+            let changed: BTreeSet<&String> = by_cap.keys().chain(&dirty).collect();
+            for cap in changed {
                 let used = rows
                     .get(cap)
                     .copied()
                     .flatten()
                     .map_or(0, |(_, _, used)| used);
-                pipe.hset(cap, "used", used.saturating_sub(*back).to_string())
+                let back = by_cap.get(cap).copied().unwrap_or(0);
+                pipe.hset(cap, "used", used.saturating_sub(back).to_string())
                     .ignore();
             }
             Ok(Ok(serde_json::to_string(&back_all).unwrap_or_default()))
@@ -1011,8 +1202,12 @@ impl StoreSlots for ValkeyStore {
         let body = format!("reserve:{epoch}:{cells:?}");
         let slots: Vec<(String, u32)> = cells.iter().map(|c| cap_key(&c.key)).collect();
         let amounts: Vec<u64> = cells.iter().map(|c| c.amount).collect();
-        let step = op!(cx, self, |_| Err(ReserveRefused::Unavailable), |me, c| me
-            .v3_reserve(c, op, &body, &slots, &amounts)
+        let unavailable = |e: RecordStoreError| {
+            tracing::warn!("busbar-store-valkey: reserve unavailable: {}", e.0);
+            Err(ReserveRefused::Unavailable)
+        };
+        let step = op!(cx, self, unavailable, |me, c| me
+            .v3_reserve(c, op, &body, epoch, &slots, &amounts)
             .await);
         match step {
             Step::Ready(Ok(g)) => {
@@ -1168,14 +1363,17 @@ impl StoreSlots for ValkeyStore {
         op!(cx, self, Err, |me, c| me.list_metering(c, bucket).await)
     }
 
-    /// Left at the 1.5.5 trait's `Ok(0)` (module doc, DATA GROWTH): no connection is made.
-    fn purge_windows_before(&self, _: &mut Op<'_>, _: u64) -> Step<RecordStoreResult<u64>> {
-        Step::Ready(Ok(0))
+    fn purge_windows_before(&self, cx: &mut Op<'_>, before: u64) -> Step<RecordStoreResult<u64>> {
+        op!(cx, self, Err, |me, c| me
+            .purge_windows_before(c, before)
+            .await)
     }
 
-    /// Left at the 1.5.5 trait's `Ok(0)` (module doc, DATA GROWTH): no connection is made.
-    fn purge_metering_before(&self, _: &mut Op<'_>, _: &str) -> Step<RecordStoreResult<u64>> {
-        Step::Ready(Ok(0))
+    fn purge_metering_before(&self, cx: &mut Op<'_>, bucket: &str) -> Step<RecordStoreResult<u64>> {
+        let bucket = bucket.to_string();
+        op!(cx, self, Err, |me, c| me
+            .purge_metering_before(c, &bucket)
+            .await)
     }
 
     fn put_credential(

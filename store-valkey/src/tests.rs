@@ -1400,6 +1400,37 @@ fn fresh_db_client(db: u32) -> redis::Connection {
     c
 }
 
+/// A namespace marked NEWER than this build is REFUSED at open, and left as found: an older build
+/// on a newer keyspace would ignore what the newer schema keeps (a v7 build on a v8 namespace grants
+/// never-expiring slices and ignores the fleet epoch's fence).
+#[test]
+fn a_namespace_newer_than_this_build_is_refused() {
+    let Some(_) = live_store() else { return };
+    let mut up = fresh_db_client(11);
+    let newer = SCHEMA_VERSION + 1;
+    redis::cmd("SET")
+        .arg("busbar:schema")
+        .arg(newer)
+        .query::<()>(&mut up)
+        .unwrap();
+    let err = match ValkeyStore::connect(&url_for_db(11)) {
+        Ok(_) => panic!("connect() must refuse a namespace marked v{newer}"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains(&format!(
+            "schema v{newer} is newer than this build (v{SCHEMA_VERSION}); refusing to open"
+        )),
+        "{err}"
+    );
+    let marker: i64 = redis::cmd("GET")
+        .arg("busbar:schema")
+        .query(&mut up)
+        .unwrap();
+    assert_eq!(marker, newer, "the marker must not be rewritten");
+    redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
+}
+
 /// A namespace marked OLDER than v6 is REFUSED, never wiped: `migrate()` has no in-place path for
 /// it, and the old wipe also destroyed a live v6/v7 namespace whose marker had merely been lost.
 /// Seeds a refund-shaped usage row (`billable_requests == 0`, `requests > 0`), forces a v5 marker
@@ -3881,8 +3912,8 @@ fn connect_timeout_ms_is_the_dial_timeout() {
     );
     assert_eq!(
         store.expect_err("a zero timeout refuses the load"),
-        "plugin 'busbar-store-valkey' open failed: valkey plugin: failed to connect: valkey \
-         connect: cannot set a 0 duration timeout"
+        "plugin 'busbar-store-valkey' open failed: invalid valkey plugin config: \
+         `connect_timeout_ms` must be a positive integer (milliseconds), got 0"
     );
 }
 
@@ -4583,6 +4614,195 @@ fn put_credential_never_remints_a_revoked_credential() {
     );
 }
 
+// ── settings: the sibling-aligned parse (unknown key, connect_timeout_ms type, url shape) ────────
+
+fn settings_err(json: &str) -> String {
+    crate::ValkeyStore::from_settings(json.as_bytes())
+        .expect_err(&format!("{json} must be refused"))
+}
+
+#[test]
+fn settings_refuse_an_unknown_top_level_key() {
+    let e = settings_err(r#"{"url":"redis://127.0.0.1:6379/0","urll":"x"}"#);
+    assert_eq!(
+        e,
+        "invalid valkey plugin config: unknown setting `urll` (accepted: url, connect_timeout_ms)"
+    );
+}
+
+#[test]
+fn settings_refuse_a_connect_timeout_that_is_not_a_positive_integer() {
+    for bad in ["\"5000\"", "1.5", "-3", "0", "null", "true"] {
+        let e = settings_err(&format!(
+            r#"{{"url":"redis://127.0.0.1:6379/0","connect_timeout_ms":{bad}}}"#
+        ));
+        assert!(
+            e.starts_with(
+                "invalid valkey plugin config: `connect_timeout_ms` must be a positive integer \
+                 (milliseconds), got "
+            ) && e.contains(bad),
+            "{bad}: {e}"
+        );
+    }
+    crate::ValkeyStore::from_settings(
+        br#"{"url":"redis://127.0.0.1:6379/0","connect_timeout_ms":250}"#,
+    )
+    .expect("a positive integer is accepted");
+}
+
+#[test]
+fn settings_refuse_a_url_that_is_not_a_non_empty_string() {
+    for bad in ["5", "\"\"", "null", "[]"] {
+        let e = settings_err(&format!(r#"{{"url":{bad}}}"#));
+        assert_eq!(
+            e, "invalid valkey plugin config: `url` must be a non-empty string",
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn a_url_parse_refusal_is_not_worded_as_a_failed_connect() {
+    let e = settings_err(r#"{"url":"http://127.0.0.1:6379/0"}"#);
+    assert!(e.starts_with("invalid valkey plugin config: url: "), "{e}");
+    assert!(
+        !e.contains("failed to connect"),
+        "nothing was connected: {e}"
+    );
+}
+
+// ── redaction: the unix-socket query form ─────────────────────────────────────────────────────
+
+#[test]
+fn the_unix_socket_query_password_never_reaches_an_error_or_a_debug() {
+    for (url, secret) in [
+        ("valkey+unix:///run/v.sock?pass=hunter2xyz", "hunter2xyz"),
+        (
+            "valkey+unix:///run/v.sock?db=1&password=hunter2xyz",
+            "hunter2xyz",
+        ),
+        ("unix:///run/v.sock?user=al&pass=p%40ssw0rd", "p%40ssw0rd"),
+    ] {
+        assert!(url_password(url).is_some(), "{url}: password extracted");
+        let leaked = scrub(
+            format!("could not reach {url}"),
+            url_password(url).as_deref(),
+        );
+        assert!(
+            !leaked.contains(secret) && !leaked.contains("p@ssw0rd"),
+            "{url}: {leaked}"
+        );
+        // `password=` is not a parameter the unix form reads, so that URL is refused: its refusal
+        // must not carry the secret either. The others parse, and their Debug never shows it.
+        let shown = match parse_url(url) {
+            Ok(t) => format!("{t:?}"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            !shown.contains(secret) && !shown.contains("p@ssw0rd"),
+            "{shown}"
+        );
+    }
+    // An error built from a bad unix URL carrying the secret never contains it.
+    let e = crate::ValkeyStore::from_settings(
+        br#"{"url":"valkey+unix:///run/v.sock?pass=hunter2xyz&db=notanumber"}"#,
+    )
+    .expect_err("a bad db is refused");
+    assert!(!e.contains("hunter2xyz"), "{e}");
+}
+
+// ── not-found / refusal wording ──────────────────────────────────────────────────────────────
+
+#[test]
+fn unknown_id_refusals_name_the_id_in_the_canonical_form() {
+    let Some(store) = live_store() else { return };
+    let id = uid("vk_never_existed");
+    let e = store.delete_key(&id).unwrap_err().to_string();
+    assert!(e.contains(&format!("delete_key: unknown id '{id}'")), "{e}");
+    assert!(!e.contains("- Client"), "{e}");
+    let e = store.scrub_key(&id).unwrap_err().to_string();
+    assert!(e.contains(&format!("scrub_key: unknown id '{id}'")), "{e}");
+    assert!(!e.contains("- Client"), "{e}");
+}
+
+#[test]
+fn put_refusals_carry_the_reason_without_the_kind_suffix() {
+    let Some(store) = live_store() else { return };
+    let id = uid("vk_tomb_wording");
+    store.put_key(&vk(&id)).unwrap();
+    store.delete_key(&id).unwrap();
+    let e = store.put_key(&vk(&id)).unwrap_err().to_string();
+    assert!(e.contains(&format!("put_key: '{id}' is tombstoned")), "{e}");
+    assert!(!e.contains("- Client"), "{e}");
+}
+
+// ── retention purges ─────────────────────────────────────────────────────────────────────────
+
+/// `#[ignore]`d like the other whole-namespace tests: a purge is GLOBAL (every window before the
+/// cut), so run beside the parallel suite it would reap other tests' live windows.
+#[test]
+#[ignore]
+fn purge_windows_before_drops_older_windows_and_counts_them() {
+    let Some(store) = live_store() else { return };
+    let base = 9_000_000_000_000u64;
+    store.purge_windows_before(base + 10).unwrap(); // everything older, run alone
+    let bucket = uid("vk_purge_win");
+    let d = UsageDelta {
+        requests: 1,
+        billable_requests: 1,
+        models: vec![],
+    };
+    for w in [base + 3, base + 5, base + 20] {
+        store.add_usage(&bucket, w, &d).unwrap();
+    }
+    assert_eq!(store.purge_windows_before(base + 10).unwrap(), 2);
+    assert_eq!(store.get_usage(&bucket, base + 3).unwrap().requests, 0);
+    assert_eq!(store.get_usage(&bucket, base + 5).unwrap().requests, 0);
+    assert_eq!(
+        store.get_usage(&bucket, base + 20).unwrap().requests,
+        1,
+        "a window at or after the cut survives"
+    );
+}
+
+#[test]
+fn purge_metering_before_drops_that_bucket_only_and_refuses_a_non_integer() {
+    let Some(store) = live_store() else { return };
+    let (b1, b2) = (unique_bucket(20260801), unique_bucket(20260901));
+    let delta = |bucket: u64, model: &str| MeteringDelta {
+        key_id: "vk_purge_m".to_string(),
+        bucket,
+        model: model.to_string(),
+        provider: "p".to_string(),
+        tokens_input: 1,
+        tokens_output: 1,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 1,
+        billable_requests: 1,
+        key_group_at_use: "g".to_string(),
+        pricing_version: "v1".to_string(),
+        priced_from_ms: 0,
+        usage_units: Default::default(),
+    };
+    store.add_metering(&delta(b1, "m1")).unwrap();
+    store.add_metering(&delta(b1, "m2")).unwrap();
+    store.add_metering(&delta(b2, "m1")).unwrap();
+    assert_eq!(store.purge_metering_before(&b1.to_string()).unwrap(), 2);
+    assert!(store.list_metering(b1).unwrap().is_empty());
+    assert_eq!(
+        store.list_metering(b2).unwrap().len(),
+        1,
+        "other buckets stay"
+    );
+    assert_eq!(store.purge_metering_before(&b1.to_string()).unwrap(), 0);
+    let e = store.purge_metering_before("abc").unwrap_err().to_string();
+    assert!(
+        e.contains("purge_metering_before: invalid bucket \"abc\", expected an integer"),
+        "{e}"
+    );
+}
+
 /// A unix-socket URL's `?pass=` is the scrub secret too: an error string that echoes the URL (or
 /// the password, raw or decoded) carries no credential bytes.
 #[test]
@@ -4604,5 +4824,37 @@ fn unix_url_query_password_is_scrubbed_from_errors() {
     // The userinfo form is unchanged; a unix URL without `pass=` has no secret.
     assert_eq!(url_password("redis://u:p@host:6379").as_deref(), Some("p"));
     assert_eq!(url_password("redis+unix:///run/v.sock?db=2"), None);
-    assert_eq!(url_password("redis+unix:///run/v.sock?password=x"), None);
+    // `password=` is not a parameter the unix form reads (it is refused at parse), yet a value an
+    // operator wrote under that name is still treated as a secret and never echoed.
+    assert_eq!(
+        url_password("redis+unix:///run/v.sock?password=x").as_deref(),
+        Some("x")
+    );
+}
+
+/// A URL parameter the store does not read is REFUSED, never silently ignored; its name is withheld
+/// when the URL carries a password (an unencoded one can split at `?`).
+#[test]
+fn an_unknown_url_parameter_is_refused_not_ignored() {
+    for url in [
+        "redis://127.0.0.1:6379/0?timeout=5",
+        "valkey+unix:///run/v.sock?db=1&password=x",
+        "redis://u:12?abc@127.0.0.1:6379/0",
+    ] {
+        assert!(parse_url(url).is_err(), "{url} must be refused");
+    }
+    let e = parse_url("redis://127.0.0.1:6379/0?timeout=5")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("timeout") && e.contains("not supported"), "{e}");
+    let e = parse_url("redis://u:12?abc@127.0.0.1:6379/0")
+        .unwrap_err()
+        .to_string();
+    assert!(!e.contains("abc"), "the password tail leaked: {e}");
+    for ok in [
+        "redis://127.0.0.1:6379/0?protocol=resp2",
+        "valkey+unix:///run/v.sock?db=1&user=al&pass=x",
+    ] {
+        parse_url(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+    }
 }
