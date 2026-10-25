@@ -1400,6 +1400,37 @@ fn fresh_db_client(db: u32) -> redis::Connection {
     c
 }
 
+/// A namespace marked NEWER than this build is REFUSED at open, and left as found: an older build
+/// on a newer keyspace would ignore what the newer schema keeps (a v7 build on a v8 namespace grants
+/// never-expiring slices and ignores the fleet epoch's fence).
+#[test]
+fn a_namespace_newer_than_this_build_is_refused() {
+    let Some(_) = live_store() else { return };
+    let mut up = fresh_db_client(11);
+    let newer = SCHEMA_VERSION + 1;
+    redis::cmd("SET")
+        .arg("busbar:schema")
+        .arg(newer)
+        .query::<()>(&mut up)
+        .unwrap();
+    let err = match ValkeyStore::connect(&url_for_db(11)) {
+        Ok(_) => panic!("connect() must refuse a namespace marked v{newer}"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains(&format!(
+            "schema v{newer} is newer than this build (v{SCHEMA_VERSION}); refusing to open"
+        )),
+        "{err}"
+    );
+    let marker: i64 = redis::cmd("GET")
+        .arg("busbar:schema")
+        .query(&mut up)
+        .unwrap();
+    assert_eq!(marker, newer, "the marker must not be rewritten");
+    redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
+}
+
 /// A namespace marked OLDER than v6 is REFUSED, never wiped: `migrate()` has no in-place path for
 /// it, and the old wipe also destroyed a live v6/v7 namespace whose marker had merely been lost.
 /// Seeds a refund-shaped usage row (`billable_requests == 0`, `requests > 0`), forces a v5 marker
