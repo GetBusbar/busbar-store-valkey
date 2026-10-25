@@ -84,6 +84,29 @@ impl Connect for LoadedStore {
     }
 }
 
+/// The verify path's read, which is no longer a store op: a credential's secret by `(kind,
+/// public_id)`, read back through the revision delta (which carries every row, revoked or not).
+trait Lookup {
+    fn lookup_credential_secret(
+        &self,
+        kind: &str,
+        public_id: &str,
+    ) -> RecordStoreResult<Option<CredentialSecret>>;
+}
+
+impl Lookup for LoadedStore {
+    fn lookup_credential_secret(
+        &self,
+        kind: &str,
+        public_id: &str,
+    ) -> RecordStoreResult<Option<CredentialSecret>> {
+        Ok(self
+            .list_credentials_since(0)?
+            .into_iter()
+            .find(|c| c.meta.kind == kind && c.meta.public_id == public_id))
+    }
+}
+
 /// The tests' INDEPENDENT view of the live Valkey (the upstream client, never the store's own
 /// path): what landed, and the cleanup the `RecordStore` surface deliberately cannot do.
 pub(crate) trait Raw {
@@ -115,6 +138,20 @@ pub(crate) trait Raw {
             redis::pipe()
                 .atomic()
                 .del(cred_id_key(id))
+                .ignore()
+                .query(c)
+        })
+    }
+
+    /// Put an audit row at its `seq`, as a 1.5.5 build wrote it: no store op appends one any more
+    /// (1.6.0's admin audit is plane records), so the reads are seeded under the store's feet.
+    fn seed_audit_for_test(&self, r: &AuditRecord) -> RecordStoreResult<()> {
+        let json = serde_json::to_string(r).expect("an audit row encodes");
+        let score = clamp(r.seq);
+        self.with_conn(|c| {
+            redis::pipe()
+                .atomic()
+                .zadd(AUDIT_ZSET, json, score)
                 .ignore()
                 .query(c)
         })
@@ -643,40 +680,6 @@ fn delete_key_does_not_glob_match_other_keys_usage() {
     assert_eq!(
         victim_usage.requests, 1,
         "an unescaped '*' in the deleted key's id must not sweep another key's usage windows"
-    );
-}
-
-// ── scrub_key ────────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn scrub_key_requires_tombstone_first() {
-    let Some(store) = live_store() else { return };
-    store.put_key(&vk("vk_live_scrub")).unwrap();
-    assert!(
-        store.scrub_key("vk_live_scrub").is_err(),
-        "scrubbing a live (non-tombstoned) key must error"
-    );
-}
-
-#[test]
-fn scrub_key_nulls_name_and_labels_after_tombstone() {
-    let Some(store) = live_store() else { return };
-    // This suite runs against a SHARED, PERSISTENT Valkey that is not flushed between runs, and
-    // this test uses a FIXED id. It used to be self-healing only because `put_key` resurrected
-    // whatever tombstone a prior run had left on that id; now that `put_key` refuses to clear a
-    // tombstone, the fixture has to be removed explicitly.
-    let _ = store.purge_key_for_test("vk_scrub");
-    let mut key = vk("vk_scrub");
-    key.labels.insert("team".to_string(), "growth".to_string());
-    store.put_key(&key).unwrap();
-    store.delete_key("vk_scrub").unwrap();
-    store.scrub_key("vk_scrub").unwrap();
-    let row = store.get_key("vk_scrub").unwrap().unwrap();
-    assert_eq!(row.name, "");
-    assert!(row.labels.is_empty());
-    assert!(
-        row.deleted_at.is_some(),
-        "scrub must not un-tombstone the key"
     );
 }
 
@@ -1281,96 +1284,6 @@ pub(crate) fn audit_seq_guard() -> std::sync::MutexGuard<'static, ()> {
     AUDIT_SEQ_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-#[test]
-fn audit_append_and_list_are_ordered_oldest_first() {
-    let _serialised = audit_seq_guard();
-    let Some(store) = live_store() else { return };
-    // The audit zset is SHARED and persistent, and this test used to be the only writer of low
-    // seqs, so it could assume it owned the whole thing. It never really did: it only looked that
-    // way because `append_audit` OVERWROTE by score, so rerunning it replaced seqs 1..3 in place
-    // rather than adding to them. Now that a duplicate seq is compared instead of overwritten, the
-    // fixture is cleared first and the assertions filter to the seqs this test actually wrote.
-    for seq in 1..=3u64 {
-        let _ = store.purge_audit_seq_for_test(seq);
-    }
-    for seq in 1..=3u64 {
-        store
-            .append_audit(&AuditRecord {
-                seq,
-                ts: 1000 + seq,
-                action: "key.mint".to_string(),
-                resource: format!("key:vk_{seq}"),
-                outcome: "applied".to_string(),
-                principal: "admin".to_string(),
-                prev_hash: String::new(),
-                hash: format!("h{seq}"),
-            })
-            .unwrap();
-    }
-    let all: Vec<_> = store
-        .list_audit()
-        .unwrap()
-        .into_iter()
-        .filter(|r| (1..=3).contains(&r.seq))
-        .collect();
-    assert_eq!(all.len(), 3);
-    assert_eq!(all[0].seq, 1, "oldest first");
-    assert_eq!(all[2].seq, 3);
-
-    // The tail is the highest seqs in the WHOLE shared zset, which this test does not own and
-    // cannot pin to 2 and 3 (it only used to look that way because `append_audit` overwrote by
-    // score, so nothing but this test's own low seqs ever accumulated).
-    //
-    // Nor can it be checked against a SEPARATELY fetched `list_audit()`: sibling tests append
-    // concurrently, so a record landing between the two calls makes them disagree through no fault
-    // of `list_audit_tail`. An earlier version of this assertion did exactly that and flaked about
-    // one run in eight. Assert instead the two things that hold no matter who else is writing: the
-    // tail is oldest-first within itself, and it comes from the newest end rather than the head.
-    // WHICH END the tail comes from has to be asserted, and can be, race-free.
-    //
-    // Two earlier versions of this were wrong in opposite directions. `all(seq >= 3)` was FALSE
-    // whenever the zset held only this test's own 1,2,3 and passed on a sibling's litter. Dropping
-    // the claim entirely then left assertions that a BROKEN implementation satisfies: returning the
-    // OLDEST entries still yields two records in ascending order, so `list_audit_tail` could have
-    // been reading the wrong end of the log with nothing anywhere noticing.
-    //
-    // The race-free version: append a record whose seq is higher than anything else present, then
-    // require it in the tail. Sibling writers can only push it out by writing an even HIGHER seq,
-    // and this test owns the top of the range by construction, so there is nothing to race.
-    let top = store
-        .list_audit()
-        .unwrap()
-        .iter()
-        .map(|r| r.seq)
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1_000);
-    store
-        .append_audit(&AuditRecord {
-            seq: top,
-            ts: 1000,
-            action: "key.mint".to_string(),
-            resource: "key:vk_top".to_string(),
-            outcome: "applied".to_string(),
-            principal: "admin".to_string(),
-            prev_hash: String::new(),
-            hash: format!("h{top}"),
-        })
-        .unwrap();
-    let tail = store.list_audit_tail(2).unwrap();
-    assert_eq!(tail.len(), 2);
-    assert!(
-        tail[0].seq < tail[1].seq,
-        "the tail is oldest-first WITHIN the tail: {tail:?}"
-    );
-    assert!(
-        tail.iter().any(|r| r.seq == top),
-        "the newest record must be IN the tail -- without this, an implementation returning the \
-         OLDEST entries passes: {tail:?}"
-    );
-    let _ = store.purge_audit_seq_for_test(top);
-}
-
 /// `VALKEY_URL` re-pointed at database `db`, so a refusal test owns a whole namespace and never
 /// leaves a stale marker in the shared one the rest of the suite uses.
 fn url_for_db(db: u32) -> String {
@@ -1401,8 +1314,7 @@ fn fresh_db_client(db: u32) -> redis::Connection {
 }
 
 /// A namespace marked NEWER than this build is REFUSED at open, and left as found: an older build
-/// on a newer keyspace would ignore what the newer schema keeps (a v7 build on a v8 namespace grants
-/// never-expiring slices and ignores the fleet epoch's fence).
+/// on a newer keyspace would not know what the newer schema did to it.
 #[test]
 fn a_namespace_newer_than_this_build_is_refused() {
     let Some(_) = live_store() else { return };
@@ -1541,8 +1453,8 @@ fn a_namespace_with_keys_but_no_marker_refuses_to_connect_and_keeps_every_key() 
 #[path = "tests/store_conformance.rs"]
 mod store_conformance;
 
-/// The store v3 slots (`StoreSlots`): the durable `op_id` dedupe, the money slots, the journal,
-/// sessions and the kernel's records.
+/// The store v3 slots (`StoreSlots`): the durable `op_id` dedupe, the plane-record append and the
+/// kernel's records, and the v9 upgrade.
 mod slots_tests;
 
 mod conformance {
@@ -1612,19 +1524,6 @@ mod conformance {
             return;
         };
         conf::assert_put_key_with_credential_is_atomic(&store, &ns);
-    }
-
-    #[test]
-    fn append_audit_duplicate_seq_is_ok_when_identical_and_an_error_when_different() {
-        let _serialised = super::audit_seq_guard();
-        let seq = 910_000_000u64 + (std::process::id() as u64 % 1_000_000);
-        let Some((store, _ns)) = setup("aud", seq) else {
-            return;
-        };
-        conf::assert_append_audit_duplicate_seq(&store, seq);
-        // Clean up AFTER as well as before: this writes into the fleet-wide audit zset, and leaving
-        // the row behind makes every later run of the suite share a slightly dirtier instance.
-        let _ = store.purge_audit_seq_for_test(seq);
     }
 
     #[test]
@@ -1771,43 +1670,32 @@ fn one_corrupt_credential_row_does_not_break_the_whole_hydration_delta() {
 ///
 /// `add_denylist` is the sharp end: an operator revokes a leaked signed token, the store says it
 /// worked, and the token keeps authenticating. This drives the exact sequence — a refused
-/// `append_audit` (which WATCHes the fleet-wide audit zset), then another client dirties that key,
+/// `put_key` over a tombstone (which WATCHes the key's row), then another client dirties that key,
 /// then a revocation on the original store which MUST land.
 #[test]
 fn a_refused_transaction_does_not_swallow_the_next_write() {
-    let _serialised = audit_seq_guard();
     let Some(store) = live_store() else { return };
-    let Some(other) = live_store() else { return };
-    let seq = 930_000_000u64 + (std::process::id() as u64 % 1_000_000);
-    let _ = store.purge_audit_seq_for_test(seq);
+    let id = uid("vk_watch");
+    store.put_key(&vk(&id)).unwrap();
+    store.delete_key(&id).unwrap();
 
-    let rec = AuditRecord {
-        seq,
-        ts: 1_700_000_000,
-        action: "key.mint".to_string(),
-        resource: "key:vk_watch".to_string(),
-        outcome: "applied".to_string(),
-        principal: "admin".to_string(),
-        prev_hash: String::new(),
-        hash: "h-watch".to_string(),
-    };
-    store.append_audit(&rec).unwrap();
-
-    // A DIFFERENT record on the same seq: refused, and the refusal is the path that used to leak
-    // the WATCH on `busbar:audit`.
-    let mut forked = rec.clone();
-    forked.action = "key.delete".to_string();
+    // A live write over the tombstone: refused, and the refusal is the path that used to leak the
+    // WATCH on the key's row.
     store
-        .append_audit(&forked)
-        .expect_err("a forked record must be refused");
+        .put_key(&vk(&id))
+        .expect_err("a live write over a tombstone must be refused");
 
     // Another client writes the watched key, dirtying it.
-    let mut moved = rec.clone();
-    moved.seq = seq + 1;
-    other.append_audit(&moved).unwrap();
+    store
+        .with_conn(|c| {
+            let row = format!("{KEY_PREFIX}{id}");
+            let raw: String = c.get(&row)?;
+            c.set::<_, _, ()>(&row, raw)
+        })
+        .unwrap();
 
     // The revocation must actually land. Before the fix this returned Ok and wrote nothing.
-    let sub = format!("sub_leaked_{seq}");
+    let sub = format!("sub_leaked_{id}");
     store.add_denylist(&sub, "token leaked").unwrap();
     let denied = store.list_denylist().unwrap();
     assert!(
@@ -1816,8 +1704,7 @@ fn a_refused_transaction_does_not_swallow_the_next_write() {
          authenticate"
     );
 
-    let _ = store.purge_audit_seq_for_test(seq);
-    let _ = store.purge_audit_seq_for_test(seq + 1);
+    store.purge_key_for_test(&id).unwrap();
 }
 
 // ── THE PLANE-RECORD VOCABULARY THESE TESTS SPEAK ─────────────────────────────────────────────
@@ -4363,6 +4250,57 @@ fn migrate_over_the_1_5_5_rows_is_idempotent() {
 
 /// `list_audit_tail(0)` is the contract's empty tail, not the whole chain.
 #[test]
+fn audit_list_and_tail_are_ordered_oldest_first() {
+    let _serialised = audit_seq_guard();
+    let Some(store) = live_store() else { return };
+    // The audit zset is shared: seed seqs above everything present, so this test owns the top of
+    // the range and the tail it asserts cannot be pushed out by a sibling.
+    let top = store
+        .list_audit()
+        .unwrap()
+        .iter()
+        .map(|r| r.seq)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1_000);
+    let seqs = [top, top + 1, top + 2];
+    for seq in seqs {
+        store.seed_audit_for_test(&audit_row(seq)).unwrap();
+    }
+    let all: Vec<u64> = store
+        .list_audit()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.seq)
+        .filter(|q| seqs.contains(q))
+        .collect();
+    assert_eq!(all, seqs, "oldest first");
+    let tail: Vec<u64> = store
+        .list_audit_tail(2)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.seq)
+        .collect();
+    for seq in seqs {
+        let _ = store.purge_audit_seq_for_test(seq);
+    }
+    assert_eq!(tail, vec![top + 1, top + 2], "the newest two, oldest first");
+}
+
+fn audit_row(seq: u64) -> AuditRecord {
+    AuditRecord {
+        seq,
+        ts: 1000,
+        action: "key.mint".to_string(),
+        resource: format!("key:vk_{seq}"),
+        outcome: "applied".to_string(),
+        principal: "admin".to_string(),
+        prev_hash: String::new(),
+        hash: format!("h{seq}"),
+    }
+}
+
+#[test]
 fn list_audit_tail_zero_is_empty() {
     let _serialised = audit_seq_guard();
     let Some(store) = live_store() else { return };
@@ -4374,18 +4312,7 @@ fn list_audit_tail_zero_is_empty() {
         .max()
         .unwrap_or(0)
         + 1_000;
-    store
-        .append_audit(&AuditRecord {
-            seq: top,
-            ts: 1000,
-            action: "key.mint".to_string(),
-            resource: "key:vk_tail0".to_string(),
-            outcome: "applied".to_string(),
-            principal: "admin".to_string(),
-            prev_hash: String::new(),
-            hash: format!("h{top}"),
-        })
-        .unwrap();
+    store.seed_audit_for_test(&audit_row(top)).unwrap();
     let tail = store.list_audit_tail(0).unwrap();
     let _ = store.purge_audit_seq_for_test(top);
     assert!(tail.is_empty(), "limit 0 must be empty, got {}", tail.len());
@@ -4696,9 +4623,6 @@ fn unknown_id_refusals_name_the_id_in_the_canonical_form() {
     let e = store.delete_key(&id).unwrap_err().to_string();
     assert!(e.contains(&format!("delete_key: unknown id '{id}'")), "{e}");
     assert!(!e.contains("- Client"), "{e}");
-    let e = store.scrub_key(&id).unwrap_err().to_string();
-    assert!(e.contains(&format!("scrub_key: unknown id '{id}'")), "{e}");
-    assert!(!e.contains("- Client"), "{e}");
 }
 
 #[test]
@@ -4713,71 +4637,6 @@ fn put_refusals_carry_the_reason_without_the_kind_suffix() {
 }
 
 // ── retention purges ─────────────────────────────────────────────────────────────────────────
-
-/// `#[ignore]`d like the other whole-namespace tests: a purge is GLOBAL (every window before the
-/// cut), so run beside the parallel suite it would reap other tests' live windows.
-#[test]
-#[ignore]
-fn purge_windows_before_drops_older_windows_and_counts_them() {
-    let Some(store) = live_store() else { return };
-    let base = 9_000_000_000_000u64;
-    store.purge_windows_before(base + 10).unwrap(); // everything older, run alone
-    let bucket = uid("vk_purge_win");
-    let d = UsageDelta {
-        requests: 1,
-        billable_requests: 1,
-        models: vec![],
-    };
-    for w in [base + 3, base + 5, base + 20] {
-        store.add_usage(&bucket, w, &d).unwrap();
-    }
-    assert_eq!(store.purge_windows_before(base + 10).unwrap(), 2);
-    assert_eq!(store.get_usage(&bucket, base + 3).unwrap().requests, 0);
-    assert_eq!(store.get_usage(&bucket, base + 5).unwrap().requests, 0);
-    assert_eq!(
-        store.get_usage(&bucket, base + 20).unwrap().requests,
-        1,
-        "a window at or after the cut survives"
-    );
-}
-
-#[test]
-fn purge_metering_before_drops_that_bucket_only_and_refuses_a_non_integer() {
-    let Some(store) = live_store() else { return };
-    let (b1, b2) = (unique_bucket(20260801), unique_bucket(20260901));
-    let delta = |bucket: u64, model: &str| MeteringDelta {
-        key_id: "vk_purge_m".to_string(),
-        bucket,
-        model: model.to_string(),
-        provider: "p".to_string(),
-        tokens_input: 1,
-        tokens_output: 1,
-        tokens_cache_read: 0,
-        tokens_cache_write: 0,
-        requests: 1,
-        billable_requests: 1,
-        key_group_at_use: "g".to_string(),
-        pricing_version: "v1".to_string(),
-        priced_from_ms: 0,
-        usage_units: Default::default(),
-    };
-    store.add_metering(&delta(b1, "m1")).unwrap();
-    store.add_metering(&delta(b1, "m2")).unwrap();
-    store.add_metering(&delta(b2, "m1")).unwrap();
-    assert_eq!(store.purge_metering_before(&b1.to_string()).unwrap(), 2);
-    assert!(store.list_metering(b1).unwrap().is_empty());
-    assert_eq!(
-        store.list_metering(b2).unwrap().len(),
-        1,
-        "other buckets stay"
-    );
-    assert_eq!(store.purge_metering_before(&b1.to_string()).unwrap(), 0);
-    let e = store.purge_metering_before("abc").unwrap_err().to_string();
-    assert!(
-        e.contains("purge_metering_before: invalid bucket \"abc\", expected an integer"),
-        "{e}"
-    );
-}
 
 /// A unix-socket URL's `?pass=` is the scrub secret too: an error string that echoes the URL (or
 /// the password, raw or decoded) carries no credential bytes.

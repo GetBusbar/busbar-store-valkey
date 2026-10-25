@@ -18,10 +18,9 @@
 //! - against the live Valkey (`VALKEY_URL`): one scenario over every surface a governance store
 //!   answers — a key (mint, read, tombstone, the tombstone guard), a credential (mint, the live-owner
 //!   refusal, lookup, revoke), the usage ledger (additive, floored), metering (the dated split), the
-//!   audit chain (replay, fork), the plane-record verbs (upsert, chain append, replay, fork, listing,
+//!   plane-record verbs (upsert, chain append, replay, fork, listing,
 //!   parents, terminal-only purge with its cascade, single-use token, live token) — and the store v3
-//!   slots (window caps, a whole-cell reserve, its replay, a release, the journal and its replay,
-//!   records, sessions).
+//!   slots (the usage batch, its replay and its reused op id, records).
 //!
 //! The two transcripts must agree line for line. Each arm runs in its own namespace (fresh ids, a
 //! fresh plane kind), so the arms never read each other's rows; the namespace is replaced by a fixed
@@ -51,7 +50,7 @@
 // prefix, and a fold namespace is no database number, so `{fold}` has nowhere to go in the url. The
 // suite's folds therefore run in a database of their own (`/14`; this repo's other live tests use the
 // url's `/0`, the admin end-to-end test `/15`, store-valkey's schema-refusal tests `/11` to `/13` and
-// its fleet-epoch tests `/1` to `/10`), one fold at a time: the namespace hooks below take
+// its v9 upgrade test `/8`), one fold at a time: the namespace hooks below take
 // that database for the fold and flush it before the fold opens, and flush it and hand it on when
 // the fold ends, on an independent connection of the `redis` client. Every fold starts on an empty
 // keyspace and leaves none; nothing in the store's behaviour changes.
@@ -166,12 +165,11 @@ fn drop_fold_keyspace(namespace: &str, settings: &[u8]) {
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use busbar_contract::abi::sdk::store::{Cap, Cell, CellKey, Dimension};
 use busbar_contract::abi::store::OpId;
 use busbar_contract::kinds::RecordBytes;
 use busbar_contract::records::{
-    AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, ModelTokensDelta,
-    PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore, SecretForm, UsageDelta, VirtualKey,
+    CredentialMeta, CredentialSecret, MeteringDelta, ModelTokensDelta, PlaneDisposition,
+    PlaneRecord, PlaneSelector, RecordStore, SecretForm, UsageDelta, VirtualKey,
 };
 use busbar_contract::store_calls::StoreCalls;
 use busbar_plugin_loader::dispatch::kinds::secret::Secret;
@@ -365,8 +363,10 @@ fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
     t.push(format!(
         "lookup:{:?}",
         store
-            .lookup_credential_secret("sigv4", &format!("AKIA{ns}c1"))
+            .list_credentials_since(0)
             .unwrap()
+            .into_iter()
+            .find(|c| c.meta.kind == "sigv4" && c.meta.public_id == format!("AKIA{ns}c1"))
             .map(|c| (c.meta.id, c.secret))
     ));
     t.push(r(store.revoke_credential(&format!("{ns}_c1"), "leaked")));
@@ -430,23 +430,6 @@ fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
         .collect();
     cells.sort();
     t.push(format!("metering:{cells:?}"));
-    // AUDIT: an identical replay is Ok, a different record at the seq is a fork.
-    let seq = 950_000_000 + u64::from(std::process::id()) * 10 + (ns.len() as u64 % 10);
-    let audit = |action: &str| AuditRecord {
-        seq,
-        ts: 1,
-        action: action.into(),
-        resource: "r".into(),
-        outcome: "applied".into(),
-        principal: "p".into(),
-        prev_hash: String::new(),
-        hash: "h".into(),
-    };
-    t.push(r(store.append_audit(&audit("a"))));
-    t.push(r(store.append_audit(&audit("a"))));
-    t.push(r(store
-        .append_audit(&audit("b"))
-        .map_err(|e| e.to_string().replace(&seq.to_string(), "SEQ"))));
     // PLANE RECORDS, in a kind nothing else writes.
     let rec = |id: &str, parent: Option<&str>, seq: u64, ts: u64, terminal: bool, body: &str| {
         PlaneRecord {
@@ -562,74 +545,25 @@ fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
         ]
     ));
     // THE STORE V3 SLOTS, through the door's own table.
-    let bucket = format!("{ns}_cap");
-    let k = CellKey {
-        bucket: &bucket,
-        pool: None,
-        dimension: Dimension::Requests,
-        window_start: 60,
-    };
-    let cells = [Cell { key: k, amount: 2 }, Cell { key: k, amount: 1 }];
-    let stream = format!("{ns}_stream");
     let schema = format!("{ns}_schema");
-    let principal = format!("{ns}_principal");
-    let session = unique() >> 2;
+    let usage_bucket = format!("{ns}_batch");
+    let cells = [(usage_bucket.as_str(), 60, delta(5, 1))];
     block(async {
+        let id = op(1);
         t.push(format!(
-            "reserve, no cap = {:?}",
-            StoreCalls::reserve(loaded, op(1), 0, &cells).await
-        ));
-        let caps = [Cap {
-            key: k,
-            cap: 3,
-            config_gen: 1,
-        }];
-        t.push(format!(
-            "window_caps = {:?}",
-            StoreCalls::window_caps(loaded, op(2), &caps).await
-        ));
-        let id = op(3);
-        let grants = StoreCalls::reserve(loaded, id, 0, &cells).await;
-        t.push(format!(
-            "reserve = {:?}",
-            grants.as_ref().map(|g| g
-                .iter()
-                // Whether the grant expires (`abi::store::money` rule (c): never `u64::MAX` in a
-                // store a fleet shares), not its instant, which is the server's clock at the draw
-                // and so differs between the two folds.
-                .map(|g| (g.granted, g.valid_until_ms != u64::MAX))
-                .collect::<Vec<_>>())
-        ));
-        let replay = StoreCalls::reserve(loaded, id, 0, &cells).await;
-        t.push(format!(
-            "replay answers the original grants = {}",
-            replay.as_ref().ok() == grants.as_ref().ok()
+            "add_usage_batch = {:?}",
+            StoreCalls::add_usage_batch(loaded, id, &cells).await
         ));
         t.push(format!(
-            "reserve past the cap = {:?}",
-            StoreCalls::reserve(loaded, op(4), 0, &cells[1..]).await
+            "add_usage_batch replay = {:?}",
+            StoreCalls::add_usage_batch(loaded, id, &cells).await
         ));
-        if let Ok(g) = &grants {
-            let items = [(g[0].slice_id, 5)];
-            t.push(format!(
-                "release = {:?}",
-                StoreCalls::slice_release(loaded, op(5), 0, &items).await
-            ));
-        }
+        t.push(format!(
+            "add_usage_batch reused op id = {:?}",
+            StoreCalls::add_usage_batch(loaded, id, &[(usage_bucket.as_str(), 60, delta(9, 1))])
+                .await
+        ));
         let rb = |b: &[u8]| RecordBytes::new(b.to_vec()).unwrap();
-        let id = op(6);
-        t.push(format!(
-            "append_batch = {:?}",
-            StoreCalls::append_batch(loaded, id, &stream, &[rb(b"one"), rb(b"two")]).await
-        ));
-        t.push(format!(
-            "append_batch replay = {:?}",
-            StoreCalls::append_batch(loaded, id, &stream, &[rb(b"one"), rb(b"two")]).await
-        ));
-        t.push(format!(
-            "append_batch reused op id = {:?}",
-            StoreCalls::append_batch(loaded, id, &stream, &[rb(b"three")]).await
-        ));
         t.push(format!(
             "record_put = {:?}",
             StoreCalls::record_put(loaded, &schema, b"k", &rb(b"v")).await
@@ -639,20 +573,6 @@ fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
             StoreCalls::record_get(loaded, &schema, b"k")
                 .await
                 .map(|v| v.map(|v| String::from_utf8_lossy(v.as_slice()).into_owned()))
-        ));
-        t.push(format!(
-            "session_put = {:?}",
-            StoreCalls::session_put(loaded, session, "node-a", &principal).await
-        ));
-        t.push(format!(
-            "sessions_for = {:?}",
-            StoreCalls::sessions_for(loaded, &principal)
-                .await
-                .map(|v| v.into_iter().map(|(_, node)| node).collect::<Vec<_>>())
-        ));
-        t.push(format!(
-            "session_remove = {:?}",
-            StoreCalls::session_remove(loaded, session).await
         ));
     });
     t.iter().map(|l| l.replace(ns, "NS")).collect()
@@ -769,7 +689,6 @@ fn the_linked_and_the_dropped_in_valkey_store_are_one_store() {
             "{linked:#?}"
         );
         assert!(has("the chain has forked"), "{linked:#?}");
-        assert!(has("the audit chain has forked"), "{linked:#?}");
         assert!(has(r#"chain:["e1", "e2", "e3"]"#), "{linked:#?}");
         assert!(has(r#"parents:["p:x", "t1"]"#), "{linked:#?}");
         assert!(has("live:[true, false, false]"), "{linked:#?}");
@@ -780,25 +699,16 @@ fn the_linked_and_the_dropped_in_valkey_store_are_one_store() {
         );
         assert!(has("redeem:[true, false]"), "{linked:#?}");
         assert!(has("metering:[(0, 2, 6"), "{linked:#?}");
-        assert!(find("reserve, no cap").contains("NoCap"), "{linked:#?}");
-        assert_eq!(find("reserve ="), "reserve = Ok([(2, true), (1, true)])");
-        assert!(find("replay").ends_with("true"), "{linked:#?}");
-        assert!(find("reserve past").contains("Exhausted"), "{linked:#?}");
-        assert_eq!(find("release"), "release = Ok([2])");
-        assert!(
-            find("append_batch =").contains("seq: 2, epoch: 0"),
-            "{linked:#?}"
+        assert_eq!(find("add_usage_batch ="), "add_usage_batch = Ok(())");
+        assert_eq!(
+            find("add_usage_batch replay"),
+            "add_usage_batch replay = Ok(())"
         );
         assert_eq!(
-            find("append_batch replay"),
-            find("append_batch =").replace("append_batch =", "append_batch replay =")
-        );
-        assert_eq!(
-            find("append_batch reused"),
-            "append_batch reused op id = Err(Conflict)"
+            find("add_usage_batch reused"),
+            "add_usage_batch reused op id = Err(Conflict)"
         );
         assert_eq!(find("record_get"), "record_get = Ok(Some(\"v\"))");
-        assert_eq!(find("sessions_for"), "sessions_for = Ok([\"node-a\"])");
     }
 }
 
