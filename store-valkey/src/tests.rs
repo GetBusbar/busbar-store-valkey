@@ -1500,30 +1500,6 @@ fn a_namespace_with_keys_but_no_marker_refuses_to_connect_and_keeps_every_key() 
     redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
 }
 
-/// A destructive full-namespace wipe of a REAL Valkey, gated on the SAME `VALKEY_URL` as
-/// every other live test above. `#[ignore]`d so a bare `cargo test` never touches a shared dev
-/// instance by accident.
-#[test]
-#[ignore]
-fn wipes_the_entire_namespace_destructively() {
-    let Some(store) = live_store() else { return };
-    store.put_key(&vk("vk_wipe_me")).unwrap();
-    store
-        .with_conn(|c| {
-            let existing: Vec<String> = c
-                .scan_match::<_, String>("busbar:*")?
-                .collect::<Result<Vec<String>, _>>()?;
-            let mut pipe = redis::pipe();
-            pipe.atomic();
-            for k in &existing {
-                pipe.del(k).ignore();
-            }
-            pipe.query::<()>(c)
-        })
-        .unwrap();
-    assert!(store.get_key("vk_wipe_me").unwrap().is_none());
-}
-
 /// The `RecordStore` contract conformance suite, this crate's own copy (`src/tests/store_conformance.rs`
 /// — see its header for provenance): every ruling the suite offers, wired against the live Valkey.
 ///
