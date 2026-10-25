@@ -73,3 +73,23 @@ fn an_op_key_names_its_id_exactly() {
     assert_eq!(a, "busbar:op:01000000000000000200000000000000");
     assert_ne!(a, op_key(OpId::from_parts(2, 1)));
 }
+
+/// The cap key's layout is a wire contract with the scripts and every other node: hex bucket, pool
+/// (`-` or `p<hex>`), dimension number, hex class, window start, in that order.
+#[test]
+fn a_cap_key_has_its_pinned_layout() {
+    let plain = cap_key(&CellKey {
+        bucket: "b",
+        pool: None,
+        dimension: Dimension::NanoUnits,
+        window_start: 1000,
+    });
+    assert_eq!(plain, ("busbar:cap:62:-:0::1000".to_string(), 0));
+    let pooled = cap_key(&CellKey {
+        bucket: "b",
+        pool: Some("p"),
+        dimension: Dimension::Class("c"),
+        window_start: 60,
+    });
+    assert_eq!(pooled, ("busbar:cap:62:p70:3:63:60".to_string(), 3));
+}
