@@ -203,6 +203,20 @@ fn tls_url_scheme_is_accepted() {
     assert_eq!(t.auth, Some((None, "pw".to_string())));
 }
 
+/// The `valkeys://` spelling reads as `rediss://`: TLS, and `#insecure` its one fragment.
+#[test]
+fn valkeys_scheme_selects_tls_and_takes_insecure() {
+    let t = parse_url("valkeys://host").expect("a valkeys URL parses");
+    assert!(t.tls && !t.insecure, "valkeys:// is TLS, verified");
+    assert_eq!(t.addr, "host:6379");
+    let t = parse_url("valkeys://host#insecure").expect("valkeys + #insecure parses");
+    assert!(
+        t.tls && t.insecure,
+        "valkeys://…#insecure is TLS, unverified"
+    );
+    assert!(!parse_url("valkey://host").unwrap().tls);
+}
+
 /// The URL reads as the upstream driver read it: user, percent-decoded password, port, database,
 /// IPv6 literals, and its refusals in its words.
 #[test]
@@ -391,9 +405,10 @@ fn unique_bucket(base: u64) -> u64 {
 #[test]
 fn put_get_roundtrips_a_key_and_stamps_revision() {
     let Some(store) = live_store() else { return };
-    store.put_key(&vk("vk_1")).unwrap();
-    let back = store.get_key("vk_1").unwrap().expect("key exists");
-    assert_eq!(back.id, "vk_1");
+    let id = uid("vk_1");
+    store.put_key(&vk(&id)).unwrap();
+    let back = store.get_key(&id).unwrap().expect("key exists");
+    assert_eq!(back.id, id);
     assert!(back.deleted_at.is_none());
     assert!(back.revision > 0, "put_key must stamp a nonzero revision");
 }
@@ -401,20 +416,18 @@ fn put_get_roundtrips_a_key_and_stamps_revision() {
 #[test]
 fn list_keys_since_only_returns_keys_past_the_watermark() {
     let Some(store) = live_store() else { return };
-    store.put_key(&vk("vk_a")).unwrap();
-    let watermark = store.get_key("vk_a").unwrap().unwrap().revision;
-    store.put_key(&vk("vk_b")).unwrap();
+    let (a, b) = (uid("vk_a"), uid("vk_b"));
+    store.put_key(&vk(&a)).unwrap();
+    let watermark = store.get_key(&a).unwrap().unwrap().revision;
+    store.put_key(&vk(&b)).unwrap();
     let delta = store.list_keys_since(watermark).unwrap();
     // Tests run in parallel against one shared instance, so `delta` may legitimately also contain
     // OTHER tests' concurrently-created keys past this watermark — assert on presence/absence of
     // THIS test's own ids, not an exact global count.
+    assert!(delta.iter().any(|k| k.id == b), "{b} must be in the delta");
     assert!(
-        delta.iter().any(|k| k.id == "vk_b"),
-        "vk_b must be in the delta"
-    );
-    assert!(
-        !delta.iter().any(|k| k.id == "vk_a"),
-        "vk_a was created BEFORE the watermark and must not reappear"
+        !delta.iter().any(|k| k.id == a),
+        "{a} was created BEFORE the watermark and must not reappear"
     );
 }
 
@@ -608,8 +621,12 @@ fn delete_key_removes_usage_windows() {
 #[test]
 fn delete_key_does_not_glob_match_other_keys_usage() {
     let Some(store) = live_store() else { return };
-    let evil = uid("vk_evil_*");
-    let victim = uid("vk_evil_victim");
+    // ONE suffix for both ids, so the UNESCAPED pattern `vk_evil_<s>_*` really does match the
+    // victim `vk_evil_<s>_victim` (a per-id `uid()` suffix would make the match impossible and the
+    // test vacuous).
+    let s = unique_suffix();
+    let evil = format!("vk_evil_{s}_*");
+    let victim = format!("vk_evil_{s}_victim");
     store.put_key(&vk(&evil)).unwrap();
     store.put_key(&vk(&victim)).unwrap();
     let d = UsageDelta {
@@ -1239,9 +1256,10 @@ fn a_server_error_surfaces_through_the_op_in_the_stores_words() {
 #[test]
 fn denylist_add_and_list_round_trips() {
     let Some(store) = live_store() else { return };
-    store.add_denylist("vk_denied", "compromised").unwrap();
+    let id = uid("vk_denied");
+    store.add_denylist(&id, "compromised").unwrap();
     let list = store.list_denylist().unwrap();
-    assert!(list.contains(&"vk_denied".to_string()));
+    assert!(list.contains(&id));
 }
 
 // ── Audit log (unchanged shape) ──────────────────────────────────────────────────────────────
@@ -1255,11 +1273,11 @@ fn denylist_add_and_list_round_trips() {
 /// between that read and the tail read pushes the record out and fails an assertion about ORDERING
 /// with something that is really a concurrency artifact. Pre-existing on dev — surfaced here because
 /// this suite now runs more tests against one shared server, not because retention changed anything.
-static AUDIT_SEQ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static AUDIT_SEQ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Take `AUDIT_SEQ_LOCK`, ignoring poisoning, so one failing audit test does not convert the others
 /// into spurious failures that bury the original.
-fn audit_seq_guard() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn audit_seq_guard() -> std::sync::MutexGuard<'static, ()> {
     AUDIT_SEQ_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -3314,6 +3332,41 @@ fn v6_namespace_upgrades_in_place_to_v7() {
         .with_conn(|c| c.set::<_, _, ()>(SCHEMA_KEY, 6i64))
         .unwrap();
     let upgraded = ValkeyStore::connect(&url).expect("a second upgrade pass on open");
+    assert_eq!(
+        upgraded.list_task_events(&t).unwrap(),
+        vec![e1.clone(), e2.clone()]
+    );
+
+    // Crash-safe: a v6 row RESURFACING beside its already-migrated v7 record (the upgrade died
+    // after the copy and before the delete, or an old node wrote it back) must not clobber the v7
+    // record: the copy is append-if-absent, and the stale v6 key is still removed.
+    let stale = sample_task(&t, "working", TASK_LIVE_TS + 1);
+    assert_ne!(stale, live);
+    upgraded
+        .with_conn(|c| {
+            let mut p = redis::pipe();
+            p.set(
+                format!("{TASK_ROW_PREFIX}{t}"),
+                serde_json::to_string(&stale).unwrap(),
+            )
+            .sadd(TASKS_INDEX, &t)
+            .zadd(TASKS_BY_UPDATED, &t, stale.updated_at)
+            .set(SCHEMA_KEY, 6);
+            p.query::<()>(c)
+        })
+        .unwrap();
+    let upgraded = ValkeyStore::connect(&url).expect("a re-seeded v6 row upgrades on open");
+    assert_eq!(
+        upgraded.get_task(&t).unwrap(),
+        Some(live.clone()),
+        "the v7 record must not be overwritten by a stale v6 row"
+    );
+    assert!(
+        !upgraded
+            .with_conn(|c| c.exists::<_, bool>(format!("{TASK_ROW_PREFIX}{t}")))
+            .unwrap(),
+        "the stale v6 row is removed"
+    );
     assert_eq!(upgraded.list_task_events(&t).unwrap(), vec![e1, e2]);
 
     reset_tasks(&upgraded, &[&t, &done]);

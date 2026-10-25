@@ -61,3 +61,17 @@ fn the_sidecar_flags_and_determinism() {
         "a different ts is a different record"
     );
 }
+
+/// The key, field and token layouts are shared with the scripts and every other node: pin the
+/// literal strings, not just their round trips.
+#[test]
+fn the_key_field_and_token_layouts_are_pinned() {
+    assert_eq!(field(42, "a:b"), "42:a:b");
+    let k = Keys::of("task");
+    assert_eq!(k.rec, "busbar:plane:7461736b:rec");
+    assert_eq!(k.body, "busbar:plane:7461736b:body");
+    assert_eq!(k.byts, "busbar:plane:7461736b:byts");
+    assert_eq!(k.pcount, "busbar:plane:7461736b:pcount");
+    assert_eq!(k.idx("ab"), "busbar:plane:7461736b:idx:6162");
+    assert_eq!(token_key("task", "n"), "busbar:plane:7461736b:tok:6e");
+}

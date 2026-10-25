@@ -1025,6 +1025,21 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_or_partial_bulk_is_refused_or_waited_for() {
+        // The two bytes after the payload must be CRLF.
+        assert!(parse(b"$3\r\nabcX\r\n").is_err());
+        // CRLF INSIDE the declared length is payload, not a terminator.
+        let (v, n) = parse(b"$4\r\na\r\nb\r\n").unwrap().unwrap();
+        assert_eq!((v, n), (Value::Data(b"a\r\nb".to_vec()), 10));
+        // A non-numeric length is refused.
+        assert!(parse(b"$x\r\n").is_err());
+        // A bulk short of its payload or terminator is waited for, not refused.
+        assert_eq!(parse(b"$5\r\nab").unwrap(), None);
+        assert_eq!(parse(b"$3\r\nabc").unwrap(), None);
+        assert_eq!(parse(b"$3\r\nabc\r").unwrap(), None);
+    }
+
+    #[test]
     fn encodes_a_command_as_bulk_strings() {
         let mut out = Vec::new();
         encode(&args_of(("SET", ["k", "v"])), &mut out);
@@ -1056,6 +1071,19 @@ mod tests {
             FromValue::from_value(Value::Array(vec![Value::Data(b"7".to_vec())])).unwrap();
         assert_eq!(ids, vec![7]);
         assert!(String::from_value(Value::Nil).is_err());
+    }
+
+    #[test]
+    fn conversions_refuse_what_does_not_fit() {
+        assert!(u64::from_value(Value::Int(-1)).is_err());
+        assert!(u32::from_value(Value::Int(i64::from(u32::MAX) + 1)).is_err());
+        assert_eq!(u64::from_value(Value::Int(5)).unwrap(), 5);
+        let odd = Value::Array(vec![
+            Value::Data(b"a".to_vec()),
+            Value::Data(b"1".to_vec()),
+            Value::Data(b"b".to_vec()),
+        ]);
+        assert!(<Vec<(String, String)>>::from_value(odd).is_err());
     }
 
     #[test]
