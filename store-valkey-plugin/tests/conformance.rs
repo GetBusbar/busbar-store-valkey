@@ -98,21 +98,48 @@ fn host(
 
 /// The fold's database on the live server, on a connection of the `redis` client's own: straight to
 /// the server, in the clear (the TLS front is the store's, not this client's).
+/// The suite's own connection to the fold's database: the far end the url names reached directly,
+/// as the server's default user (the url's own user is the canary's, which the store authenticates
+/// as through the chip).
 fn fold_client(settings: &[u8]) -> redis::RedisResult<redis::Connection> {
     let v: serde_json::Value =
         serde_json::from_slice(settings).expect("conformance.json's settings are JSON");
     let url = v["url"]
         .as_str()
-        .expect("conformance.json's settings name a url")
-        .replace(
-            &format!("rediss://{}", conformance_host::FAR_END),
-            &format!("redis://{}", upstream()),
-        );
+        .expect("conformance.json's settings name a url");
+    let at = url.rsplit_once('@').map_or(url, |(_, at)| at);
+    let at = at.strip_prefix("rediss://").unwrap_or(at);
+    let url = format!(
+        "redis://{}",
+        at.replace(conformance_host::FAR_END, upstream())
+    );
     redis::Client::open(url.as_str())?.get_connection()
 }
 
+/// THE CANARY'S USER: the url authenticates as `conf-canary` with the credential conformance.json
+/// names, so the store's `AUTH` carries it on every fold and the suite's canary searches for it.
+fn canary_user(c: &mut redis::Connection) -> redis::RedisResult<()> {
+    let inputs: serde_json::Value =
+        serde_json::from_str(include_str!("conformance.json")).expect("conformance.json is JSON");
+    let password = inputs["credentials"][0]
+        .as_str()
+        .expect("conformance.json names the canary credential");
+    redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg("conf-canary")
+        .arg("reset")
+        .arg("on")
+        .arg(format!(">{password}"))
+        .arg("~*")
+        .arg("&*")
+        .arg("+@all")
+        .query::<()>(c)
+}
+
 fn flush_fold_keyspace(settings: &[u8]) -> redis::RedisResult<()> {
-    redis::cmd("FLUSHDB").query::<()>(&mut fold_client(settings)?)
+    let mut c = fold_client(settings)?;
+    canary_user(&mut c)?;
+    redis::cmd("FLUSHDB").query::<()>(&mut c)
 }
 
 /// The suite's database, held by one fold at a time: the namespace of the fold holding it.

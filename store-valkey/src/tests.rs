@@ -149,114 +149,98 @@ impl Raw for LoadedStore {
     }
 }
 
-/// The password-scrub never lets the URL secret out in an error string, and the URL password
-/// extractor handles every URL shape.
+/// The parsed password is sealed: the target holds it as the chip's credential, and a URL error
+/// never carries it.
+fn auth_is(t: &Target, user: Option<&str>, password: &[u8]) -> bool {
+    t.auth
+        .as_ref()
+        .is_some_and(|(u, p)| u.as_deref() == user && p.verify_eq(password))
+}
+
+fn url(text: &str) -> CredUrl {
+    CredUrl::parse(text).expect("splits")
+}
+
 #[test]
-fn password_scrub_and_extraction() {
-    assert_eq!(
-        url_password("redis://:s3cr3t@host:6379/0").as_deref(),
-        Some("s3cr3t")
-    );
-    assert_eq!(
-        url_password("rediss://user:p%40ss@host:6380").as_deref(),
-        Some("p%40ss")
-    );
-    assert_eq!(url_password("redis://host:6379"), None);
-    assert_eq!(url_password("redis://user@host:6379"), None);
-    assert_eq!(url_password("not a url"), None);
-
-    let msg = "connection refused for redis://:s3cr3t@host:6379/0".to_string();
-    let scrubbed = scrub(msg, Some("s3cr3t"));
-    assert!(!scrubbed.contains("s3cr3t"), "got {scrubbed}");
-    assert!(scrubbed.contains("<redacted>"));
-    assert_eq!(scrub("plain".into(), None), "plain");
-    assert_eq!(scrub("plain".into(), Some("zz")), "plain");
-
-    let raw = url_password("rediss://user:p%40ss@host:6380").expect("password");
-    assert_eq!(raw, "p%40ss");
-    let decoded_leak = "auth failed with password p@ss".to_string();
-    let s = scrub(decoded_leak, Some(&raw));
-    assert!(
-        !s.contains("p@ss") && s.contains("<redacted>"),
-        "the DECODED password form must be scrubbed too; got {s}"
-    );
-    let raw_leak = "dsn rediss://user:p%40ss@host:6380".to_string();
-    let s2 = scrub(raw_leak, Some(&raw));
-    assert!(
-        !s2.contains("p%40ss"),
-        "the raw password form is scrubbed; got {s2}"
-    );
-    assert_eq!(percent_decode("p%40ss"), "p@ss");
-    assert_eq!(percent_decode("no-escape"), "no-escape");
-    assert_eq!(
-        percent_decode("bad%zz"),
-        "bad%zz",
-        "a malformed escape is left verbatim"
-    );
+fn a_url_error_never_carries_the_password() {
+    let e = crate::ValkeyStore::new("redis://:s3cr3t-pw@host:6379/x")
+        .expect_err("a bad database")
+        .to_string();
+    assert!(!e.contains("s3cr3t"), "{e}");
+    let e = crate::ValkeyStore::new("redis+unix:///run/v.sock?pass=s3cr3t-pw&zz=1")
+        .expect_err("an unknown parameter")
+        .to_string();
+    assert!(!e.contains("s3cr3t"), "{e}");
 }
 
 #[test]
 fn tls_url_scheme_is_accepted() {
-    let t = parse_url("rediss://:pw@localhost:6380/0").expect("a rediss URL parses");
+    let t = parse_url(&url("rediss://:pw@localhost:6380/0")).expect("a rediss URL parses");
     assert!(t.tls);
     assert_eq!(t.addr, "localhost:6380");
-    assert_eq!(t.auth, Some((None, "pw".to_string())));
+    assert!(auth_is(&t, None, b"pw"));
 }
 
 /// The `valkeys://` spelling reads as `rediss://`: TLS, and `#insecure` its one fragment.
 #[test]
 fn valkeys_scheme_selects_tls_and_takes_insecure() {
-    let t = parse_url("valkeys://host").expect("a valkeys URL parses");
+    let t = parse_url(&url("valkeys://host")).expect("a valkeys URL parses");
     assert!(t.tls && !t.insecure, "valkeys:// is TLS, verified");
     assert_eq!(t.addr, "host:6379");
-    let t = parse_url("valkeys://host#insecure").expect("valkeys + #insecure parses");
+    let t = parse_url(&url("valkeys://host#insecure")).expect("valkeys + #insecure parses");
     assert!(
         t.tls && t.insecure,
         "valkeys://…#insecure is TLS, unverified"
     );
-    assert!(!parse_url("valkey://host").unwrap().tls);
+    assert!(!parse_url(&url("valkey://host")).unwrap().tls);
 }
 
 /// The URL reads as the upstream driver read it: user, percent-decoded password, port, database,
 /// IPv6 literals, and its refusals in its words.
 #[test]
 fn urls_parse_as_the_upstream_driver_read_them() {
-    let t = parse_url("redis://alice:p%40ss@db.internal:7000/3").unwrap();
+    let t = parse_url(&url("redis://alice:p%40ss@db.internal:7000/3")).unwrap();
     assert_eq!(
         (t.addr.as_str(), t.host.as_str(), t.tls, t.db),
         ("db.internal:7000", "db.internal", false, 3)
     );
-    assert_eq!(t.auth, Some((Some("alice".into()), "p@ss".into())));
-    let t = parse_url("valkey://[::1]/").unwrap();
+    assert!(auth_is(&t, Some("alice"), b"p@ss"));
+    let t = parse_url(&url("valkey://[::1]/")).unwrap();
     assert_eq!(
         (t.addr.as_str(), t.host.as_str(), t.db),
         ("[::1]:6379", "::1", 0)
     );
-    assert_eq!(parse_url("redis://h").unwrap().auth, None);
+    assert!(parse_url(&url("redis://h")).unwrap().auth.is_none());
     assert_eq!(
-        parse_url("not-a-valkey-url").unwrap_err().to_string(),
+        parse_url(&url("not-a-valkey-url")).unwrap_err().to_string(),
         "Redis URL did not parse - InvalidClientConfig"
     );
     assert_eq!(
-        parse_url("redis://h/x").unwrap_err().to_string(),
+        parse_url(&url("redis://h/x")).unwrap_err().to_string(),
         "Invalid database number - InvalidClientConfig"
     );
-    assert!(parse_url("http://h").is_err());
+    assert!(parse_url(&url("http://h")).is_err());
     assert_eq!(
-        parse_url("redis://0.0.0.0:6379").unwrap_err().to_string(),
+        parse_url(&url("redis://0.0.0.0:6379"))
+            .unwrap_err()
+            .to_string(),
         "Cannot connect to a wildcard address (0.0.0.0 or ::) - InvalidClientConfig"
     );
     assert_eq!(
-        parse_url("redis://h/?protocol=9").unwrap_err().to_string(),
+        parse_url(&url("redis://h/?protocol=9"))
+            .unwrap_err()
+            .to_string(),
         "Invalid protocol version - InvalidClientConfig: 9"
     );
-    assert!(parse_url("redis://h/?protocol=resp3").is_ok());
+    assert!(parse_url(&url("redis://h/?protocol=resp3")).is_ok());
     // `#insecure` is the one fragment a TLS URL takes; any other is refused in the driver's words.
-    let t = parse_url("rediss://h:6380/#insecure").unwrap();
+    let t = parse_url(&url("rediss://h:6380/#insecure")).unwrap();
     assert!(t.tls && t.insecure);
-    assert!(!parse_url("rediss://h:6380/").unwrap().insecure);
+    assert!(!parse_url(&url("rediss://h:6380/")).unwrap().insecure);
     assert_eq!(
-        parse_url("rediss://h/#other").unwrap_err().to_string(),
+        parse_url(&url("rediss://h/#other"))
+            .unwrap_err()
+            .to_string(),
         "only #insecure is supported as URL fragment - InvalidClientConfig"
     );
 }
@@ -271,18 +255,21 @@ fn unix_socket_urls_parse_as_the_upstream_driver_read_them() {
         "valkey+unix:///run/valkey.sock",
         "unix:/run/valkey.sock",
     ] {
-        let t = parse_url(url).unwrap_or_else(|e| panic!("{url}: {e}"));
+        let t = parse_url(&self::url(url)).unwrap_or_else(|e| panic!("{url}: {e}"));
         assert_eq!(
             (t.addr.as_str(), t.tls, t.db),
             ("unix:/run/valkey.sock", false, 0)
         );
-        assert_eq!(t.auth, None);
+        assert!(t.auth.is_none());
     }
-    let t = parse_url("redis+unix:///run/v.sock?db=2&user=%25al&pass=%26%3F+x").unwrap();
+    let t = parse_url(&url(
+        "redis+unix:///run/v.sock?db=2&user=%25al&pass=%26%3F+x",
+    ))
+    .unwrap();
     assert_eq!(t.db, 2);
-    assert_eq!(t.auth, Some((Some("%al".into()), "&? x".into())));
+    assert!(auth_is(&t, Some("%al"), b"&? x"));
     assert_eq!(
-        parse_url("unix:///run/v.sock?db=x")
+        parse_url(&url("unix:///run/v.sock?db=x"))
             .unwrap_err()
             .to_string(),
         "Invalid database number - InvalidClientConfig"
@@ -4396,7 +4383,7 @@ fn list_audit_tail_zero_is_empty() {
 fn debug_output_redacts_the_url_password() {
     let url = "redis://user:s3cr3t@host:6379/0";
     let store = crate::ValkeyStore::new(url).unwrap();
-    let t = parse_url(url).unwrap();
+    let t = parse_url(&self::url(url)).unwrap();
     for out in [format!("{store:?}"), format!("{t:?}")] {
         assert!(!out.contains("s3cr3t"), "password leaked: {out}");
         assert!(out.contains("<redacted>"), "no redaction marker: {out}");
@@ -4659,18 +4646,15 @@ fn the_unix_socket_query_password_never_reaches_an_error_or_a_debug() {
         ),
         ("unix:///run/v.sock?user=al&pass=p%40ssw0rd", "p%40ssw0rd"),
     ] {
-        assert!(url_password(url).is_some(), "{url}: password extracted");
-        let leaked = scrub(
-            format!("could not reach {url}"),
-            url_password(url).as_deref(),
-        );
+        let input = self::url(url);
+        assert!(input.password().is_some(), "{url}: password sealed");
         assert!(
-            !leaked.contains(secret) && !leaked.contains("p@ssw0rd"),
-            "{url}: {leaked}"
+            !input.public().contains(secret) && !input.public().contains("p@ssw0rd"),
+            "{url}: the public text keeps the password"
         );
         // `password=` is not a parameter the unix form reads, so that URL is refused: its refusal
         // must not carry the secret either. The others parse, and their Debug never shows it.
-        let shown = match parse_url(url) {
+        let shown = match parse_url(&input) {
             Ok(t) => format!("{t:?}"),
             Err(e) => e.to_string(),
         };
@@ -4788,24 +4772,26 @@ fn unix_url_query_password_is_scrubbed_from_errors() {
         "unix:///run/v.sock?user=al&pass=CANARY-vk-p4ss",
         "valkey+unix:///run/v.sock?pass=CANARY%2Dvk%2Dp4ss&db=1",
     ] {
-        let secret = url_password(url);
+        let store = crate::ValkeyStore::new(url).expect("a unix URL parses");
         for leak in [
-            format!("valkey connect: cannot reach {url}"),
+            format!("valkey connect: cannot reach {}", self::url(url).public()),
             "valkey connect: AUTH CANARY-vk-p4ss refused".to_string(),
         ] {
-            let out = scrub(leak, secret.as_deref());
+            let out = store.quiet(leak);
             assert!(!out.contains("CANARY"), "{url}: password leaked: {out}");
         }
+        assert!(!format!("{store:?}").contains("CANARY"));
     }
     // The userinfo form is unchanged; a unix URL without `pass=` has no secret.
-    assert_eq!(url_password("redis://u:p@host:6379").as_deref(), Some("p"));
-    assert_eq!(url_password("redis+unix:///run/v.sock?db=2"), None);
+    assert!(url("redis://u:p@host:6379")
+        .password()
+        .is_some_and(|c| c.verify_eq(b"p")));
+    assert!(url("redis+unix:///run/v.sock?db=2").password().is_none());
     // `password=` is not a parameter the unix form reads (it is refused at parse), yet a value an
-    // operator wrote under that name is still treated as a secret and never echoed.
-    assert_eq!(
-        url_password("redis+unix:///run/v.sock?password=x").as_deref(),
-        Some("x")
-    );
+    // operator wrote under that name is still sealed, never kept in the text.
+    let p = url("redis+unix:///run/v.sock?password=x");
+    assert!(p.password().is_some_and(|c| c.verify_eq(b"x")));
+    assert!(parse_url(&p).is_err());
 }
 
 /// A URL parameter the store does not read is REFUSED, never silently ignored; its name is withheld
@@ -4817,13 +4803,13 @@ fn an_unknown_url_parameter_is_refused_not_ignored() {
         "valkey+unix:///run/v.sock?db=1&password=x",
         "redis://u:12?abc@127.0.0.1:6379/0",
     ] {
-        assert!(parse_url(url).is_err(), "{url} must be refused");
+        assert!(parse_url(&self::url(url)).is_err(), "{url} must be refused");
     }
-    let e = parse_url("redis://127.0.0.1:6379/0?timeout=5")
+    let e = parse_url(&url("redis://127.0.0.1:6379/0?timeout=5"))
         .unwrap_err()
         .to_string();
     assert!(e.contains("timeout") && e.contains("not supported"), "{e}");
-    let e = parse_url("redis://u:12?abc@127.0.0.1:6379/0")
+    let e = parse_url(&url("redis://u:12?abc@127.0.0.1:6379/0"))
         .unwrap_err()
         .to_string();
     assert!(!e.contains("abc"), "the password tail leaked: {e}");
@@ -4831,6 +4817,6 @@ fn an_unknown_url_parameter_is_refused_not_ignored() {
         "redis://127.0.0.1:6379/0?protocol=resp2",
         "valkey+unix:///run/v.sock?db=1&user=al&pass=x",
     ] {
-        parse_url(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        parse_url(&url(ok)).unwrap_or_else(|e| panic!("{ok}: {e}"));
     }
 }

@@ -1,5 +1,6 @@
 {
-  "settings": { "url": "rediss://localhost:50555/14" },
+  "settings": { "url": "rediss://conf-canary:CANARY-vk-conf-5b2d@localhost:50555/14" },
+  "credentials": ["CANARY-vk-conf-5b2d"],
   "store": {
     "credential_kind": "sigv4",
     "node": 7,

@@ -10,6 +10,7 @@
 //! typed `get`/`hgetall`/... helpers and the optimistic [`transaction!`]), as `async` calls, so the
 //! store's bodies read as they did over the blocking client.
 
+use busbar_contract::abi::sdk::cred::Seal;
 use std::fmt;
 use std::future::Future;
 
@@ -568,6 +569,21 @@ impl Conn {
             _ => {}
         }
         match v {
+            Value::Error(e) => Err(RedisError::server(e)),
+            v => Ok(v),
+        }
+    }
+
+    /// A sealed command (the chip's whole `AUTH`) and its reply; an error reply is `Err`.
+    ///
+    /// # Errors
+    /// The connection failed or the server answered an error.
+    pub async fn request_sealed(&mut self, seal: &Seal) -> RedisResult<Value> {
+        self.wire
+            .write_sealed(seal)
+            .await
+            .map_err(|e| RedisError::io(&e))?;
+        match self.read().await? {
             Value::Error(e) => Err(RedisError::server(e)),
             v => Ok(v),
         }
