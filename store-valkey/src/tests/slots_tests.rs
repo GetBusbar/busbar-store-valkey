@@ -437,6 +437,7 @@ fn a_usage_and_a_metering_batch_apply_once() {
 /// anywhere in an audit batch writes none of the batch.
 #[test]
 fn a_failed_batch_applies_nothing_and_records_nothing() {
+    let _serialised = super::audit_seq_guard();
     let Some(s) = live_store() else { return };
     let base = audit_base();
     s.append_audit(&audit(base, "first")).expect("seed");
@@ -474,6 +475,7 @@ fn a_failed_batch_applies_nothing_and_records_nothing() {
 /// records are a fork inside the batch.
 #[test]
 fn an_audit_batch_judges_its_own_records_against_each_other() {
+    let _serialised = super::audit_seq_guard();
     let Some(s) = live_store() else { return };
     let base = audit_base();
     s.append_audit_batch(op(4), &[audit(base, "a"), audit(base, "a")])
@@ -732,6 +734,151 @@ fn window_caps_newest_generation_wins_and_an_equal_generation_must_agree() {
     s.window_caps(op(18), &[cap(2, 3)])
         .expect("a newer generation raises it");
     reserve(&s, op(19), EPOCH, &[cell]).expect("cap 2 holds a second");
+}
+
+/// S2 for the remaining op-id slots: the same `op_id` with a DIFFERENT body answers `Conflict` and
+/// applies nothing.
+#[test]
+fn the_same_op_id_with_a_different_body_conflicts_on_every_slot() {
+    let _serialised = super::audit_seq_guard();
+    let Some(s) = live_store() else { return };
+
+    // slice_release: the second body hands back more, and must change nothing.
+    let bucket = fresh("s2-release");
+    let k = key(&bucket, 120);
+    s.window_caps(
+        op(80),
+        &[Cap {
+            key: k,
+            cap: 10,
+            config_gen: 1,
+        }],
+    )
+    .expect("cap");
+    let g = reserve(&s, op(81), EPOCH, &[Cell { key: k, amount: 6 }]).expect("draw");
+    let id = op(82);
+    assert_eq!(release(&s, id, &[(g[0].slice_id, 1)]), Ok(vec![1]));
+    assert_eq!(
+        release(&s, id, &[(g[0].slice_id, 2)]),
+        Err(OpRefused::Conflict),
+        "a different release body under one op id must conflict"
+    );
+    assert_eq!(
+        release(&s, op(83), &[(g[0].slice_id, 5)]),
+        Ok(vec![5]),
+        "the conflicting release applied nothing: 5 are still held"
+    );
+
+    // window_caps: a different cap under one op id conflicts and the first cap stands.
+    let capped = fresh("s2-caps");
+    let ck = key(&capped, 120);
+    let cap = |cap| Cap {
+        key: ck,
+        cap,
+        config_gen: 1,
+    };
+    let id = op(84);
+    s.window_caps(id, &[cap(1)]).expect("first push");
+    assert_eq!(s.window_caps(id, &[cap(2)]), Err(CapsRefused::Conflict));
+    let cell = Cell { key: ck, amount: 1 };
+    reserve(&s, op(85), EPOCH, &[cell]).expect("cap 1 holds one");
+    assert_eq!(
+        reserve(&s, op(86), EPOCH, &[cell]),
+        Err(ReserveRefused::Exhausted { cell: 0 }),
+        "the conflicting push applied nothing"
+    );
+
+    // add_usage_batch
+    let a = fresh("s2-batch");
+    let d = |n| UsageDelta {
+        requests: n,
+        billable_requests: 0,
+        models: Vec::new(),
+    };
+    let id = op(87);
+    s.add_usage_batch(id, &[(a.as_str(), 0, d(1))])
+        .expect("applies");
+    assert_eq!(
+        s.add_usage_batch(id, &[(a.as_str(), 0, d(5))]),
+        Err(OpRefused::Conflict)
+    );
+    assert_eq!(s.get_usage(&a, 0).unwrap().requests, 1);
+
+    // add_metering_batch
+    let bucket = super::unique_bucket(88);
+    let m = |n| busbar_contract::records::MeteringDelta {
+        key_id: fresh("vk"),
+        bucket,
+        model: "m".into(),
+        provider: "p".into(),
+        tokens_input: n,
+        tokens_output: 0,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 1,
+        billable_requests: 1,
+        key_group_at_use: String::new(),
+        pricing_version: String::new(),
+        priced_from_ms: 0,
+        usage_units: Default::default(),
+    };
+    let first = m(5);
+    let id = op(89);
+    s.add_metering_batch(id, std::slice::from_ref(&first))
+        .expect("applies");
+    let other = busbar_contract::records::MeteringDelta {
+        tokens_input: 99,
+        ..first.clone()
+    };
+    assert_eq!(s.add_metering_batch(id, &[other]), Err(OpRefused::Conflict));
+    let rows = s.list_metering(bucket).expect("list");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].tokens_input, 5, "{rows:?}");
+
+    // append_audit_batch
+    let base = audit_base();
+    let id = op(90);
+    s.append_audit_batch(id, &[audit(base, "one")])
+        .expect("applies");
+    assert_eq!(
+        s.append_audit_batch(id, &[audit(base, "one"), audit(base + 1, "two")]),
+        Err(OpRefused::Conflict)
+    );
+    let stored: Vec<u64> = s
+        .list_audit()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.seq)
+        .filter(|q| *q == base || *q == base + 1)
+        .collect();
+    assert_eq!(stored, vec![base], "the conflicting batch wrote nothing");
+    s.purge_audit_seq_for_test(base).unwrap();
+}
+
+/// A `window_caps` push that conflicts part-way applies NONE of itself: the first cap here would
+/// CHANGE its stored value (a newer generation), and must still read back unchanged.
+#[test]
+fn a_conflicting_window_caps_push_does_not_apply_its_earlier_caps() {
+    let Some(s) = live_store() else { return };
+    let (a, b) = (fresh("atomic-a"), fresh("atomic-b"));
+    let (ka, kb) = (key(&a, 120), key(&b, 120));
+    let cap = |key, cap, config_gen| Cap {
+        key,
+        cap,
+        config_gen,
+    };
+    s.window_caps(op(91), &[cap(ka, 1, 1)]).expect("a: cap 1");
+    assert_eq!(
+        s.window_caps(op(92), &[cap(ka, 5, 2), cap(kb, 1, 1), cap(kb, 2, 1)]),
+        Err(CapsRefused::CapConflict { index: 2 })
+    );
+    let cell = Cell { key: ka, amount: 1 };
+    reserve(&s, op(93), EPOCH, &[cell]).expect("a still holds one");
+    assert_eq!(
+        reserve(&s, op(94), EPOCH, &[cell]),
+        Err(ReserveRefused::Exhausted { cell: 0 }),
+        "the conflicting push raised a's cap to 5 before it failed"
+    );
 }
 
 #[test]
