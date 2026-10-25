@@ -157,9 +157,9 @@ macro_rules! with_conn_no_retry {
     };
 }
 
-/// Default connect timeout (`Client::open` + the initial `get_connection`): with no DSN-level
-/// escape hatch (unlike postgres's libpq `connect_timeout`), a blackholed/firewalled host would
-/// otherwise wedge engine boot indefinitely. `connect_with_timeout` lets a caller override this.
+/// Default connect timeout: bounds each new connection's dial and handshake, so a
+/// blackholed/firewalled host cannot wedge engine boot indefinitely. The `connect_timeout_ms`
+/// setting overrides it.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ── Key-space helpers (one namespace prefix so a Valkey shared with other apps never collides) ──
@@ -463,7 +463,7 @@ const ADD_FLOORED_LUA: &str = r"
         ";
 
 /// What the store connects to, parsed once from its settings' URL.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct Target {
     /// The connection's target on the host's connector: `host:port`, or `unix:<path>` for a
     /// unix-socket URL.
@@ -480,6 +480,23 @@ struct Target {
     auth: Option<(Option<String>, String)>,
     /// `SELECT`, when the URL names a database other than 0.
     db: i64,
+}
+
+impl std::fmt::Debug for Target {
+    /// Every field but the URL password, which prints as `<redacted>`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Target")
+            .field("addr", &self.addr)
+            .field("host", &self.host)
+            .field("tls", &self.tls)
+            .field("insecure", &self.insecure)
+            .field(
+                "auth",
+                &self.auth.as_ref().map(|(user, _)| (user, "<redacted>")),
+            )
+            .field("db", &self.db)
+            .finish()
+    }
 }
 
 /// The upstream driver's refusal of a URL, word for word (the 1.5.5 boot refusal read so).
@@ -635,7 +652,6 @@ pub struct ValkeyStore {
     inner: Arc<Inner>,
 }
 
-#[derive(Debug)]
 struct Inner {
     target: Target,
     /// The URL password (if any), scrubbed out of every error string this crate emits.
@@ -645,6 +661,24 @@ struct Inner {
     /// THE KEPT CONNECTION: 1.5.5 held ONE connection behind a mutex (no pool setting), so the set
     /// holds one.
     pool: Arc<Pool>,
+}
+
+impl std::fmt::Debug for Inner {
+    /// Every field but the URL password (`secret`), which prints as `<redacted>`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            target,
+            secret,
+            connect_timeout,
+            pool,
+        } = self;
+        f.debug_struct("Inner")
+            .field("target", target)
+            .field("secret", &secret.as_ref().map(|_| "<redacted>"))
+            .field("connect_timeout", connect_timeout)
+            .field("pool", pool)
+            .finish()
+    }
 }
 
 /// How many connections the store keeps: 1.5.5's one (it had no pool setting).
@@ -1581,8 +1615,8 @@ impl ValkeyStore {
             )));
         }
         // Atomic key+credential mint: WATCH both rows so neither write is observed without the
-        // other. The credential row cannot pre-exist for a brand-new mint (a fresh id/slot), so this
-        // is simpler than `put_credential`'s slot-reuse path — no old-pointer cleanup needed.
+        // other. The slot may already hold a credential: a LIVE one refuses the mint, a REVOKED one
+        // is reclaimed with its old pointers deleted, exactly as `put_credential` does.
         let key_row = format!("{KEY_PREFIX}{}", key.id);
         let row_key = cred_row_key(&secret.meta.key_id, &secret.meta.kind, secret.meta.slot);
         let ids_key = cred_ids_key(&secret.meta.key_id);
@@ -1622,25 +1656,45 @@ impl ValkeyStore {
                             )));
                         }
                     }
-                    let pub_holder: Option<String> = c.get(&pub_key).await?;
-                    if let Some(holder) = &pub_holder {
-                        if *holder == slot_ptr {
-                            // Possibly retry-safe: the public_id already points at THIS slot. This
-                            // only happens for a genuinely fresh mint if `with_conn`'s automatic
-                            // reconnect-and-retry is replaying this whole closure after a
-                            // connection blip dropped the reply for an EXEC that had already
-                            // committed server-side — so confirm by id before treating it as a
-                            // no-op rather than a real collision.
-                            let existing_row: Option<String> = c.get(&row_key).await?;
-                            let same = existing_row
-                                .as_deref()
-                                .and_then(|r| serde_json::from_str::<CredentialSecret>(r).ok())
-                                .is_some_and(|cur| cur.meta.id == secret.meta.id);
-                            if same {
+                    // The slot's existing credential row (watched), read as `put_credential` reads
+                    // it: minting into an occupied LIVE slot must fail, never overwrite it.
+                    let existing: Option<String> = c.get(&row_key).await?;
+                    let mut old_pub: Option<String> = None;
+                    let mut old_id: Option<String> = None;
+                    if let Some(raw) = &existing {
+                        let cur: CredentialSecret = serde_json::from_str(raw)
+                            .map_err(|_| RedisError::from((ErrorKind::Client, "cred decode")))?;
+                        if cur.meta.revoked_at.is_none() {
+                            if cur.meta.id == secret.meta.id {
+                                // Retry-safe no-op: `with_conn`'s reconnect-and-retry replaying
+                                // an EXEC that had already committed server-side.
                                 pipe.atomic();
                                 return pipe.query(c).await;
                             }
+                            return Err(RedisError::from((
+                                ErrorKind::Client,
+                                "put_key_with_credential: slot holds a live credential; revoke it first",
+                            )));
                         }
+                        if cur.meta.id == secret.meta.id {
+                            // A replayed mint must never un-revoke a revoked credential.
+                            return Err(RedisError::from((
+                                ErrorKind::Client,
+                                "put_key_with_credential refused",
+                                format!(
+                                    "put_key_with_credential: credential {} is revoked; a \
+                                     revoked credential is never re-minted",
+                                    secret.meta.id
+                                ),
+                            )));
+                        }
+                        old_pub = Some(cur.meta.public_id);
+                        old_id = Some(cur.meta.id);
+                    }
+                    // UNIQUE(kind, public_id): a holder other than this slot is a collision
+                    // (reclaiming this slot's own previous public_id is fine).
+                    let pub_holder: Option<String> = c.get(&pub_key).await?;
+                    if pub_holder.as_ref().is_some_and(|h| *h != slot_ptr) {
                         return Err(RedisError::from((
                             ErrorKind::Client,
                             "put_key_with_credential: public_id already claimed",
@@ -1655,6 +1709,17 @@ impl ValkeyStore {
                     let cred_json = cred_to_json(&secret)
                         .map_err(|_| RedisError::from((ErrorKind::Client, "cred encode")))?;
                     pipe.atomic();
+                    // A revoked occupant's pointers die in the same atomic pipe as the reclaim.
+                    if let Some(old_pub) = &old_pub {
+                        if *old_pub != secret.meta.public_id {
+                            pipe.del(cred_pub_key(&secret.meta.kind, old_pub)).ignore();
+                        }
+                    }
+                    if let Some(old_id) = &old_id {
+                        if *old_id != secret.meta.id {
+                            pipe.del(cred_id_key(old_id)).ignore();
+                        }
+                    }
                     pipe.set(&key_row, &key_json).ignore();
                     pipe.sadd(KEYS_INDEX, &key.id).ignore();
                     pipe.zadd(KEYS_BYREV, &key.id, key_rev).ignore();
@@ -1867,6 +1932,10 @@ impl ValkeyStore {
         c: &mut Conn,
         limit: u64,
     ) -> RecordStoreResult<Vec<AuditRecord>> {
+        if limit == 0 {
+            // The contract's empty tail; `ZRANGE 0 -1` would be the WHOLE chain.
+            return Ok(Vec::new());
+        }
         let start: isize = isize::try_from(limit).map(|n| -n).unwrap_or(isize::MIN);
         let members: Vec<String> = with_conn!(self, |c| c.zrange(AUDIT_ZSET, start, -1).await)?;
         let mut out = Vec::with_capacity(members.len());
