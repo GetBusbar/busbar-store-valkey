@@ -4692,9 +4692,16 @@ fn the_unix_socket_query_password_never_reaches_an_error_or_a_debug() {
             !leaked.contains(secret) && !leaked.contains("p@ssw0rd"),
             "{url}: {leaked}"
         );
-        let t = parse_url(url).expect("parses");
-        let dbg = format!("{t:?}");
-        assert!(!dbg.contains(secret) && !dbg.contains("p@ssw0rd"), "{dbg}");
+        // `password=` is not a parameter the unix form reads, so that URL is refused: its refusal
+        // must not carry the secret either. The others parse, and their Debug never shows it.
+        let shown = match parse_url(url) {
+            Ok(t) => format!("{t:?}"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            !shown.contains(secret) && !shown.contains("p@ssw0rd"),
+            "{shown}"
+        );
     }
     // An error built from a bad unix URL carrying the secret never contains it.
     let e = crate::ValkeyStore::from_settings(
@@ -4794,4 +4801,60 @@ fn purge_metering_before_drops_that_bucket_only_and_refuses_a_non_integer() {
         e.contains("purge_metering_before: invalid bucket \"abc\", expected an integer"),
         "{e}"
     );
+}
+
+/// A unix-socket URL's `?pass=` is the scrub secret too: an error string that echoes the URL (or
+/// the password, raw or decoded) carries no credential bytes.
+#[test]
+fn unix_url_query_password_is_scrubbed_from_errors() {
+    for url in [
+        "redis+unix:///run/v.sock?db=2&pass=CANARY-vk-p4ss",
+        "unix:///run/v.sock?user=al&pass=CANARY-vk-p4ss",
+        "valkey+unix:///run/v.sock?pass=CANARY%2Dvk%2Dp4ss&db=1",
+    ] {
+        let secret = url_password(url);
+        for leak in [
+            format!("valkey connect: cannot reach {url}"),
+            "valkey connect: AUTH CANARY-vk-p4ss refused".to_string(),
+        ] {
+            let out = scrub(leak, secret.as_deref());
+            assert!(!out.contains("CANARY"), "{url}: password leaked: {out}");
+        }
+    }
+    // The userinfo form is unchanged; a unix URL without `pass=` has no secret.
+    assert_eq!(url_password("redis://u:p@host:6379").as_deref(), Some("p"));
+    assert_eq!(url_password("redis+unix:///run/v.sock?db=2"), None);
+    // `password=` is not a parameter the unix form reads (it is refused at parse), yet a value an
+    // operator wrote under that name is still treated as a secret and never echoed.
+    assert_eq!(
+        url_password("redis+unix:///run/v.sock?password=x").as_deref(),
+        Some("x")
+    );
+}
+
+/// A URL parameter the store does not read is REFUSED, never silently ignored; its name is withheld
+/// when the URL carries a password (an unencoded one can split at `?`).
+#[test]
+fn an_unknown_url_parameter_is_refused_not_ignored() {
+    for url in [
+        "redis://127.0.0.1:6379/0?timeout=5",
+        "valkey+unix:///run/v.sock?db=1&password=x",
+        "redis://u:12?abc@127.0.0.1:6379/0",
+    ] {
+        assert!(parse_url(url).is_err(), "{url} must be refused");
+    }
+    let e = parse_url("redis://127.0.0.1:6379/0?timeout=5")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("timeout") && e.contains("not supported"), "{e}");
+    let e = parse_url("redis://u:12?abc@127.0.0.1:6379/0")
+        .unwrap_err()
+        .to_string();
+    assert!(!e.contains("abc"), "the password tail leaked: {e}");
+    for ok in [
+        "redis://127.0.0.1:6379/0?protocol=resp2",
+        "valkey+unix:///run/v.sock?db=1&user=al&pass=x",
+    ] {
+        parse_url(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+    }
 }
