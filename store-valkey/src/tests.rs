@@ -1196,7 +1196,7 @@ fn connect_refuses_to_start_under_an_eviction_policy() {
 fn reconnecting_to_an_already_migrated_namespace_does_not_wipe_existing_data() {
     let Some(store1) = live_store() else { return };
     // By the time `store1`'s own `connect()` above returns, the schema marker is unconditionally
-    // at `SCHEMA_VERSION` (every migrate() branch — fresh, already-current, or wipe-then-mark —
+    // at `SCHEMA_VERSION` (every migrate() branch — fresh, already-current, or in-place upgrade —
     // ends with the marker set), so this write happens strictly after any wipe `store1`'s own
     // connect could have triggered.
     let id = uid("vk_migrate_reconnect");
@@ -1353,57 +1353,133 @@ fn audit_append_and_list_are_ordered_oldest_first() {
     let _ = store.purge_audit_seq_for_test(top);
 }
 
-/// A namespace OLDER than v6 is still wiped (v6 and later are migrated in place — see
-/// `v6_namespace_upgrades_in_place_to_v7` below). The v5->v6 SCHEMA_VERSION bump exists to close a real billing bug: `GovState::hydrate_budgets`
-/// (busbarAI core) cannot infer "legacy pre-split row" from `billable_requests == 0 && requests >
-/// 0` alone, because that is ALSO the shape of a bucket that was legitimately fully refunded
-/// (`refund_bucket` decrements `billable_requests`, never `requests`), so a restart could silently
-/// re-bill correctly-refunded fees. The one-time cutover therefore lives here, at a real schema-
-/// version boundary (see `SCHEMA_VERSION`'s doc comment for the full rationale): any pre-v6
-/// namespace is wiped on the next `connect()`, exactly like every prior bump this crate has done,
-/// so `hydrate_budgets` can trust `billable_requests` unconditionally from v6 onward with no more
-/// value-based guessing. `#[ignore]`d for the same reason as `wipes_the_entire_namespace_destructively`:
-/// this seeds real usage data shaped like the refund-collision case, then forces a v5 marker and a
-/// fresh `connect()` (destructively wiping the shared `busbar:*` namespace), so it must run alone.
+/// `VALKEY_URL` re-pointed at database `db`, so a refusal test owns a whole namespace and never
+/// leaves a stale marker in the shared one the rest of the suite uses.
+fn url_for_db(db: u32) -> String {
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let base = url.split('?').next().unwrap();
+    let (head, _) = base
+        .rsplit_once('/')
+        .filter(|(h, _)| h.contains("://"))
+        .unwrap_or((base, ""));
+    let head = if head.ends_with(':') || head.ends_with('/') {
+        base.trim_end_matches('/')
+    } else {
+        head
+    };
+    match url.split_once('?') {
+        Some((_, q)) => format!("{head}/{db}?{q}"),
+        None => format!("{head}/{db}"),
+    }
+}
+
+/// An independent upstream client on database `db`, emptied first.
+fn fresh_db_client(db: u32) -> redis::Connection {
+    let mut c = redis::Client::open(url_for_db(db).as_str())
+        .and_then(|c| c.get_connection())
+        .unwrap();
+    redis::cmd("FLUSHDB").query::<()>(&mut c).unwrap();
+    c
+}
+
+/// A namespace marked OLDER than v6 is REFUSED, never wiped: `migrate()` has no in-place path for
+/// it, and the old wipe also destroyed a live v6/v7 namespace whose marker had merely been lost.
+/// Seeds a refund-shaped usage row (`billable_requests == 0`, `requests > 0`), forces a v5 marker
+/// and requires `connect()` to error, say nothing was changed, and leave the row and marker alone.
 #[test]
 #[ignore]
-fn a_pre_v6_namespace_is_still_wiped_with_refund_shaped_data() {
-    let Some(store) = live_store() else { return };
-    // Seed data shaped exactly like the ambiguous case: billable_requests == 0, requests > 0 (a
-    // legitimately-refunded window, or an unmigrated legacy row).
+fn a_pre_v6_namespace_is_refused_not_wiped_and_keeps_refund_shaped_data() {
+    let Some(_) = live_store() else { return };
+    let mut up = fresh_db_client(13);
     let bucket = "vk_migrate_v6_refund_shaped";
-    let ledger = UsageLedger {
-        requests: 3,
-        billable_requests: 0,
-        models: vec![],
-    };
-    store.put_usage(bucket, 1_700_000_000, &ledger).unwrap();
-    assert_eq!(
-        store.get_usage(bucket, 1_700_000_000).unwrap().requests,
-        3,
-        "precondition: the seeded row is really there before we force the version back"
-    );
-
-    // Force the marker back to v5, simulating a namespace that predates this bump (the real thing
-    // migrate() checks: `version < SCHEMA_VERSION`).
-    store
-        .with_conn(|c| c.set::<_, _, ()>("busbar:schema", 5i64))
+    let row_key = format!("busbar:usage:{bucket}:1700000000");
+    redis::cmd("SET")
+        .arg(&row_key)
+        .arg("{\"requests\":3,\"billable_requests\":0,\"models\":[]}")
+        .query::<()>(&mut up)
+        .unwrap();
+    redis::cmd("SET")
+        .arg("busbar:schema")
+        .arg(5i64)
+        .query::<()>(&mut up)
         .unwrap();
 
-    let url = std::env::var("VALKEY_URL").unwrap();
-    let store2 = ValkeyStore::connect(&url).expect("connect() must succeed and run migrate()");
+    let err = match ValkeyStore::connect(&url_for_db(13)) {
+        Ok(_) => panic!("connect() must refuse a namespace marked v5"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("busbar:schema"), "names the marker: {err}");
+    assert!(
+        err.contains("= 5") || err.contains("is 5"),
+        "names the version: {err}"
+    );
+    assert!(
+        err.contains("NOTHING was changed"),
+        "says nothing changed: {err}"
+    );
 
-    assert_eq!(
-        store2.get_usage(bucket, 1_700_000_000).unwrap(),
-        UsageLedger::default(),
-        "a namespace at v5 (pre-v6) must be wiped by the v6 bump, including any refund-shaped \
-         usage row - there is no real customer data to preserve at this bump (1.5.0 unreleased)"
+    let still: Option<String> = redis::cmd("GET").arg(&row_key).query(&mut up).unwrap();
+    assert!(still.is_some(), "the usage row must survive the refusal");
+    let marker: i64 = redis::cmd("GET")
+        .arg("busbar:schema")
+        .query(&mut up)
+        .unwrap();
+    assert_eq!(marker, 5, "the marker must not be rewritten");
+    redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
+}
+
+/// A namespace holding `busbar:*` keys but NO schema marker (operator DEL, partial restore) is
+/// refused and every seeded key survives -- the old code read it as v0 and wiped it.
+#[test]
+#[ignore]
+fn a_namespace_with_keys_but_no_marker_refuses_to_connect_and_keeps_every_key() {
+    let Some(_) = live_store() else { return };
+    let mut up = fresh_db_client(12);
+    let seeded = [
+        "busbar:key:vk_no_marker",
+        "busbar:usage:vk_no_marker:1700000000",
+        "busbar:keys",
+        "busbar:cred:vk_SECRETID_no_marker:aws:slot",
+    ];
+    for k in seeded {
+        redis::cmd("SET")
+            .arg(k)
+            .arg("x")
+            .query::<()>(&mut up)
+            .unwrap();
+    }
+
+    let err = match ValkeyStore::connect(&url_for_db(12)) {
+        Ok(_) => panic!("connect() must refuse a keyed namespace with no marker"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("missing"), "says the marker is missing: {err}");
+    assert!(
+        err.contains("NOTHING was changed"),
+        "says nothing changed: {err}"
     );
-    let marker: i64 = store2.with_conn(|c| c.get("busbar:schema")).unwrap();
-    assert_eq!(
-        marker, SCHEMA_VERSION,
-        "the marker must land on the current SCHEMA_VERSION after migrate()"
+    assert!(
+        err.contains("holds 4 other `busbar:*` key(s)"),
+        "reports the key count: {err}"
     );
+
+    assert!(
+        !err.contains("SECRETID"),
+        "no id may leak into the error: {err}"
+    );
+    for k in seeded {
+        let n: i64 = redis::cmd("EXISTS").arg(k).query(&mut up).unwrap();
+        assert_eq!(n, 1, "{k} must survive the refusal");
+    }
+    let marker: Option<i64> = redis::cmd("GET")
+        .arg("busbar:schema")
+        .query(&mut up)
+        .unwrap();
+    assert_eq!(
+        marker, None,
+        "no marker may be written over a namespace we refused"
+    );
+    redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
 }
 
 /// A destructive full-namespace wipe of a REAL Valkey, gated on the SAME `VALKEY_URL` as
