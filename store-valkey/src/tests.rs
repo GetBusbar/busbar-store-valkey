@@ -203,6 +203,20 @@ fn tls_url_scheme_is_accepted() {
     assert_eq!(t.auth, Some((None, "pw".to_string())));
 }
 
+/// The `valkeys://` spelling reads as `rediss://`: TLS, and `#insecure` its one fragment.
+#[test]
+fn valkeys_scheme_selects_tls_and_takes_insecure() {
+    let t = parse_url("valkeys://host").expect("a valkeys URL parses");
+    assert!(t.tls && !t.insecure, "valkeys:// is TLS, verified");
+    assert_eq!(t.addr, "host:6379");
+    let t = parse_url("valkeys://host#insecure").expect("valkeys + #insecure parses");
+    assert!(
+        t.tls && t.insecure,
+        "valkeys://…#insecure is TLS, unverified"
+    );
+    assert!(!parse_url("valkey://host").unwrap().tls);
+}
+
 /// The URL reads as the upstream driver read it: user, percent-decoded password, port, database,
 /// IPv6 literals, and its refusals in its words.
 #[test]
@@ -391,9 +405,10 @@ fn unique_bucket(base: u64) -> u64 {
 #[test]
 fn put_get_roundtrips_a_key_and_stamps_revision() {
     let Some(store) = live_store() else { return };
-    store.put_key(&vk("vk_1")).unwrap();
-    let back = store.get_key("vk_1").unwrap().expect("key exists");
-    assert_eq!(back.id, "vk_1");
+    let id = uid("vk_1");
+    store.put_key(&vk(&id)).unwrap();
+    let back = store.get_key(&id).unwrap().expect("key exists");
+    assert_eq!(back.id, id);
     assert!(back.deleted_at.is_none());
     assert!(back.revision > 0, "put_key must stamp a nonzero revision");
 }
@@ -401,20 +416,18 @@ fn put_get_roundtrips_a_key_and_stamps_revision() {
 #[test]
 fn list_keys_since_only_returns_keys_past_the_watermark() {
     let Some(store) = live_store() else { return };
-    store.put_key(&vk("vk_a")).unwrap();
-    let watermark = store.get_key("vk_a").unwrap().unwrap().revision;
-    store.put_key(&vk("vk_b")).unwrap();
+    let (a, b) = (uid("vk_a"), uid("vk_b"));
+    store.put_key(&vk(&a)).unwrap();
+    let watermark = store.get_key(&a).unwrap().unwrap().revision;
+    store.put_key(&vk(&b)).unwrap();
     let delta = store.list_keys_since(watermark).unwrap();
     // Tests run in parallel against one shared instance, so `delta` may legitimately also contain
     // OTHER tests' concurrently-created keys past this watermark — assert on presence/absence of
     // THIS test's own ids, not an exact global count.
+    assert!(delta.iter().any(|k| k.id == b), "{b} must be in the delta");
     assert!(
-        delta.iter().any(|k| k.id == "vk_b"),
-        "vk_b must be in the delta"
-    );
-    assert!(
-        !delta.iter().any(|k| k.id == "vk_a"),
-        "vk_a was created BEFORE the watermark and must not reappear"
+        !delta.iter().any(|k| k.id == a),
+        "{a} was created BEFORE the watermark and must not reappear"
     );
 }
 
@@ -608,8 +621,12 @@ fn delete_key_removes_usage_windows() {
 #[test]
 fn delete_key_does_not_glob_match_other_keys_usage() {
     let Some(store) = live_store() else { return };
-    let evil = uid("vk_evil_*");
-    let victim = uid("vk_evil_victim");
+    // ONE suffix for both ids, so the UNESCAPED pattern `vk_evil_<s>_*` really does match the
+    // victim `vk_evil_<s>_victim` (a per-id `uid()` suffix would make the match impossible and the
+    // test vacuous).
+    let s = unique_suffix();
+    let evil = format!("vk_evil_{s}_*");
+    let victim = format!("vk_evil_{s}_victim");
     store.put_key(&vk(&evil)).unwrap();
     store.put_key(&vk(&victim)).unwrap();
     let d = UsageDelta {
@@ -1196,7 +1213,7 @@ fn connect_refuses_to_start_under_an_eviction_policy() {
 fn reconnecting_to_an_already_migrated_namespace_does_not_wipe_existing_data() {
     let Some(store1) = live_store() else { return };
     // By the time `store1`'s own `connect()` above returns, the schema marker is unconditionally
-    // at `SCHEMA_VERSION` (every migrate() branch — fresh, already-current, or wipe-then-mark —
+    // at `SCHEMA_VERSION` (every migrate() branch — fresh, already-current, or in-place upgrade —
     // ends with the marker set), so this write happens strictly after any wipe `store1`'s own
     // connect could have triggered.
     let id = uid("vk_migrate_reconnect");
@@ -1239,9 +1256,10 @@ fn a_server_error_surfaces_through_the_op_in_the_stores_words() {
 #[test]
 fn denylist_add_and_list_round_trips() {
     let Some(store) = live_store() else { return };
-    store.add_denylist("vk_denied", "compromised").unwrap();
+    let id = uid("vk_denied");
+    store.add_denylist(&id, "compromised").unwrap();
     let list = store.list_denylist().unwrap();
-    assert!(list.contains(&"vk_denied".to_string()));
+    assert!(list.contains(&id));
 }
 
 // ── Audit log (unchanged shape) ──────────────────────────────────────────────────────────────
@@ -1255,11 +1273,11 @@ fn denylist_add_and_list_round_trips() {
 /// between that read and the tail read pushes the record out and fails an assertion about ORDERING
 /// with something that is really a concurrency artifact. Pre-existing on dev — surfaced here because
 /// this suite now runs more tests against one shared server, not because retention changed anything.
-static AUDIT_SEQ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static AUDIT_SEQ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Take `AUDIT_SEQ_LOCK`, ignoring poisoning, so one failing audit test does not convert the others
 /// into spurious failures that bury the original.
-fn audit_seq_guard() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn audit_seq_guard() -> std::sync::MutexGuard<'static, ()> {
     AUDIT_SEQ_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -1353,57 +1371,133 @@ fn audit_append_and_list_are_ordered_oldest_first() {
     let _ = store.purge_audit_seq_for_test(top);
 }
 
-/// A namespace OLDER than v6 is still wiped (v6 and later are migrated in place — see
-/// `v6_namespace_upgrades_in_place_to_v7` below). The v5->v6 SCHEMA_VERSION bump exists to close a real billing bug: `GovState::hydrate_budgets`
-/// (busbarAI core) cannot infer "legacy pre-split row" from `billable_requests == 0 && requests >
-/// 0` alone, because that is ALSO the shape of a bucket that was legitimately fully refunded
-/// (`refund_bucket` decrements `billable_requests`, never `requests`), so a restart could silently
-/// re-bill correctly-refunded fees. The one-time cutover therefore lives here, at a real schema-
-/// version boundary (see `SCHEMA_VERSION`'s doc comment for the full rationale): any pre-v6
-/// namespace is wiped on the next `connect()`, exactly like every prior bump this crate has done,
-/// so `hydrate_budgets` can trust `billable_requests` unconditionally from v6 onward with no more
-/// value-based guessing. `#[ignore]`d for the same reason as `wipes_the_entire_namespace_destructively`:
-/// this seeds real usage data shaped like the refund-collision case, then forces a v5 marker and a
-/// fresh `connect()` (destructively wiping the shared `busbar:*` namespace), so it must run alone.
+/// `VALKEY_URL` re-pointed at database `db`, so a refusal test owns a whole namespace and never
+/// leaves a stale marker in the shared one the rest of the suite uses.
+fn url_for_db(db: u32) -> String {
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let base = url.split('?').next().unwrap();
+    let (head, _) = base
+        .rsplit_once('/')
+        .filter(|(h, _)| h.contains("://"))
+        .unwrap_or((base, ""));
+    let head = if head.ends_with(':') || head.ends_with('/') {
+        base.trim_end_matches('/')
+    } else {
+        head
+    };
+    match url.split_once('?') {
+        Some((_, q)) => format!("{head}/{db}?{q}"),
+        None => format!("{head}/{db}"),
+    }
+}
+
+/// An independent upstream client on database `db`, emptied first.
+fn fresh_db_client(db: u32) -> redis::Connection {
+    let mut c = redis::Client::open(url_for_db(db).as_str())
+        .and_then(|c| c.get_connection())
+        .unwrap();
+    redis::cmd("FLUSHDB").query::<()>(&mut c).unwrap();
+    c
+}
+
+/// A namespace marked OLDER than v6 is REFUSED, never wiped: `migrate()` has no in-place path for
+/// it, and the old wipe also destroyed a live v6/v7 namespace whose marker had merely been lost.
+/// Seeds a refund-shaped usage row (`billable_requests == 0`, `requests > 0`), forces a v5 marker
+/// and requires `connect()` to error, say nothing was changed, and leave the row and marker alone.
 #[test]
 #[ignore]
-fn a_pre_v6_namespace_is_still_wiped_with_refund_shaped_data() {
-    let Some(store) = live_store() else { return };
-    // Seed data shaped exactly like the ambiguous case: billable_requests == 0, requests > 0 (a
-    // legitimately-refunded window, or an unmigrated legacy row).
+fn a_pre_v6_namespace_is_refused_not_wiped_and_keeps_refund_shaped_data() {
+    let Some(_) = live_store() else { return };
+    let mut up = fresh_db_client(13);
     let bucket = "vk_migrate_v6_refund_shaped";
-    let ledger = UsageLedger {
-        requests: 3,
-        billable_requests: 0,
-        models: vec![],
-    };
-    store.put_usage(bucket, 1_700_000_000, &ledger).unwrap();
-    assert_eq!(
-        store.get_usage(bucket, 1_700_000_000).unwrap().requests,
-        3,
-        "precondition: the seeded row is really there before we force the version back"
-    );
-
-    // Force the marker back to v5, simulating a namespace that predates this bump (the real thing
-    // migrate() checks: `version < SCHEMA_VERSION`).
-    store
-        .with_conn(|c| c.set::<_, _, ()>("busbar:schema", 5i64))
+    let row_key = format!("busbar:usage:{bucket}:1700000000");
+    redis::cmd("SET")
+        .arg(&row_key)
+        .arg("{\"requests\":3,\"billable_requests\":0,\"models\":[]}")
+        .query::<()>(&mut up)
+        .unwrap();
+    redis::cmd("SET")
+        .arg("busbar:schema")
+        .arg(5i64)
+        .query::<()>(&mut up)
         .unwrap();
 
-    let url = std::env::var("VALKEY_URL").unwrap();
-    let store2 = ValkeyStore::connect(&url).expect("connect() must succeed and run migrate()");
+    let err = match ValkeyStore::connect(&url_for_db(13)) {
+        Ok(_) => panic!("connect() must refuse a namespace marked v5"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("busbar:schema"), "names the marker: {err}");
+    assert!(
+        err.contains("= 5") || err.contains("is 5"),
+        "names the version: {err}"
+    );
+    assert!(
+        err.contains("NOTHING was changed"),
+        "says nothing changed: {err}"
+    );
 
-    assert_eq!(
-        store2.get_usage(bucket, 1_700_000_000).unwrap(),
-        UsageLedger::default(),
-        "a namespace at v5 (pre-v6) must be wiped by the v6 bump, including any refund-shaped \
-         usage row - there is no real customer data to preserve at this bump (1.5.0 unreleased)"
+    let still: Option<String> = redis::cmd("GET").arg(&row_key).query(&mut up).unwrap();
+    assert!(still.is_some(), "the usage row must survive the refusal");
+    let marker: i64 = redis::cmd("GET")
+        .arg("busbar:schema")
+        .query(&mut up)
+        .unwrap();
+    assert_eq!(marker, 5, "the marker must not be rewritten");
+    redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
+}
+
+/// A namespace holding `busbar:*` keys but NO schema marker (operator DEL, partial restore) is
+/// refused and every seeded key survives -- the old code read it as v0 and wiped it.
+#[test]
+#[ignore]
+fn a_namespace_with_keys_but_no_marker_refuses_to_connect_and_keeps_every_key() {
+    let Some(_) = live_store() else { return };
+    let mut up = fresh_db_client(12);
+    let seeded = [
+        "busbar:key:vk_no_marker",
+        "busbar:usage:vk_no_marker:1700000000",
+        "busbar:keys",
+        "busbar:cred:vk_SECRETID_no_marker:aws:slot",
+    ];
+    for k in seeded {
+        redis::cmd("SET")
+            .arg(k)
+            .arg("x")
+            .query::<()>(&mut up)
+            .unwrap();
+    }
+
+    let err = match ValkeyStore::connect(&url_for_db(12)) {
+        Ok(_) => panic!("connect() must refuse a keyed namespace with no marker"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("missing"), "says the marker is missing: {err}");
+    assert!(
+        err.contains("NOTHING was changed"),
+        "says nothing changed: {err}"
     );
-    let marker: i64 = store2.with_conn(|c| c.get("busbar:schema")).unwrap();
-    assert_eq!(
-        marker, SCHEMA_VERSION,
-        "the marker must land on the current SCHEMA_VERSION after migrate()"
+    assert!(
+        err.contains("holds 4 other `busbar:*` key(s)"),
+        "reports the key count: {err}"
     );
+
+    assert!(
+        !err.contains("SECRETID"),
+        "no id may leak into the error: {err}"
+    );
+    for k in seeded {
+        let n: i64 = redis::cmd("EXISTS").arg(k).query(&mut up).unwrap();
+        assert_eq!(n, 1, "{k} must survive the refusal");
+    }
+    let marker: Option<i64> = redis::cmd("GET")
+        .arg("busbar:schema")
+        .query(&mut up)
+        .unwrap();
+    assert_eq!(
+        marker, None,
+        "no marker may be written over a namespace we refused"
+    );
+    redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
 }
 
 /// A destructive full-namespace wipe of a REAL Valkey, gated on the SAME `VALKEY_URL` as
@@ -3238,6 +3332,41 @@ fn v6_namespace_upgrades_in_place_to_v7() {
         .with_conn(|c| c.set::<_, _, ()>(SCHEMA_KEY, 6i64))
         .unwrap();
     let upgraded = ValkeyStore::connect(&url).expect("a second upgrade pass on open");
+    assert_eq!(
+        upgraded.list_task_events(&t).unwrap(),
+        vec![e1.clone(), e2.clone()]
+    );
+
+    // Crash-safe: a v6 row RESURFACING beside its already-migrated v7 record (the upgrade died
+    // after the copy and before the delete, or an old node wrote it back) must not clobber the v7
+    // record: the copy is append-if-absent, and the stale v6 key is still removed.
+    let stale = sample_task(&t, "working", TASK_LIVE_TS + 1);
+    assert_ne!(stale, live);
+    upgraded
+        .with_conn(|c| {
+            let mut p = redis::pipe();
+            p.set(
+                format!("{TASK_ROW_PREFIX}{t}"),
+                serde_json::to_string(&stale).unwrap(),
+            )
+            .sadd(TASKS_INDEX, &t)
+            .zadd(TASKS_BY_UPDATED, &t, stale.updated_at)
+            .set(SCHEMA_KEY, 6);
+            p.query::<()>(c)
+        })
+        .unwrap();
+    let upgraded = ValkeyStore::connect(&url).expect("a re-seeded v6 row upgrades on open");
+    assert_eq!(
+        upgraded.get_task(&t).unwrap(),
+        Some(live.clone()),
+        "the v7 record must not be overwritten by a stale v6 row"
+    );
+    assert!(
+        !upgraded
+            .with_conn(|c| c.exists::<_, bool>(format!("{TASK_ROW_PREFIX}{t}")))
+            .unwrap(),
+        "the stale v6 row is removed"
+    );
     assert_eq!(upgraded.list_task_events(&t).unwrap(), vec![e1, e2]);
 
     reset_tasks(&upgraded, &[&t, &done]);
@@ -4223,4 +4352,233 @@ fn migrate_over_the_1_5_5_rows_is_idempotent() {
     assert_eq!(schema_marker(&store), SCHEMA_VERSION);
     assert_1_5_5_keys_read_back(&store);
     assert_eq!(read_everything_1_5_5(&store), first);
+}
+
+/// `list_audit_tail(0)` is the contract's empty tail, not the whole chain.
+#[test]
+fn list_audit_tail_zero_is_empty() {
+    let _serialised = audit_seq_guard();
+    let Some(store) = live_store() else { return };
+    let top = store
+        .list_audit()
+        .unwrap()
+        .iter()
+        .map(|r| r.seq)
+        .max()
+        .unwrap_or(0)
+        + 1_000;
+    store
+        .append_audit(&AuditRecord {
+            seq: top,
+            ts: 1000,
+            action: "key.mint".to_string(),
+            resource: "key:vk_tail0".to_string(),
+            outcome: "applied".to_string(),
+            principal: "admin".to_string(),
+            prev_hash: String::new(),
+            hash: format!("h{top}"),
+        })
+        .unwrap();
+    let tail = store.list_audit_tail(0).unwrap();
+    let _ = store.purge_audit_seq_for_test(top);
+    assert!(tail.is_empty(), "limit 0 must be empty, got {}", tail.len());
+}
+
+/// The URL password never reaches `Debug` output.
+#[test]
+fn debug_output_redacts_the_url_password() {
+    let url = "redis://user:s3cr3t@host:6379/0";
+    let store = crate::ValkeyStore::new(url).unwrap();
+    let t = parse_url(url).unwrap();
+    for out in [format!("{store:?}"), format!("{t:?}")] {
+        assert!(!out.contains("s3cr3t"), "password leaked: {out}");
+        assert!(out.contains("<redacted>"), "no redaction marker: {out}");
+    }
+}
+
+/// `put_key_with_credential` into a slot holding a DIFFERENT LIVE credential is refused, and the
+/// live credential's pointers still resolve to it.
+#[test]
+fn put_key_with_credential_refuses_an_occupied_live_slot() {
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_kwc_occ");
+    let p1 = uid("AKIA_KWC_OCC1");
+    let p2 = uid("AKIA_KWC_OCC2");
+    let key = vk(&key_id);
+    let c1 = cred(&key_id, &p1, 0);
+    let c2 = cred(&key_id, &p2, 0);
+    store.put_key_with_credential(&key, &c1).unwrap();
+    let err = store.put_key_with_credential(&key, &c2);
+    assert!(
+        err.is_err(),
+        "minting into an occupied LIVE slot must fail: {err:?}"
+    );
+    let live = store
+        .lookup_credential_secret("sigv4", &p1)
+        .unwrap()
+        .expect("C1 must still resolve");
+    assert_eq!(live.meta.id, c1.meta.id);
+    assert!(store
+        .lookup_credential_secret("sigv4", &p2)
+        .unwrap()
+        .is_none());
+}
+
+/// After the occupant is revoked, the slot can be re-minted and the old public_id stops resolving.
+#[test]
+fn put_key_with_credential_reclaims_a_revoked_slot_and_drops_old_pointers() {
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_kwc_recl");
+    let p1 = uid("AKIA_KWC_RECL1");
+    let p2 = uid("AKIA_KWC_RECL2");
+    let key = vk(&key_id);
+    let c1 = cred(&key_id, &p1, 0);
+    let c2 = cred(&key_id, &p2, 0);
+    store.put_key_with_credential(&key, &c1).unwrap();
+    store.revoke_credential(&c1.meta.id, "rotated").unwrap();
+    store.put_key_with_credential(&key, &c2).unwrap();
+    assert!(store
+        .lookup_credential_secret("sigv4", &p1)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store
+            .lookup_credential_secret("sigv4", &p2)
+            .unwrap()
+            .expect("C2 resolves")
+            .meta
+            .id,
+        c2.meta.id
+    );
+    // C1's old id pointer is gone: revoking it must not touch C2.
+    let _ = store.revoke_credential(&c1.meta.id, "late retry");
+    assert!(
+        store
+            .lookup_credential_secret("sigv4", &p2)
+            .unwrap()
+            .expect("C2 resolves")
+            .meta
+            .revoked_at
+            .is_none(),
+        "revoking C1's old id must leave C2 un-revoked"
+    );
+}
+
+/// A replayed mint of a REVOKED credential must not un-revoke it.
+#[test]
+fn put_key_with_credential_never_remints_a_revoked_credential() {
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_kwc_unrev");
+    let p1 = uid("AKIA_KWC_UNREV");
+    let key = vk(&key_id);
+    let c1 = cred(&key_id, &p1, 0);
+    store.put_key_with_credential(&key, &c1).unwrap();
+    store.revoke_credential(&c1.meta.id, "rotated").unwrap();
+    let again = store.put_key_with_credential(&key, &c1);
+    assert!(
+        again.is_err(),
+        "re-minting a revoked credential must fail: {again:?}"
+    );
+    let row = store.lookup_credential_secret("sigv4", &p1).unwrap();
+    assert!(
+        row.is_none_or(|r| r.meta.revoked_at.is_some()),
+        "the credential must stay revoked"
+    );
+}
+
+/// A RESP parse error leaves the bad bytes buffered on the kept connection, so the connection must
+/// be discarded: the op AFTER the malformed reply succeeds (on a fresh connection) instead of
+/// failing on the same buffered bytes forever.
+#[test]
+fn a_malformed_reply_discards_the_kept_connection() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    if live_store().is_none() {
+        return;
+    }
+    let (backend, db, userinfo) = live_parts();
+    let poison = Arc::new(AtomicBool::new(false));
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let at = l.local_addr().unwrap().to_string();
+    let flag = poison.clone();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(s) = s else { return };
+            let b = std::net::TcpStream::connect(&backend).expect("the live server");
+            let (s2, b2) = (s.try_clone().unwrap(), b.try_clone().unwrap());
+            std::thread::spawn(move || pump(s, b));
+            let flag = flag.clone();
+            std::thread::spawn(move || {
+                let (mut from, mut to) = (b2, s2);
+                let mut buf = [0_u8; 16 * 1024];
+                loop {
+                    match from.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            if flag.swap(false, Ordering::SeqCst) {
+                                // The malformed reply now; the REAL reply late, as a slow
+                                // (not gone) server would deliver it.
+                                if to.write_all(b"!bad\r\n").is_err() {
+                                    return;
+                                }
+                                let (mut late, stale) =
+                                    (to.try_clone().unwrap(), buf[..n].to_vec());
+                                std::thread::spawn(move || {
+                                    std::thread::sleep(std::time::Duration::from_millis(300));
+                                    let _ = late.write_all(&stale);
+                                });
+                                continue;
+                            }
+                            if to.write_all(&buf[..n]).is_err() || to.flush().is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let (store, _) = open_on(
+        &settings_for(&format!("redis://{userinfo}{at}/{db}")),
+        plain,
+    );
+    let store = store.expect("opens through the proxy");
+    let id = uid("vk_malformed");
+    store.put_key(&vk(&id)).unwrap();
+    poison.store(true, Ordering::SeqCst);
+    assert!(
+        store.list_denylist().is_err(),
+        "the malformed reply is refused"
+    );
+    // The late real reply to the refused op lands on the old connection after this wait; it must
+    // not be read as the reply to a LATER op.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let got = store.get_key(&id);
+    assert!(
+        matches!(&got, Ok(Some(k)) if k.id == id),
+        "the op after a malformed reply must not run on the poisoned kept connection: {got:?}"
+    );
+    let _ = store.purge_key_for_test(&id);
+}
+
+/// A replayed `put_credential` of a REVOKED credential must not un-revoke it.
+#[test]
+fn put_credential_never_remints_a_revoked_credential() {
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_pc_unrev");
+    let p1 = uid("AKIA_PC_UNREV");
+    store.put_key(&vk(&key_id)).unwrap();
+    let c1 = cred(&key_id, &p1, 0);
+    store.put_credential(&c1).unwrap();
+    store.revoke_credential(&c1.meta.id, "rotated").unwrap();
+    let again = store.put_credential(&c1);
+    assert!(
+        again.is_err(),
+        "re-minting a revoked credential must fail: {again:?}"
+    );
+    let row = store.lookup_credential_secret("sigv4", &p1).unwrap();
+    assert!(
+        row.is_none_or(|r| r.meta.revoked_at.is_some()),
+        "the credential must stay revoked"
+    );
 }
