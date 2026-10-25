@@ -4582,3 +4582,27 @@ fn put_credential_never_remints_a_revoked_credential() {
         "the credential must stay revoked"
     );
 }
+
+/// A unix-socket URL's `?pass=` is the scrub secret too: an error string that echoes the URL (or
+/// the password, raw or decoded) carries no credential bytes.
+#[test]
+fn unix_url_query_password_is_scrubbed_from_errors() {
+    for url in [
+        "redis+unix:///run/v.sock?db=2&pass=CANARY-vk-p4ss",
+        "unix:///run/v.sock?user=al&pass=CANARY-vk-p4ss",
+        "valkey+unix:///run/v.sock?pass=CANARY%2Dvk%2Dp4ss&db=1",
+    ] {
+        let secret = url_password(url);
+        for leak in [
+            format!("valkey connect: cannot reach {url}"),
+            "valkey connect: AUTH CANARY-vk-p4ss refused".to_string(),
+        ] {
+            let out = scrub(leak, secret.as_deref());
+            assert!(!out.contains("CANARY"), "{url}: password leaked: {out}");
+        }
+    }
+    // The userinfo form is unchanged; a unix URL without `pass=` has no secret.
+    assert_eq!(url_password("redis://u:p@host:6379").as_deref(), Some("p"));
+    assert_eq!(url_password("redis+unix:///run/v.sock?db=2"), None);
+    assert_eq!(url_password("redis+unix:///run/v.sock?password=x"), None);
+}
