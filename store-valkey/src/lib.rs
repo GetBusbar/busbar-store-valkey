@@ -1547,6 +1547,18 @@ impl ValkeyStore {
                             "put_credential: slot holds a live credential; revoke it first",
                         )));
                     }
+                    if cur.meta.id == secret.meta.id {
+                        // A replayed mint must never un-revoke a revoked credential.
+                        return Err(RedisError::from((
+                            ErrorKind::Client,
+                            "put_credential refused",
+                            format!(
+                                "put_credential: credential {} is revoked; a revoked credential \
+                                 is never re-minted",
+                                secret.meta.id
+                            ),
+                        )));
+                    }
                     old_pub = Some(cur.meta.public_id);
                     old_id = Some(cur.meta.id);
                 }
