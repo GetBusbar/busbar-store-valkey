@@ -463,6 +463,11 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
     if decoded != s && !decoded.is_empty() && out.contains(&decoded) {
         out = out.replace(&decoded, "<redacted>");
     }
+    // A query value's `+` reads as a space (form encoding: the unix URL's `?pass=`).
+    let spaced = percent_decode(&s.replace('+', " "));
+    if spaced != decoded && !spaced.is_empty() && out.contains(&spaced) {
+        out = out.replace(&spaced, "<redacted>");
+    }
     out
 }
 
@@ -554,6 +559,24 @@ fn percent_decode_utf8(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// Every query parameter a URL form reads is named in `known`; any other one is REFUSED (the
+/// upstream driver ignored it silently, which would leave an operator believing a setting applied).
+/// The parameter's name is echoed only when the URL carries no password: a password written
+/// unencoded can split at `?` and arrive here as a "name" (one holding the `@` that ended it).
+fn check_query(url: &url::Url, known: &[&str], has_secret: bool) -> RedisResult<()> {
+    match url.query_pairs().find(|(k, _)| !known.contains(&k.as_ref())) {
+        None => Ok(()),
+        Some((k, _)) if has_secret || k.contains('@') => Err(url_refused(
+            "an unknown URL parameter is not supported (its name is withheld: the URL carries a password)",
+        )),
+        Some((k, _)) => Err(RedisError::from((
+            ErrorKind::InvalidClientConfig,
+            "URL parameter is not supported by this store",
+            k.into_owned(),
+        ))),
+    }
+}
+
 /// The upstream driver's `protocol=` query check (`2`/`resp2`/`3`/`resp3`). The store speaks
 /// RESP2 whatever it says: every reply it reads converts the same either way.
 fn check_protocol(url: &url::Url) -> RedisResult<()> {
@@ -610,6 +633,7 @@ fn parse_url(input: &str) -> RedisResult<Target> {
         false
     };
     check_protocol(&url)?;
+    check_query(&url, &["protocol"], url_password(input).is_some())?;
     let db = match url.path().trim_matches('/') {
         "" => 0,
         path => path
@@ -660,6 +684,11 @@ fn parse_unix(url: &url::Url) -> RedisResult<Target> {
         None => 0,
     };
     check_protocol(url)?;
+    check_query(
+        url,
+        &["db", "user", "pass", "protocol"],
+        query.contains_key("pass") || query.contains_key("password"),
+    )?;
     let user = query.get("user").map(|u| u.to_string());
     let pass = query.get("pass").map(|p| p.to_string());
     Ok(Target {
