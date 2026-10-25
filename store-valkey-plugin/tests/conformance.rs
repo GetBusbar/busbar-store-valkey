@@ -50,7 +50,7 @@
 // EACH FOLD'S KEYSPACE (Q-P4-8): the store's keys are fixed (`busbar:*`) and its settings name no key
 // prefix, and a fold namespace is no database number, so `{fold}` has nowhere to go in the url. The
 // suite's folds therefore run in a database of their own (`/14`; this repo's other live tests use the
-// url's `/0` and the admin end-to-end test `/15`), one fold at a time: the namespace hooks below take
+// url's `/0`, the admin end-to-end test `/15`, and store-valkey's schema-refusal tests `/12` and `/13`), one fold at a time: the namespace hooks below take
 // that database for the fold and flush it before the fold opens, and flush it and hand it on when
 // the fold ends, on an independent connection of the `redis` client. Every fold starts on an empty
 // keyspace and leaves none; nothing in the store's behaviour changes.
