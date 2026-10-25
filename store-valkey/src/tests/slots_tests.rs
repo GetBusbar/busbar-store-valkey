@@ -542,10 +542,8 @@ fn reserve_needs_a_cap_grants_whole_cells_and_refuses_past_the_cap() {
     );
     assert_eq!(
         release(&s, op(8), &[(g[1].slice_id, 1)]),
-        Err(OpRefused::Failed(format!(
-            "slice_release: slice {} is not held",
-            g[1].slice_id
-        )))
+        Ok(vec![0]),
+        "a closed slice answers 0 under a new op_id"
     );
     reserve(&s, op(9), EPOCH, &[cell(3)]).expect("the released 3 can be drawn again");
     assert_eq!(
@@ -553,6 +551,107 @@ fn reserve_needs_a_cap_grants_whole_cells_and_refuses_past_the_cap() {
         Err(ReserveRefused::Exhausted { cell: 0 }),
         "the replayed release freed nothing twice"
     );
+}
+
+/// A batch naming an emptied rolling slice and a live one answers [0, n]; n is drawable again.
+#[test]
+fn a_batch_release_of_a_closed_and_a_live_slice_answers_zero_and_the_rest() {
+    let Some(s) = live_store() else { return };
+    let bucket = fresh("batch-closed");
+    let k = key(&bucket, 60);
+    s.window_caps(
+        op(80),
+        &[Cap {
+            key: k,
+            cap: 5,
+            config_gen: 1,
+        }],
+    )
+    .expect("cap");
+    let cell = |amount| Cell { key: k, amount };
+    let g = reserve(&s, op(81), EPOCH, &[cell(2), cell(3)]).expect("2 + 3 fits 5");
+    assert_eq!(release(&s, op(82), &[(g[0].slice_id, 2)]), Ok(vec![2]));
+    assert_eq!(
+        release(&s, op(83), &[(g[0].slice_id, 1), (g[1].slice_id, 3)]),
+        Ok(vec![0, 3])
+    );
+    assert_eq!(
+        reserve(&s, op(84), EPOCH, &[cell(5)]).expect("all 5 drawable again")[0].granted,
+        5
+    );
+}
+
+/// An id never handed out (0, or past the counter) is Failed "was never granted", applying nothing.
+#[test]
+fn a_release_naming_a_slice_never_granted_is_refused_and_applies_nothing() {
+    let Some(s) = live_store() else { return };
+    let bucket = fresh("never-granted");
+    let k = key(&bucket, 60);
+    s.window_caps(
+        op(90),
+        &[Cap {
+            key: k,
+            cap: 5,
+            config_gen: 1,
+        }],
+    )
+    .expect("cap");
+    let cell = |amount| Cell { key: k, amount };
+    let g = reserve(&s, op(91), EPOCH, &[cell(5)]).expect("draw");
+    let counter: u64 = s
+        .with_conn(|c| redis::Commands::get(c, "busbar:slices"))
+        .expect("counter");
+    for (n, bad) in [0, counter + 1_000_000, u64::MAX].into_iter().enumerate() {
+        let r = release(&s, op(92 + n as u64), &[(g[0].slice_id, 5), (bad, 1)]);
+        match r {
+            Err(OpRefused::Failed(m)) => assert!(
+                m.contains("was never granted"),
+                "id {bad}: wrong message {m}"
+            ),
+            other => panic!("id {bad}: expected Failed(never granted), got {other:?}"),
+        }
+    }
+    assert_eq!(
+        reserve(&s, op(99), EPOCH, &[cell(1)]),
+        Err(ReserveRefused::Exhausted { cell: 0 }),
+        "a refused release applied nothing"
+    );
+}
+
+/// A window-0 slice's key is deleted at its first release; a second release still answers 0.
+#[test]
+fn a_window_0_slice_key_is_deleted_at_its_first_release() {
+    let Some(s) = live_store() else { return };
+    let bucket = fresh("w0-del");
+    let zero = key(&bucket, 0);
+    s.window_caps(
+        op(100),
+        &[Cap {
+            key: zero,
+            cap: 10,
+            config_gen: 1,
+        }],
+    )
+    .expect("cap");
+    let g = reserve(
+        &s,
+        op(101),
+        EPOCH,
+        &[Cell {
+            key: zero,
+            amount: 6,
+        }],
+    )
+    .expect("draw");
+    let skey = format!("busbar:slice:{}", g[0].slice_id);
+    let exists = |s: &ValkeyStore| -> bool {
+        s.with_conn(|c| redis::Commands::exists(c, skey.as_str()))
+            .expect("exists")
+    };
+    assert!(exists(&s), "the slice is held before its release");
+    assert_eq!(release(&s, op(102), &[(g[0].slice_id, 2)]), Ok(vec![2]));
+    assert!(!exists(&s), "a closed window-0 slice key must be deleted");
+    assert_eq!(release(&s, op(103), &[(g[0].slice_id, 4)]), Ok(vec![0]));
 }
 
 /// RED before slice life (e): a release on window 0 is final. The holder of a 6-unit window-0 slice
