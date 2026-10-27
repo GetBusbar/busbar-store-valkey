@@ -138,6 +138,10 @@ impl ValkeyStore {
         ran.unwrap_or_else(|e| Err(OpRefused::Failed(self.err(e, "command").0)))
     }
 
+    /// `record_put` (slot 40): an upsert on `(schema, key)`. An EMPTY value removes the row
+    /// (ARCHITECT 2026-10-21): it is the host's strike, so the key leaves both the ordered key set
+    /// and the values, `record_get` then answers `None` and `record_scan` never returns it.
+    /// Removing a row that is not there is `Ok`.
     async fn v3_record_put(
         &self,
         c: &mut Conn,
@@ -146,6 +150,23 @@ impl ValkeyStore {
         value: &[u8],
     ) -> Result<(), String> {
         let (k, v) = records_keys(schema);
+        if value.is_empty() {
+            return with_conn!(self, |c| {
+                pipe()
+                    .atomic()
+                    .cmd("ZREM")
+                    .arg(&k)
+                    .arg(key)
+                    .ignore()
+                    .cmd("HDEL")
+                    .arg(&v)
+                    .arg(key)
+                    .ignore()
+                    .query(c)
+                    .await
+            })
+            .map_err(|e| e.0);
+        }
         with_conn!(self, |c| {
             pipe()
                 .atomic()
