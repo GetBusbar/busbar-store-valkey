@@ -57,7 +57,7 @@
 #[path = "support/conformance_host.rs"]
 mod conformance_host;
 
-busbar_plugin_loader::conformance_suite! {
+busbar_test_kit::conformance_suite! {
     door: busbar_store_valkey::door,
     cdylib: "busbar_store_valkey_plugin",
     inputs: include_str!("conformance.json"),
@@ -233,7 +233,7 @@ fn bind(d: &Dispatcher) -> Bind {
         max_inflight_cap: 64,
         sink: Arc::new(NoSink),
         dispatcher: d.adopter(),
-        conns: ConnTable::Host(Arc::new(busbar_plugin_loader::tcp_conns::TcpConns::new(
+        conns: ConnTable::Host(Arc::new(busbar_test_kit::tcp_conns::TcpConns::new(
             d.conn_waker(),
         ))),
     }

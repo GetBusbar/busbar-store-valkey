@@ -13,7 +13,7 @@ use busbar_plugin_loader::dispatch::{
     load_linked, Bind, DispatchConfig, Dispatcher, LinkedRow, NoSink,
 };
 use busbar_plugin_loader::store_v3::LoadedStore;
-use busbar_plugin_loader::tcp_conns::TcpConns;
+use busbar_test_kit::tcp_conns::TcpConns;
 
 /// THE STORE UNDER TEST is the store as the host opens it: its door through the loader
 /// (`load_linked`, `LoadedStore::open`), every op one connection through the host's connector path
@@ -3537,13 +3537,13 @@ impl TestTls {
     }
 }
 
-impl busbar_plugin_loader::tcp_conns::SecureDial for TestTls {
+impl busbar_test_kit::tcp_conns::SecureDial for TestTls {
     fn secure(
         &self,
         server: &str,
         verify_off: bool,
         mut tcp: std::net::TcpStream,
-    ) -> std::io::Result<Box<dyn busbar_plugin_loader::tcp_conns::SecuredSock>> {
+    ) -> std::io::Result<Box<dyn busbar_test_kit::tcp_conns::SecuredSock>> {
         let invalid = |e: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, e);
         let name = rustls_pki_types::ServerName::try_from(server.to_owned())
             .map_err(|e| invalid(e.to_string()))?;
@@ -3574,7 +3574,7 @@ impl std::io::Write for TestTlsStream {
     }
 }
 
-impl busbar_plugin_loader::tcp_conns::SecuredSock for TestTlsStream {
+impl busbar_test_kit::tcp_conns::SecuredSock for TestTlsStream {
     fn tcp(&self) -> &std::net::TcpStream {
         self.0.get_ref()
     }
