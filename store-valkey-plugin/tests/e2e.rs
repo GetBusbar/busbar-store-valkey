@@ -586,7 +586,7 @@ fn load_and_exercise_valkey_plugin_bad_config_fails_over_abi() {
         .err()
         .expect("an unparseable valkey url must fail to load, not silently succeed");
     assert!(
-        err.contains("valkey plugin: failed to connect"),
+        err.contains("invalid valkey plugin config: url: "),
         "expected the plugin's own connect-failure context, got: {err}"
     );
 }
