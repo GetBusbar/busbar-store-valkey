@@ -328,11 +328,11 @@ fn unix_socket_urls_parse_as_the_upstream_driver_read_them() {
 
 #[test]
 fn glob_escaping_covers_every_metacharacter() {
-    assert_eq!(escape_glob("*"), "\\*");
-    assert_eq!(escape_glob("a?b"), "a\\?b");
-    assert_eq!(escape_glob("[x]"), "\\[x\\]");
-    assert_eq!(escape_glob("back\\slash"), "back\\\\slash");
-    assert_eq!(escape_glob("plain-id-123"), "plain-id-123");
+    assert_eq!(escape("*", GLOB), "\\*");
+    assert_eq!(escape("a?b", GLOB), "a\\?b");
+    assert_eq!(escape("[x]", GLOB), "\\[x\\]");
+    assert_eq!(escape("back\\slash", GLOB), "back\\\\slash");
+    assert_eq!(escape("plain-id-123", GLOB), "plain-id-123");
 }
 
 /// End-to-end against a REAL Valkey, gated on `VALKEY_URL` (a docker service in CI). Skips
@@ -4322,7 +4322,8 @@ fn list_audit_tail_zero_is_empty() {
 #[test]
 fn debug_output_redacts_the_url_password() {
     let url = "redis://user:s3cr3t@host:6379/0";
-    let store = crate::ValkeyStore::new(url).unwrap();
+    let store =
+        crate::ValkeyStore::from_settings(format!(r#"{{"url":"{url}"}}"#).as_bytes()).unwrap();
     let t = parse_url(url).unwrap();
     for out in [format!("{store:?}"), format!("{t:?}")] {
         assert!(!out.contains("s3cr3t"), "password leaked: {out}");
