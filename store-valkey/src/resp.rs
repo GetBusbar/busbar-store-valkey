@@ -36,6 +36,8 @@ enum Repr {
     General(ErrorKind, &'static str, Option<String>),
     Server(String),
     Io(String),
+    /// The store's own refusal, its text verbatim (no `- Kind` suffix).
+    Refused(String),
 }
 
 /// A command's failure. Its text is the upstream driver's shape (`desc - Kind: detail`), so the
@@ -60,6 +62,15 @@ impl RedisError {
     #[must_use]
     pub fn is_connection_error(&self) -> bool {
         matches!(self.repr, Repr::Io(_))
+    }
+
+    /// The store's own refusal of an op (an unknown id, a tombstoned id): `text` reads verbatim,
+    /// with no ` - Client` suffix, in the siblings' `<op>: <reason>` shape.
+    #[must_use]
+    pub fn refused(text: impl Into<String>) -> Self {
+        Self {
+            repr: Repr::Refused(text.into()),
+        }
     }
 
     fn server(text: String) -> Self {
@@ -103,7 +114,7 @@ impl fmt::Display for RedisError {
                     None => Ok(()),
                 }
             }
-            Repr::Server(t) | Repr::Io(t) => f.write_str(t),
+            Repr::Server(t) | Repr::Io(t) | Repr::Refused(t) => f.write_str(t),
         }
     }
 }
@@ -294,12 +305,6 @@ impl<A: ToArgs, B: ToArgs> ToArgs for (A, B) {
     }
 }
 
-fn args_of<T: ToArgs>(t: T) -> Vec<Vec<u8>> {
-    let mut v = Vec::new();
-    t.write_args(&mut v);
-    v
-}
-
 // ── conversions ──────────────────────────────────────────────────────────────────────────────
 
 /// A Rust value a reply converts to (the upstream driver's conversions, as the store used them).
@@ -325,12 +330,6 @@ pub trait FromValue: Sized {
     /// The bytes back, for the caller to convert as one item.
     fn from_bytes(bytes: Vec<u8>) -> Result<Vec<Self>, Vec<u8>> {
         Err(bytes)
-    }
-}
-
-impl FromValue for Value {
-    fn from_value(v: Value) -> RedisResult<Self> {
-        Ok(v)
     }
 }
 
@@ -367,7 +366,7 @@ macro_rules! numeric_from {
         }
     )*};
 }
-numeric_from!(i64, u64, i32, u32, usize, isize);
+numeric_from!(i64, u64, u32);
 
 impl FromValue for u8 {
     fn from_value(v: Value) -> RedisResult<Self> {
@@ -380,19 +379,6 @@ impl FromValue for u8 {
 
     fn from_bytes(bytes: Vec<u8>) -> Result<Vec<Self>, Vec<u8>> {
         Ok(bytes)
-    }
-}
-
-impl FromValue for bool {
-    fn from_value(v: Value) -> RedisResult<Self> {
-        match &v {
-            Value::Nil => Ok(false),
-            Value::Int(i) => Ok(*i != 0),
-            Value::Status(s) if s == "OK" => Ok(true),
-            Value::Data(b) if b == b"1" => Ok(true),
-            Value::Data(b) if b == b"0" => Ok(false),
-            _ => Err(RedisError::type_error(format!("(response was {v:?})"))),
-        }
     }
 }
 
@@ -456,22 +442,6 @@ impl<A: FromValue, B: FromValue> FromValue for (A, B) {
     }
 }
 
-impl<A: FromValue, B: FromValue, C: FromValue> FromValue for (A, B, C) {
-    fn from_value(v: Value) -> RedisResult<Self> {
-        match v {
-            Value::Array(items) if items.len() == 3 => {
-                let mut it = items.into_iter();
-                Ok((
-                    A::from_value(it.next().unwrap_or(Value::Nil))?,
-                    B::from_value(it.next().unwrap_or(Value::Nil))?,
-                    C::from_value(it.next().unwrap_or(Value::Nil))?,
-                ))
-            }
-            other => Err(RedisError::type_error(format!("a triple from {other:?}"))),
-        }
-    }
-}
-
 // ── the connection ───────────────────────────────────────────────────────────────────────────
 
 /// ONE OP'S CONNECTION to the server, over its [`Wire`].
@@ -510,7 +480,17 @@ impl Conn {
                     i.drain(..n);
                     v
                 }))
-            })?;
+            });
+            let got = match got {
+                Ok(got) => got,
+                Err(e) => {
+                    // A reply that does not parse leaves the stream out of step with the commands
+                    // sent (the rest of that reply, or a late one, would be read as a LATER op's
+                    // reply): this connection is never kept.
+                    self.wire.discard();
+                    return Err(e);
+                }
+            };
             if let Some(v) = got {
                 return Ok(v);
             }
@@ -654,34 +634,23 @@ impl Conn {
         cmd("INCRBY").arg(key).arg(delta).query(self).await
     }
 
-    /// `LLEN`.
-    pub async fn llen<K: ToArgs, RV: FromValue>(&mut self, key: K) -> RedisResult<RV> {
-        cmd("LLEN").arg(key).query(self).await
-    }
-
-    /// Every key matching `pattern` (`SCAN ... MATCH`, followed to the end), as the upstream
-    /// driver's iterator of results.
-    pub async fn scan_match<P: ToArgs, RV: FromValue>(
-        &mut self,
-        pattern: P,
-    ) -> RedisResult<std::vec::IntoIter<RedisResult<RV>>> {
-        let pattern = args_of(pattern);
+    /// Every key matching `pattern` (`SCAN ... MATCH`, followed to the end).
+    pub async fn scan_match(&mut self, pattern: &str) -> RedisResult<Vec<String>> {
         let mut cursor = String::from("0");
         let mut out = Vec::new();
         loop {
-            let (next, keys): (String, Vec<Value>) = cmd("SCAN")
+            let (next, keys): (String, Vec<String>) = cmd("SCAN")
                 .arg(&cursor)
                 .arg("MATCH")
-                .arg(&pattern)
+                .arg(pattern)
                 .query(self)
                 .await?;
-            out.extend(keys.into_iter().map(RV::from_value));
+            out.extend(keys);
             if next == "0" {
-                break;
+                return Ok(out);
             }
             cursor = next;
         }
-        Ok(out.into_iter())
     }
 }
 
@@ -752,12 +721,6 @@ macro_rules! pipe_cmd {
 }
 
 impl Pipeline {
-    /// A new pipeline.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Run the commands as one transaction (`MULTI`/`EXEC`).
     pub fn atomic(&mut self) -> &mut Self {
         self.atomic = true;
@@ -799,9 +762,6 @@ impl Pipeline {
         /// `SADD`.
         sadd(k: K, m: M) => "SADD");
     pipe_cmd!(
-        /// `SREM`.
-        srem(k: K, m: M) => "SREM");
-    pipe_cmd!(
         /// `HSET key field value`.
         hset(k: K, f: F, v: V) => "HSET");
     /// `HSET key field value ...` (every pair).
@@ -815,12 +775,6 @@ impl Pipeline {
     pipe_cmd!(
         /// `HGETALL`.
         hgetall(k: K) => "HGETALL");
-    pipe_cmd!(
-        /// `RPUSH key value ...`.
-        rpush(k: K, v: V) => "RPUSH");
-    pipe_cmd!(
-        /// `LLEN`.
-        llen(k: K) => "LLEN");
     pipe_cmd!(
         /// `EXPIRE key seconds`.
         expire(k: K, s: S) => "EXPIRE");
@@ -967,7 +921,7 @@ macro_rules! transaction {
                     .arg(__keys)
                     .exec(&mut *$c)
                     .await?;
-                let mut __pipe = $crate::resp::Pipeline::new();
+                let mut __pipe = $crate::resp::pipe();
                 __pipe.atomic();
                 let __ran: $crate::resp::RedisResult<Option<_>> = $crate::resp::rr(async {
                     let $pipe = &mut __pipe;
@@ -1000,6 +954,12 @@ macro_rules! transaction {
 mod tests {
     use super::*;
 
+    fn args_of<T: ToArgs>(t: T) -> Vec<Vec<u8>> {
+        let mut v = Vec::new();
+        t.write_args(&mut v);
+        v
+    }
+
     #[test]
     fn parses_every_reply_type_and_waits_for_a_whole_one() {
         let all = b"*6\r\n+OK\r\n-ERR no\r\n:-7\r\n$3\r\nabc\r\n$-1\r\n*-1\r\n";
@@ -1022,6 +982,21 @@ mod tests {
         assert!(parse(b"?x\r\n").is_err());
         let (v, n) = parse(b"$0\r\n\r\n:1\r\n").unwrap().unwrap();
         assert_eq!((v, n), (Value::Data(Vec::new()), 6));
+    }
+
+    #[test]
+    fn a_malformed_or_partial_bulk_is_refused_or_waited_for() {
+        // The two bytes after the payload must be CRLF.
+        assert!(parse(b"$3\r\nabcX\r\n").is_err());
+        // CRLF INSIDE the declared length is payload, not a terminator.
+        let (v, n) = parse(b"$4\r\na\r\nb\r\n").unwrap().unwrap();
+        assert_eq!((v, n), (Value::Data(b"a\r\nb".to_vec()), 10));
+        // A non-numeric length is refused.
+        assert!(parse(b"$x\r\n").is_err());
+        // A bulk short of its payload or terminator is waited for, not refused.
+        assert_eq!(parse(b"$5\r\nab").unwrap(), None);
+        assert_eq!(parse(b"$3\r\nabc").unwrap(), None);
+        assert_eq!(parse(b"$3\r\nabc\r").unwrap(), None);
     }
 
     #[test]
@@ -1059,10 +1034,24 @@ mod tests {
     }
 
     #[test]
+    fn conversions_refuse_what_does_not_fit() {
+        assert!(u64::from_value(Value::Int(-1)).is_err());
+        assert!(u32::from_value(Value::Int(i64::from(u32::MAX) + 1)).is_err());
+        assert_eq!(u64::from_value(Value::Int(5)).unwrap(), 5);
+        let odd = Value::Array(vec![
+            Value::Data(b"a".to_vec()),
+            Value::Data(b"1".to_vec()),
+            Value::Data(b"b".to_vec()),
+        ]);
+        assert!(<Vec<(String, String)>>::from_value(odd).is_err());
+    }
+
+    #[test]
     fn errors_read_as_the_upstream_driver_wrote_them() {
         let e = RedisError::from((ErrorKind::Client, "put_key refused", "why".to_string()));
         assert_eq!(e.to_string(), "put_key refused - Client: why");
-        let e = RedisError::from((ErrorKind::Client, "delete_key: unknown id"));
-        assert_eq!(e.to_string(), "delete_key: unknown id - Client");
+        let e = RedisError::refused("delete_key: unknown id 'vk_x'");
+        assert_eq!(e.to_string(), "delete_key: unknown id 'vk_x'");
+        assert!(!e.is_connection_error());
     }
 }
