@@ -1,109 +1,47 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The **Valkey** backend for busbar's durable governance store — the
-//! shared, multi-node `db` plugin over a KEY-VALUE data model. It serves the store v3 door
-//! (`busbar_contract::abi::sdk::store`) over the HOST'S CONNECTOR, depending only on the
-//! `busbar-contract` crate, never on the engine: it speaks RESP2 itself ([`resp`]) and holds no
-//! socket, no TLS stack and no runtime of its own (ARCHITECT rulings 2026-10-03 on Q-L14-1 and
-//! Q-L16-2).
+//! The **Valkey** backend for busbar's durable governance store: the shared, multi-node store
+//! over a key-value data model. It serves the store v3 door (`busbar_contract::abi::sdk::store`)
+//! over the HOST'S CONNECTOR: it speaks RESP2 itself ([`resp`]) and holds no socket, TLS stack or
+//! runtime of its own. `redis://` / `rediss://` URLs (and the `valkey://` spellings) are read as
+//! the upstream driver 1.5.5 linked read them.
 //!
-//! Valkey is what busbar ships and documents: the Linux-Foundation-governed, BSD-licensed store the
-//! ecosystem standardized on. The only remnants of the pre-fork name in this crate are the `url://`
-//! scheme strings operators already write (`redis://` / `rediss://`, with `valkey://` /
-//! `valkeys://` read the same) and the upstream driver the TESTS use to verify Valkey independently.
+//! ## Keyspace (schema v9, every key under `busbar:`)
 //!
-//! ## Schema v5 — the generic-credentials redesign
-//!
-//! `AwsCredential`/`aws_credentials` (a type/table that only ever held SigV4 credentials, discovered
-//! mid-audit to be vendor-shaped rather than designed) is replaced by a kind-polymorphic
-//! `CredentialMeta`/`CredentialSecret` — see `busbar_contract::records` for the full rationale.
-//! `VirtualKey` gains `deleted_at` (tombstone, not hard-delete — see [`RecordStore::delete_key`]'s doc)
-//! and `revision`
-//! (a store-global monotonic counter for incremental hydration).
-//!
-//! - **virtual keys** — `busbar:key:<id>` holds the JSON [`VirtualKey`] (now carrying `deleted_at`/
-//!   `revision`); `busbar:keys` indexes every id (`list_keys` is unfiltered — including tombstones,
-//!   per the trait's own contract, since a hydrator must observe a tombstone to evict cached
-//!   credentials); `busbar:keys:byrev` is a ZSET scored by revision, serving both "all keys" and
-//!   "keys since N" (`list_keys_since`).
-//! - **credentials** — `busbar:cred:<key_id>:<kind>:<slot>` holds the JSON [`CredentialSecret`]
-//!   (meta + secret together; the METADATA-only view the admin/listing surface gets is produced by
-//!   discarding `.secret` after decode, never by a separate on-disk shape — so there is no
-//!   `SELECT *`-shaped bug possible here, only a decode-then-drop-field bug, which is far easier to
-//!   audit). `slot` is `0` or `1`, baked into the key name, so `(key_id, kind, slot)` uniqueness is
-//!   a structural property of the keyspace, not an application-level check to get wrong.
-//!   `busbar:cred:pub:<kind>:<public_id>` enforces `UNIQUE(kind, public_id)` via `SETNX`.
-//!   `busbar:cred:id:<cred_id>` resolves a credential by its own id (`revoke_credential`'s lookup).
-//!   `busbar:cred:ids:<key_id>` is a SET of `"<kind>:<slot>"` members, bounding `delete_key`'s fan-out
-//!   to a small `SMEMBERS` regardless of how many kinds exist. `busbar:creds:byrev` is the credential
-//!   equivalent of `keys:byrev`.
-//! - **token ledger** / **metering** / **audit** / **denylist** — unchanged in shape from the prior
-//!   schema (see the write-behind/HINCRBY/ZSET reasoning below); metering gains `billable_requests`
-//!   (HINCRBY, same as `requests`), `key_group_at_use`/`pricing_version` (`HSETNX` — first-write-wins,
-//!   the attribution snapshot at first use of the bucket), and the `tokens_cache_creation` field is
-//!   renamed `tokens_cache_write` (a naming-drift fix: identical concept, same as `TierTokens`).
-//!
-//! ## Schema v7 — busbar 1.6.0
-//!
-//! - **plane records** — busbar 1.6.0 replaced the protocol-named durable methods (`put_task`,
-//!   `append_mcp_call`, `put_mcp_demotion`, `redeem_ask_state`, …) with eight kind-tagged verbs over an
-//!   opaque [`PlaneRecord`](busbar_contract::records::PlaneRecord) plus [`RecordStore::plane_token_live`]. ONE keyspace per kind holds every
-//!   kind's records (see [`plane`]); the store never decodes a body. The v6 typed task / task-event /
-//!   demotion / spent-approval keyspaces are copied into it in place on connect ([`legacy`]).
-//! - **usage** — the four reserved units keep their `m:<model>:<tier>` hash fields; every other
-//!   (open) unit gets a `u:<hex unit>:<model>` field. `add_usage` floors each counter at 0 server-side.
-//! - **metering** — `priced_from_ms` joins the row's identity (a rate-card edit splits the day's
-//!   cell); open classes ride as `u:<class>` fields.
-//! - **keys** — the contract's own wire carries `idp_subject`/`binding_mode`/`minted_by` and every
-//!   scope kind in its own `allowed_{kind}s` field; a v6 row reads back unchanged.
+//! - **keys**: `key:<id>` (JSON [`VirtualKey`], tombstoned on delete, never removed), `keys` (SET of
+//!   ids), `keys:byrev` (ZSET by revision, for `list_keys_since`).
+//! - **credentials**: `cred:<key_id>:<kind>:<slot>` (JSON [`CredentialSecret`]; the metadata view is
+//!   the decoded row minus `.secret`), `cred:pub:<kind>:<public_id>` (UNIQUE(kind, public_id)),
+//!   `cred:id:<cred_id>`, `cred:ids:<key_id>` (SET of `<kind>:<slot>`), `creds:byrev`.
+//! - **usage** `usage:<bucket>:<window>` (HASH; reserved units `m:<model>:<unit>`, open units
+//!   `u:<hex unit>:<model>`, floored at 0 server-side); **metering** `metering:<bucket>` (SET of row
+//!   hashes); **audit** `audit` (ZSET); **denylist** `denylist` / `denylist:<sub>`.
+//! - **plane records** ([`plane`]); the v6 typed keyspaces are copied into it on connect ([`legacy`]).
 //!
 //! ## Atomicity
 //!
-//! Every multi-key write cascade runs as ONE atomic `MULTI`/`EXEC` pipeline
-//! ([`Pipeline::atomic`]), or — where a write's correctness depends on a value read
-//! immediately beforehand (credential slot occupancy, `delete_key`'s credential fan-out) — as an
-//! optimistic `WATCH`/`MULTI`/`EXEC` transaction (`transaction!`, [`resp`]), so a concurrent mutation of
-//! the watched key aborts and retries the whole read+build+EXEC cycle against fresh state rather than
-//! racing. `delete_key`'s cascade (tombstone the key row, destroy every credential row + its
-//! reverse-lookup pointers, drop the credential-id index) is the highest-stakes of these: a mid-
-//! cascade failure must never leave a credential outliving the key it was destroyed for, mirroring
-//! the crate's long-standing invariant, now generalized past SigV4 to every credential kind.
+//! Every multi-key write is ONE `MULTI`/`EXEC` pipeline, or, where it depends on a value read just
+//! before (credential slot occupancy, `delete_key`'s credential fan-out), an optimistic
+//! `WATCH`/`MULTI`/`EXEC` transaction (`transaction!`) that re-runs on an abort.
 //!
-//! ## Connections, TLS, reconnect
+//! ## Connections
 //!
-//! The store reaches the server through the host's connector (the store SDK's `wire`): the host
-//! dials the URL's `host:port` (or, for a unix-socket URL, its path as `unix:<path>`) for the store's
-//! one declared `tcp` need (egress class operator-infrastructure), secures it for `rediss://` (the
-//! connector's TLS and trust; unverified for `#insecure`, as 1.5.5), and the store sends `AUTH` / `SELECT` as the URL says, then its
-//! commands; a read that has nothing yet PENDS on the op's ticket and is resumed on the connector's
-//! wake. Like 1.5.5's one mutex-guarded connection, the store KEEPS one connection across ops
-//! (`wire::Pool` of one, ARCHITECT ruling STORE-KEEP): the handshake runs once per connection, and
-//! ops queue for it. 1.5.5's reconnect-and-retry is kept call for call: a connection-level failure
-//! on a `with_conn!` call (reads and the idempotent writes, as 1.5.5's `with_conn`) closes the
-//! connection and re-runs that call ONCE on a fresh one; the `with_conn_no_retry!` calls (the
-//! non-idempotent writes 1.5.5 never replayed) fail instead, and the next op dials fresh.
-//! `connect_timeout_ms` bounds every new connection's dial and handshake (TLS, `AUTH`, `SELECT`)
-//! in all, the span 1.5.5's `get_connection_with_timeout` bounded. `open` parses the settings only; its connect step
-//! (`StoreSlots::connect`) makes the first connection, migrates the schema and checks `noeviction`,
-//! so an unreachable or misconfigured server still refuses the load at boot in the store's own
-//! words. Error strings are scrubbed of the URL password.
-//!
-//! ## Data growth (documented)
-//!
-//! Rows are written WITHOUT a TTL: usage windows, metering buckets, and audit entries accumulate;
-//! the store is the durable system of record. Retention is the engine's to apply: the store keeps
-//! ledger counts and records, not money, and no longer carries a purge op for usage windows or
-//! metering buckets.
+//! One kept connection (1.5.5's one mutex-guarded connection), dialled through the host's connector
+//! for the store's one `tcp` need, secured for `rediss://` (unverified for `#insecure`), then `AUTH`
+//! and `SELECT` as the URL says; `connect_timeout_ms` bounds dial plus handshake. A connection-level
+//! failure on a `with_conn!` call reconnects and re-runs that call once; `with_conn_no_retry!` calls
+//! (non-idempotent writes) fail instead. `open` only parses; its connect step migrates the schema and
+//! checks `noeviction`. Error strings are scrubbed of the URL password. Rows carry no TTL: retention
+//! is the engine's.
 
 #![forbid(unsafe_code)]
 
 use busbar_contract::abi::sdk::store::wire::{Pool, Wire};
 use busbar_contract::records::MeteringDelta;
 use busbar_contract::records::{
-    AuditRecord, CredentialMeta, CredentialSecret, MeteringRow, ModelTokens, PlaneRecordRef,
-    PlaneSelector, RecordStoreError, RecordStoreResult, UsageDelta, UsageLedger, VirtualKey,
-    RESERVED_UNITS,
+    AuditRecord, CredentialMeta, CredentialSecret, MeteringRow, ModelTokens, RecordStoreError,
+    RecordStoreResult, UsageDelta, UsageLedger, VirtualKey, RESERVED_UNITS,
 };
 use resp::{cmd, pipe, Conn, ErrorKind, Pipeline, RedisError, RedisResult};
 use std::sync::Arc;
@@ -172,86 +110,28 @@ const CRED_ID_PREFIX: &str = "busbar:cred:id:";
 const CREDS_BYREV: &str = "busbar:creds:byrev";
 const AUDIT_ZSET: &str = "busbar:audit";
 
-// ── THE PLANE-RECORD KEYSPACE (1.6.0) ─────────────────────────────────────────────────────────
-//
-// Every kind a plane declares (`task`, `task_event`, `call`, `demotion`, …) is stored by the
-// kind-neutral verbs in [`plane`]; the single-use token ledger the `redeem_plane_token` verb keeps is
-// there too. The v6 typed keyspaces those verbs replaced (`busbar:task:*`, `busbar:tasks*`,
-// `busbar:mcp:demotions`, `busbar:askstate:*`) are copied in on connect by [`legacy`]; the v6 MCP
-// tool-call log (`busbar:mcp:*`) is left in place, unread (see `legacy`'s doc for why).
 mod legacy;
-pub mod plane;
+mod plane;
 
-/// The signed-token REVOCATION denylist (1.5.0). `busbar:denylist:<sub>` holds the operator reason
-/// (a plain string), and `busbar:denylist` is a SET indexing every denied sub so `list_denylist` is
-/// a SMEMBERS.
 const DENYLIST_PREFIX: &str = "busbar:denylist:";
 const DENYLIST_INDEX: &str = "busbar:denylist";
-/// The store-global monotonic revision counter (INCR only). Stamped onto `VirtualKey`/`CredentialMeta`
-/// rows at write time, driving `list_keys_since`/`list_credentials_since`'s incremental hydration.
+/// The store-global revision counter (`INCR`), stamped on key and credential rows.
 const REVISION_KEY: &str = "busbar:revision";
-/// The schema-version marker key (mirrors the SQLite `PRAGMA user_version`). v5 (1.5.0 dev) = the
-/// generic-credentials redesign: `AwsCredential` -> kind-polymorphic `CredentialMeta`/`CredentialSecret`,
-/// `VirtualKey` gains `deleted_at`/`revision`, `delete_key` becomes a tombstone, metering gains
-/// `billable_requests`/`key_group_at_use`/`pricing_version` and renames `tokens_cache_creation` to
-/// `tokens_cache_write`. A namespace marked below v6 is REFUSED on connect, never wiped (it used to be wiped).
-///
-/// v6 closes a real billing bug in busbarAI core's `GovState::hydrate_budgets`: that function used
-/// to infer "legacy pre-split row, needs `billable_requests` seeded from `requests`" from the value
-/// shape `billable_requests == 0 && requests > 0` alone — but that exact shape is ALSO what a bucket
-/// looks like after a legitimate full refund (`refund_bucket` decrements `billable_requests` but
-/// never `requests`, by design), so a restart could silently re-bill correctly-refunded fees. Fixed
-/// by removing the value-based guess from `hydrate_budgets` entirely and doing the one-time cutover
-/// HERE instead, at a real schema-version boundary, which by construction happens exactly once ever
-/// per store. v6 originally wiped any pre-v6 namespace; that wipe was only ever safe while 1.5.0 was
-/// unreleased, and `migrate()` now REFUSES such a namespace (see its doc) instead.
-/// The durable MCP tool-call log, the durable A2A TASK STORE and the durable TRUST STATE (the MCP
-/// demotion record and the spent-approval ledger) all landed WITHOUT bumping this, and that is a
-/// deliberate decision rather than an oversight. Each is a PURELY ADDITIVE keyspace
-/// (`busbar:mcp:*`, `busbar:task:*`/`busbar:tasks*`, `busbar:askstate:*`): nothing that already
-/// exists changes shape, so
-/// there is nothing for a migration to do, and a bump here does not mean "migrate" — `migrate()`
-/// handles a `version < SCHEMA_VERSION` namespace only through an in-place path. Bumping to
-/// mark an addition that needs no migration would leave operators' existing namespaces unable to
-/// connect (refused) until a migrate-in-place path exists. The version marker moves again only when
-/// such a path exists to move it for.
-///
-/// v7 (busbar 1.6.0) is that path: the typed task / task-event / demotion / spent-approval keyspaces
-/// are copied IN PLACE into the kind-neutral plane-record keyspace ([`legacy::migrate_v6_to_v7`]).
-/// Nothing a v6 namespace holds is wiped: keys, credentials, usage, metering, audit and the denylist
-/// read back unchanged under v7, and the v6 MCP call log stays where it is. A namespace OLDER
-/// than v6 (plugin v1.0.0, which wrote 5, or a 1.5.0 development build) is refused, not wiped.
-///
-/// v8 (store kind epoch and slice life), ADDITIVE: `busbar:epoch` (the ONE fleet epoch `reserve`
-/// fenced with), each slice hash's `until` (its `valid_until_ms`) and `busbar:open:<slot>` (the
-/// slot's open slices by `until`). Superseded by v9, which deletes them; v8 never shipped in a
-/// release.
-///
-/// v9 (money is a view on ledger x rate card), SUBTRACTIVE: the store keeps only ledger counts
-/// (usage windows and metering rows) and the records the kernel puts. The keys of the deleted slots
-/// go: the money keys (`busbar:cap:*`, `busbar:slice:*`, `busbar:open:*`, `busbar:slices`,
-/// `busbar:epoch`), the journal (`busbar:journal:*`) and the sessions (`busbar:session:*`,
-/// `busbar:sessions:*`), removed by `SCAN` + `UNLINK` in [`ValkeyStore::drop_dead_slot_keys`], and so
-/// are the `busbar:op:*` dedupe hashes of the deleted slots. The hash of a kept slot is untouched,
-/// so a retry across the upgrade still answers its original. The marker is written last. A namespace
-/// marked NEWER than this build is refused at open.
+/// The schema marker. v6 is the oldest namespace migrated in place (older is REFUSED, never wiped);
+/// v7 (1.6.0) copied the v6 typed task / event / demotion / spent-approval keys into the plane
+/// keyspace ([`legacy`]); v8 never shipped; v9 deleted the keys of the dropped money, journal and
+/// session slots ([`ValkeyStore::drop_dead_slot_keys`]). A NEWER marker is refused.
 const SCHEMA_KEY: &str = "busbar:schema";
 const SCHEMA_VERSION: i64 = 9;
-/// The names (the first `:`-segment of an op's value fields) of the slots whose `busbar:op:*`
-/// dedupe hashes survive the v9 upgrade.
+/// The slots whose `busbar:op:*` dedupe hashes survive the v9 upgrade.
 const KEPT_OP_SLOTS: [&str; 3] = [
     "add_usage_batch",
     "add_metering_batch",
     "append_plane_record",
 ];
-/// The oldest schema `migrate()` can upgrade in place: a namespace with data below it is REFUSED
-/// (never wiped). v6 and later are always migrated in place.
 const FIRST_MIGRATED_SCHEMA: i64 = 6;
 
-/// Internal sentinel: `delete_key`'s outer retry loop uses this to distinguish "credential
-/// membership changed since our watch-set pre-read, restart with a fresh watch set" from a real
-/// terminal error. `ErrorKind` has no built-in "retry me" variant, so this is carried in
-/// the error message rather than the kind.
+/// `delete_key`'s "credential membership changed; rebuild the watch set" signal.
 const DELETE_KEY_RETRY_SENTINEL: &str = "__internal_delete_key_retry__";
 
 fn usage_key(bucket_id: &str, window_start: u64) -> String {
@@ -274,20 +154,24 @@ fn cred_id_key(cred_id: &str) -> String {
     format!("{CRED_ID_PREFIX}{cred_id}")
 }
 
-/// Escape Valkey glob metacharacters (`*`, `?`, `[`, `]`, and the escape character `\` itself)
-/// in a value that must match LITERALLY inside a `SCAN MATCH` pattern. Without this, a virtual key id
-/// containing one of these characters lets `delete_key`'s cleanup SCAN match keys belonging to OTHER
-/// buckets/ids that merely share a glob-matching prefix.
-fn escape_glob(s: &str) -> String {
+/// `s` with a `\\` before every character of `special` (which holds `\\` itself, so the escape
+/// round-trips). Glob metacharacters for a `SCAN MATCH` that must match LITERALLY (else an id could
+/// match other ids' keys); `|` for a metering row's joined identity (else two identities collide).
+fn escape(s: &str, special: &[char]) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+        if special.contains(&c) {
             out.push('\\');
         }
         out.push(c);
     }
     out
 }
+
+/// The glob metacharacters [`escape`] quotes in a `SCAN MATCH` pattern.
+const GLOB: &[char] = &['*', '?', '[', ']', '\\'];
+/// The characters [`escape`] quotes in a metering row's identity component.
+const ROW_SEP: &[char] = &['\\', '|'];
 
 /// Hash field for one (model, unit) counter in a usage window. The four RESERVED units keep the v6
 /// spelling `m:<model>:<tier>` (parsed with a RIGHT split on the tier, so a model name containing `:`
@@ -339,23 +223,6 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 fn metering_set(bucket: u64) -> String {
     format!("busbar:metering:{bucket}")
 }
-/// Escape `\` and the `|` join delimiter (in that order, so the escape character itself round-trips
-/// unambiguously) in one `metering_row` component. Without this, two DISTINCT `(key_id, model,
-/// provider)` triples can collide onto the identical joined string whenever a component contains a
-/// literal `|` — e.g. `("k", "a|b", "p")` and `("k", "a", "b|p")` both join to `"k|a|b|p"` — merging
-/// two logically separate metering rows' HINCRBY'd counters into one. Neither `key_id` (busbar-
-/// generated) nor `model`/`provider` (operator-configured lane names, never restricted to a fixed
-/// charset anywhere upstream) is guaranteed `|`-free, so this is not a theoretical concern.
-fn escape_metering_component(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if matches!(c, '\\' | '|') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
 
 /// The hash key of one metering cell: `(bucket, key_id, model, provider, priced_from_ms)`.
 ///
@@ -364,7 +231,7 @@ fn escape_metering_component(s: &str) -> String {
 /// the opening entry, and every row written before the field existed — keeps the v6 three-component
 /// key, so a v6 cell and a v7 write of the same undated cell are one cell. A dated cell appends a
 /// fourth `|<ms>` component. Each component is escaped before joining (see
-/// `escape_metering_component`), so the join is injective: an escaped component never contains a bare
+/// [`escape`]), so the join is injective: an escaped component never contains a bare
 /// `|`, so a three-component key and a four-component key can never render the same, and two
 /// different identities never share a row.
 fn metering_row(
@@ -376,9 +243,9 @@ fn metering_row(
 ) -> String {
     let base = format!(
         "busbar:metering:{bucket}:{}|{}|{}",
-        escape_metering_component(key_id),
-        escape_metering_component(model),
-        escape_metering_component(provider)
+        escape(key_id, ROW_SEP),
+        escape(model, ROW_SEP),
+        escape(provider, ROW_SEP)
     );
     match priced_from_ms {
         0 => base,
@@ -429,10 +296,8 @@ fn url_password(url: &str) -> Option<String> {
         .map(|(_, v)| v.to_string())
 }
 
-/// Percent-DECODE a URL component (`%40` -> `@`, `%25` -> `%`). A malformed escape is left verbatim.
-/// Used so the scrub redacts BOTH the raw (as-written-in-URL) and decoded forms of the password -
-/// the valkey driver may surface either in an error string.
-fn percent_decode(s: &str) -> String {
+/// Percent-DECODE a URL component (`%40` -> `@`); a malformed escape is left verbatim.
+fn percent_bytes(s: &str) -> Vec<u8> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -449,7 +314,12 @@ fn percent_decode(s: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
+}
+
+/// [`percent_bytes`], lossily as text: the scrub redacts both the raw and decoded password.
+fn percent_decode(s: &str) -> String {
+    String::from_utf8_lossy(&percent_bytes(s)).into_owned()
 }
 
 /// Replace every occurrence of `secret` (in BOTH its raw and percent-decoded forms) in `msg` with
@@ -540,26 +410,9 @@ fn url_refused(why: &'static str) -> RedisError {
     RedisError::from((ErrorKind::InvalidClientConfig, why))
 }
 
-/// Percent-decode `s` as UTF-8 (the upstream driver's user/password reading); `None` when the
-/// decoded bytes are not UTF-8.
+/// Percent-decode `s` as UTF-8 (the upstream driver's user/password reading).
 fn percent_decode_utf8(s: &str) -> Option<String> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(hi), Some(lo)) = (hi, lo) {
-                out.push((hi * 16 + lo) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8(out).ok()
+    String::from_utf8(percent_bytes(s)).ok()
 }
 
 /// Every query parameter a URL form reads is named in `known`; any other one is REFUSED (the
@@ -741,9 +594,6 @@ impl std::fmt::Debug for Inner {
     }
 }
 
-/// How many connections the store keeps: 1.5.5's one (it had no pool setting).
-const KEPT_CONNECTIONS: usize = 1;
-
 /// The store's one outbound need: a `tcp` stream to the server the settings' URL names (the store
 /// names the target at each connect), governed as operator infrastructure (private, loopback and
 /// plaintext allowed). Its timeout bounds the dial (1.5.5's default connect timeout).
@@ -751,31 +601,13 @@ pub const NEEDS: &[busbar_contract::abi::host::conn::connector::Need] = {
     use busbar_contract::abi::host::conn::connector::{
         Need, DIRECTION_OUTBOUND, EGRESS_OPERATOR_INFRASTRUCTURE, KEEP_NAMED,
     };
-    use busbar_contract::abi::mechanism::call::{AbiStr, Blob, BLOB_ABSENT};
-    const NONE: AbiStr = AbiStr {
-        ptr: std::ptr::null(),
-        len: 0,
-    };
     &[Need {
         direction: DIRECTION_OUTBOUND,
         egress_class: EGRESS_OPERATOR_INFRASTRUCTURE,
         transport: busbar_contract::abi::sdk::door::abi_str("tcp"),
-        auth: NONE,
-        target_from: NONE,
-        trust_from: NONE,
-        details: Blob {
-            ptr: std::ptr::null(),
-            len: 0,
-            fmt: BLOB_ABSENT,
-            flags: 0,
-        },
-        keep_response_headers: std::ptr::null(),
-        keep_response_headers_len: 0,
         timeout_ms: DEFAULT_CONNECT_TIMEOUT.as_millis() as u64,
         keep_mode: KEEP_NAMED,
-        _reserved: 0,
-        deny_response_headers: std::ptr::null(),
-        deny_response_headers_len: 0,
+        ..Need::ZERO
     }]
 };
 
@@ -783,39 +615,6 @@ pub const NEEDS: &[busbar_contract::abi::host::conn::connector::Need] = {
 const NEED_TCP: u32 = 0;
 
 impl ValkeyStore {
-    /// The store for `url` (no connection is made here: `open`'s connect step makes the first,
-    /// through the host's connector), with [`DEFAULT_CONNECT_TIMEOUT`].
-    ///
-    /// # Errors
-    /// A URL the store cannot read, in the upstream driver's words.
-    pub fn new(url: &str) -> RecordStoreResult<Self> {
-        Self::with_timeout(url, DEFAULT_CONNECT_TIMEOUT)
-    }
-
-    /// As [`Self::new`], stating the connect timeout.
-    ///
-    /// # Errors
-    /// As [`Self::new`].
-    pub fn with_timeout(url: &str, timeout: Duration) -> RecordStoreResult<Self> {
-        let secret = url_password(url);
-        let target = parse_url(url).map_err(|e| {
-            RecordStoreError(scrub(format!("valkey connect: {e}"), secret.as_deref()))
-        })?;
-        Ok(Self::from_parts(target, secret, timeout))
-    }
-
-    /// The store over an already-parsed target.
-    fn from_parts(target: Target, secret: Option<String>, connect_timeout: Duration) -> Self {
-        Self {
-            inner: Arc::new(Inner {
-                target,
-                secret,
-                connect_timeout,
-                pool: Pool::new(KEPT_CONNECTIONS),
-            }),
-        }
-    }
-
     /// The op's connection over `wire`: the kept one when it is idle (its handshake done), else a
     /// fresh dial, secured for `rediss://`, `AUTH` and `SELECT` as the URL says — the dial AND the
     /// handshake bounded by `connect_timeout_ms` in all, the span 1.5.5's
@@ -981,11 +780,7 @@ impl ValkeyStore {
                     .set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION)
                     .await);
             }
-            let existing: Vec<String> = with_conn!(self, |c| {
-                c.scan_match::<_, String>("busbar:*")
-                    .await?
-                    .collect::<Result<Vec<String>, _>>()
-            })?;
+            let existing = self.scan(c, "busbar:*").await?;
             let others: Vec<&String> = existing.iter().filter(|k| *k != SCHEMA_KEY).collect();
             if others.is_empty() {
                 return with_conn!(self, |c| c
@@ -1059,18 +854,10 @@ impl ValkeyStore {
             "busbar:session:*",
             "busbar:sessions:*",
         ] {
-            let keys: Vec<String> = with_conn!(self, |c| {
-                c.scan_match::<_, String>(pattern)
-                    .await?
-                    .collect::<Result<Vec<String>, _>>()
-            })?;
+            let keys = self.scan(c, pattern).await?;
             self.unlink_all(c, &keys).await?;
         }
-        let ops: Vec<String> = with_conn!(self, |c| {
-            c.scan_match::<_, String>("busbar:op:*")
-                .await?
-                .collect::<Result<Vec<String>, _>>()
-        })?;
+        let ops = self.scan(c, "busbar:op:*").await?;
         let mut dead = Vec::new();
         for chunk in ops.chunks(500) {
             let bodies: Vec<Option<Vec<u8>>> = with_conn!(self, |c| {
@@ -1097,6 +884,11 @@ impl ValkeyStore {
             with_conn!(self, |c| cmd("UNLINK").arg(chunk).query::<i64>(c).await)?;
         }
         Ok(())
+    }
+
+    /// Every key matching `pattern`.
+    async fn scan(&self, c: &mut Conn, pattern: &str) -> RecordStoreResult<Vec<String>> {
+        with_conn!(self, |c| c.scan_match(pattern).await)
     }
 
     fn err(&self, e: RedisError, ctx: &str) -> RecordStoreError {
@@ -1136,6 +928,107 @@ async fn owner_is_live(c: &mut Conn, key_row: &str, key_id: &str) -> RedisResult
             "put_credential: key '{key_id}' does not decode; refusing to attach a credential to it"
         )),
     }
+}
+
+/// Whether the key row at `row` is a stored tombstone. A row that does not decode is not one:
+/// refusing it would make a corrupt row permanently unwritable.
+async fn tombstoned(c: &mut Conn, row: &str) -> RedisResult<bool> {
+    let prior: Option<String> = c.get(row).await?;
+    Ok(prior
+        .as_deref()
+        .and_then(|r| key_from_json(r).ok())
+        .is_some_and(|k| k.deleted_at.is_some()))
+}
+
+/// What a credential slot allows a mint of `secret`, read inside the WATCHed transaction.
+enum Slot {
+    /// The slot already holds THIS credential, live: a reconnect-and-retry replaying an `EXEC` that
+    /// had committed. Nothing to write.
+    Replay,
+    /// Free; a revoked previous occupant's `(public_id, id)`, whose pointers the write deletes.
+    Free(Option<(String, String)>),
+}
+
+/// The slot checks of a credential mint (`op` names the refusals): a DIFFERENT live credential in
+/// the slot is refused (never silently destroyed mid-overlap), a revoked one is never re-minted
+/// under its own id, and `UNIQUE(kind, public_id)` is a real read of the pointer (a `SETNX` queued
+/// in an `.ignore()`d pipe would discard the "already claimed" answer).
+async fn read_slot(c: &mut Conn, secret: &CredentialSecret, op: &str) -> RedisResult<Slot> {
+    let m = &secret.meta;
+    let solo = op == "put_credential";
+    let existing: Option<String> = c.get(cred_row_key(&m.key_id, &m.kind, m.slot)).await?;
+    let mut prior = None;
+    if let Some(raw) = &existing {
+        let cur: CredentialSecret = serde_json::from_str(raw)
+            .map_err(|_| RedisError::from((ErrorKind::Client, "cred decode")))?;
+        if cur.meta.revoked_at.is_none() {
+            if cur.meta.id == m.id {
+                return Ok(Slot::Replay);
+            }
+            return Err(RedisError::from((
+                ErrorKind::Client,
+                if solo {
+                    "put_credential: slot holds a live credential; revoke it first"
+                } else {
+                    "put_key_with_credential: slot holds a live credential; revoke it first"
+                },
+            )));
+        }
+        if cur.meta.id == m.id {
+            return Err(RedisError::refused(format!(
+                "{op}: credential {} is revoked; a revoked credential is never re-minted",
+                m.id
+            )));
+        }
+        prior = Some((cur.meta.public_id, cur.meta.id));
+    }
+    let holder: Option<String> = c.get(cred_pub_key(&m.kind, &m.public_id)).await?;
+    if holder.is_some_and(|h| h != slot_pointer(m)) {
+        return Err(RedisError::from((
+            ErrorKind::Client,
+            if solo {
+                "put_credential: public_id already claimed by a different credential"
+            } else {
+                "put_key_with_credential: public_id already claimed"
+            },
+        )));
+    }
+    Ok(Slot::Free(prior))
+}
+
+/// A credential's `<key_id>:<kind>:<slot>` pointer.
+fn slot_pointer(m: &CredentialMeta) -> String {
+    format!("{}:{}:{}", m.key_id, m.kind, m.slot)
+}
+
+/// Queue the writes of a credential row and its pointers on `pipe`, deleting a revoked previous
+/// occupant's pointers in the same atomic step (a stale `cred:id:<old>` would let a later revoke of
+/// the old id wipe the new occupant).
+fn queue_credential(
+    pipe: &mut Pipeline,
+    secret: &CredentialSecret,
+    prior: &Option<(String, String)>,
+) -> RedisResult<()> {
+    let m = &secret.meta;
+    let json =
+        cred_to_json(secret).map_err(|_| RedisError::from((ErrorKind::Client, "cred encode")))?;
+    let ptr = slot_pointer(m);
+    if let Some((old_pub, old_id)) = prior {
+        if *old_pub != m.public_id {
+            pipe.del(cred_pub_key(&m.kind, old_pub)).ignore();
+        }
+        if *old_id != m.id {
+            pipe.del(cred_id_key(old_id)).ignore();
+        }
+    }
+    pipe.set(cred_pub_key(&m.kind, &m.public_id), &ptr).ignore();
+    pipe.set(cred_id_key(&m.id), &ptr).ignore();
+    pipe.set(cred_row_key(&m.key_id, &m.kind, m.slot), &json)
+        .ignore();
+    pipe.sadd(cred_ids_key(&m.key_id), format!("{}:{}", m.kind, m.slot))
+        .ignore();
+    pipe.zadd(CREDS_BYREV, &ptr, m.revision).ignore();
+    Ok(())
 }
 
 fn key_from_json(raw: &str) -> RecordStoreResult<VirtualKey> {
@@ -1232,29 +1125,17 @@ fn queue_metering(pipe: &mut Pipeline, d: &MeteringDelta) {
 /// `add_metering`, `append_plane_record`) reach the store as their `op_id` slots.
 impl ValkeyStore {
     pub(crate) async fn put_key(&self, c: &mut Conn, key: &VirtualKey) -> RecordStoreResult<()> {
-        let key = key.clone();
         let row_key = format!("{KEY_PREFIX}{}", key.id);
         with_conn!(self, |c| {
-            // TOMBSTONE PRECONDITION (see `Store::put_key`): a live-shaped write must not overwrite
-            // a tombstoned row, which would reissue an id the contract says is never reissued and
-            // revive every token minted before the delete. WATCHed rather than read-then-written, so
-            // a `delete_key` committing between the read and the SET aborts and retries instead of
-            // slipping through — the same TOCTOU the caller-side checks in core cannot close.
+            // A live-shaped write must not clear a tombstone (an id is never reissued), WATCHed so
+            // a `delete_key` committing in between aborts and retries this.
             transaction!(c, &[row_key.as_str()], |c, pipe| {
-                if key.deleted_at.is_none() {
-                    let existing: Option<String> = c.get(&row_key).await?;
-                    // A row that does not parse is left to the normal write path rather than being
-                    // treated as a tombstone: refusing here would make a corrupt row permanently
-                    // unwritable, and this method is not the one that should be adjudicating that.
-                    if let Some(prior) = existing.as_deref().and_then(|r| key_from_json(r).ok()) {
-                        if prior.deleted_at.is_some() {
-                            return Err(RedisError::refused(format!(
-                                "put_key: '{}' is tombstoned and its id is never reissued; \
-                                     refusing to clear the tombstone",
-                                key.id
-                            )));
-                        }
-                    }
+                if key.deleted_at.is_none() && tombstoned(c, &row_key).await? {
+                    return Err(RedisError::refused(format!(
+                        "put_key: '{}' is tombstoned and its id is never reissued; \
+                             refusing to clear the tombstone",
+                        key.id
+                    )));
                 }
                 let mut key = key.clone();
                 let rev = self.next_revision(c).await?;
@@ -1284,24 +1165,9 @@ impl ValkeyStore {
     }
 
     pub(crate) async fn list_keys(&self, c: &mut Conn) -> RecordStoreResult<Vec<VirtualKey>> {
-        // Deliberately UNFILTERED — including tombstones. See the trait's own doc: this serves both
-        // the admin-listing caller (which filters `is_live()` itself) and `list_keys_since`'s default
-        // hydration fallback, which needs to SEE a tombstone to evict cached credentials.
+        // UNFILTERED, tombstones included: a hydrator must see a tombstone to evict its credentials.
         let ids: Vec<String> = with_conn!(self, |c| c.smembers(KEYS_INDEX).await)?;
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let raws: Vec<Option<String>> = with_conn!(self, |c| {
-            let mut pipe = pipe();
-            for id in &ids {
-                pipe.get(format!("{KEY_PREFIX}{id}"));
-            }
-            pipe.query(c).await
-        })?;
-        let mut out = Vec::with_capacity(ids.len());
-        for raw in raws.into_iter().flatten() {
-            out.push(key_from_json(&raw)?);
-        }
+        let mut out = self.get_keys(c, &ids).await?;
         out.sort_by(|a, b| {
             a.created_at
                 .cmp(&b.created_at)
@@ -1315,51 +1181,47 @@ impl ValkeyStore {
         c: &mut Conn,
         since: u64,
     ) -> RecordStoreResult<Vec<VirtualKey>> {
-        // Real delta-fetch: ZRANGEBYSCORE the byrev index, not a full scan-and-filter — the whole
-        // point of maintaining `keys:byrev`.
         let ids: Vec<String> = with_conn!(self, |c| c
             .zrangebyscore(KEYS_BYREV, format!("({since}"), "+inf")
             .await)?;
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let raws: Vec<Option<String>> = with_conn!(self, |c| {
+        self.get_keys(c, &ids).await
+    }
+
+    /// The key rows of `ids` (a missing row is skipped, a corrupt one refused).
+    async fn get_keys(&self, c: &mut Conn, ids: &[String]) -> RecordStoreResult<Vec<VirtualKey>> {
+        let rows: Vec<String> = ids.iter().map(|id| format!("{KEY_PREFIX}{id}")).collect();
+        let raws = self.get_all(c, &rows).await?;
+        raws.into_iter()
+            .flatten()
+            .map(|r| key_from_json(&r))
+            .collect()
+    }
+
+    /// `GET` every one of `keys`, in one pipeline.
+    async fn get_all(
+        &self,
+        c: &mut Conn,
+        keys: &[String],
+    ) -> RecordStoreResult<Vec<Option<String>>> {
+        with_conn!(self, |c| {
             let mut pipe = pipe();
-            for id in &ids {
-                pipe.get(format!("{KEY_PREFIX}{id}"));
+            for k in keys {
+                pipe.get(k);
             }
             pipe.query(c).await
-        })?;
-        let mut out = Vec::with_capacity(ids.len());
-        for raw in raws.into_iter().flatten() {
-            out.push(key_from_json(&raw)?);
-        }
-        Ok(out)
+        })
     }
 
     pub(crate) async fn delete_key(&self, c: &mut Conn, id: &str) -> RecordStoreResult<()> {
         let ids_key = cred_ids_key(id);
         let key_row = format!("{KEY_PREFIX}{id}");
-        // Usage windows: a non-blocking SCAN outside the transaction (mirrors the crate's prior
-        // behavior). A deleted key's rate-limit windows are meaningless — best-effort cleanup, not a
-        // correctness-critical invariant like the credential cascade below, so a concurrent
-        // add_usage/put_usage racing a new window into existence between this SCAN and the EXEC is an
-        // acceptable, already-documented gap (stale data, not an identity/auth issue).
-        let pattern = format!("busbar:usage:{}:*", escape_glob(id));
-        let usage_keys: Vec<String> = with_conn!(self, |c| {
-            c.scan_match::<_, String>(&pattern)
-                .await?
-                .collect::<Result<Vec<String>, _>>()
-        })?;
-        // WATCH the key row, its credential-id index, AND every current member's own credential
-        // row: a concurrent put_credential can rewrite a slot's row in place (reusing an existing
-        // member of `ids_key`, so SADD never fires and `ids_key` itself doesn't change) — if only
-        // `key_row`/`ids_key` were watched, that in-place rewrite would slip past WATCH entirely,
-        // and this cascade would then destroy the row (and fail to clean up the NEW public_id's
-        // reverse pointer) without ever having observed the change. Because the row-key set itself
-        // depends on `ids_key`'s membership, and membership can also change between our pre-read
-        // and the transaction's WATCH, this loops: any membership change aborts (ids_key is
-        // watched) and we recompute the watch set from scratch against fresh state.
+        // Usage windows: best-effort cleanup by a SCAN outside the transaction (a window raced in
+        // before the EXEC is stale data, not an identity issue).
+        let pattern = format!("busbar:usage:{}:*", escape(id, GLOB));
+        let usage_keys = self.scan(c, &pattern).await?;
+        // WATCH the key row, its credential-id index AND every member's credential row (a slot
+        // rewritten in place changes no index). The row set depends on the membership, so a
+        // membership change rebuilds the watch set from fresh state (the outer loop).
         with_conn!(self, |c| loop {
             let members: Vec<String> = c.smembers(&ids_key).await?;
             let row_keys: Vec<String> = members
@@ -1373,9 +1235,7 @@ impl ValkeyStore {
             let outcome = transaction!(c, &watch_keys, |c, pipe| {
                 let raw: Option<String> = c.get(&key_row).await?;
                 let Some(raw) = raw else {
-                    // Unknown id (never existed): a real error, matching the SQL backends'
-                    // `delete_key`-on-unknown-id contract — distinct from "already tombstoned",
-                    // which IS an idempotent no-op (see below).
+                    // Unknown id: an error, as the SQL backends (a tombstoned one is a no-op).
                     return Err(RedisError::refused(format!(
                         "delete_key: unknown id '{id}'"
                     )));
@@ -1383,18 +1243,12 @@ impl ValkeyStore {
                 let mut key: VirtualKey = serde_json::from_str(&raw)
                     .map_err(|_| RedisError::from((ErrorKind::Client, "key decode")))?;
                 if key.deleted_at.is_some() {
-                    // Already tombstoned: idempotent no-op (do not re-bump revision or re-destroy
-                    // credentials that are already gone).
+                    // Already tombstoned: an idempotent no-op.
                     pipe.atomic();
                     return pipe.query(c).await;
                 }
-                // `transaction!`'s own internal WATCH-abort retry reruns this body with
-                // the SAME fixed `watch_keys` computed above -- it can't recompute which row keys
-                // to watch. So re-read membership fresh here and compare against the outer
-                // pre-read: if it changed, `ids_key` (which IS watched) will already have aborted
-                // this EXEC, but we still need to bail out to the OUTER loop to rebuild `watch_keys`
-                // against the new members' rows, rather than silently proceeding against the stale
-                // set.
+                // `transaction!` re-runs this body with the SAME watch set: a membership change
+                // goes back to the outer loop to rebuild it.
                 let fresh_members: Vec<String> = c.smembers(&ids_key).await?;
                 if fresh_members.len() != members.len()
                     || !fresh_members.iter().all(|m| members.contains(m))
@@ -1417,26 +1271,16 @@ impl ValkeyStore {
                 for uk in &usage_keys {
                     pipe.del(uk).ignore();
                 }
-                // Destroy every credential row + its reverse-lookup pointers. Per the trait's own
-                // hydration contract, a hard-deleted credential row is fine here (not a hazard) —
-                // the CONSUMER evicts cached credentials off this key's OWN `deleted_at` delta, never
-                // waiting for a credential-row delta that (by construction) will never come.
+                // Destroy every credential row and its pointers (a consumer evicts off the key's
+                // own tombstone delta).
                 for member in &members {
                     let Some((_, kind, slot)) = parse_slot_pointer(&format!("{id}:{member}"))
                     else {
                         continue;
                     };
                     let row_key = cred_row_key(id, &kind, slot);
-                    // Need the row's public_id to clean up its reverse pointer — read it (still
-                    // inside the WATCHed transaction closure, so this is consistent with the EXEC).
-                    // A missing row is a legitimate no-op (already gone). A row that IS present but
-                    // fails to decode must abort the whole cascade rather than be silently skipped
-                    // — an `if let Ok(...) = ...` swallow here would still delete the row while
-                    // leaving its `cred:pub:*`/`cred:id:*` reverse pointers permanently dangling,
-                    // reporting `delete_key` as a success despite violating its own "destroy every
-                    // credential row + pointers" contract. Every other decode path in this file
-                    // (key_from_json, cred_from_json, list_metering) propagates a corrupt value as
-                    // an error rather than silently under-delivering; this matches that.
+                    // A row that does not decode aborts the cascade: skipping it would leave its
+                    // pointers dangling behind a reported success.
                     if let Some(raw) = c.get::<_, Option<String>>(&row_key).await? {
                         let cred: CredentialSecret = serde_json::from_str(&raw).map_err(|_| {
                             RedisError::from((
@@ -1468,9 +1312,6 @@ impl ValkeyStore {
     ) -> RecordStoreResult<UsageLedger> {
         let k = usage_key(bucket_id, window_start);
         let fields: Vec<(String, i64)> = with_conn!(self, |c| c.hgetall(&k).await)?;
-        if fields.is_empty() {
-            return Ok(UsageLedger::default());
-        }
         let mut ledger = UsageLedger::default();
         for (name, v) in fields {
             if name == "requests" {
@@ -1622,113 +1463,23 @@ impl ValkeyStore {
         c: &mut Conn,
         secret: &CredentialSecret,
     ) -> RecordStoreResult<()> {
-        let row_key = cred_row_key(&secret.meta.key_id, &secret.meta.kind, secret.meta.slot);
-        let ids_key = cred_ids_key(&secret.meta.key_id);
-        let pub_key = cred_pub_key(&secret.meta.kind, &secret.meta.public_id);
-        let id_key = cred_id_key(&secret.meta.id);
-        let key_row = format!("{KEY_PREFIX}{}", secret.meta.key_id);
-        let mut secret = secret.clone();
-        let slot_ptr = format!(
-            "{}:{}:{}",
-            secret.meta.key_id, secret.meta.kind, secret.meta.slot
-        );
+        let m = &secret.meta;
+        let row_key = cred_row_key(&m.key_id, &m.kind, m.slot);
+        let pub_key = cred_pub_key(&m.kind, &m.public_id);
+        let key_row = format!("{KEY_PREFIX}{}", m.key_id);
         with_conn!(self, |c| {
-            // WATCH the OWNING KEY's row too: a credential must hang off a real, live key, and a
-            // `delete_key` committing between that check and the write must abort this, never slip
-            // under it (the tombstone cascade would otherwise be undone through this door).
-            //
-            // WATCH both the slot's own row AND the public_id pointer: the uniqueness check reads
-            // `pub_key` here, immediately (not through the pipe, so its result is actually
-            // inspected — a `SETNX` queued inside an `.ignore()`d pipe command would silently
-            // discard the "already claimed" signal, which is exactly the bug this shape avoids). A
-            // concurrent writer claiming this public_id between the read and EXEC touches the
-            // watched `pub_key`, aborting and retrying this whole closure against fresh state.
+            // WATCHed: the owning key's row (a `delete_key` in between must abort this, never slip
+            // under it), the slot's row and the public id pointer.
             let watched = [row_key.as_str(), pub_key.as_str(), key_row.as_str()];
             transaction!(c, &watched, |c, pipe| {
-                owner_is_live(c, &key_row, &secret.meta.key_id).await?;
-                let existing: Option<String> = c.get(&row_key).await?;
-                let mut old_pub: Option<String> = None;
-                let mut old_id: Option<String> = None;
-                if let Some(raw) = &existing {
-                    let cur: CredentialSecret = serde_json::from_str(raw)
-                        .map_err(|_| RedisError::from((ErrorKind::Client, "cred decode")))?;
-                    if cur.meta.revoked_at.is_none() {
-                        if cur.meta.id == secret.meta.id {
-                            // Retry-safe no-op: the slot already holds THIS SAME credential
-                            // (matched by its own id, never reused across mints). This is not a
-                            // genuine second mint attempt — it is `with_conn`'s automatic
-                            // reconnect-and-retry replaying this whole closure after a connection
-                            // blip dropped the reply for an EXEC that had already committed
-                            // server-side. Erroring here would report failure for a write that, in
-                            // fact, already fully succeeded.
-                            pipe.atomic();
-                            return pipe.query(c).await;
-                        }
-                        // Slot occupied by a DIFFERENT live credential — an explicit mint into it
-                        // would silently destroy a working credential mid-overlap-window. Fail
-                        // loud.
-                        return Err(RedisError::from((
-                            ErrorKind::Client,
-                            "put_credential: slot holds a live credential; revoke it first",
-                        )));
-                    }
-                    if cur.meta.id == secret.meta.id {
-                        // A replayed mint must never un-revoke a revoked credential.
-                        return Err(RedisError::refused(format!(
-                            "put_credential: credential {} is revoked; a revoked credential \
-                                 is never re-minted",
-                            secret.meta.id
-                        )));
-                    }
-                    old_pub = Some(cur.meta.public_id);
-                    old_id = Some(cur.meta.id);
-                }
-                // UNIQUE(kind, public_id), enforced by an actual read-and-check (not a discarded
-                // SETNX): if some OTHER slot already holds this public_id, reject before writing
-                // anything. Reclaiming the SAME slot's own previous public_id is fine (that case is
-                // `old_pub == Some(secret.meta.public_id)` and is not a collision).
-                let pub_holder: Option<String> = c.get(&pub_key).await?;
-                if let Some(holder) = &pub_holder {
-                    if *holder != slot_ptr {
-                        return Err(RedisError::from((
-                            ErrorKind::Client,
-                            "put_credential: public_id already claimed by a different credential",
-                        )));
-                    }
-                }
-                let rev = self.next_revision(c).await?;
-                secret.meta.revision = rev;
-                let json = cred_to_json(&secret)
-                    .map_err(|_| RedisError::from((ErrorKind::Client, "cred encode")))?;
-
-                pipe.atomic();
-                if let Some(old_pub) = &old_pub {
-                    if *old_pub != secret.meta.public_id {
-                        pipe.del(cred_pub_key(&secret.meta.kind, old_pub)).ignore();
-                    }
-                }
-                if let Some(old_id) = &old_id {
-                    // Reclaiming this slot with a DIFFERENT credential id: the previous occupant's
-                    // `cred:id:<old_id>` pointer would otherwise keep resolving to this slot
-                    // forever, now holding someone else's row. Left alive, a later call to
-                    // `revoke_credential(old_id)` (an idempotent-retry, or simply a caller that
-                    // still has the old id) would revoke and secret-wipe the NEW, unrelated
-                    // occupant instead of being the no-op the trait's contract promises for a dead
-                    // id. Delete it in the same atomic pipe as the reclaim so the two writes are
-                    // never observed apart.
-                    if *old_id != secret.meta.id {
-                        pipe.del(cred_id_key(old_id)).ignore();
-                    }
-                }
-                pipe.set(&pub_key, &slot_ptr).ignore();
-                pipe.set(&id_key, &slot_ptr).ignore();
-                pipe.set(&row_key, &json).ignore();
-                pipe.sadd(
-                    &ids_key,
-                    format!("{}:{}", secret.meta.kind, secret.meta.slot),
-                )
-                .ignore();
-                pipe.zadd(CREDS_BYREV, &slot_ptr, rev).ignore();
+                owner_is_live(c, &key_row, &m.key_id).await?;
+                let prior = match read_slot(c, secret, "put_credential").await? {
+                    Slot::Replay => return pipe.atomic().query(c).await,
+                    Slot::Free(prior) => prior,
+                };
+                let mut secret = secret.clone();
+                secret.meta.revision = self.next_revision(c).await?;
+                queue_credential(pipe.atomic(), &secret, &prior)?;
                 pipe.query(c).await
             })
         })
@@ -1747,116 +1498,38 @@ impl ValkeyStore {
                 secret.meta.key_id, key.id
             )));
         }
-        // Atomic key+credential mint: WATCH both rows so neither write is observed without the
-        // other. The slot may already hold a credential: a LIVE one refuses the mint, a REVOKED one
-        // is reclaimed with its old pointers deleted, exactly as `put_credential` does.
+        // The atomic mint: `put_key`'s tombstone check and `put_credential`'s slot checks, WATCHing
+        // the key row, the slot's row and the public id pointer.
+        let m = &secret.meta;
         let key_row = format!("{KEY_PREFIX}{}", key.id);
-        let row_key = cred_row_key(&secret.meta.key_id, &secret.meta.kind, secret.meta.slot);
-        let ids_key = cred_ids_key(&secret.meta.key_id);
-        let pub_key = cred_pub_key(&secret.meta.kind, &secret.meta.public_id);
-        let id_key = cred_id_key(&secret.meta.id);
-        let mut key = key.clone();
-        let mut secret = secret.clone();
-        let slot_ptr = format!(
-            "{}:{}:{}",
-            secret.meta.key_id, secret.meta.kind, secret.meta.slot
-        );
+        let row_key = cred_row_key(&m.key_id, &m.kind, m.slot);
+        let pub_key = cred_pub_key(&m.kind, &m.public_id);
         with_conn!(self, |c| {
-            // WATCH the key row, the credential's own row, AND the public_id pointer — a fresh
-            // mint's public_id must not already be claimed (real check, not a discarded SETNX; see
-            // `put_credential`'s identical reasoning).
             transaction!(
                 c,
                 &[key_row.as_str(), row_key.as_str(), pub_key.as_str()],
                 |c, pipe| {
-                    // The tombstone precondition `put_key` enforces, on the atomic mint too: a
-                    // live-shaped key must not clear a stored tombstone.
-                    if key.deleted_at.is_none() {
-                        let prior: Option<String> = c.get(&key_row).await?;
-                        if prior
-                            .as_deref()
-                            .and_then(|r| key_from_json(r).ok())
-                            .is_some_and(|k| k.deleted_at.is_some())
-                        {
-                            return Err(RedisError::refused(format!(
-                                "put_key_with_credential: '{}' is tombstoned and its id is \
-                                     never reissued",
-                                key.id
-                            )));
-                        }
-                    }
-                    // The slot's existing credential row (watched), read as `put_credential` reads
-                    // it: minting into an occupied LIVE slot must fail, never overwrite it.
-                    let existing: Option<String> = c.get(&row_key).await?;
-                    let mut old_pub: Option<String> = None;
-                    let mut old_id: Option<String> = None;
-                    if let Some(raw) = &existing {
-                        let cur: CredentialSecret = serde_json::from_str(raw)
-                            .map_err(|_| RedisError::from((ErrorKind::Client, "cred decode")))?;
-                        if cur.meta.revoked_at.is_none() {
-                            if cur.meta.id == secret.meta.id {
-                                // Retry-safe no-op: `with_conn`'s reconnect-and-retry replaying
-                                // an EXEC that had already committed server-side.
-                                pipe.atomic();
-                                return pipe.query(c).await;
-                            }
-                            return Err(RedisError::from((
-                                ErrorKind::Client,
-                                "put_key_with_credential: slot holds a live credential; revoke it first",
-                            )));
-                        }
-                        if cur.meta.id == secret.meta.id {
-                            // A replayed mint must never un-revoke a revoked credential.
-                            return Err(RedisError::refused(format!(
-                                "put_key_with_credential: credential {} is revoked; a \
-                                     revoked credential is never re-minted",
-                                secret.meta.id
-                            )));
-                        }
-                        old_pub = Some(cur.meta.public_id);
-                        old_id = Some(cur.meta.id);
-                    }
-                    // UNIQUE(kind, public_id): a holder other than this slot is a collision
-                    // (reclaiming this slot's own previous public_id is fine).
-                    let pub_holder: Option<String> = c.get(&pub_key).await?;
-                    if pub_holder.as_ref().is_some_and(|h| *h != slot_ptr) {
-                        return Err(RedisError::from((
-                            ErrorKind::Client,
-                            "put_key_with_credential: public_id already claimed",
+                    if key.deleted_at.is_none() && tombstoned(c, &key_row).await? {
+                        return Err(RedisError::refused(format!(
+                            "put_key_with_credential: '{}' is tombstoned and its id is \
+                                 never reissued",
+                            key.id
                         )));
                     }
-                    let key_rev = self.next_revision(c).await?;
-                    let cred_rev = self.next_revision(c).await?;
-                    key.revision = key_rev;
-                    secret.meta.revision = cred_rev;
+                    let prior = match read_slot(c, secret, "put_key_with_credential").await? {
+                        Slot::Replay => return pipe.atomic().query(c).await,
+                        Slot::Free(prior) => prior,
+                    };
+                    let (mut key, mut secret) = (key.clone(), secret.clone());
+                    key.revision = self.next_revision(c).await?;
+                    secret.meta.revision = self.next_revision(c).await?;
                     let key_json = serde_json::to_string(&key)
                         .map_err(|_| RedisError::from((ErrorKind::Client, "key encode")))?;
-                    let cred_json = cred_to_json(&secret)
-                        .map_err(|_| RedisError::from((ErrorKind::Client, "cred encode")))?;
                     pipe.atomic();
-                    // A revoked occupant's pointers die in the same atomic pipe as the reclaim.
-                    if let Some(old_pub) = &old_pub {
-                        if *old_pub != secret.meta.public_id {
-                            pipe.del(cred_pub_key(&secret.meta.kind, old_pub)).ignore();
-                        }
-                    }
-                    if let Some(old_id) = &old_id {
-                        if *old_id != secret.meta.id {
-                            pipe.del(cred_id_key(old_id)).ignore();
-                        }
-                    }
                     pipe.set(&key_row, &key_json).ignore();
                     pipe.sadd(KEYS_INDEX, &key.id).ignore();
-                    pipe.zadd(KEYS_BYREV, &key.id, key_rev).ignore();
-                    pipe.set(&pub_key, &slot_ptr).ignore();
-                    pipe.set(&id_key, &slot_ptr).ignore();
-                    pipe.set(&row_key, &cred_json).ignore();
-                    pipe.sadd(
-                        &ids_key,
-                        format!("{}:{}", secret.meta.kind, secret.meta.slot),
-                    )
-                    .ignore();
-                    pipe.zadd(CREDS_BYREV, &slot_ptr, cred_rev).ignore();
+                    pipe.zadd(KEYS_BYREV, &key.id, key.revision).ignore();
+                    queue_credential(pipe, &secret, &prior)?;
                     pipe.query(c).await
                 },
             )
@@ -1869,9 +1542,6 @@ impl ValkeyStore {
         key_id: &str,
     ) -> RecordStoreResult<Vec<CredentialMeta>> {
         let members: Vec<String> = with_conn!(self, |c| c.smembers(cred_ids_key(key_id)).await)?;
-        if members.is_empty() {
-            return Ok(Vec::new());
-        }
         let row_keys: Vec<String> = members
             .iter()
             .filter_map(|m| {
@@ -1879,21 +1549,12 @@ impl ValkeyStore {
                 Some(cred_row_key(key_id, kind, slot.parse().ok()?))
             })
             .collect();
-        let raws: Vec<Option<String>> = with_conn!(self, |c| {
-            let mut pipe = pipe();
-            for k in &row_keys {
-                pipe.get(k);
-            }
-            pipe.query(c).await
-        })?;
-        let mut out = Vec::with_capacity(raws.len());
-        for raw in raws.into_iter().flatten() {
-            // Decode the full CredentialSecret, then keep ONLY `.meta` — the secret never leaves
-            // this function's stack. There is no separate on-disk "meta view" to drift from the
-            // real row; this is the one and only decode path for a credential row.
-            out.push(cred_from_json(&raw)?.meta);
-        }
-        Ok(out)
+        // The metadata view is the decoded row minus its secret: there is one decode path.
+        let raws = self.get_all(c, &row_keys).await?;
+        raws.into_iter()
+            .flatten()
+            .map(|r| cred_from_json(&r).map(|c| c.meta))
+            .collect()
     }
 
     pub(crate) async fn revoke_credential(
@@ -1907,19 +1568,13 @@ impl ValkeyStore {
             transaction!(c, &[id_key.as_str()], |c, pipe| {
                 let ptr: Option<String> = c.get(&id_key).await?;
                 let Some(ptr) = ptr else {
-                    // Unknown credential id: an ERROR. The trait's "idempotent" covers revoking an
-                    // ALREADY-REVOKED id, not an id that names nothing — a silent no-op here lets
-                    // an operator responding to a leak believe the credential is dead while it is
-                    // still live and still authenticating.
+                    // Unknown id: an ERROR (only an already-revoked id is an idempotent no-op).
                     return Err(RedisError::refused(format!(
                         "revoke_credential: unknown id '{id}'"
                     )));
                 };
-                // A pointer that exists but does not parse is CORRUPTION, not an unknown id.
-                // Returning Ok here would report a revocation that never happened: the row keeps
-                // its secret, `revoked_at` stays unset, and the credential goes on authenticating
-                // while the audit trail says it was revoked. `delete_key` already fails loud on
-                // the sibling case (see `delete_key_fails_loud_on_a_corrupt_credential_row`).
+                // A pointer that does not parse is corruption: never report a revocation that
+                // did not happen.
                 let Some((key_id, kind, slot)) = parse_slot_pointer(&ptr) else {
                     return Err(RedisError::from((
                         ErrorKind::Client,
@@ -1966,9 +1621,6 @@ impl ValkeyStore {
         let members: Vec<String> = with_conn!(self, |c| c
             .zrangebyscore(CREDS_BYREV, format!("({since}"), "+inf")
             .await)?;
-        if members.is_empty() {
-            return Ok(Vec::new());
-        }
         let row_keys: Vec<String> = members
             .iter()
             .filter_map(|m| {
@@ -1976,32 +1628,10 @@ impl ValkeyStore {
                 Some(cred_row_key(&key_id, &kind, slot))
             })
             .collect();
-        let raws: Vec<Option<String>> = with_conn!(self, |c| {
-            let mut pipe = pipe();
-            for k in &row_keys {
-                pipe.get(k);
-            }
-            pipe.query(c).await
-        })?;
-        // A row that will not decode is SKIPPED, not propagated as an error for the whole call.
-        //
-        // This is the hydration delta, and it is a GLOBAL scan of every credential in the store, so
-        // failing the call on one bad row turns a single corrupt row into a total credential
-        // hydration failure for every key at once — the engine hydrates nothing and no credential
-        // authenticates anywhere. Skipping degrades that to exactly one credential missing.
-        //
-        // Skipping is also the fail-CLOSED direction here, which is why it is safe: a credential
-        // that cannot be decoded cannot be used to authenticate anyone, so omitting it from the
-        // delta denies access rather than granting it. Core's own `load_by_credential` already
-        // takes the same view, skipping credentials it cannot use rather than refusing to load.
-        //
-        // Deliberately NOT the same call as `delete_key`, which fails loud on a corrupt row: there,
-        // continuing would orphan that row's reverse-lookup pointers, so silence would leave the
-        // store inconsistent. Here nothing is written and nothing is left inconsistent.
-        //
-        // Reported through `tracing`: the door's trampoline captures every event a slot body raises
-        // into the plugin's own log (`busbar_contract::abi::sdk::capture`), compiled in or dropped
-        // in. The row key names `key_id:kind:slot` and carries no secret.
+        let raws = self.get_all(c, &row_keys).await?;
+        // A row that does not decode is SKIPPED (and logged; the row key carries no secret): this
+        // global hydration delta must not fail whole on one corrupt row, and omitting a credential
+        // denies access, never grants it. (`delete_key` fails loud instead: it writes.)
         let mut out = Vec::with_capacity(raws.len());
         for (i, raw) in raws.into_iter().enumerate() {
             let Some(raw) = raw else { continue };
@@ -2021,14 +1651,19 @@ impl ValkeyStore {
     }
 
     pub(crate) async fn list_audit(&self, c: &mut Conn) -> RecordStoreResult<Vec<AuditRecord>> {
-        let members: Vec<String> = with_conn!(self, |c| c.zrange(AUDIT_ZSET, 0, -1).await)?;
-        let mut out = Vec::with_capacity(members.len());
-        for m in members {
-            let rec: AuditRecord = serde_json::from_str(&m)
-                .map_err(|e| RecordStoreError(format!("audit decode failed: {e}")))?;
-            out.push(rec);
-        }
-        Ok(out)
+        self.audit_from(c, 0).await
+    }
+
+    /// The audit chain from rank `start` (negative counts from the end) to its end.
+    async fn audit_from(&self, c: &mut Conn, start: isize) -> RecordStoreResult<Vec<AuditRecord>> {
+        let members: Vec<String> = with_conn!(self, |c| c.zrange(AUDIT_ZSET, start, -1).await)?;
+        members
+            .iter()
+            .map(|m| {
+                serde_json::from_str(m)
+                    .map_err(|e| RecordStoreError(format!("audit decode failed: {e}")))
+            })
+            .collect()
     }
 
     pub(crate) async fn list_audit_tail(
@@ -2040,15 +1675,8 @@ impl ValkeyStore {
             // The contract's empty tail; `ZRANGE 0 -1` would be the WHOLE chain.
             return Ok(Vec::new());
         }
-        let start: isize = isize::try_from(limit).map(|n| -n).unwrap_or(isize::MIN);
-        let members: Vec<String> = with_conn!(self, |c| c.zrange(AUDIT_ZSET, start, -1).await)?;
-        let mut out = Vec::with_capacity(members.len());
-        for m in members {
-            let rec: AuditRecord = serde_json::from_str(&m)
-                .map_err(|e| RecordStoreError(format!("audit decode failed: {e}")))?;
-            out.push(rec);
-        }
-        Ok(out)
+        self.audit_from(c, isize::try_from(limit).map(|n| -n).unwrap_or(isize::MIN))
+            .await
     }
 
     pub(crate) async fn add_denylist(
@@ -2071,85 +1699,6 @@ impl ValkeyStore {
 
     pub(crate) async fn list_denylist(&self, c: &mut Conn) -> RecordStoreResult<Vec<String>> {
         with_conn!(self, |c| c.smembers(DENYLIST_INDEX).await)
-    }
-
-    // ── THE NEUTRAL KIND-TAGGED PLANE-RECORD VERBS (1.6.0) ─────────────────────────────────────
-    //
-    // One keyspace per kind, for every kind; the store never decodes a body. See [`plane`] for the
-    // layout and for why each step is a server-side script.
-
-    pub(crate) async fn upsert_plane_record(
-        &self,
-        c: &mut Conn,
-        record: PlaneRecordRef<'_>,
-    ) -> RecordStoreResult<()> {
-        plane::upsert(self, c, record).await
-    }
-
-    pub(crate) async fn get_plane_record(
-        &self,
-        c: &mut Conn,
-        kind: &str,
-        id: &str,
-    ) -> RecordStoreResult<Option<Vec<u8>>> {
-        plane::get(self, c, kind, id).await
-    }
-
-    pub(crate) async fn list_plane_records(
-        &self,
-        c: &mut Conn,
-        kind: &str,
-        selector: &PlaneSelector<'_>,
-    ) -> RecordStoreResult<Vec<Vec<u8>>> {
-        plane::list(self, c, kind, selector).await
-    }
-
-    pub(crate) async fn list_plane_record_parents(
-        &self,
-        c: &mut Conn,
-        kind: &str,
-    ) -> RecordStoreResult<Vec<String>> {
-        plane::parents(self, c, kind).await
-    }
-
-    pub(crate) async fn purge_plane_records_before(
-        &self,
-        c: &mut Conn,
-        kind: &str,
-        before: u64,
-    ) -> RecordStoreResult<u64> {
-        plane::purge_before(self, c, kind, before).await
-    }
-
-    pub(crate) async fn delete_plane_record(
-        &self,
-        c: &mut Conn,
-        kind: &str,
-        id: &str,
-    ) -> RecordStoreResult<()> {
-        plane::delete(self, c, kind, id).await
-    }
-
-    pub(crate) async fn redeem_plane_token(
-        &self,
-        c: &mut Conn,
-        kind: &str,
-        token: &str,
-        expires_at: u64,
-        now: u64,
-    ) -> RecordStoreResult<bool> {
-        plane::redeem_token(self, c, kind, token, expires_at, now).await
-    }
-
-    pub(crate) async fn plane_token_live(
-        &self,
-        c: &mut Conn,
-        kind: &str,
-        token: &str,
-        expires_at: u64,
-        now: u64,
-    ) -> RecordStoreResult<bool> {
-        plane::token_live(self, c, kind, token, expires_at, now).await
     }
 }
 
@@ -2231,13 +1780,16 @@ impl ValkeyStore {
         let secret = url_password(url);
         let target =
             parse_url(url).map_err(|e| scrub(format!("{BAD}: url: {e}"), secret.as_deref()))?;
-        Ok(Self::from_parts(target, secret, timeout))
+        Ok(Self {
+            inner: Arc::new(Inner {
+                target,
+                secret,
+                connect_timeout: timeout,
+                // 1.5.5 kept ONE connection (it had no pool setting).
+                pool: Pool::new(1),
+            }),
+        })
     }
-}
-
-/// The load's refusal for a store that does not connect, in 1.5.5's words.
-fn failed_to_connect(e: &RecordStoreError) -> String {
-    format!("valkey plugin: failed to connect: {}", e.0)
 }
 
 mod slots;
