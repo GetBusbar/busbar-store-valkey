@@ -37,7 +37,7 @@
 //! listing; every listing is re-sorted by the exact `seq` parsed out of `F`, so a `seq` past 2^53
 //! still orders correctly.
 
-use crate::resp::{cmd, pipe, Conn, Script};
+use crate::resp::{cmd, pipe, Conn, Script, ScriptInvocation};
 use crate::{clamp, hex, ValkeyStore};
 use busbar_contract::abi::sdk::store::{OpRefused, OpResult};
 use busbar_contract::abi::store::OP_ID_RETENTION_SECS;
@@ -277,6 +277,28 @@ static PURGE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 // a purge would under-report its count and of a first append would read its own write back as an
 // identical replay. The failure surfaces instead.
 
+/// A write script's call for `record`: `KEYS = rec, body, byts, idx, pcount`; `ARGV = F, sidecar,
+/// body, ts, seq, identity`.
+fn write_call<'s>(
+    script: &'s Script,
+    record: &PlaneRecordRef<'_>,
+) -> RecordStoreResult<ScriptInvocation<'s>> {
+    let keys = Keys::of(record.kind);
+    let ident = identity(record);
+    let mut inv = script.key(&keys.rec);
+    inv.key(&keys.body)
+        .key(&keys.byts)
+        .key(keys.idx(ident))
+        .key(&keys.pcount)
+        .arg(field(record.seq, ident))
+        .arg(sidecar(record)?)
+        .arg(record.body)
+        .arg(clamp(record.ts))
+        .arg(clamp(record.seq))
+        .arg(ident);
+    Ok(inv)
+}
+
 /// Put `record` at its position with `script` ([`UPSERT`] or [`APPEND`]); the script's reply.
 async fn put(
     store: &ValkeyStore,
@@ -284,27 +306,8 @@ async fn put(
     script: &Script,
     record: PlaneRecordRef<'_>,
 ) -> RecordStoreResult<i64> {
-    let keys = Keys::of(record.kind);
-    let ident = identity(&record);
-    let f = field(record.seq, ident);
-    let side = sidecar(&record)?;
-    let idx = keys.idx(ident);
-    with_conn_no_retry!(store, |c| {
-        script
-            .key(&keys.rec)
-            .key(&keys.body)
-            .key(&keys.byts)
-            .key(&idx)
-            .key(&keys.pcount)
-            .arg(&f)
-            .arg(&side)
-            .arg(record.body)
-            .arg(clamp(record.ts))
-            .arg(clamp(record.seq))
-            .arg(ident)
-            .invoke(c)
-            .await
-    })
+    let inv = write_call(script, &record)?;
+    with_conn_no_retry!(store, |c| inv.invoke(c).await)
 }
 
 /// `upsert_plane_record`: UPSERT BY position — a second write for one record replaces it, never
@@ -337,31 +340,10 @@ pub(crate) async fn append_op(
     body: &str,
     record: PlaneRecordRef<'_>,
 ) -> OpResult<()> {
-    let keys = Keys::of(record.kind);
-    let ident = identity(&record);
-    let f = field(record.seq, ident);
-    let side = sidecar(&record).map_err(|e| OpRefused::Failed(e.0))?;
-    let idx = keys.idx(ident);
-    let answer: i64 = with_conn_no_retry!(store, |c| {
-        APPEND_OP
-            .key(&keys.rec)
-            .key(&keys.body)
-            .key(&keys.byts)
-            .key(&idx)
-            .key(&keys.pcount)
-            .key(op_key)
-            .arg(&f)
-            .arg(&side)
-            .arg(record.body)
-            .arg(clamp(record.ts))
-            .arg(clamp(record.seq))
-            .arg(ident)
-            .arg(body)
-            .arg(OP_ID_RETENTION_SECS)
-            .invoke(c)
-            .await
-    })
-    .map_err(|e| OpRefused::Failed(e.0))?;
+    let mut inv = write_call(&APPEND_OP, &record).map_err(|e| OpRefused::Failed(e.0))?;
+    inv.key(op_key).arg(body).arg(OP_ID_RETENTION_SECS);
+    let answer: i64 =
+        with_conn_no_retry!(store, |c| inv.invoke(c).await).map_err(|e| OpRefused::Failed(e.0))?;
     match answer {
         0 => Ok(()),
         1 => Err(OpRefused::Failed(fork(&record).0)),

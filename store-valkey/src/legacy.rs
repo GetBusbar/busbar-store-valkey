@@ -109,48 +109,58 @@ fn decode<T: serde::de::DeserializeOwned>(
     })
 }
 
-fn encode<T: serde::Serialize>(row: &T) -> RecordStoreResult<Vec<u8>> {
-    serde_json::to_vec(row)
-        .map_err(|e| RecordStoreError(format!("v6 -> v7 upgrade: encode a plane body: {e}")))
-}
-
-/// Every key matching `pattern` (a literal prefix plus `*`).
-async fn scan(store: &ValkeyStore, c: &mut Conn, pattern: &str) -> RecordStoreResult<Vec<String>> {
-    with_conn!(store, |c| {
-        c.scan_match::<_, String>(pattern)
-            .await?
-            .collect::<Result<Vec<String>, _>>()
-    })
+/// Copy one v6 row into the plane keyspace as `kind` at `(id, seq)`, unless that position is taken.
+#[allow(clippy::too_many_arguments)]
+async fn copy<T: serde::Serialize>(
+    store: &ValkeyStore,
+    c: &mut Conn,
+    kind: &str,
+    id: String,
+    parent: Option<String>,
+    (seq, ts): (u64, u64),
+    disposition: PlaneDisposition,
+    row: &T,
+) -> RecordStoreResult<()> {
+    let body = serde_json::to_vec(row)
+        .map_err(|e| RecordStoreError(format!("v6 -> v7 upgrade: encode a plane body: {e}")))?;
+    let record = PlaneRecord {
+        kind: kind.into(),
+        id,
+        parent,
+        seq,
+        ts,
+        disposition,
+        body,
+    };
+    plane::append_if_absent(store, c, record.view()).await
 }
 
 /// Run the upgrade. See the module doc.
 pub(crate) async fn migrate_v6_to_v7(store: &ValkeyStore, c: &mut Conn) -> RecordStoreResult<()> {
     // TASK EVENTS first, then tasks: a task's events are in before the task row that owns them, so
     // there is no instant at which a migrated task exists with its chain still behind.
-    for key in scan(store, c, &format!("{TASK_EVENTS_PREFIX}*")).await? {
+    for key in store.scan(c, &format!("{TASK_EVENTS_PREFIX}*")).await? {
         let members: Vec<Vec<u8>> = with_conn!(store, |c| c.zrange(&key, 0, -1).await)?;
         for raw in members {
             let e: rows::TaskEvent = decode("task event", &key, &raw)?;
-            plane::append_if_absent(
+            let (id, at) = (e.task_id.clone(), (e.seq, e.ts));
+            let active = PlaneDisposition::Active;
+            copy(
                 store,
                 c,
-                PlaneRecord {
-                    kind: KIND_TASK_EVENT.into(),
-                    id: e.task_id.clone(),
-                    parent: Some(e.task_id.clone()),
-                    seq: e.seq,
-                    ts: e.ts,
-                    disposition: PlaneDisposition::Active,
-                    body: encode(&e)?,
-                }
-                .view(),
+                KIND_TASK_EVENT,
+                id.clone(),
+                Some(id),
+                at,
+                active,
+                &e,
             )
             .await?;
         }
         with_conn!(store, |c| c.del::<_, ()>(&key).await)?;
     }
 
-    for key in scan(store, c, &format!("{TASK_ROW_PREFIX}*")).await? {
+    for key in store.scan(c, &format!("{TASK_ROW_PREFIX}*")).await? {
         let raw: Option<Vec<u8>> = with_conn!(store, |c| c.get(&key).await)?;
         if let Some(raw) = raw {
             let t: rows::Task = decode("task", &key, &raw)?;
@@ -159,21 +169,8 @@ pub(crate) async fn migrate_v6_to_v7(store: &ValkeyStore, c: &mut Conn) -> Recor
             } else {
                 PlaneDisposition::Active
             };
-            plane::append_if_absent(
-                store,
-                c,
-                PlaneRecord {
-                    kind: KIND_TASK.into(),
-                    id: t.task_id.clone(),
-                    parent: None,
-                    seq: 0,
-                    ts: t.updated_at,
-                    disposition,
-                    body: encode(&t)?,
-                }
-                .view(),
-            )
-            .await?;
+            let (id, at) = (t.task_id.clone(), (0, t.updated_at));
+            copy(store, c, KIND_TASK, id, None, at, disposition, &t).await?;
         }
         with_conn!(store, |c| c.del::<_, ()>(&key).await)?;
     }
@@ -185,28 +182,15 @@ pub(crate) async fn migrate_v6_to_v7(store: &ValkeyStore, c: &mut Conn) -> Recor
         with_conn!(store, |c| c.hgetall(MCP_DEMOTIONS_HASH).await)?;
     for (server, raw) in demotions {
         let d: rows::Demotion = decode("demotion", MCP_DEMOTIONS_HASH, &raw)?;
-        plane::append_if_absent(
-            store,
-            c,
-            PlaneRecord {
-                kind: KIND_DEMOTION.into(),
-                id: server,
-                parent: None,
-                seq: 0,
-                ts: d.recorded_at,
-                disposition: PlaneDisposition::Active,
-                body: encode(&d)?,
-            }
-            .view(),
-        )
-        .await?;
+        let (at, active) = ((0, d.recorded_at), PlaneDisposition::Active);
+        copy(store, c, KIND_DEMOTION, server, None, at, active, &d).await?;
     }
     with_conn!(store, |c| c.del::<_, ()>(MCP_DEMOTIONS_HASH).await)?;
 
     // SPENT APPROVALS: each keeps its own remaining life. A key already past its TTL is gone on the
     // server and needs nothing; one with no TTL (never written by v6, which always set EX) is
     // carried with the ten-year bound the redeem verb applies.
-    for key in scan(store, c, &format!("{ASK_STATE_PREFIX}*")).await? {
+    for key in store.scan(c, &format!("{ASK_STATE_PREFIX}*")).await? {
         let nonce = &key[ASK_STATE_PREFIX.len()..];
         let (value, ttl): (Option<String>, i64) =
             with_conn!(store, |c| pipe().get(&key).ttl(&key).query(c).await)?;
