@@ -1,24 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! **THE PLANE-RECORD KEYSPACE (busbar 1.6.0).** The eight kind-tagged verbs over an opaque
+//! **The plane-record keyspace.** The eight kind-tagged verbs over an opaque
 //! [`PlaneRecord`](busbar_contract::records::PlaneRecord), plus [`RecordStore::plane_token_live`](busbar_contract::records::RecordStore).
 //!
 //! ## Layout
 //!
 //! Every key carries the record KIND as lower-case hex (`K`), so no kind — whatever characters a
 //! plane declares it with — can make one kind's key render as another's. Inside a kind, a record's
-//! POSITION is `(identity, seq)`, where `identity` is its `parent` when it has one (a chain child: a
-//! `task_event`'s task, a `call`'s principal) and its own `id` otherwise (an upserted top-level
-//! record: a `task`, a `demotion`). The position is the hash field `F = "<seq>:<identity>"`: `seq` is
+//! POSITION is `(identity, seq)`, where `identity` is, for an APPENDED record, its `parent` when it
+//! has one (a chain child: a `task_event`'s task, a `call`'s principal) and its own `id` otherwise,
+//! and for an UPSERTED record always its own `id` (a `task`, a `demotion`; the contract upserts by
+//! `(kind, id)`, parent or not). The position is the hash field `F = "<seq>:<identity>"`: `seq` is
 //! digits, so the first `:` always ends it and any identity round-trips.
 //!
 //! - `busbar:plane:K:rec`    HASH  `F` → the typed SIDECAR (see [`sidecar`]); never the body.
 //! - `busbar:plane:K:body`   HASH  `F` → the opaque body, verbatim bytes. The store never decodes it.
 //! - `busbar:plane:K:byts`   ZSET  `F` scored by `ts` — the retention index `purge` reads.
 //! - `busbar:plane:K:idx:I`  ZSET  `F` scored by `seq`, one per identity (`I` = hex identity) — what
-//!   a parent's chain listing and an identity's delete read, so neither scans the kind.
-//! - `busbar:plane:K:pcount` HASH  identity → how many of its records carry a `parent` — the boot
+//!   a parent's chain listing and an identity's delete read, so neither scans the kind. An upserted
+//!   record that names a parent is also on its parent's index (the listing checks the sidecar's
+//!   parent; a delete takes only the positions at its own identity).
+//! - `busbar:plane:K:pcount` HASH  parent → how many records name it as their `parent` — the boot
 //!   enumeration of parents (`list_plane_record_parents`), kept exact by every write and removal.
 //! - `busbar:plane:K:tok:T`  STRING, `SET NX EX` — one redeemed single-use token (`T` = hex token).
 //!
@@ -37,7 +40,7 @@
 //! listing; every listing is re-sorted by the exact `seq` parsed out of `F`, so a `seq` past 2^53
 //! still orders correctly.
 
-use crate::resp::{cmd, pipe, Conn, Script};
+use crate::resp::{cmd, pipe, Conn, Script, ScriptInvocation};
 use crate::{clamp, hex, ValkeyStore};
 use busbar_contract::abi::sdk::store::{OpRefused, OpResult};
 use busbar_contract::abi::store::OP_ID_RETENTION_SECS;
@@ -48,7 +51,7 @@ use busbar_contract::records::{
 /// The kind a purge of which CASCADES: a purged `task` takes its `task_event` chain with it, and only
 /// its own. Nothing else ever removes a task's events, so leaving them would keep chains whose task
 /// no longer exists forever — outliving the retention decision just made about them. (store-sqlite,
-/// store-postgres and store-mysql settle it the same way, and the v6 typed purge here did too.)
+/// store-postgres and store-mysql settle it the same way.)
 pub(crate) const CASCADING_KIND: &str = "task";
 /// The child kind a [`CASCADING_KIND`] purge takes with it.
 const CASCADED_KIND: &str = "task_event";
@@ -96,12 +99,14 @@ fn parse_field(f: &str) -> Option<(u64, &str)> {
     Some((seq.parse().ok()?, identity))
 }
 
-/// A chain position is `(parent, seq)`; a top-level record is its own `id` at `seq`.
+/// An APPENDED record's identity: a chain position is `(parent, seq)`; a top-level record is its
+/// own `id` at `seq`. An UPSERTED record's identity is always its own `id`, parent or not (the
+/// contract upserts by `(kind, id)`); one that names a parent is also on its parent's index.
 fn identity<'a>(record: &PlaneRecordRef<'a>) -> &'a str {
     record.parent.unwrap_or(record.id)
 }
 
-/// THE TYPED SIDECAR — everything about a record except its body, as ONE deterministic string.
+/// The typed sidecar — everything about a record except its body, as ONE deterministic string.
 ///
 /// Two leading flag characters the scripts read without decoding anything: `1`/`0` whether the
 /// record has a `parent` (what [`Keys::pcount`] counts), then `t`/`a` its disposition (what a
@@ -131,32 +136,79 @@ fn sidecar(record: &PlaneRecordRef<'_>) -> RecordStoreResult<String> {
     Ok(format!("{parented}{disposition}{json}"))
 }
 
-/// Shared Lua: `write(rec, body, byts, idx, pcount, F, sidecar, body, ts, seq, identity)` — put the
-/// record at `F`, replacing whatever was there and keeping `pcount` exact across the replacement.
+/// The parent a sidecar names: its JSON after the two flag characters (`None` when the parented
+/// flag is `0`, or the sidecar does not read).
+fn parent_of(side: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Named {
+        parent: Option<String>,
+    }
+    if !side.starts_with('1') {
+        return None;
+    }
+    serde_json::from_str::<Named>(side.get(2..)?).ok()?.parent
+}
+
+/// Shared Lua: a record's PARENT LINK. A record that names a parent is counted under that parent in
+/// `pcount` and listed on the parent's index (`prefix` .. hex parent). For an appended child that
+/// index is its own identity's; an upserted record lives at its own id, so it is on both.
+/// `unlink(pcount, idx, prefix, F, sidecar)` takes the record at `F` (whose own index is `idx`) out
+/// of both; `tohex` spells an identity as its index key does.
+const LUA_LINK: &str = r"
+local function tohex(s)
+    return (string.gsub(s, '.', function(c) return string.format('%02x', string.byte(c)) end))
+end
+local function parent_of(side)
+    if string.sub(side, 1, 1) ~= '1' then
+        return ''
+    end
+    return cjson.decode(string.sub(side, 3)).parent
+end
+local function unlink(pcount, idx, prefix, f, side)
+    local p = parent_of(side)
+    if p == '' then
+        return
+    end
+    if redis.call('HINCRBY', pcount, p, -1) <= 0 then
+        redis.call('HDEL', pcount, p)
+    end
+    local pidx = prefix .. tohex(p)
+    if pidx ~= idx then
+        redis.call('ZREM', pidx, f)
+    end
+end
+";
+
+/// Shared Lua: `write(rec, body, byts, idx, pcount, F, sidecar, body, ts, seq, parent, prefix)` —
+/// put the record at `F` on its own index `idx`, replacing whatever was there, and link it to
+/// `parent` (`''` = none), keeping `pcount` and the parent indexes exact across the replacement.
 const LUA_WRITE: &str = r"
-local function write(rec, body, byts, idx, pcount, f, side, b, ts, seq, ident)
+local function write(rec, body, byts, idx, pcount, f, side, b, ts, seq, parent, prefix)
     local old = redis.call('HGET', rec, f)
-    if old and string.sub(old, 1, 1) == '1' then
-        if redis.call('HINCRBY', pcount, ident, -1) <= 0 then
-            redis.call('HDEL', pcount, ident)
-        end
+    if old then
+        unlink(pcount, idx, prefix, f, old)
     end
     redis.call('HSET', rec, f, side)
     redis.call('HSET', body, f, b)
     redis.call('ZADD', byts, ts, f)
     redis.call('ZADD', idx, seq, f)
-    if string.sub(side, 1, 1) == '1' then
-        redis.call('HINCRBY', pcount, ident, 1)
+    if parent ~= '' then
+        redis.call('HINCRBY', pcount, parent, 1)
+        local pidx = prefix .. tohex(parent)
+        if pidx ~= idx then
+            redis.call('ZADD', pidx, seq, f)
+        end
     end
 end
 ";
 
-/// UPSERT: `KEYS = rec, body, byts, idx, pcount`; `ARGV = F, sidecar, body, ts, seq, identity`.
+/// UPSERT: `KEYS = rec, body, byts, idx, pcount`; `ARGV = F, sidecar, body, ts, seq, parent,
+/// idx_prefix`.
 static UPSERT: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
-        "{LUA_WRITE}
+        "{LUA_LINK}{LUA_WRITE}
         write(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5],
-              ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6])
+              ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6], ARGV[7])
         return 0"
     ))
 });
@@ -165,7 +217,7 @@ static UPSERT: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 /// identical replay (no write), `1` = a DIFFERENT record already holds the position (a fork).
 static APPEND: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
-        "{LUA_WRITE}
+        "{LUA_LINK}{LUA_WRITE}
         local old = redis.call('HGET', KEYS[1], ARGV[1])
         if old then
             if old == ARGV[2] and redis.call('HGET', KEYS[2], ARGV[1]) == ARGV[3] then
@@ -174,24 +226,24 @@ static APPEND: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
             return 1
         end
         write(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5],
-              ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6])
+              ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6], ARGV[7])
         return 0"
     ))
 });
 
 /// APPEND UNDER AN `op_id` (`slots`): [`APPEND`], deduped on the op's record. `KEYS` as
 /// [`APPEND`], then `KEYS[6]` = the op's record (a hash: `b` = the op's value fields, `a` = its
-/// answer); `ARGV` as [`APPEND`], then `ARGV[7]` = the op's value fields, `ARGV[8]` = the record's
+/// answer); `ARGV` as [`APPEND`], then `ARGV[8]` = the op's value fields, `ARGV[9]` = the record's
 /// lifetime in seconds. Returns `0` = written, or nothing to write (the op replayed, or the
 /// identical record already at the position); `1` = a fork; `2` = the op id was used with different
 /// value fields. Only a write records the op, in the same script, so the record and the write are
 /// one step: neither is ever seen without the other.
 static APPEND_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
-        "{LUA_WRITE}
+        "{LUA_LINK}{LUA_WRITE}
         local prior = redis.call('HGET', KEYS[6], 'b')
         if prior then
-            if prior == ARGV[7] then
+            if prior == ARGV[8] then
                 return 0
             end
             return 2
@@ -204,34 +256,42 @@ static APPEND_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
             return 1
         end
         write(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5],
-              ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6])
-        redis.call('HSET', KEYS[6], 'b', ARGV[7], 'a', '')
-        redis.call('EXPIRE', KEYS[6], ARGV[8])
+              ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6], ARGV[7])
+        redis.call('HSET', KEYS[6], 'b', ARGV[8], 'a', '')
+        redis.call('EXPIRE', KEYS[6], ARGV[9])
         return 0"
     ))
 });
 
-/// Shared Lua: `drop_identity(rec, body, byts, pcount, idx, ident)` — remove every record at one
-/// identity (every `seq`), its index and its parent count.
+/// Shared Lua: `drop_identity(rec, body, byts, pcount, idx, ident, prefix)` — remove every record
+/// at one identity (every `seq`) and unlink each from its parent. The identity's index may also
+/// list upserted records that only name it as their parent (they live at their own ids): they stay.
 const LUA_DROP_IDENTITY: &str = r"
-local function drop_identity(rec, body, byts, pcount, idx, ident)
+local function drop_identity(rec, body, byts, pcount, idx, ident, prefix)
     local fs = redis.call('ZRANGE', idx, 0, -1)
+    local n = 0
     for _, f in ipairs(fs) do
-        redis.call('HDEL', rec, f)
-        redis.call('HDEL', body, f)
-        redis.call('ZREM', byts, f)
+        if string.sub(f, string.find(f, ':', 1, true) + 1) == ident then
+            local side = redis.call('HGET', rec, f)
+            if side then
+                unlink(pcount, idx, prefix, f, side)
+            end
+            redis.call('HDEL', rec, f)
+            redis.call('HDEL', body, f)
+            redis.call('ZREM', byts, f)
+            redis.call('ZREM', idx, f)
+            n = n + 1
+        end
     end
-    redis.call('DEL', idx)
-    redis.call('HDEL', pcount, ident)
-    return #fs
+    return n
 end
 ";
 
-/// DELETE one identity: `KEYS = rec, body, byts, pcount, idx`; `ARGV = identity`.
+/// DELETE one identity: `KEYS = rec, body, byts, pcount, idx`; `ARGV = identity, idx_prefix`.
 static DELETE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
-        "{LUA_DROP_IDENTITY}
-        return drop_identity(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5], ARGV[1])"
+        "{LUA_LINK}{LUA_DROP_IDENTITY}
+        return drop_identity(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5], ARGV[1], ARGV[2])"
     ))
 });
 
@@ -240,10 +300,7 @@ static DELETE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 /// cascade_idx_prefix ('' = no cascade)`. Returns how many records OF THE KIND went.
 static PURGE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
-        "{LUA_DROP_IDENTITY}
-        local function tohex(s)
-            return (string.gsub(s, '.', function(c) return string.format('%02x', string.byte(c)) end))
-        end
+        "{LUA_LINK}{LUA_DROP_IDENTITY}
         local removed = 0
         local cands = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', '(' .. ARGV[1])
         for _, f in ipairs(cands) do
@@ -257,14 +314,11 @@ static PURGE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
                 redis.call('HDEL', KEYS[2], f)
                 redis.call('ZREM', KEYS[3], f)
                 redis.call('ZREM', idx, f)
-                if string.sub(side, 1, 1) == '1' then
-                    if redis.call('HINCRBY', KEYS[4], ident, -1) <= 0 then
-                        redis.call('HDEL', KEYS[4], ident)
-                    end
-                end
+                unlink(KEYS[4], idx, ARGV[3], f, side)
                 removed = removed + 1
                 if ARGV[4] ~= '' then
-                    drop_identity(KEYS[5], KEYS[6], KEYS[7], KEYS[8], ARGV[4] .. tohex(ident), ident)
+                    drop_identity(KEYS[5], KEYS[6], KEYS[7], KEYS[8], ARGV[4] .. tohex(ident),
+                                  ident, ARGV[4])
                 end
             end
         end
@@ -277,44 +331,49 @@ static PURGE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 // a purge would under-report its count and of a first append would read its own write back as an
 // identical replay. The failure surfaces instead.
 
-/// Put `record` at its position with `script` ([`UPSERT`] or [`APPEND`]); the script's reply.
+/// A write script's call for `record`: `KEYS = rec, body, byts, idx, pcount`; `ARGV = F, sidecar,
+/// body, ts, seq, identity`.
+fn write_call<'s>(
+    script: &'s Script,
+    record: &PlaneRecordRef<'_>,
+    ident: &str,
+) -> RecordStoreResult<ScriptInvocation<'s>> {
+    let keys = Keys::of(record.kind);
+    let mut inv = script.key(&keys.rec);
+    inv.key(&keys.body)
+        .key(&keys.byts)
+        .key(keys.idx(ident))
+        .key(&keys.pcount)
+        .arg(field(record.seq, ident))
+        .arg(sidecar(record)?)
+        .arg(record.body)
+        .arg(clamp(record.ts))
+        .arg(clamp(record.seq))
+        .arg(record.parent.unwrap_or(""))
+        .arg(&keys.idx_prefix);
+    Ok(inv)
+}
+
+/// Put `record` at `ident`'s position with `script` ([`UPSERT`] or [`APPEND`]); the script's reply.
 async fn put(
     store: &ValkeyStore,
     c: &mut Conn,
     script: &Script,
     record: PlaneRecordRef<'_>,
+    ident: &str,
 ) -> RecordStoreResult<i64> {
-    let keys = Keys::of(record.kind);
-    let ident = identity(&record);
-    let f = field(record.seq, ident);
-    let side = sidecar(&record)?;
-    let idx = keys.idx(ident);
-    with_conn_no_retry!(store, |c| {
-        script
-            .key(&keys.rec)
-            .key(&keys.body)
-            .key(&keys.byts)
-            .key(&idx)
-            .key(&keys.pcount)
-            .arg(&f)
-            .arg(&side)
-            .arg(record.body)
-            .arg(clamp(record.ts))
-            .arg(clamp(record.seq))
-            .arg(ident)
-            .invoke(c)
-            .await
-    })
+    let inv = write_call(script, &record, ident)?;
+    with_conn_no_retry!(store, |c| inv.invoke(c).await)
 }
 
-/// `upsert_plane_record`: UPSERT BY position — a second write for one record replaces it, never
-/// stands a rival beside it.
+/// `upsert_plane_record`: UPSERT BY `(kind, id)`, parent or not — a second write for one id
+/// replaces it, never stands a rival beside it.
 pub(crate) async fn upsert(
     store: &ValkeyStore,
     c: &mut Conn,
     record: PlaneRecordRef<'_>,
 ) -> RecordStoreResult<()> {
-    put(store, c, &UPSERT, record).await.map(|_| ())
+    put(store, c, &UPSERT, record, record.id).await.map(|_| ())
 }
 
 /// The fork refusal: names the position and nothing else — never stored (or caller) content.
@@ -337,31 +396,11 @@ pub(crate) async fn append_op(
     body: &str,
     record: PlaneRecordRef<'_>,
 ) -> OpResult<()> {
-    let keys = Keys::of(record.kind);
-    let ident = identity(&record);
-    let f = field(record.seq, ident);
-    let side = sidecar(&record).map_err(|e| OpRefused::Failed(e.0))?;
-    let idx = keys.idx(ident);
-    let answer: i64 = with_conn_no_retry!(store, |c| {
-        APPEND_OP
-            .key(&keys.rec)
-            .key(&keys.body)
-            .key(&keys.byts)
-            .key(&idx)
-            .key(&keys.pcount)
-            .key(op_key)
-            .arg(&f)
-            .arg(&side)
-            .arg(record.body)
-            .arg(clamp(record.ts))
-            .arg(clamp(record.seq))
-            .arg(ident)
-            .arg(body)
-            .arg(OP_ID_RETENTION_SECS)
-            .invoke(c)
-            .await
-    })
-    .map_err(|e| OpRefused::Failed(e.0))?;
+    let mut inv =
+        write_call(&APPEND_OP, &record, identity(&record)).map_err(|e| OpRefused::Failed(e.0))?;
+    inv.key(op_key).arg(body).arg(OP_ID_RETENTION_SECS);
+    let answer: i64 =
+        with_conn_no_retry!(store, |c| inv.invoke(c).await).map_err(|e| OpRefused::Failed(e.0))?;
     match answer {
         0 => Ok(()),
         1 => Err(OpRefused::Failed(fork(&record).0)),
@@ -377,7 +416,9 @@ pub(crate) async fn append_if_absent(
     c: &mut Conn,
     record: PlaneRecordRef<'_>,
 ) -> RecordStoreResult<()> {
-    put(store, c, &APPEND, record).await.map(|_| ())
+    put(store, c, &APPEND, record, identity(&record))
+        .await
+        .map(|_| ())
 }
 
 /// `get_plane_record`: an upserted record lives at `(id, 0)`. No caller-scoping filter, deliberately:
@@ -445,10 +486,10 @@ pub(crate) async fn list(
                 .zip(sides)
                 .zip(bodies)
                 .filter_map(|((f, side), body)| {
-                    // Only the records whose `parent` IS this parent: an upserted top-level record
-                    // whose own id equals the parent's shares the identity, and is not a child.
+                    // Only the records whose `parent` IS this parent: a record whose own id equals
+                    // the parent's shares its index, and is not a child of it.
                     let side = side?;
-                    if !side.starts_with('1') {
+                    if parent_of(&side).as_deref() != Some(&**parent) {
                         return None;
                     }
                     let (seq, ident) = parse_field(&f)?;
@@ -479,13 +520,24 @@ pub(crate) async fn parents(
     Ok(out)
 }
 
+/// `purge_plane_records_before`, the age-only entry: `task` has always dropped only its TERMINAL
+/// rows here, every other kind every row older than `before`.
+pub(crate) async fn purge_before(
+    store: &ValkeyStore,
+    c: &mut Conn,
+    kind: &str,
+    before: u64,
+) -> RecordStoreResult<u64> {
+    purge(store, c, kind, before, kind == CASCADING_KIND).await
+}
+
 /// `purge_plane_records`: STRICTLY older than the cutoff, and the count actually performed. WHICH
 /// rows go is the rule the call carries (never one inferred from the kind's name), read off the
 /// typed disposition, never out of the body: `terminal_only` drops only TERMINAL rows (an
 /// interrupted task waiting on a human is exactly the row that legitimately sits still longest),
 /// otherwise every row older than `before` goes. A purged `task` takes its `task_event` chain with
 /// it either way.
-pub(crate) async fn purge_before(
+pub(crate) async fn purge(
     store: &ValkeyStore,
     c: &mut Conn,
     kind: &str,
@@ -539,6 +591,7 @@ pub(crate) async fn delete(
             .key(&keys.pcount)
             .key(&idx)
             .arg(id)
+            .arg(&keys.idx_prefix)
             .invoke::<i64>(c)
             .await
     })
@@ -555,7 +608,7 @@ pub(crate) fn token_key(kind: &str, token: &str) -> String {
 /// ledger entry can be bounded without anyone noticing.
 const MAX_TOKEN_TTL_SECS: u64 = 315_360_000; // ten years
 
-/// `redeem_plane_token`: THE TEST AND SET, as ONE `SET NX EX` the server orders against every other
+/// `redeem_plane_token`: the test and set, as ONE `SET NX EX` the server orders against every other
 /// node's. It sets and reports OK, or it finds the key present and reports nil — and that reply IS the
 /// answer, never a prior read. A `GET` followed by a `SET` would tell both halves of a race they were
 /// first, and on this backend a fleet sharing one Valkey is the ORDINARY deployment.

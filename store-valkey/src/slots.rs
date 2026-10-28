@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE STORE V3 DOOR over [`ValkeyStore`]: `store_door!` and the slots the store v3 table adds to
-//! the 1.5.5 op set ([`StoreSlots`]): the `op_id`-carrying writes (the usage and metering batches
+//! The store v3 door over [`ValkeyStore`]: `store_door!` and the slots the store v3 table adds to
+//! the base op set ([`StoreSlots`]): the `op_id`-carrying writes (the usage and metering batches
 //! and the plane-record append) and the kernel's records. The store keeps ledger counts and
 //! records, not money: busbar derives money from the counts and its rate card.
 //!
@@ -19,7 +19,7 @@
 //! atomic step, the Valkey equivalent of the SQL stores' one transaction:
 //!
 //! - the usage and metering batches read nothing, so they watch only the op's record under an
-//!   optimistic `WATCH`/`MULTI`/`EXEC` ([`deduped!`]); a concurrent writer of it aborts the `EXEC`
+//!   optimistic `WATCH`/`MULTI`/`EXEC` (`deduped`); a concurrent writer of it aborts the `EXEC`
 //!   and the whole step re-runs against fresh state. The usage add is the floored-add script
 //!   queued as a plain `EVAL`.
 //! - `append_plane_record` under an `op_id` is one server-side script ([`crate::plane`]), so the
@@ -29,10 +29,10 @@
 //! value fields are a conflict and apply nothing; a refused or failed op writes nothing, its
 //! record included (S3).
 //!
-//! //! ## Every slot is one op through the host's connector
+//! ## Every slot is one op through the host's connector
 //!
 //! Each slot runs its body with the store SDK's `wire::drive_kept` on the store's ONE kept
-//! connection (1.5.5's one mutex-guarded connection): drawn when the op starts (dialled through the
+//! connection: drawn when the op starts (dialled through the
 //! host's connector on the op's ticket when there is none), every command a write and a read that
 //! may PEND (the op answers PENDING and is resumed on the connector's wake), handed back when the op
 //! answers. The body is the blocking client's body, `async`.
@@ -47,9 +47,9 @@ use busbar_contract::records::{
     PlaneSelector, RecordStoreError, RecordStoreResult, UsageDelta, UsageLedger, VirtualKey,
 };
 
-use crate::resp::{cmd, pipe, Conn, RedisResult};
+use crate::resp::{cmd, pipe, Conn, Pipeline, RedisResult};
 use crate::{
-    hex, queue_metering, usage_fields, usage_key, ValkeyStore, ADD_FLOORED_LUA, NAME, NEEDS,
+    hex, plane, queue_metering, usage_fields, usage_key, ValkeyStore, ADD_FLOORED_LUA, NAME, NEEDS,
 };
 
 busbar_contract::store_door!(ValkeyStore, NAME, env!("CARGO_PKG_VERSION"), 64, needs: NEEDS);
@@ -63,78 +63,6 @@ fn op_key(op: OpId) -> String {
 fn records_keys(schema: &str) -> (String, String) {
     let p = format!("busbar:records:{}", hex(schema.as_bytes()));
     (format!("{p}:k"), format!("{p}:v"))
-}
-
-/// How an `op_id` write's refusal type spells the two refusals the dedupe itself answers.
-trait Refusal {
-    /// The same `op_id` with different value fields.
-    fn conflict() -> Self;
-    /// The backend could not run the op; nothing applied.
-    fn backend(text: String) -> Self;
-}
-
-impl Refusal for OpRefused {
-    fn conflict() -> Self {
-        OpRefused::Conflict
-    }
-    fn backend(text: String) -> Self {
-        OpRefused::Failed(text)
-    }
-}
-
-/// What one `op_id` write's effect decided under `WATCH`: its answer (the writes are queued on the
-/// pipe), or the refusal it answers with nothing applied.
-type Decided<E> = RedisResult<Result<String, E>>;
-
-/// Pin an `op_id` write's effect (an async block) to its [`Decided`] shape.
-fn decided<E, F: std::future::Future<Output = Decided<E>>>(f: F) -> F {
-    f
-}
-
-/// RUN ONE `op_id`-CARRYING WRITE (module doc, DEDUPE) on `$c`: `WATCH` the op's record and
-/// `$watch`, answer a recorded op from its record, else run the effect (its reads are watched; it
-/// queues its writes on `$pipe`), then `EXEC` them with the op's record. An `EXEC` a concurrent
-/// writer aborted re-runs the whole step. A lost `EXEC` reply is never retried (it may have
-/// committed): the op fails, and its caller retries under the same `op_id`.
-macro_rules! deduped {
-    ($me:expr, $c:ident, $op:expr, $body:expr, $watch:expr, $E:ty, |$cc:ident, $pipe:ident| $apply:expr) => {{
-        let opk = op_key($op);
-        let body: &str = $body;
-        let mut keys: Vec<String> = Vec::with_capacity($watch.len() + 1);
-        keys.push(opk.clone());
-        keys.extend($watch.iter().cloned());
-        let ran: RedisResult<Result<String, $E>> = transaction!($c, &keys, |$c, tx| {
-            let (b, a): (Option<Vec<u8>>, Option<String>) =
-                cmd("HMGET").arg(&opk).arg("b").arg("a").query($c).await?;
-            if let Some(b) = b {
-                return Ok(Some(if b == body.as_bytes() {
-                    Ok(a.unwrap_or_default())
-                } else {
-                    Err(<$E as Refusal>::conflict())
-                }));
-            }
-            let effect: Decided<$E> = decided(async {
-                let $pipe = &mut *tx;
-                let $cc = &mut *$c;
-                $apply
-            })
-            .await;
-            let answer = match effect? {
-                Ok(a) => a,
-                Err(e) => return Ok(Some(Err(e))),
-            };
-            tx.hset_multiple(&opk, &[("b", body), ("a", answer.as_str())])
-                .ignore()
-                .expire(&opk, OP_ID_RETENTION_SECS as i64)
-                .ignore();
-            let committed: Option<()> = tx.query($c).await?;
-            Ok(committed.map(|()| Ok(answer)))
-        });
-        match ran {
-            Ok(answer) => answer,
-            Err(e) => Err(<$E as Refusal>::backend($me.err(e, "command").0)),
-        }
-    }};
 }
 
 /// RUN `$body` AS ONE OP through the host's connector (module doc) on the store's kept connection:
@@ -161,54 +89,59 @@ macro_rules! op {
     }};
 }
 
-/// A failed connection as a `String` refusal.
-fn text(e: RecordStoreError) -> String {
-    e.0
+/// Slots whose body is `$body(&store, conn, args..)` run as one op ([`op!`]): each argument
+/// the body needs past the call is owned first (`=> to_owned` and the like) and lent back to it.
+macro_rules! ops {
+    ($($name:ident($($arg:ident: $ty:ty $(=> $own:ident)?),*) -> $out:ty = $body:path;)*) => {$(
+        fn $name(&self, cx: &mut Op<'_>, $($arg: $ty),*) -> Step<RecordStoreResult<$out>> {
+            $(let $arg = ops!(@own $arg $($own)?);)*
+            op!(cx, self, Err, |me, c| $body(&me, c, $(ops!(@lend $arg $($own)?)),*).await)
+        }
+    )*};
+    (@own $a:ident) => { $a };
+    (@own $a:ident $own:ident) => { $a.$own() };
+    (@lend $a:ident) => { $a };
+    (@lend $a:ident $own:ident) => { &$a };
 }
 
 impl ValkeyStore {
-    /// Queue `adds`' usage adds (the floored-add script, as a plain `EVAL`) for one `op_id` write.
-    async fn usage_op(
+    /// RUN ONE `op_id`-CARRYING WRITE (module doc, DEDUPE) on `c`: `WATCH` the op's record; a
+    /// recorded op answers from it (a replay, or a conflict on different value fields); else `queue`
+    /// puts the effect on the atomic pipeline, `EXEC`ed with the op's record. An `EXEC` a concurrent
+    /// writer aborted re-runs the whole step. A lost `EXEC` reply is never retried (it may have
+    /// committed): the op fails, and its caller retries under the same `op_id`.
+    async fn deduped(
         &self,
         c: &mut Conn,
         op: OpId,
         body: &str,
-        adds: &[(String, Vec<(String, i64)>)],
+        queue: impl Fn(&mut Pipeline),
     ) -> OpResult<()> {
-        let none: [String; 0] = [];
-        deduped!(self, c, op, body, none, OpRefused, |c, pipe| {
-            let _ = &c;
-            for (key, fields) in adds {
-                let eval = pipe.cmd("EVAL").arg(ADD_FLOORED_LUA).arg(1).arg(key);
-                for (f, d) in fields {
-                    eval.arg(f).arg(*d);
-                }
-                eval.ignore();
+        let opk = op_key(op);
+        let ran: RedisResult<OpResult<()>> = transaction!(c, &[opk.as_str()], |c, tx| {
+            let recorded: Option<Vec<u8>> = cmd("HGET").arg(&opk).arg("b").query(c).await?;
+            if let Some(b) = recorded {
+                return Ok(Some(if b == body.as_bytes() {
+                    Ok(())
+                } else {
+                    Err(OpRefused::Conflict)
+                }));
             }
-            Ok(Ok(String::new()))
-        })
-        .map(drop)
+            queue(tx);
+            tx.hset_multiple(&opk, &[("b", body), ("a", "")])
+                .ignore()
+                .expire(&opk, OP_ID_RETENTION_SECS as i64)
+                .ignore();
+            let committed: Option<()> = tx.query(c).await?;
+            Ok(committed.map(Ok))
+        });
+        ran.unwrap_or_else(|e| Err(OpRefused::Failed(self.err(e, "command").0)))
     }
 
-    /// Queue every metering delta of `deltas` for one `op_id` write.
-    async fn metering_op(
-        &self,
-        c: &mut Conn,
-        op: OpId,
-        body: &str,
-        deltas: &[MeteringDelta],
-    ) -> OpResult<()> {
-        let none: [String; 0] = [];
-        deduped!(self, c, op, body, none, OpRefused, |c, pipe| {
-            let _ = &c;
-            for d in deltas {
-                queue_metering(pipe, d);
-            }
-            Ok(Ok(String::new()))
-        })
-        .map(drop)
-    }
-
+    /// `record_put` (slot 40): an upsert on `(schema, key)`. An EMPTY value removes the row:
+    /// it is the host's strike, so the key leaves both the ordered key set and the values,
+    /// `record_get` then answers `None` and `record_scan` never returns it.
+    /// Removing a row that is not there is `Ok`.
     async fn v3_record_put(
         &self,
         c: &mut Conn,
@@ -217,7 +150,6 @@ impl ValkeyStore {
         value: &[u8],
     ) -> Result<(), String> {
         let (k, v) = records_keys(schema);
-        // AN EMPTY VALUE REMOVES THE ROW (abi/store slot 26 `record_put`).
         if value.is_empty() {
             return with_conn!(self, |c| {
                 pipe()
@@ -338,7 +270,7 @@ impl StoreSlots for ValkeyStore {
             Box::pin(async move {
                 me.connect_step(w)
                     .await
-                    .map_err(|e| crate::failed_to_connect(&e))
+                    .map_err(|e| format!("valkey plugin: failed to connect: {}", e.0))
             })
         })
     }
@@ -351,9 +283,12 @@ impl StoreSlots for ValkeyStore {
     ) -> Step<OpResult<()>> {
         let body = format!("append_plane_record:{record:?}");
         let record = record.to_record();
-        op!(cx, self, |e| Err(OpRefused::Failed(text(e))), |me, c| {
-            crate::plane::append_op(&me, c, &op_key(op), &body, record.view()).await
-        })
+        op!(
+            cx,
+            self,
+            |e: RecordStoreError| Err(OpRefused::Failed(e.0)),
+            |me, c| crate::plane::append_op(&me, c, &op_key(op), &body, record.view()).await
+        )
     }
 
     fn record_put(
@@ -364,7 +299,7 @@ impl StoreSlots for ValkeyStore {
         value: &[u8],
     ) -> Step<Result<(), String>> {
         let (schema, key, value) = (schema.to_string(), key.to_vec(), value.to_vec());
-        op!(cx, self, |e| Err(text(e)), |me, c| me
+        op!(cx, self, |e: RecordStoreError| Err(e.0), |me, c| me
             .v3_record_put(c, &schema, &key, &value)
             .await)
     }
@@ -376,7 +311,7 @@ impl StoreSlots for ValkeyStore {
         key: &[u8],
     ) -> Step<Result<Option<RecordBytes>, String>> {
         let (schema, key) = (schema.to_string(), key.to_vec());
-        op!(cx, self, |e| Err(text(e)), |me, c| me
+        op!(cx, self, |e: RecordStoreError| Err(e.0), |me, c| me
             .v3_record_get(c, &schema, &key)
             .await)
     }
@@ -389,7 +324,7 @@ impl StoreSlots for ValkeyStore {
         limit: u32,
     ) -> Step<Result<Scanned, String>> {
         let (schema, prefix) = (schema.to_string(), prefix.to_vec());
-        op!(cx, self, |e| Err(text(e)), |me, c| me
+        op!(cx, self, |e: RecordStoreError| Err(e.0), |me, c| me
             .v3_record_scan(c, &schema, &prefix, limit)
             .await)
     }
@@ -402,9 +337,23 @@ impl StoreSlots for ValkeyStore {
     ) -> Step<OpResult<()>> {
         let body = format!("add_usage_batch:{cells:?}");
         let adds = usage_adds(cells.iter().map(|(b, w, d)| (*b, *w, d)));
-        op!(cx, self, |e| Err(OpRefused::Failed(text(e))), |me, c| me
-            .usage_op(c, op, &body, &adds)
-            .await)
+        op!(
+            cx,
+            self,
+            |e: RecordStoreError| Err(OpRefused::Failed(e.0)),
+            |me, c| {
+                me.deduped(c, op, &body, |pipe| {
+                    for (key, fields) in &adds {
+                        let eval = pipe.cmd("EVAL").arg(ADD_FLOORED_LUA).arg(1).arg(key);
+                        for (f, d) in fields {
+                            eval.arg(f).arg(*d);
+                        }
+                        eval.ignore();
+                    }
+                })
+                .await
+            }
+        )
     }
 
     fn add_metering_batch(
@@ -415,151 +364,57 @@ impl StoreSlots for ValkeyStore {
     ) -> Step<OpResult<()>> {
         let body = format!("add_metering_batch:{deltas:?}");
         let deltas = deltas.to_vec();
-        op!(cx, self, |e| Err(OpRefused::Failed(text(e))), |me, c| me
-            .metering_op(c, op, &body, &deltas)
-            .await)
+        op!(
+            cx,
+            self,
+            |e: RecordStoreError| Err(OpRefused::Failed(e.0)),
+            |me, c| {
+                me.deduped(c, op, &body, |pipe| {
+                    deltas.iter().for_each(|d| queue_metering(pipe, d))
+                })
+                .await
+            }
+        )
     }
 
-    // ── the 1.5.5 op set: each body is the store's own (`lib.rs`), run as one op ──────────────
-
-    fn put_key(&self, cx: &mut Op<'_>, key: &VirtualKey) -> Step<RecordStoreResult<()>> {
-        let key = key.clone();
-        op!(cx, self, Err, |me, c| me.put_key(c, &key).await)
-    }
-
-    fn get_key(&self, cx: &mut Op<'_>, id: &str) -> Step<RecordStoreResult<Option<VirtualKey>>> {
-        let id = id.to_string();
-        op!(cx, self, Err, |me, c| me.get_key(c, &id).await)
-    }
-
-    fn list_keys(&self, cx: &mut Op<'_>) -> Step<RecordStoreResult<Vec<VirtualKey>>> {
-        op!(cx, self, Err, |me, c| me.list_keys(c).await)
-    }
-
-    fn delete_key(&self, cx: &mut Op<'_>, id: &str) -> Step<RecordStoreResult<()>> {
-        let id = id.to_string();
-        op!(cx, self, Err, |me, c| me.delete_key(c, &id).await)
-    }
-
-    fn list_keys_since(
-        &self,
-        cx: &mut Op<'_>,
-        since: u64,
-    ) -> Step<RecordStoreResult<Vec<VirtualKey>>> {
-        op!(cx, self, Err, |me, c| me.list_keys_since(c, since).await)
-    }
-
-    fn get_usage(
-        &self,
-        cx: &mut Op<'_>,
-        bucket_id: &str,
-        window_start: u64,
-    ) -> Step<RecordStoreResult<UsageLedger>> {
-        let bucket_id = bucket_id.to_string();
-        op!(cx, self, Err, |me, c| me
-            .get_usage(c, &bucket_id, window_start)
-            .await)
-    }
-
-    fn put_usage(
-        &self,
-        cx: &mut Op<'_>,
-        bucket_id: &str,
-        window_start: u64,
-        ledger: &UsageLedger,
-    ) -> Step<RecordStoreResult<()>> {
-        let (bucket_id, ledger) = (bucket_id.to_string(), ledger.clone());
-        op!(cx, self, Err, |me, c| me
-            .put_usage(c, &bucket_id, window_start, &ledger)
-            .await)
-    }
-
-    fn list_metering(
-        &self,
-        cx: &mut Op<'_>,
-        bucket: u64,
-    ) -> Step<RecordStoreResult<Vec<MeteringRow>>> {
-        op!(cx, self, Err, |me, c| me.list_metering(c, bucket).await)
-    }
-
-    fn put_credential(
-        &self,
-        cx: &mut Op<'_>,
-        secret: &CredentialSecret,
-    ) -> Step<RecordStoreResult<()>> {
-        let secret = secret.clone();
-        op!(cx, self, Err, |me, c| me.put_credential(c, &secret).await)
-    }
-
-    fn put_key_with_credential(
-        &self,
-        cx: &mut Op<'_>,
-        key: &VirtualKey,
-        secret: &CredentialSecret,
-    ) -> Step<RecordStoreResult<()>> {
-        let (key, secret) = (key.clone(), secret.clone());
-        op!(cx, self, Err, |me, c| me
-            .put_key_with_credential(c, &key, &secret)
-            .await)
-    }
-
-    fn list_credentials(
-        &self,
-        cx: &mut Op<'_>,
-        key_id: &str,
-    ) -> Step<RecordStoreResult<Vec<CredentialMeta>>> {
-        let key_id = key_id.to_string();
-        op!(cx, self, Err, |me, c| me.list_credentials(c, &key_id).await)
-    }
-
-    fn revoke_credential(
-        &self,
-        cx: &mut Op<'_>,
-        id: &str,
-        reason: &str,
-    ) -> Step<RecordStoreResult<()>> {
-        let (id, reason) = (id.to_string(), reason.to_string());
-        op!(cx, self, Err, |me, c| me
-            .revoke_credential(c, &id, &reason)
-            .await)
-    }
-
-    fn list_credentials_since(
-        &self,
-        cx: &mut Op<'_>,
-        since: u64,
-    ) -> Step<RecordStoreResult<Vec<CredentialSecret>>> {
-        op!(cx, self, Err, |me, c| me
-            .list_credentials_since(c, since)
-            .await)
-    }
-
-    fn list_audit(&self, cx: &mut Op<'_>) -> Step<RecordStoreResult<Vec<AuditRecord>>> {
-        op!(cx, self, Err, |me, c| me.list_audit(c).await)
-    }
-
-    fn add_denylist(
-        &self,
-        cx: &mut Op<'_>,
-        sub: &str,
-        reason: &str,
-    ) -> Step<RecordStoreResult<()>> {
-        let (sub, reason) = (sub.to_string(), reason.to_string());
-        op!(cx, self, Err, |me, c| me
-            .add_denylist(c, &sub, &reason)
-            .await)
-    }
-
-    fn list_denylist(&self, cx: &mut Op<'_>) -> Step<RecordStoreResult<Vec<String>>> {
-        op!(cx, self, Err, |me, c| me.list_denylist(c).await)
-    }
-
-    fn list_audit_tail(
-        &self,
-        cx: &mut Op<'_>,
-        limit: u64,
-    ) -> Step<RecordStoreResult<Vec<AuditRecord>>> {
-        op!(cx, self, Err, |me, c| me.list_audit_tail(c, limit).await)
+    // The base op set and the plane verbs: each body is the store's own, run as one op.
+    ops! {
+        put_key(key: &VirtualKey => clone) -> () = ValkeyStore::put_key;
+        get_key(id: &str => to_owned) -> Option<VirtualKey> = ValkeyStore::get_key;
+        list_keys() -> Vec<VirtualKey> = ValkeyStore::list_keys;
+        delete_key(id: &str => to_owned) -> () = ValkeyStore::delete_key;
+        list_keys_since(since: u64) -> Vec<VirtualKey> = ValkeyStore::list_keys_since;
+        get_usage(bucket_id: &str => to_owned, window_start: u64) -> UsageLedger
+            = ValkeyStore::get_usage;
+        put_usage(bucket_id: &str => to_owned, window_start: u64, ledger: &UsageLedger => clone)
+            -> () = ValkeyStore::put_usage;
+        list_metering(bucket: u64) -> Vec<MeteringRow> = ValkeyStore::list_metering;
+        put_credential(secret: &CredentialSecret => clone) -> () = ValkeyStore::put_credential;
+        put_key_with_credential(key: &VirtualKey => clone, secret: &CredentialSecret => clone)
+            -> () = ValkeyStore::put_key_with_credential;
+        list_credentials(key_id: &str => to_owned) -> Vec<CredentialMeta>
+            = ValkeyStore::list_credentials;
+        revoke_credential(id: &str => to_owned, reason: &str => to_owned) -> ()
+            = ValkeyStore::revoke_credential;
+        list_credentials_since(since: u64) -> Vec<CredentialSecret>
+            = ValkeyStore::list_credentials_since;
+        list_audit() -> Vec<AuditRecord> = ValkeyStore::list_audit;
+        add_denylist(sub: &str => to_owned, reason: &str => to_owned) -> ()
+            = ValkeyStore::add_denylist;
+        list_denylist() -> Vec<String> = ValkeyStore::list_denylist;
+        list_audit_tail(limit: u64) -> Vec<AuditRecord> = ValkeyStore::list_audit_tail;
+        get_plane_record(kind: &str => to_owned, id: &str => to_owned) -> Option<Vec<u8>>
+            = plane::get;
+        list_plane_records(kind: &str => to_owned, selector: &PlaneSelector<'_> => to_static)
+            -> Vec<Vec<u8>> = plane::list;
+        list_plane_record_parents(kind: &str => to_owned) -> Vec<String> = plane::parents;
+        purge_plane_records_before(kind: &str => to_owned, before: u64) -> u64
+            = plane::purge_before;
+        delete_plane_record(kind: &str => to_owned, id: &str => to_owned) -> () = plane::delete;
+        redeem_plane_token(kind: &str => to_owned, token: &str => to_owned, expires_at: u64, now: u64)
+            -> bool = plane::redeem_token;
+        plane_token_live(kind: &str => to_owned, token: &str => to_owned, expires_at: u64, now: u64)
+            -> bool = plane::token_live;
     }
 
     fn upsert_plane_record(
@@ -568,43 +423,7 @@ impl StoreSlots for ValkeyStore {
         record: PlaneRecordRef<'_>,
     ) -> Step<RecordStoreResult<()>> {
         let record = record.to_record();
-        op!(cx, self, Err, |me, c| me
-            .upsert_plane_record(c, record.view())
-            .await)
-    }
-
-    fn get_plane_record(
-        &self,
-        cx: &mut Op<'_>,
-        kind: &str,
-        id: &str,
-    ) -> Step<RecordStoreResult<Option<Vec<u8>>>> {
-        let (kind, id) = (kind.to_string(), id.to_string());
-        op!(cx, self, Err, |me, c| me
-            .get_plane_record(c, &kind, &id)
-            .await)
-    }
-
-    fn list_plane_records(
-        &self,
-        cx: &mut Op<'_>,
-        kind: &str,
-        selector: &PlaneSelector<'_>,
-    ) -> Step<RecordStoreResult<Vec<Vec<u8>>>> {
-        let (kind, selector) = (kind.to_string(), selector.to_static());
-        op!(cx, self, Err, |me, c| me
-            .list_plane_records(c, &kind, &selector)
-            .await)
-    }
-
-    fn list_plane_record_parents(
-        &self,
-        cx: &mut Op<'_>,
-        kind: &str,
-    ) -> Step<RecordStoreResult<Vec<String>>> {
-        let kind = kind.to_string();
-        op!(cx, self, Err, |me, c| me
-            .list_plane_record_parents(c, &kind)
+        op!(cx, self, Err, |me, c| plane::upsert(&me, c, record.view())
             .await)
     }
 
@@ -616,61 +435,15 @@ impl StoreSlots for ValkeyStore {
         retention: busbar_contract::records::Retention,
     ) -> Step<RecordStoreResult<u64>> {
         let kind = kind.to_string();
-        op!(cx, self, Err, |me, c| me
-            .purge_plane_records(c, &kind, before, retention)
-            .await)
-    }
-
-    fn purge_plane_records_before(
-        &self,
-        cx: &mut Op<'_>,
-        kind: &str,
-        before: u64,
-    ) -> Step<RecordStoreResult<u64>> {
-        let kind = kind.to_string();
-        op!(cx, self, Err, |me, c| me
-            .purge_plane_records_before(c, &kind, before)
-            .await)
-    }
-
-    fn delete_plane_record(
-        &self,
-        cx: &mut Op<'_>,
-        kind: &str,
-        id: &str,
-    ) -> Step<RecordStoreResult<()>> {
-        let (kind, id) = (kind.to_string(), id.to_string());
-        op!(cx, self, Err, |me, c| me
-            .delete_plane_record(c, &kind, &id)
-            .await)
-    }
-
-    fn redeem_plane_token(
-        &self,
-        cx: &mut Op<'_>,
-        kind: &str,
-        token: &str,
-        expires_at: u64,
-        now: u64,
-    ) -> Step<RecordStoreResult<bool>> {
-        let (kind, token) = (kind.to_string(), token.to_string());
-        op!(cx, self, Err, |me, c| me
-            .redeem_plane_token(c, &kind, &token, expires_at, now)
-            .await)
-    }
-
-    fn plane_token_live(
-        &self,
-        cx: &mut Op<'_>,
-        kind: &str,
-        token: &str,
-        expires_at: u64,
-        now: u64,
-    ) -> Step<RecordStoreResult<bool>> {
-        let (kind, token) = (kind.to_string(), token.to_string());
-        op!(cx, self, Err, |me, c| me
-            .plane_token_live(c, &kind, &token, expires_at, now)
-            .await)
+        let terminal_only = retention == busbar_contract::records::Retention::TerminalOnly;
+        op!(cx, self, Err, |me, c| plane::purge(
+            &me,
+            c,
+            &kind,
+            before,
+            terminal_only
+        )
+        .await)
     }
 }
 

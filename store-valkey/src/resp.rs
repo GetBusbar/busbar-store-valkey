@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! A RESP2 CLIENT OVER THE HOST'S CONNECTOR: the subset of the Valkey protocol this store speaks,
+//! A RESP2 client over the host's connector: the subset of the Valkey protocol this store speaks,
 //! sans-IO. Every byte goes out and comes back through the op's one connection (the store SDK's
 //! [`Wire`]); this module only encodes commands, parses replies and converts them to Rust values.
 //! No socket, no TLS stack and no runtime of its own: the host's connector owns all three.
@@ -15,8 +15,6 @@ use std::future::Future;
 
 use busbar_contract::abi::sdk::conn::ConnFailure;
 use busbar_contract::abi::sdk::store::wire::Wire;
-
-// ── errors ───────────────────────────────────────────────────────────────────────────────────
 
 /// What kind of failure a [`RedisError`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,8 +55,8 @@ impl RedisError {
     }
 
     /// A CONNECTION-LEVEL failure (the connector's: dropped, refused, timed out; or the server
-    /// closing), worth one reconnect-and-retry, as the upstream driver's `is_io_error` /
-    /// `is_connection_dropped` / `is_connection_refusal` / `is_timeout` were for 1.5.5.
+    /// closing), worth one reconnect-and-retry (the upstream driver's `is_io_error` /
+    /// `is_connection_dropped` / `is_connection_refusal` / `is_timeout`).
     #[must_use]
     pub fn is_connection_error(&self) -> bool {
         matches!(self.repr, Repr::Io(_))
@@ -123,8 +121,6 @@ impl std::error::Error for RedisError {}
 
 /// A command's result.
 pub type RedisResult<T> = Result<T, RedisError>;
-
-// ── values ───────────────────────────────────────────────────────────────────────────────────
 
 /// One RESP2 reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,8 +225,6 @@ pub fn encode(args: &[Vec<u8>], out: &mut Vec<u8>) {
     }
 }
 
-// ── arguments ────────────────────────────────────────────────────────────────────────────────
-
 /// What a command argument writes: one or more bulk strings.
 pub trait ToArgs {
     /// Append this argument's bulk strings.
@@ -305,14 +299,6 @@ impl<A: ToArgs, B: ToArgs> ToArgs for (A, B) {
     }
 }
 
-fn args_of<T: ToArgs>(t: T) -> Vec<Vec<u8>> {
-    let mut v = Vec::new();
-    t.write_args(&mut v);
-    v
-}
-
-// ── conversions ──────────────────────────────────────────────────────────────────────────────
-
 /// A Rust value a reply converts to (the upstream driver's conversions, as the store used them).
 pub trait FromValue: Sized {
     /// Convert one reply.
@@ -336,12 +322,6 @@ pub trait FromValue: Sized {
     /// The bytes back, for the caller to convert as one item.
     fn from_bytes(bytes: Vec<u8>) -> Result<Vec<Self>, Vec<u8>> {
         Err(bytes)
-    }
-}
-
-impl FromValue for Value {
-    fn from_value(v: Value) -> RedisResult<Self> {
-        Ok(v)
     }
 }
 
@@ -378,7 +358,7 @@ macro_rules! numeric_from {
         }
     )*};
 }
-numeric_from!(i64, u64, i32, u32, usize, isize);
+numeric_from!(i64, u64, u32);
 
 impl FromValue for u8 {
     fn from_value(v: Value) -> RedisResult<Self> {
@@ -391,19 +371,6 @@ impl FromValue for u8 {
 
     fn from_bytes(bytes: Vec<u8>) -> Result<Vec<Self>, Vec<u8>> {
         Ok(bytes)
-    }
-}
-
-impl FromValue for bool {
-    fn from_value(v: Value) -> RedisResult<Self> {
-        match &v {
-            Value::Nil => Ok(false),
-            Value::Int(i) => Ok(*i != 0),
-            Value::Status(s) if s == "OK" => Ok(true),
-            Value::Data(b) if b == b"1" => Ok(true),
-            Value::Data(b) if b == b"0" => Ok(false),
-            _ => Err(RedisError::type_error(format!("(response was {v:?})"))),
-        }
     }
 }
 
@@ -466,24 +433,6 @@ impl<A: FromValue, B: FromValue> FromValue for (A, B) {
         Ok(out)
     }
 }
-
-impl<A: FromValue, B: FromValue, C: FromValue> FromValue for (A, B, C) {
-    fn from_value(v: Value) -> RedisResult<Self> {
-        match v {
-            Value::Array(items) if items.len() == 3 => {
-                let mut it = items.into_iter();
-                Ok((
-                    A::from_value(it.next().unwrap_or(Value::Nil))?,
-                    B::from_value(it.next().unwrap_or(Value::Nil))?,
-                    C::from_value(it.next().unwrap_or(Value::Nil))?,
-                ))
-            }
-            other => Err(RedisError::type_error(format!("a triple from {other:?}"))),
-        }
-    }
-}
-
-// ── the connection ───────────────────────────────────────────────────────────────────────────
 
 /// ONE OP'S CONNECTION to the server, over its [`Wire`].
 #[derive(Debug)]
@@ -675,33 +624,25 @@ impl Conn {
         cmd("INCRBY").arg(key).arg(delta).query(self).await
     }
 
-    /// Every key matching `pattern` (`SCAN ... MATCH`, followed to the end), as the upstream
-    /// driver's iterator of results.
-    pub async fn scan_match<P: ToArgs, RV: FromValue>(
-        &mut self,
-        pattern: P,
-    ) -> RedisResult<std::vec::IntoIter<RedisResult<RV>>> {
-        let pattern = args_of(pattern);
+    /// Every key matching `pattern` (`SCAN ... MATCH`, followed to the end).
+    pub async fn scan_match(&mut self, pattern: &str) -> RedisResult<Vec<String>> {
         let mut cursor = String::from("0");
         let mut out = Vec::new();
         loop {
-            let (next, keys): (String, Vec<Value>) = cmd("SCAN")
+            let (next, keys): (String, Vec<String>) = cmd("SCAN")
                 .arg(&cursor)
                 .arg("MATCH")
-                .arg(&pattern)
+                .arg(pattern)
                 .query(self)
                 .await?;
-            out.extend(keys.into_iter().map(RV::from_value));
+            out.extend(keys);
             if next == "0" {
-                break;
+                return Ok(out);
             }
             cursor = next;
         }
-        Ok(out.into_iter())
     }
 }
-
-// ── commands ─────────────────────────────────────────────────────────────────────────────────
 
 /// One command.
 #[derive(Debug, Clone, Default)]
@@ -740,8 +681,6 @@ impl Cmd {
         c.request(self.args.clone()).await.map(drop)
     }
 }
-
-// ── pipelines ────────────────────────────────────────────────────────────────────────────────
 
 /// Several commands in one write; atomic ([`Pipeline::atomic`]) as `MULTI`/`EXEC`.
 #[derive(Debug, Clone, Default)]
@@ -882,8 +821,6 @@ impl Pipeline {
     }
 }
 
-// ── scripts ──────────────────────────────────────────────────────────────────────────────────
-
 /// A Lua script, run as `EVAL` (its source travels with each call: no script cache to miss).
 #[derive(Debug, Clone)]
 pub struct Script {
@@ -947,14 +884,12 @@ impl ScriptInvocation<'_> {
     }
 }
 
-// ── transactions ─────────────────────────────────────────────────────────────────────────────
-
 /// Pin an async block's output to a command result (so `?` inside it knows its error type).
 pub fn rr<T, F: Future<Output = RedisResult<T>>>(f: F) -> F {
     f
 }
 
-/// THE OPTIMISTIC TRANSACTION, as the upstream driver's `transaction`: `WATCH` the keys, run the
+/// The optimistic transaction, as the upstream driver's `transaction`: `WATCH` the keys, run the
 /// body (it reads, and queues its writes on the atomic pipeline it is handed, then answers that
 /// pipeline's `query`: `None` when a watched key changed and `EXEC` aborted), and run it all again
 /// on an abort. Evaluates to the body's `Some` value, or its error (a `WATCH` left in force by a
@@ -1000,6 +935,12 @@ macro_rules! transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args_of<T: ToArgs>(t: T) -> Vec<Vec<u8>> {
+        let mut v = Vec::new();
+        t.write_args(&mut v);
+        v
+    }
 
     #[test]
     fn parses_every_reply_type_and_waits_for_a_whole_one() {
