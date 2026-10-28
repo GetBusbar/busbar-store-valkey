@@ -75,3 +75,17 @@ fn the_key_field_and_token_layouts_are_pinned() {
     assert_eq!(k.idx("ab"), "busbar:plane:7461736b:idx:6162");
     assert_eq!(token_key("task", "n"), "busbar:plane:7461736b:tok:6e");
 }
+
+/// The parent the listing checks is the one the sidecar names, and only when it is flagged
+/// parented: a record whose own id is a parent's name is not that parent's child.
+#[test]
+fn a_sidecar_names_its_parent() {
+    let child = rec("task", "t1", Some("ctx"), 0, PlaneDisposition::Active);
+    assert_eq!(
+        parent_of(&sidecar(&child.view()).unwrap()),
+        Some("ctx".to_string())
+    );
+    let top = rec("task", "ctx", None, 0, PlaneDisposition::Active);
+    assert_eq!(parent_of(&sidecar(&top.view()).unwrap()), None);
+    assert_eq!(parent_of("1a{not json"), None);
+}
