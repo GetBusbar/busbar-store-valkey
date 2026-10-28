@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! A RESP2 CLIENT OVER THE HOST'S CONNECTOR: the subset of the Valkey protocol this store speaks,
+//! A RESP2 client over the host's connector: the subset of the Valkey protocol this store speaks,
 //! sans-IO. Every byte goes out and comes back through the op's one connection (the store SDK's
 //! [`Wire`]); this module only encodes commands, parses replies and converts them to Rust values.
 //! No socket, no TLS stack and no runtime of its own: the host's connector owns all three.
@@ -15,8 +15,6 @@ use std::future::Future;
 
 use busbar_contract::abi::sdk::conn::ConnFailure;
 use busbar_contract::abi::sdk::store::wire::Wire;
-
-// ── errors ───────────────────────────────────────────────────────────────────────────────────
 
 /// What kind of failure a [`RedisError`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,8 +55,8 @@ impl RedisError {
     }
 
     /// A CONNECTION-LEVEL failure (the connector's: dropped, refused, timed out; or the server
-    /// closing), worth one reconnect-and-retry, as the upstream driver's `is_io_error` /
-    /// `is_connection_dropped` / `is_connection_refusal` / `is_timeout` were for 1.5.5.
+    /// closing), worth one reconnect-and-retry (the upstream driver's `is_io_error` /
+    /// `is_connection_dropped` / `is_connection_refusal` / `is_timeout`).
     #[must_use]
     pub fn is_connection_error(&self) -> bool {
         matches!(self.repr, Repr::Io(_))
@@ -123,8 +121,6 @@ impl std::error::Error for RedisError {}
 
 /// A command's result.
 pub type RedisResult<T> = Result<T, RedisError>;
-
-// ── values ───────────────────────────────────────────────────────────────────────────────────
 
 /// One RESP2 reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,8 +225,6 @@ pub fn encode(args: &[Vec<u8>], out: &mut Vec<u8>) {
     }
 }
 
-// ── arguments ────────────────────────────────────────────────────────────────────────────────
-
 /// What a command argument writes: one or more bulk strings.
 pub trait ToArgs {
     /// Append this argument's bulk strings.
@@ -304,8 +298,6 @@ impl<A: ToArgs, B: ToArgs> ToArgs for (A, B) {
         self.1.write_args(out);
     }
 }
-
-// ── conversions ──────────────────────────────────────────────────────────────────────────────
 
 /// A Rust value a reply converts to (the upstream driver's conversions, as the store used them).
 pub trait FromValue: Sized {
@@ -441,8 +433,6 @@ impl<A: FromValue, B: FromValue> FromValue for (A, B) {
         Ok(out)
     }
 }
-
-// ── the connection ───────────────────────────────────────────────────────────────────────────
 
 /// ONE OP'S CONNECTION to the server, over its [`Wire`].
 #[derive(Debug)]
@@ -654,8 +644,6 @@ impl Conn {
     }
 }
 
-// ── commands ─────────────────────────────────────────────────────────────────────────────────
-
 /// One command.
 #[derive(Debug, Clone, Default)]
 pub struct Cmd {
@@ -693,8 +681,6 @@ impl Cmd {
         c.request(self.args.clone()).await.map(drop)
     }
 }
-
-// ── pipelines ────────────────────────────────────────────────────────────────────────────────
 
 /// Several commands in one write; atomic ([`Pipeline::atomic`]) as `MULTI`/`EXEC`.
 #[derive(Debug, Clone, Default)]
@@ -835,8 +821,6 @@ impl Pipeline {
     }
 }
 
-// ── scripts ──────────────────────────────────────────────────────────────────────────────────
-
 /// A Lua script, run as `EVAL` (its source travels with each call: no script cache to miss).
 #[derive(Debug, Clone)]
 pub struct Script {
@@ -900,14 +884,12 @@ impl ScriptInvocation<'_> {
     }
 }
 
-// ── transactions ─────────────────────────────────────────────────────────────────────────────
-
 /// Pin an async block's output to a command result (so `?` inside it knows its error type).
 pub fn rr<T, F: Future<Output = RedisResult<T>>>(f: F) -> F {
     f
 }
 
-/// THE OPTIMISTIC TRANSACTION, as the upstream driver's `transaction`: `WATCH` the keys, run the
+/// The optimistic transaction, as the upstream driver's `transaction`: `WATCH` the keys, run the
 /// body (it reads, and queues its writes on the atomic pipeline it is handed, then answers that
 /// pipeline's `query`: `None` when a watched key changed and `EXEC` aborted), and run it all again
 /// on an abort. Evaluates to the body's `Some` value, or its error (a `WATCH` left in force by a

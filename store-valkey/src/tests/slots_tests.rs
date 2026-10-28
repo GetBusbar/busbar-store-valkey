@@ -411,6 +411,65 @@ fn records_upsert_read_back_and_scan_a_prefix_in_key_order() {
     );
 }
 
+/// AN EMPTY PUT REMOVES THE ROW (slot 40's rule, ARCHITECT 2026-10-21): the host writes every
+/// strike as an empty `record_put` and reads empty as absent, so the key LEAVES both the ordered key
+/// set and the values hash: `record_get` answers `None`, `record_scan` never returns it, and both
+/// shrink. Removing a row that is not there is `Ok`.
+#[test]
+fn an_empty_put_removes_the_row() {
+    let Some(s) = live_store() else { return };
+    let schema = fresh("schema");
+    let p = format!("busbar:records:{}", crate::hex(schema.as_bytes()));
+    let url = std::env::var("VALKEY_URL").expect("a live store has a URL");
+    let mut raw = redis::Client::open(url.as_str())
+        .and_then(|c| c.get_connection())
+        .expect("an independent client");
+    let mut held = || -> (u64, u64) {
+        let keys: u64 = redis::cmd("ZCARD")
+            .arg(format!("{p}:k"))
+            .query(&mut raw)
+            .expect("ZCARD");
+        let values: u64 = redis::cmd("HLEN")
+            .arg(format!("{p}:v"))
+            .query(&mut raw)
+            .expect("HLEN");
+        (keys, values)
+    };
+    s.record_put(&schema, b"a/1", b"one").expect("put");
+    s.record_put(&schema, b"a/2", b"two").expect("put");
+    assert_eq!(held(), (2, 2));
+
+    s.record_put(&schema, b"a/1", b"").expect("strike");
+    assert_eq!(
+        held(),
+        (1, 1),
+        "the struck row left the key set and the values"
+    );
+    assert_eq!(s.record_get(&schema, b"a/1").expect("get"), None);
+    let scan: Vec<(Vec<u8>, Vec<u8>)> = s
+        .record_scan(&schema, b"a/", 10)
+        .expect("scan")
+        .into_iter()
+        .map(|(k, v)| (k, v.as_slice().to_vec()))
+        .collect();
+    assert_eq!(
+        scan,
+        vec![(b"a/2".to_vec(), b"two".to_vec())],
+        "a scan never returns a struck row"
+    );
+
+    s.record_put(&schema, b"a/9", b"")
+        .expect("a strike of nothing is Ok");
+    assert_eq!(held(), (1, 1));
+    s.record_put(&schema, b"a/1", b"again").expect("put again");
+    assert_eq!(
+        s.record_get(&schema, b"a/1")
+            .expect("get")
+            .map(|r| r.as_slice().to_vec()),
+        Some(b"again".to_vec())
+    );
+}
+
 /// The plane-record `op_id` write dedupes, still refuses a fork, and refuses a reused op id.
 #[test]
 fn an_op_id_plane_append_dedupes_and_still_refuses_a_fork() {
