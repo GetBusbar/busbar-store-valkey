@@ -41,7 +41,8 @@ tracing = { workspace = true }
 # `LoadedStore`), over the loader's test connection table (`TcpConns`, `test-support`), with a
 # runtime for the async `StoreCalls`. The upstream RESP client verifies what landed in Valkey
 # INDEPENDENTLY of the store (tests only; never in the shipped image).
-busbar-plugin-loader = { workspace = true, features = ["test-support"] }
+busbar-plugin-loader = { workspace = true }
+busbar-test-kit = { workspace = true }
 # The shared host-services test double (`busbar_contract::services::double`, dev-only feature):
 # the unit tests' clock-only host overrides the clock and answers every other service unserved.
 busbar-contract = { workspace = true, features = ["services-double"] }
