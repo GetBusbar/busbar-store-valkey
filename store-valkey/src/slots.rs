@@ -217,6 +217,24 @@ impl ValkeyStore {
         value: &[u8],
     ) -> Result<(), String> {
         let (k, v) = records_keys(schema);
+        // AN EMPTY VALUE REMOVES THE ROW (abi/store slot 26 `record_put`).
+        if value.is_empty() {
+            return with_conn!(self, |c| {
+                pipe()
+                    .atomic()
+                    .cmd("ZREM")
+                    .arg(&k)
+                    .arg(key)
+                    .ignore()
+                    .cmd("HDEL")
+                    .arg(&v)
+                    .arg(key)
+                    .ignore()
+                    .query(c)
+                    .await
+            })
+            .map_err(|e| e.0);
+        }
         with_conn!(self, |c| {
             pipe()
                 .atomic()
