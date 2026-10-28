@@ -4694,3 +4694,87 @@ fn an_unknown_url_parameter_is_refused_not_ignored() {
         parse_url(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
     }
 }
+
+/// UPSERT IS BY `(kind, id)` (the contract's `RecordStore::upsert_plane_record` /
+/// `get_plane_record`), with or without a parent: an upserted record that names a parent reads back
+/// by its own id, a second id under the same parent is a second record (never an overwrite), the
+/// parent-scoped listing and the parent enumeration still see both, and a delete or a purge keeps
+/// both exact.
+#[test]
+fn a_parented_upserted_record_reads_back_by_its_own_id() {
+    let Some(store) = live_store() else { return };
+    let kind = "vk_parented_task";
+    let child = |id: &str, ts: u64, body: &[u8]| busbar_contract::records::PlaneRecord {
+        kind: kind.to_string(),
+        id: id.to_string(),
+        parent: Some("vk_ctx".to_string()),
+        seq: 0,
+        ts,
+        disposition: PlaneDisposition::Active,
+        body: body.to_vec(),
+    };
+    for id in ["vk_c1", "vk_c2", "vk_ctx"] {
+        store.delete_plane_record(kind, id).unwrap();
+    }
+    store.purge_plane_records_before(kind, u64::MAX).unwrap();
+
+    store
+        .upsert_plane_record(child("vk_c1", 10, b"one").view())
+        .unwrap();
+    store
+        .upsert_plane_record(child("vk_c2", 10, b"two").view())
+        .unwrap();
+    assert_eq!(
+        store.get_plane_record(kind, "vk_c1").unwrap(),
+        Some(b"one".to_vec())
+    );
+    assert_eq!(
+        store.get_plane_record(kind, "vk_c2").unwrap(),
+        Some(b"two".to_vec())
+    );
+    let parent = busbar_contract::records::PlaneSelector::Parent("vk_ctx".into());
+    let mut listed = store.list_plane_records(kind, &parent).unwrap();
+    listed.sort();
+    assert_eq!(listed, vec![b"one".to_vec(), b"two".to_vec()]);
+    assert_eq!(
+        store.list_plane_record_parents(kind).unwrap(),
+        vec!["vk_ctx".to_string()]
+    );
+    // A record whose own id is the parent's name, under another parent, is not the parent's child.
+    let mut other = child("vk_ctx", 10, b"other");
+    other.parent = Some("vk_elsewhere".to_string());
+    store.upsert_plane_record(other.view()).unwrap();
+    let mut listed = store.list_plane_records(kind, &parent).unwrap();
+    listed.sort();
+    assert_eq!(listed, vec![b"one".to_vec(), b"two".to_vec()]);
+    store.delete_plane_record(kind, "vk_ctx").unwrap();
+    assert_eq!(
+        store.get_plane_record(kind, "vk_c1").unwrap(),
+        Some(b"one".to_vec())
+    );
+
+    // A second upsert of one id replaces it; deleting it by id removes it alone.
+    store
+        .upsert_plane_record(child("vk_c1", 10, b"one'").view())
+        .unwrap();
+    assert_eq!(
+        store.get_plane_record(kind, "vk_c1").unwrap(),
+        Some(b"one'".to_vec())
+    );
+    store.delete_plane_record(kind, "vk_c1").unwrap();
+    assert_eq!(store.get_plane_record(kind, "vk_c1").unwrap(), None);
+    assert_eq!(
+        store.list_plane_records(kind, &parent).unwrap(),
+        vec![b"two".to_vec()]
+    );
+    assert_eq!(
+        store.list_plane_record_parents(kind).unwrap(),
+        vec!["vk_ctx".to_string()]
+    );
+
+    // A purge takes the last child out of the parent's listing and enumeration too.
+    assert_eq!(store.purge_plane_records_before(kind, 11).unwrap(), 1);
+    assert_eq!(store.get_plane_record(kind, "vk_c2").unwrap(), None);
+    assert!(store.list_plane_records(kind, &parent).unwrap().is_empty());
+    assert!(store.list_plane_record_parents(kind).unwrap().is_empty());
+}
