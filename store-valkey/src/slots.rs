@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE STORE V3 DOOR over [`ValkeyStore`]: `store_door!` and the slots the store v3 table adds to
-//! the 1.5.5 op set ([`StoreSlots`]): the `op_id`-carrying writes (the usage and metering batches
+//! The store v3 door over [`ValkeyStore`]: `store_door!` and the slots the store v3 table adds to
+//! the base op set ([`StoreSlots`]): the `op_id`-carrying writes (the usage and metering batches
 //! and the plane-record append) and the kernel's records. The store keeps ledger counts and
 //! records, not money: busbar derives money from the counts and its rate card.
 //!
@@ -29,10 +29,10 @@
 //! value fields are a conflict and apply nothing; a refused or failed op writes nothing, its
 //! record included (S3).
 //!
-//! //! ## Every slot is one op through the host's connector
+//! ## Every slot is one op through the host's connector
 //!
 //! Each slot runs its body with the store SDK's `wire::drive_kept` on the store's ONE kept
-//! connection (1.5.5's one mutex-guarded connection): drawn when the op starts (dialled through the
+//! connection: drawn when the op starts (dialled through the
 //! host's connector on the op's ticket when there is none), every command a write and a read that
 //! may PEND (the op answers PENDING and is resumed on the connector's wake), handed back when the op
 //! answers. The body is the blocking client's body, `async`.
@@ -138,9 +138,9 @@ impl ValkeyStore {
         ran.unwrap_or_else(|e| Err(OpRefused::Failed(self.err(e, "command").0)))
     }
 
-    /// `record_put` (slot 40): an upsert on `(schema, key)`. An EMPTY value removes the row
-    /// (ARCHITECT 2026-10-21): it is the host's strike, so the key leaves both the ordered key set
-    /// and the values, `record_get` then answers `None` and `record_scan` never returns it.
+    /// `record_put` (slot 40): an upsert on `(schema, key)`. An EMPTY value removes the row:
+    /// it is the host's strike, so the key leaves both the ordered key set and the values,
+    /// `record_get` then answers `None` and `record_scan` never returns it.
     /// Removing a row that is not there is `Ok`.
     async fn v3_record_put(
         &self,
@@ -377,7 +377,7 @@ impl StoreSlots for ValkeyStore {
         )
     }
 
-    // The 1.5.5 op set and the plane verbs: each body is the store's own, run as one op.
+    // The base op set and the plane verbs: each body is the store's own, run as one op.
     ops! {
         put_key(key: &VirtualKey => clone) -> () = ValkeyStore::put_key;
         get_key(id: &str => to_owned) -> Option<VirtualKey> = ValkeyStore::get_key;

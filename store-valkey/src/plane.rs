@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! **THE PLANE-RECORD KEYSPACE (busbar 1.6.0).** The eight kind-tagged verbs over an opaque
+//! **The plane-record keyspace.** The eight kind-tagged verbs over an opaque
 //! [`PlaneRecord`](busbar_contract::records::PlaneRecord), plus [`RecordStore::plane_token_live`](busbar_contract::records::RecordStore).
 //!
 //! ## Layout
@@ -48,7 +48,7 @@ use busbar_contract::records::{
 /// The kind a purge of which CASCADES: a purged `task` takes its `task_event` chain with it, and only
 /// its own. Nothing else ever removes a task's events, so leaving them would keep chains whose task
 /// no longer exists forever — outliving the retention decision just made about them. (store-sqlite,
-/// store-postgres and store-mysql settle it the same way, and the v6 typed purge here did too.)
+/// store-postgres and store-mysql settle it the same way.)
 const CASCADING_KIND: &str = "task";
 /// The child kind a [`CASCADING_KIND`] purge takes with it.
 const CASCADED_KIND: &str = "task_event";
@@ -101,7 +101,7 @@ fn identity<'a>(record: &PlaneRecordRef<'a>) -> &'a str {
     record.parent.unwrap_or(record.id)
 }
 
-/// THE TYPED SIDECAR — everything about a record except its body, as ONE deterministic string.
+/// The typed sidecar — everything about a record except its body, as ONE deterministic string.
 ///
 /// Two leading flag characters the scripts read without decoding anything: `1`/`0` whether the
 /// record has a `parent` (what [`Keys::pcount`] counts), then `t`/`a` its disposition (what a
@@ -535,7 +535,7 @@ pub(crate) fn token_key(kind: &str, token: &str) -> String {
 /// ledger entry can be bounded without anyone noticing.
 const MAX_TOKEN_TTL_SECS: u64 = 315_360_000; // ten years
 
-/// `redeem_plane_token`: THE TEST AND SET, as ONE `SET NX EX` the server orders against every other
+/// `redeem_plane_token`: the test and set, as ONE `SET NX EX` the server orders against every other
 /// node's. It sets and reports OK, or it finds the key present and reports nil — and that reply IS the
 /// answer, never a prior read. A `GET` followed by a `SET` would tell both halves of a race they were
 /// first, and on this backend a fleet sharing one Valkey is the ORDINARY deployment.
