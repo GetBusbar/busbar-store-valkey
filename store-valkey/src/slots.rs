@@ -434,12 +434,16 @@ impl StoreSlots for ValkeyStore {
         before: u64,
         retention: busbar_contract::records::Retention,
     ) -> Step<RecordStoreResult<u64>> {
-        match retention {
-            busbar_contract::records::Retention::Age => {
-                StoreSlots::purge_plane_records_before(self, cx, kind, before)
-            }
-            busbar_contract::records::Retention::TerminalOnly => Step::Ready(Ok(0)),
-        }
+        let kind = kind.to_string();
+        let terminal_only = retention == busbar_contract::records::Retention::TerminalOnly;
+        op!(cx, self, Err, |me, c| plane::purge(
+            &me,
+            c,
+            &kind,
+            before,
+            terminal_only
+        )
+        .await)
     }
 }
 
