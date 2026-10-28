@@ -1,5 +1,5 @@
 # RENDERED by `busbar-release plugin heal` from GetBusbar/busbar-release template/ and busbar's
-# `.github/fleet/deps.toml` at 9f29c70fb0914c700c44bef77f77646d1cb110e9; a hand edit is overwritten by the next sync. CI runs
+# `.github/fleet/deps.toml` at 6acd5afc46969040ebd548bc3ae21feb5d979f34; a hand edit is overwritten by the next sync. CI runs
 # `cargo deny check` on it (busbar's plugin-ci.yml at the pin). The license allowlist is busbar's own;
 # the one reviewed git source is busbar itself, at the pin.
 [graph]
@@ -139,6 +139,8 @@ deny = [
     { crate = "prost:>=0.15.0", reason = "busbar resolves prost to 0.14.3; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "psl:<2.0.0", reason = "busbar resolves psl to 2.1.244; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "psl:>=3.0.0", reason = "busbar resolves psl to 2.1.244; a plugin may not pull a second version (OWNER 2026-10-02)" },
+    { crate = "quote:<1.0.0", reason = "busbar resolves quote to 1.0.45; a plugin may not pull a second version (OWNER 2026-10-02)" },
+    { crate = "quote:>=2.0.0", reason = "busbar resolves quote to 1.0.45; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "rcgen:<0.14.0", reason = "busbar resolves rcgen to 0.14.10; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "rcgen:>=0.15.0", reason = "busbar resolves rcgen to 0.14.10; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "reqwest:<0.12.0", reason = "busbar resolves reqwest to 0.12.28; a plugin may not pull a second version (OWNER 2026-10-02)" },
