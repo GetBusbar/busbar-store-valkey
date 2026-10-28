@@ -5,7 +5,7 @@
 //! over a key-value data model. It serves the store v3 door (`busbar_contract::abi::sdk::store`)
 //! over the HOST'S CONNECTOR: it speaks RESP2 itself ([`resp`]) and holds no socket, TLS stack or
 //! runtime of its own. `redis://` / `rediss://` URLs (and the `valkey://` spellings) are read as
-//! the upstream driver 1.5.5 linked read them.
+//! the upstream `redis` driver reads them.
 //!
 //! ## Keyspace (schema v9, every key under `busbar:`)
 //!
@@ -27,7 +27,7 @@
 //!
 //! ## Connections
 //!
-//! One kept connection (1.5.5's one mutex-guarded connection), dialled through the host's connector
+//! One kept connection, dialled through the host's connector
 //! for the store's one `tcp` need, secured for `rediss://` (unverified for `#insecure`), then `AUTH`
 //! and `SELECT` as the URL says; `connect_timeout_ms` bounds dial plus handshake. A connection-level
 //! failure on a `with_conn!` call reconnects and re-runs that call once; `with_conn_no_retry!` calls
@@ -54,10 +54,10 @@ mod resp;
 /// `self.with_conn(|c| EXPR)` over the blocking client, now: `EXPR` on the op's one connection
 /// `c`, its failure in the store's words (`valkey command: …`, the URL password scrubbed).
 ///
-/// As 1.5.5's `with_conn`: a CONNECTION-LEVEL failure closes the connection and runs `EXPR` once
-/// more on a fresh one (its failure then reads `valkey reconnect after drop: …` /
-/// `valkey retry after reconnect: …`); any other failure clears a `WATCH` it left in force, as
-/// 1.5.5's did before the connection went back to the next caller.
+/// A CONNECTION-LEVEL failure closes the connection and runs `EXPR` once more on a fresh one (its
+/// failure then reads `valkey reconnect after drop: …` / `valkey retry after reconnect: …`); any
+/// other failure clears a `WATCH` it left in force before the connection goes back to the next
+/// caller.
 macro_rules! with_conn {
     ($me:expr, |$c:ident| $e:expr $(,)?) => {
         match $crate::resp::rr(async { $e }).await {
@@ -78,7 +78,7 @@ macro_rules! with_conn {
     };
 }
 
-/// 1.5.5's `with_conn_no_retry`: `EXPR` once, never replayed (a non-idempotent write whose lost
+/// Like `with_conn`, but `EXPR` once, never replayed (a non-idempotent write whose lost
 /// reply may have applied); a connection-level failure leaves the connection unfit, and the next op
 /// dials fresh.
 macro_rules! with_conn_no_retry {
@@ -100,7 +100,7 @@ macro_rules! with_conn_no_retry {
 /// setting overrides it.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-// ── Key-space helpers (one namespace prefix so a Valkey shared with other apps never collides) ──
+// Key-space helpers: one namespace prefix so a Valkey shared with other apps never collides.
 const KEY_PREFIX: &str = "busbar:key:";
 const KEYS_INDEX: &str = "busbar:keys";
 const KEYS_BYREV: &str = "busbar:keys:byrev";
@@ -118,7 +118,7 @@ const DENYLIST_INDEX: &str = "busbar:denylist";
 /// The store-global revision counter (`INCR`), stamped on key and credential rows.
 const REVISION_KEY: &str = "busbar:revision";
 /// The schema marker. v6 is the oldest namespace migrated in place (older is REFUSED, never wiped);
-/// v7 (1.6.0) copied the v6 typed task / event / demotion / spent-approval keys into the plane
+/// v7 copied the v6 typed task / event / demotion / spent-approval keys into the plane
 /// keyspace ([`legacy`]); v8 never shipped; v9 deleted the keys of the dropped money, journal and
 /// session slots ([`ValkeyStore::drop_dead_slot_keys`]). A NEWER marker is refused.
 const SCHEMA_KEY: &str = "busbar:schema";
@@ -226,8 +226,8 @@ fn metering_set(bucket: u64) -> String {
 
 /// The hash key of one metering cell: `(bucket, key_id, model, provider, priced_from_ms)`.
 ///
-/// `priced_from_ms` joins the identity (DECISIONS #79: a rate-card edit SPLITS the day's cell at the
-/// edit, and each half prices at the card it was earned under). A cell whose price started at `0` —
+/// `priced_from_ms` joins the identity (a rate-card edit SPLITS the day's cell at the edit, and each
+/// half prices at the card it was earned under). A cell whose price started at `0` —
 /// the opening entry, and every row written before the field existed — keeps the v6 three-component
 /// key, so a v6 cell and a v7 write of the same undated cell are one cell. A dated cell appends a
 /// fourth `|<ms>` component. Each component is escaped before joining (see
@@ -378,9 +378,9 @@ struct Target {
     host: String,
     /// `rediss://` / `valkeys://`: secure the connection before its first byte.
     tls: bool,
-    /// `#insecure` on a TLS URL: secure it WITHOUT verifying the server's certificate, as 1.5.5's
-    /// driver did (ARCHITECT ruling 2026-10-03 on Q-L16-4; the host honours it for this store's
-    /// operator-infrastructure need only, and logs a WARN naming the instance).
+    /// `#insecure` on a TLS URL: secure it WITHOUT verifying the server's certificate (the host
+    /// honours it for this store's operator-infrastructure need only, and logs a WARN naming the
+    /// instance).
     insecure: bool,
     /// `AUTH` (`user`, `password`), when the URL carries a password.
     auth: Option<(Option<String>, String)>,
@@ -405,7 +405,7 @@ impl std::fmt::Debug for Target {
     }
 }
 
-/// The upstream driver's refusal of a URL, word for word (the 1.5.5 boot refusal read so).
+/// The upstream driver's refusal of a URL, word for word.
 fn url_refused(why: &'static str) -> RedisError {
     RedisError::from((ErrorKind::InvalidClientConfig, why))
 }
@@ -447,7 +447,7 @@ fn check_protocol(url: &url::Url) -> RedisResult<()> {
     }
 }
 
-/// Parse a Valkey URL exactly as the upstream driver 1.5.5 linked read it (`redis` 1.7.1's
+/// Parse a Valkey URL exactly as the upstream driver reads it (`redis` 1.7.1's
 /// `IntoConnectionInfo for &str`): `redis://[user[:password]@]host[:port][/db]`, `rediss://` for TLS
 /// (`#insecure` the one fragment it took), the `valkey://` / `valkeys://` spellings, and the
 /// unix-socket URLs `unix://`, `redis+unix://`, `valkey+unix://` (`?db=`, `?user=`, `?pass=`).
@@ -558,8 +558,8 @@ fn parse_unix(url: &url::Url) -> RedisResult<Target> {
 }
 
 /// Valkey `RecordStore` backend (durable, shared across a cluster), reached through the HOST'S
-/// CONNECTOR: one kept connection (dialled, secured, `AUTH`, `SELECT` once), every op on it in turn,
-/// as 1.5.5's one mutex-guarded connection; the store holds no socket and no TLS stack of its own.
+/// CONNECTOR: one kept connection (dialled, secured, `AUTH`, `SELECT` once), every op on it in turn;
+/// the store holds no socket and no TLS stack of its own.
 #[derive(Debug, Clone)]
 pub struct ValkeyStore {
     inner: Arc<Inner>,
@@ -571,8 +571,7 @@ struct Inner {
     secret: Option<String>,
     /// `connect_timeout_ms` (default [`DEFAULT_CONNECT_TIMEOUT`]): every dial's bound.
     connect_timeout: Duration,
-    /// THE KEPT CONNECTION: 1.5.5 held ONE connection behind a mutex (no pool setting), so the set
-    /// holds one.
+    /// The kept connection: ONE (there is no pool setting), so the set holds one.
     pool: Arc<Pool>,
 }
 
@@ -596,7 +595,7 @@ impl std::fmt::Debug for Inner {
 
 /// The store's one outbound need: a `tcp` stream to the server the settings' URL names (the store
 /// names the target at each connect), governed as operator infrastructure (private, loopback and
-/// plaintext allowed). Its timeout bounds the dial (1.5.5's default connect timeout).
+/// plaintext allowed). Its timeout bounds the dial.
 pub const NEEDS: &[busbar_contract::abi::host::conn::connector::Need] = {
     use busbar_contract::abi::host::conn::connector::{
         Need, DIRECTION_OUTBOUND, EGRESS_OPERATOR_INFRASTRUCTURE, KEEP_NAMED,
@@ -617,8 +616,7 @@ const NEED_TCP: u32 = 0;
 impl ValkeyStore {
     /// The op's connection over `wire`: the kept one when it is idle (its handshake done), else a
     /// fresh dial, secured for `rediss://`, `AUTH` and `SELECT` as the URL says — the dial AND the
-    /// handshake bounded by `connect_timeout_ms` in all, the span 1.5.5's
-    /// `get_connection_with_timeout` bounded. A failure reads `valkey {ctx}: …` (1.5.5's `connect`
+    /// handshake bounded by `connect_timeout_ms` in all. A failure reads `valkey {ctx}: …` (`connect`
     /// at boot, `reconnect` when an op had to dial).
     async fn conn(&self, wire: Wire, ctx: &str) -> RecordStoreResult<Conn> {
         let failed = |e: String| {
@@ -649,7 +647,7 @@ impl ValkeyStore {
     }
 
     /// A NEW connection's handshake: TLS for `rediss://` (before its first byte; unverified for
-    /// `#insecure`, as 1.5.5), `AUTH`, `SELECT`.
+    /// `#insecure`), `AUTH`, `SELECT`.
     async fn handshake(&self, c: &mut Conn) -> RedisResult<()> {
         let t = &self.inner.target;
         if t.tls {
@@ -673,7 +671,7 @@ impl ValkeyStore {
         Ok(())
     }
 
-    /// 1.5.5's reconnect after a dropped connection: close it, dial a fresh one, handshake (the
+    /// Reconnect after a dropped connection: close it, dial a fresh one, handshake (the
     /// dial and the handshake bounded by `connect_timeout_ms`, as every new connection is).
     async fn reconnect(&self, c: &mut Conn) -> RedisResult<()> {
         let ms = u32::try_from(self.inner.connect_timeout.as_millis()).unwrap_or(u32::MAX);
@@ -694,8 +692,8 @@ impl ValkeyStore {
         &self.inner.pool
     }
 
-    /// `open`'s connect step: the first connection, the schema migration and the noeviction check,
-    /// exactly as 1.5.5's connect ran them (its failures are the load's refusal).
+    /// `open`'s connect step: the first connection, the schema migration and the noeviction check
+    /// (its failures are the load's refusal).
     async fn connect_step(&self, wire: Wire) -> RecordStoreResult<()> {
         let mut c = self.conn(wire, "connect").await?;
         self.migrate(&mut c).await?;
@@ -1120,8 +1118,8 @@ fn queue_metering(pipe: &mut Pipeline, d: &MeteringDelta) {
     .ignore();
 }
 
-/// THE 1.5.5 OP SET's bodies, each over the op's one connection `c` (the store door, `slots`,
-/// runs each as one op through the host's connector). The un-deduped 1.5.5 writes (`add_usage`,
+/// The base op set's bodies, each over the op's one connection `c` (the store door, `slots`, runs
+/// each as one op through the host's connector). The un-deduped writes (`add_usage`,
 /// `add_metering`, `append_plane_record`) reach the store as their `op_id` slots.
 impl ValkeyStore {
     pub(crate) async fn put_key(&self, c: &mut Conn, key: &VirtualKey) -> RecordStoreResult<()> {
@@ -1712,8 +1710,6 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
-// ── THE DOOR (DECISIONS #2 rule (1): compiled in or dropped in, one contract, one loading path) ──
-//
 // The store's door lives HERE, in the logic crate (`slots`: `store_door!` over this store's
 // `StoreSlots`): a busbar build that links this crate registers `door` as its compiled-in row
 // (`LinkedRow::of(door)`), and the sibling `busbar-store-valkey-plugin` cdylib exports the same
@@ -1735,7 +1731,7 @@ impl ValkeyStore {
     /// host's connector. `connect_timeout_ms` is optional (default [`DEFAULT_CONNECT_TIMEOUT`]).
     ///
     /// # Errors
-    /// A text naming why the settings do not open a store (1.5.5's words).
+    /// A text naming why the settings do not open a store.
     pub fn from_settings(settings: &[u8]) -> Result<Self, String> {
         let v: serde_json::Value = if settings.iter().all(u8::is_ascii_whitespace) {
             serde_json::Value::Object(Default::default())
@@ -1785,7 +1781,7 @@ impl ValkeyStore {
                 target,
                 secret,
                 connect_timeout: timeout,
-                // 1.5.5 kept ONE connection (it had no pool setting).
+                // ONE connection (there is no pool setting).
                 pool: Pool::new(1),
             }),
         })
@@ -1794,7 +1790,7 @@ impl ValkeyStore {
 
 mod slots;
 
-/// THE STORE DOOR (store v3, `busbar_contract::abi::store`): every slot of the store v3 table over
+/// The store door (store v3, `busbar_contract::abi::store`): every slot of the store v3 table over
 /// [`ValkeyStore`], through the contract's store SDK.
 pub use slots::door;
 
