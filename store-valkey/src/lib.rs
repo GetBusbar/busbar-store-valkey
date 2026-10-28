@@ -2118,7 +2118,19 @@ impl ValkeyStore {
         kind: &str,
         before: u64,
     ) -> RecordStoreResult<u64> {
-        plane::purge_before(self, c, kind, before).await
+        // The age-only entry: `task` has always dropped only its TERMINAL rows here.
+        plane::purge_before(self, c, kind, before, kind == plane::CASCADING_KIND).await
+    }
+
+    pub(crate) async fn purge_plane_records(
+        &self,
+        c: &mut Conn,
+        kind: &str,
+        before: u64,
+        retention: busbar_contract::records::Retention,
+    ) -> RecordStoreResult<u64> {
+        let terminal_only = retention == busbar_contract::records::Retention::TerminalOnly;
+        plane::purge_before(self, c, kind, before, terminal_only).await
     }
 
     pub(crate) async fn delete_plane_record(

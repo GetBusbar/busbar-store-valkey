@@ -49,7 +49,7 @@ use busbar_contract::records::{
 /// its own. Nothing else ever removes a task's events, so leaving them would keep chains whose task
 /// no longer exists forever — outliving the retention decision just made about them. (store-sqlite,
 /// store-postgres and store-mysql settle it the same way, and the v6 typed purge here did too.)
-const CASCADING_KIND: &str = "task";
+pub(crate) const CASCADING_KIND: &str = "task";
 /// The child kind a [`CASCADING_KIND`] purge takes with it.
 const CASCADED_KIND: &str = "task_event";
 
@@ -479,20 +479,22 @@ pub(crate) async fn parents(
     Ok(out)
 }
 
-/// `purge_plane_records_before`: STRICTLY older than the cutoff, and the count actually performed.
-/// WHICH rows go is the kind's own contract, read off the typed disposition, never out of the body:
-/// `task` drops only TERMINAL rows (an interrupted task waiting on a human is exactly the row that
-/// legitimately sits still longest) and takes each purged task's `task_event` chain with it; every
-/// other kind drops every row older than `before`.
+/// `purge_plane_records`: STRICTLY older than the cutoff, and the count actually performed. WHICH
+/// rows go is the rule the call carries (never one inferred from the kind's name), read off the
+/// typed disposition, never out of the body: `terminal_only` drops only TERMINAL rows (an
+/// interrupted task waiting on a human is exactly the row that legitimately sits still longest),
+/// otherwise every row older than `before` goes. A purged `task` takes its `task_event` chain with
+/// it either way.
 pub(crate) async fn purge_before(
     store: &ValkeyStore,
     c: &mut Conn,
     kind: &str,
     before: u64,
+    terminal_only: bool,
 ) -> RecordStoreResult<u64> {
     let keys = Keys::of(kind);
     let cascade = (kind == CASCADING_KIND).then(|| Keys::of(CASCADED_KIND));
-    let terminal_only = if kind == CASCADING_KIND { "1" } else { "0" };
+    let terminal_only = if terminal_only { "1" } else { "0" };
     let removed: i64 = with_conn_no_retry!(store, |c| {
         let mut inv = PURGE.key(&keys.rec);
         inv.key(&keys.body).key(&keys.byts).key(&keys.pcount);
