@@ -36,6 +36,8 @@ enum Repr {
     General(ErrorKind, &'static str, Option<String>),
     Server(String),
     Io(String),
+    /// The store's own refusal, its text verbatim (no `- Kind` suffix).
+    Refused(String),
 }
 
 /// A command's failure. Its text is the upstream driver's shape (`desc - Kind: detail`), so the
@@ -60,6 +62,15 @@ impl RedisError {
     #[must_use]
     pub fn is_connection_error(&self) -> bool {
         matches!(self.repr, Repr::Io(_))
+    }
+
+    /// The store's own refusal of an op (an unknown id, a tombstoned id): `text` reads verbatim,
+    /// with no ` - Client` suffix, in the siblings' `<op>: <reason>` shape.
+    #[must_use]
+    pub fn refused(text: impl Into<String>) -> Self {
+        Self {
+            repr: Repr::Refused(text.into()),
+        }
     }
 
     fn server(text: String) -> Self {
@@ -103,7 +114,7 @@ impl fmt::Display for RedisError {
                     None => Ok(()),
                 }
             }
-            Repr::Server(t) | Repr::Io(t) => f.write_str(t),
+            Repr::Server(t) | Repr::Io(t) | Repr::Refused(t) => f.write_str(t),
         }
     }
 }
@@ -510,7 +521,17 @@ impl Conn {
                     i.drain(..n);
                     v
                 }))
-            })?;
+            });
+            let got = match got {
+                Ok(got) => got,
+                Err(e) => {
+                    // A reply that does not parse leaves the stream out of step with the commands
+                    // sent (the rest of that reply, or a late one, would be read as a LATER op's
+                    // reply): this connection is never kept.
+                    self.wire.discard();
+                    return Err(e);
+                }
+            };
             if let Some(v) = got {
                 return Ok(v);
             }
@@ -654,11 +675,6 @@ impl Conn {
         cmd("INCRBY").arg(key).arg(delta).query(self).await
     }
 
-    /// `LLEN`.
-    pub async fn llen<K: ToArgs, RV: FromValue>(&mut self, key: K) -> RedisResult<RV> {
-        cmd("LLEN").arg(key).query(self).await
-    }
-
     /// Every key matching `pattern` (`SCAN ... MATCH`, followed to the end), as the upstream
     /// driver's iterator of results.
     pub async fn scan_match<P: ToArgs, RV: FromValue>(
@@ -752,12 +768,6 @@ macro_rules! pipe_cmd {
 }
 
 impl Pipeline {
-    /// A new pipeline.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Run the commands as one transaction (`MULTI`/`EXEC`).
     pub fn atomic(&mut self) -> &mut Self {
         self.atomic = true;
@@ -799,9 +809,6 @@ impl Pipeline {
         /// `SADD`.
         sadd(k: K, m: M) => "SADD");
     pipe_cmd!(
-        /// `SREM`.
-        srem(k: K, m: M) => "SREM");
-    pipe_cmd!(
         /// `HSET key field value`.
         hset(k: K, f: F, v: V) => "HSET");
     /// `HSET key field value ...` (every pair).
@@ -815,12 +822,6 @@ impl Pipeline {
     pipe_cmd!(
         /// `HGETALL`.
         hgetall(k: K) => "HGETALL");
-    pipe_cmd!(
-        /// `RPUSH key value ...`.
-        rpush(k: K, v: V) => "RPUSH");
-    pipe_cmd!(
-        /// `LLEN`.
-        llen(k: K) => "LLEN");
     pipe_cmd!(
         /// `EXPIRE key seconds`.
         expire(k: K, s: S) => "EXPIRE");
@@ -967,7 +968,7 @@ macro_rules! transaction {
                     .arg(__keys)
                     .exec(&mut *$c)
                     .await?;
-                let mut __pipe = $crate::resp::Pipeline::new();
+                let mut __pipe = $crate::resp::pipe();
                 __pipe.atomic();
                 let __ran: $crate::resp::RedisResult<Option<_>> = $crate::resp::rr(async {
                     let $pipe = &mut __pipe;
@@ -1025,6 +1026,21 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_or_partial_bulk_is_refused_or_waited_for() {
+        // The two bytes after the payload must be CRLF.
+        assert!(parse(b"$3\r\nabcX\r\n").is_err());
+        // CRLF INSIDE the declared length is payload, not a terminator.
+        let (v, n) = parse(b"$4\r\na\r\nb\r\n").unwrap().unwrap();
+        assert_eq!((v, n), (Value::Data(b"a\r\nb".to_vec()), 10));
+        // A non-numeric length is refused.
+        assert!(parse(b"$x\r\n").is_err());
+        // A bulk short of its payload or terminator is waited for, not refused.
+        assert_eq!(parse(b"$5\r\nab").unwrap(), None);
+        assert_eq!(parse(b"$3\r\nabc").unwrap(), None);
+        assert_eq!(parse(b"$3\r\nabc\r").unwrap(), None);
+    }
+
+    #[test]
     fn encodes_a_command_as_bulk_strings() {
         let mut out = Vec::new();
         encode(&args_of(("SET", ["k", "v"])), &mut out);
@@ -1059,10 +1075,24 @@ mod tests {
     }
 
     #[test]
+    fn conversions_refuse_what_does_not_fit() {
+        assert!(u64::from_value(Value::Int(-1)).is_err());
+        assert!(u32::from_value(Value::Int(i64::from(u32::MAX) + 1)).is_err());
+        assert_eq!(u64::from_value(Value::Int(5)).unwrap(), 5);
+        let odd = Value::Array(vec![
+            Value::Data(b"a".to_vec()),
+            Value::Data(b"1".to_vec()),
+            Value::Data(b"b".to_vec()),
+        ]);
+        assert!(<Vec<(String, String)>>::from_value(odd).is_err());
+    }
+
+    #[test]
     fn errors_read_as_the_upstream_driver_wrote_them() {
         let e = RedisError::from((ErrorKind::Client, "put_key refused", "why".to_string()));
         assert_eq!(e.to_string(), "put_key refused - Client: why");
-        let e = RedisError::from((ErrorKind::Client, "delete_key: unknown id"));
-        assert_eq!(e.to_string(), "delete_key: unknown id - Client");
+        let e = RedisError::refused("delete_key: unknown id 'vk_x'");
+        assert_eq!(e.to_string(), "delete_key: unknown id 'vk_x'");
+        assert!(!e.is_connection_error());
     }
 }
