@@ -873,6 +873,7 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
              admin_listen: \"127.0.0.1:{admin_port}\"\n\
              identity-providers:\n  admin-tokens:\n    module: admin-tokens\n    token: {{ env: E2E_ADMIN_TOKEN }}\n\
              auth:\n  chain: [keys]\n  signing_key: {{ env: BUSBAR_SIGNING_KEY }}\n  admin_auth: [admin-tokens]\n\
+             credentials:\n  at_rest:\n    key: {{ env: BUSBAR_SIGNING_KEY }}\n\
              plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
              providers:\n  mock:\n    api_key: {{ env: MOCK_KEY }}\n\
              models:\n  test-model:\n    provider: mock\n\
