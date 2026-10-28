@@ -1777,7 +1777,11 @@ trait Vocab: RecordStore {
             .collect())
     }
     fn purge_tasks_before(&self, before: u64) -> RecordStoreResult<u64> {
-        self.purge_plane_records_before("task", before)
+        self.purge_plane_records(
+            "task",
+            before,
+            busbar_contract::records::Retention::TerminalOnly,
+        )
     }
     fn append_task_event(&self, e: &TaskEventRow) -> RecordStoreResult<()> {
         self.append_plane_record(
