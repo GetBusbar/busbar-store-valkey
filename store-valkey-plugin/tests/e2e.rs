@@ -662,8 +662,10 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
         &[
             "build",
             "--release",
-            "-p",
-            "busbar",
+            "--manifest-path",
+            "dist/default/Cargo.toml",
+            "--target-dir",
+            "target",
             "--features",
             "test-harness",
             "--bin",
@@ -682,6 +684,8 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
     ] {
         let status = Command::new("cargo")
             .args(args)
+            // Both binaries are read back from `<checkout>/target/release` below.
+            .env_remove("CARGO_TARGET_DIR")
             .current_dir(&root)
             .status()
             .expect("run cargo build for busbar + busbar-plugin-pack");
@@ -690,12 +694,7 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
             "building the real busbar + busbar-plugin-pack binaries must succeed ({args:?})"
         );
     }
-    // The nested `cargo build` inherits this process's environment, so a `CARGO_TARGET_DIR` set for
-    // the outer `cargo test` redirects it too; look where it actually put the binaries.
-    let target = match std::env::var_os("CARGO_TARGET_DIR") {
-        Some(dir) => root.join(dir),
-        None => root.join("target"),
-    };
+    let target = root.join("target");
     (
         target.join("release/busbar"),
         target.join("release/busbar-plugin-pack"),
@@ -849,7 +848,7 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
     let overlay = work.join("overlay.json");
     std::fs::write(
         &providers,
-        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n  api_key_env: MOCK_KEY\n",
+        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n",
     )
     .unwrap();
     // The compiled-in `memory` store at first boot (`store: {module: memory}`: busbar 1.6.0 refuses
