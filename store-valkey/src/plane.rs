@@ -41,7 +41,9 @@
 //! still orders correctly.
 
 use crate::resp::{cmd, pipe, Conn, Script, ScriptInvocation};
-use crate::{clamp, hex, ValkeyStore};
+use crate::{hex, ValkeyStore};
+use busbar_contract::abi::sdk::store::column::clamp;
+use busbar_contract::abi::sdk::store::fork;
 use busbar_contract::abi::sdk::store::{OpRefused, OpResult};
 use busbar_contract::abi::store::OP_ID_RETENTION_SECS;
 use busbar_contract::records::{
@@ -376,15 +378,6 @@ pub(crate) async fn upsert(
     put(store, c, &UPSERT, record, record.id).await.map(|_| ())
 }
 
-/// The fork refusal: names the position and nothing else — never stored (or caller) content.
-fn fork(record: &PlaneRecordRef<'_>) -> RecordStoreError {
-    RecordStoreError(format!(
-        "append_plane_record: kind '{}' already holds a different record at sequence {} of \
-         this chain; the chain has forked",
-        record.kind, record.seq
-    ))
-}
-
 /// `append_plane_record` under an `op_id` ([`APPEND_OP`]): `op_key` is the op's record, `body` its
 /// value fields. A replay or the identical record is `Ok` with nothing written; a different record
 /// at the position is the fork the append script refuses; the op id used with different value fields is a
@@ -403,7 +396,9 @@ pub(crate) async fn append_op(
         with_conn_no_retry!(store, |c| inv.invoke(c).await).map_err(|e| OpRefused::Failed(e.0))?;
     match answer {
         0 => Ok(()),
-        1 => Err(OpRefused::Failed(fork(&record).0)),
+        1 => Err(OpRefused::Failed(
+            fork::chain_fork(record.kind, identity(&record), record.seq).0,
+        )),
         _ => Err(OpRefused::Conflict),
     }
 }
