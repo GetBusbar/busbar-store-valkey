@@ -2051,12 +2051,12 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
         "a replay must not duplicate the row"
     );
 
-    let forked = sample_call(&p, 1, 2_000_000_100, "", "DIFFERENT");
+    let forked = sample_call(&p, 1, 2_000_000_100, "", "h2-second-writer");
     let err = store
         .append_mcp_call(&forked)
         .expect_err("a different record at an occupied (principal, seq) is a fork and must error");
     assert!(
-        !format!("{err}").contains("DIFFERENT"),
+        !format!("{err}").contains("h2-second-writer"),
         "the error must not echo stored content back"
     );
     assert_eq!(

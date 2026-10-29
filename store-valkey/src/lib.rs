@@ -37,6 +37,7 @@
 
 #![forbid(unsafe_code)]
 
+use busbar_contract::abi::sdk::store::column::{clamp, read_u64};
 use busbar_contract::abi::sdk::store::wire::{Pool, Wire};
 use busbar_contract::records::MeteringDelta;
 use busbar_contract::records::{
@@ -256,18 +257,6 @@ fn metering_row(
 /// The metering-cell hash field an open (non-token) ledgered class accumulates under. Everything after
 /// the fixed `u:` prefix is the class name, verbatim, so no class name can collide with a fixed field.
 const METERING_UNIT_PREFIX: &str = "u:";
-
-/// Clamp a `u64` into `i64` for Valkey integer ops (HINCRBY is signed) - a value above `i64::MAX` pins
-/// to `i64::MAX`, never wraps. Mirrors the SQL backends.
-fn clamp(v: u64) -> i64 {
-    i64::try_from(v).unwrap_or(i64::MAX)
-}
-
-/// Read a signed counter back as a `u64`, clamping a (corrupt / direct-DB) negative to 0 instead of
-/// wrapping via `as` - mirrors the SQL backends' DI-3 posture.
-fn read_u64(v: i64) -> u64 {
-    v.max(0) as u64
-}
 
 /// Extract the PASSWORD from a valkey URL, if any - the secret that must never appear in an error
 /// string or a Debug print. Two forms carry one: the userinfo (`redis://user:pass@host/...`,
