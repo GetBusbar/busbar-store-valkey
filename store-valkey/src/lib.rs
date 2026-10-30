@@ -611,6 +611,9 @@ impl ValkeyStore {
             Err(e) => Err(e.to_string()),
         };
         c.wire().unbound();
+        if ready.is_err() {
+            c.wire().discard();
+        }
         ready.map_err(failed)?;
         Ok(c)
     }
@@ -653,6 +656,9 @@ impl ValkeyStore {
             Err(e) => Err(RedisError::io(&e)),
         };
         c.wire().unbound();
+        if r.is_err() {
+            c.wire().discard();
+        }
         r
     }
 
