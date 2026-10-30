@@ -168,6 +168,20 @@ thread_local! {
     static COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+impl Value {
+    /// The reply's kind, for error text: never its content.
+    pub(crate) fn shape(&self) -> &'static str {
+        match self {
+            Value::Nil => "nil",
+            Value::Int(_) => "integer",
+            Value::Data(_) => "bulk string",
+            Value::Status(_) => "status",
+            Value::Array(_) => "array",
+            Value::Error(_) => "error",
+        }
+    }
+}
+
 /// Parse one reply from the front of `buf`: the reply and how many bytes it took, or `None` when
 /// `buf` does not hold a whole reply yet. A first pass only checks that the reply is complete (it
 /// allocates and copies nothing), so a reply that arrives in many fills is built once, when whole.
@@ -413,7 +427,10 @@ impl FromValue for String {
                 .map_err(|_| RedisError::type_error("a bulk string is not UTF-8".into())),
             Value::Status(s) => Ok(s),
             Value::Int(i) => Ok(i.to_string()),
-            other => Err(RedisError::type_error(format!("(response was {other:?})"))),
+            other => Err(RedisError::type_error(format!(
+                "expected a string, got {}",
+                other.shape()
+            ))),
         }
     }
 }
@@ -428,7 +445,12 @@ macro_rules! numeric_from {
                     Value::Status(s) => s.parse().ok(),
                     _ => None,
                 };
-                parsed.ok_or_else(|| RedisError::type_error(format!("(response was {v:?})")))
+                parsed.ok_or_else(|| {
+                    RedisError::type_error(format!(
+                        "expected an integer, got a non-integer {}",
+                        v.shape()
+                    ))
+                })
             }
         }
     )*};
@@ -441,7 +463,9 @@ impl FromValue for u8 {
             Value::Int(i) => u8::try_from(*i).ok(),
             _ => None,
         }
-        .ok_or_else(|| RedisError::type_error(format!("(response was {v:?})")))
+        .ok_or_else(|| {
+            RedisError::type_error(format!("expected a byte, got a non-byte {}", v.shape()))
+        })
     }
 
     fn from_bytes(bytes: Vec<u8>) -> Result<Vec<Self>, Vec<u8>> {
@@ -487,7 +511,10 @@ impl<A: FromValue, B: FromValue> FromValue for (A, B) {
                     B::from_value(b.unwrap_or(Value::Nil))?,
                 ))
             }
-            other => Err(RedisError::type_error(format!("a pair from {other:?}"))),
+            other => Err(RedisError::type_error(format!(
+                "expected a pair, got {}",
+                other.shape()
+            ))),
         }
     }
 

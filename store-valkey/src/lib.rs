@@ -1017,8 +1017,22 @@ fn queue_credential(
     Ok(())
 }
 
+/// A decode failure in words that name where, never the stored value (serde's type errors echo it).
+fn decode_text(e: &serde_json::Error) -> String {
+    if e.is_data() {
+        format!(
+            "a value does not fit its type at line {} column {}",
+            e.line(),
+            e.column()
+        )
+    } else {
+        e.to_string()
+    }
+}
+
 fn key_from_json(raw: &str) -> RecordStoreResult<VirtualKey> {
-    serde_json::from_str(raw).map_err(|e| RecordStoreError(format!("key decode failed: {e}")))
+    serde_json::from_str(raw)
+        .map_err(|e| RecordStoreError(format!("key decode failed: {}", decode_text(&e))))
 }
 fn cred_to_json(cred: &CredentialSecret) -> RecordStoreResult<String> {
     serde_json::to_string(cred)
@@ -1026,7 +1040,7 @@ fn cred_to_json(cred: &CredentialSecret) -> RecordStoreResult<String> {
 }
 fn cred_from_json(raw: &str) -> RecordStoreResult<CredentialSecret> {
     serde_json::from_str(raw)
-        .map_err(|e| RecordStoreError(format!("credential decode failed: {e}")))
+        .map_err(|e| RecordStoreError(format!("credential decode failed: {}", decode_text(&e))))
 }
 
 /// Parse a `"<key_id>:<kind>:<slot>"` pointer value back into its parts. `kind` cannot itself contain
@@ -1360,7 +1374,7 @@ impl ValkeyStore {
                 // read back as 0 and under-report billing/usage data.
                 let num = |field: &str, val: &str| {
                     val.parse::<i64>().map_err(|e| {
-                        RecordStoreError(format!("list_metering: bad {field} value {val:?}: {e}"))
+                        RecordStoreError(format!("list_metering: bad {field} value: {e}"))
                     })
                 };
                 if let Some(class) = name.strip_prefix(METERING_UNIT_PREFIX) {
@@ -1389,7 +1403,7 @@ impl ValkeyStore {
                     "priced_from_ms" => {
                         m.priced_from_ms = val.parse::<u64>().map_err(|e| {
                             RecordStoreError(format!(
-                                "list_metering: bad priced_from_ms value {val:?}: {e}"
+                                "list_metering: bad priced_from_ms value: {e}"
                             ))
                         })?
                     }
@@ -1628,8 +1642,9 @@ impl ValkeyStore {
         members
             .iter()
             .map(|m| {
-                serde_json::from_str(m)
-                    .map_err(|e| RecordStoreError(format!("audit decode failed: {e}")))
+                serde_json::from_str(m).map_err(|e| {
+                    RecordStoreError(format!("audit decode failed: {}", decode_text(&e)))
+                })
             })
             .collect()
     }
