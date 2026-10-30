@@ -207,12 +207,15 @@ fn parse_usage_field(field: &str) -> Option<(String, String)> {
     Some((model.to_string(), unit))
 }
 
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
 /// Lower-case hex of `bytes` — the collision-free spelling of a caller-supplied component inside a
 /// key or field name (hex contains no separator character).
 pub(crate) fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        out.push_str(&format!("{b:02x}"));
+        out.push(char::from(HEX_DIGITS[usize::from(b >> 4)]));
+        out.push(char::from(HEX_DIGITS[usize::from(b & 15)]));
     }
     out
 }
