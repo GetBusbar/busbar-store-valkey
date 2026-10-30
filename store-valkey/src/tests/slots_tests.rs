@@ -984,3 +984,30 @@ fn a_record_scan_page_is_not_shortened_by_a_concurrent_strike() {
     let page = page.join().unwrap().unwrap();
     assert_eq!(page.len(), 3, "the page was cut by a strike: {page:?}");
 }
+
+/// The contract upserts by `(kind, id)` and reads at seq 0: a second upsert of an id with another
+/// `seq` replaces the first, never stands beside it.
+#[test]
+fn an_upsert_replaces_by_id_whatever_its_seq() {
+    let Some(s) = live_store() else { return };
+    let kind = fresh("upsert-seq");
+    let rec = |seq: u64, body: &[u8]| PlaneRecord {
+        kind: kind.clone(),
+        id: "a".into(),
+        parent: None,
+        seq,
+        ts: 1,
+        disposition: PlaneDisposition::Active,
+        body: body.to_vec(),
+    };
+    s.upsert_plane_record(rec(3, b"three").view()).unwrap();
+    s.upsert_plane_record(rec(4, b"four").view()).unwrap();
+    assert_eq!(
+        s.list_plane_records(&kind, &PlaneSelector::All).unwrap(),
+        vec![b"four".to_vec()]
+    );
+    assert_eq!(
+        s.get_plane_record(&kind, "a").unwrap(),
+        Some(b"four".to_vec())
+    );
+}
