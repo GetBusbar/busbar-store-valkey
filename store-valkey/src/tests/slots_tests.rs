@@ -786,7 +786,7 @@ fn a_batch_with_an_unusable_cell_applies_nothing_and_records_nothing() {
     let (bad, good) = (fresh("atomic-bad"), fresh("atomic-good"));
     let mut r = raw_conn();
     let bad_key = format!("busbar:usage:{bad}:0");
-    let _: () = r.set(&bad_key, "not a hash").unwrap();
+    let _: () = r.set(&bad_key, "secret-text").unwrap();
     let d = UsageDelta {
         requests: 2,
         billable_requests: 0,
@@ -796,7 +796,7 @@ fn a_batch_with_an_unusable_cell_applies_nothing_and_records_nothing() {
     let id = op(43);
     let e = s.add_usage_batch(id, &cells).expect_err("refused");
     assert!(
-        matches!(&e, OpRefused::Refused(t) if t.contains(&bad_key) && !t.contains("not a hash")),
+        matches!(&e, OpRefused::Refused(t) if t.contains(&bad_key) && !t.contains("secret-text")),
         "{e:?}"
     );
     assert_eq!(s.get_usage(&good, 0).unwrap().requests, 0, "cell 2 applied");
@@ -831,4 +831,25 @@ fn a_non_integer_counter_field_refuses_the_batch_without_echoing_it() {
         "{e:?}"
     );
     assert_eq!(s.get_usage(&good, 0).unwrap().requests, 0);
+}
+
+#[test]
+fn a_metering_batch_with_a_wrong_typed_row_applies_nothing() {
+    let Some(s) = live_store() else { return };
+    let (bad, good) = (super::unique_bucket(45), super::unique_bucket(46));
+    let mut r = raw_conn();
+    let probe = metering_delta(bad, 1);
+    s.add_metering_batch(op(47), std::slice::from_ref(&probe))
+        .expect("seed");
+    let rows: Vec<String> = r.smembers(format!("busbar:metering:{bad}")).unwrap();
+    let _: () = r.del(&rows[0]).unwrap();
+    let _: () = r.set(&rows[0], "not a hash").unwrap();
+    let id = op(48);
+    let batch = [metering_delta(good, 1), probe];
+    let e = s.add_metering_batch(id, &batch).expect_err("refused");
+    assert!(matches!(e, OpRefused::Refused(_)), "{e:?}");
+    assert!(s.list_metering(good).unwrap().is_empty(), "applied");
+    let _: () = r.del(&rows[0]).unwrap();
+    s.add_metering_batch(id, &batch).expect("the retry applies");
+    assert_eq!(s.list_metering(good).unwrap().len(), 1);
 }
