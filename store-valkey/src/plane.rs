@@ -40,7 +40,7 @@
 //! listing; every listing is re-sorted by the exact `seq` parsed out of `F`, so a `seq` past 2^53
 //! still orders correctly.
 
-use crate::resp::{cmd, pipe, Conn, Script, ScriptInvocation};
+use crate::resp::{cmd, pipe, Conn, Script, ScriptInvocation, Value};
 use crate::{hex, ValkeyStore};
 use busbar_contract::abi::sdk::store::column::clamp;
 use busbar_contract::abi::sdk::store::fork;
@@ -234,21 +234,16 @@ static APPEND: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 });
 
 /// APPEND UNDER AN `op_id` (`slots`): [`APPEND`], deduped on the op's record. `KEYS` as
-/// [`APPEND`], then `KEYS[6]` = the op's record (a hash: `b` = the op's value fields, `a` = its
-/// answer); `ARGV` as [`APPEND`], then `ARGV[8]` = the op's value fields, `ARGV[9]` = the record's
-/// lifetime in seconds. Returns `0` = written, or nothing to write (the op replayed, or the
-/// identical record already at the position); `1` = a fork; `2` = the op id was used with different
-/// value fields. Only a write records the op, in the same script, so the record and the write are
-/// one step: neither is ever seen without the other.
+/// [`APPEND`], then `KEYS[6]` = the op's record (a hash: `b` = the op's body); `ARGV` as [`APPEND`],
+/// then `ARGV[8]` = the op's body, `ARGV[9]` = the record's lifetime in seconds. Returns the body
+/// recorded under the op's id (nothing written), or `0` = written or the identical record already
+/// at the position, `1` = a fork. Only a write records the op, in the same script.
 static APPEND_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_LINK}{LUA_WRITE}
         local prior = redis.call('HGET', KEYS[6], 'b')
         if prior then
-            if prior == ARGV[8] then
-                return 0
-            end
-            return 2
+            return prior
         end
         local old = redis.call('HGET', KEYS[1], ARGV[1])
         if old then
@@ -259,7 +254,7 @@ static APPEND_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
         end
         write(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5],
               ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6], ARGV[7])
-        redis.call('HSET', KEYS[6], 'b', ARGV[8], 'a', '')
+        redis.call('HSET', KEYS[6], 'b', ARGV[8])
         redis.call('EXPIRE', KEYS[6], ARGV[9])
         return 0"
     ))
@@ -379,27 +374,29 @@ pub(crate) async fn upsert(
 }
 
 /// `append_plane_record` under an `op_id` ([`APPEND_OP`]): `op_key` is the op's record, `body` its
-/// value fields. A replay or the identical record is `Ok` with nothing written; a different record
-/// at the position is the fork the append script refuses; the op id used with different value fields is a
-/// conflict.
+/// body. The body already recorded under the op's id (nothing written), or `None`: written, or the
+/// identical record already at the position. A different record there is the fork refused.
 pub(crate) async fn append_op(
     store: &ValkeyStore,
     c: &mut Conn,
     op_key: &str,
-    body: &str,
+    body: &[u8],
     record: PlaneRecordRef<'_>,
-) -> OpResult<()> {
+) -> OpResult<Option<Vec<u8>>> {
     let mut inv =
         write_call(&APPEND_OP, &record, identity(&record)).map_err(|e| OpRefused::Failed(e.0))?;
     inv.key(op_key).arg(body).arg(OP_ID_RETENTION_SECS);
-    let answer: i64 =
+    let answer: Value =
         with_conn_no_retry!(store, |c| inv.invoke(c).await).map_err(|e| OpRefused::Failed(e.0))?;
     match answer {
-        0 => Ok(()),
-        1 => Err(OpRefused::Failed(
+        Value::Data(prior) => Ok(Some(prior)),
+        Value::Int(0) => Ok(None),
+        Value::Int(1) => Err(OpRefused::Failed(
             fork::chain_fork(record.kind, identity(&record), record.seq).0,
         )),
-        _ => Err(OpRefused::Conflict),
+        other => Err(OpRefused::Failed(format!(
+            "valkey command: the append script answered {other:?}"
+        ))),
     }
 }
 

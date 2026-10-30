@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 use super::*;
-use busbar_contract::records::{PlaneDisposition, RecordStore, SecretForm};
+use busbar_contract::records::{MeteringDelta, PlaneDisposition, RecordStore, SecretForm};
 #[allow(unused_imports)]
 use redis::Commands;
 use std::sync::OnceLock;

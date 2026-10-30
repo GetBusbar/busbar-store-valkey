@@ -39,7 +39,6 @@
 
 use busbar_contract::abi::sdk::store::column::{clamp, read_u64};
 use busbar_contract::abi::sdk::store::wire::{Pool, Wire};
-use busbar_contract::records::MeteringDelta;
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringRow, ModelTokens, RecordStoreError,
     RecordStoreResult, UsageDelta, UsageLedger, VirtualKey, RESERVED_UNITS,
@@ -332,30 +331,6 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
     }
     out
 }
-
-/// ADD-THEN-FLOOR over one hash: `ARGV` is `field, delta` pairs; each field is `HINCRBY`'d and, if
-/// the result went below 0, pinned to 0. A counter a v6 build left negative (its unfloored HINCRBY)
-/// is read as the 0 it always reported before the add, so the add lands on what readers saw. The add
-/// itself stays an integer HINCRBY (Lua numbers are doubles; a read-add-write in Lua would round
-/// counters past 2^53). One script, so the server runs every pair atomically — the
-/// same guarantee the v6 `MULTI` pipeline gave, plus the per-counter floor the contract's
-/// `UsageLedger::apply_delta` specifies.
-///
-/// The source is also queued as a plain `EVAL` inside an `op_id` write's `MULTI` (`slots`), where
-/// an `EVALSHA` could miss a flushed script cache after the transaction had begun.
-const ADD_FLOORED_LUA: &str = r"
-        for i = 1, #ARGV, 2 do
-            local cur = redis.call('HGET', KEYS[1], ARGV[i])
-            if cur and tonumber(cur) < 0 then
-                redis.call('HSET', KEYS[1], ARGV[i], 0)
-            end
-            local v = redis.call('HINCRBY', KEYS[1], ARGV[i], ARGV[i + 1])
-            if v < 0 then
-                redis.call('HSET', KEYS[1], ARGV[i], 0)
-            end
-        end
-        return 0
-        ";
 
 /// What the store connects to, parsed once from its settings' URL.
 #[derive(Clone)]
@@ -1039,7 +1014,7 @@ fn parse_slot_pointer(s: &str) -> Option<(String, String, u8)> {
     Some((key_id.to_string(), kind.to_string(), slot.parse().ok()?))
 }
 
-/// The fields one usage delta adds, as `(hash field, delta)` pairs for [`ADD_FLOORED_LUA`]: the two
+/// The fields one usage delta adds, as `(hash field, delta)` pairs for `add_usage_batch`: the two
 /// request counters always, and every non-zero unit.
 fn usage_fields(delta: &UsageDelta) -> Vec<(String, i64)> {
     let mut fields: Vec<(String, i64)> = vec![
@@ -1054,57 +1029,6 @@ fn usage_fields(delta: &UsageDelta) -> Vec<(String, i64)> {
         }
     }
     fields
-}
-
-/// Queue one metering delta's writes on `pipe` (the caller makes it atomic): the row joins its
-/// bucket's set, every counter is an `HINCRBY`, the identity fields are set, and the attribution
-/// snapshot is first-write-wins.
-fn queue_metering(pipe: &mut Pipeline, d: &MeteringDelta) {
-    let row = metering_row(d.bucket, &d.key_id, &d.model, &d.provider, d.priced_from_ms);
-    pipe.sadd(metering_set(d.bucket), &row).ignore();
-    for (field, v) in [
-        ("tokens_input", d.tokens_input),
-        ("tokens_output", d.tokens_output),
-        ("tokens_cache_read", d.tokens_cache_read),
-        ("tokens_cache_write", d.tokens_cache_write),
-        ("requests", d.requests),
-        ("billable_requests", d.billable_requests),
-    ] {
-        pipe.cmd("HINCRBY")
-            .arg(&row)
-            .arg(field)
-            .arg(clamp(v))
-            .ignore();
-    }
-    for (class, v) in &d.usage_units {
-        pipe.cmd("HINCRBY")
-            .arg(&row)
-            .arg(format!("{METERING_UNIT_PREFIX}{class}"))
-            .arg(clamp(*v))
-            .ignore();
-    }
-    pipe.hset_multiple(
-        &row,
-        &[
-            ("key_id", d.key_id.as_str()),
-            ("model", d.model.as_str()),
-            ("provider", d.provider.as_str()),
-        ],
-    )
-    .ignore()
-    .hset(&row, "priced_from_ms", d.priced_from_ms.to_string())
-    .ignore()
-    // First-write-wins attribution snapshot: HSETNX only sets if the field is absent.
-    .cmd("HSETNX")
-    .arg(&row)
-    .arg("key_group_at_use")
-    .arg(&d.key_group_at_use)
-    .ignore()
-    .cmd("HSETNX")
-    .arg(&row)
-    .arg("pricing_version")
-    .arg(&d.pricing_version)
-    .ignore();
 }
 
 /// The base op set's bodies, each over the op's one connection `c` (the store door, `slots`, runs

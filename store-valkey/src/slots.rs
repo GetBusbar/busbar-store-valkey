@@ -8,26 +8,17 @@
 //!
 //! ## Layout (schema v9, `crate::SCHEMA_VERSION`)
 //!
-//! - `busbar:op:<hex op_id>`            HASH `b` = the op's value fields, `a` = its answer; expires
+//! - `busbar:op:<hex op_id>`            HASH `b` = the op's body ([`Dedupe`]); expires
 //!   [`OP_ID_RETENTION_SECS`] after it is written (S4).
 //! - `busbar:records:<hex schema>:k`    ZSET of keys, every score 0, so `ZRANGEBYLEX` reads them in
 //!   byte order; `busbar:records:<hex schema>:v` HASH key -> value.
 //!
 //! ## Dedupe (`abi::store` S1-S4), durable and atomic
 //!
-//! Every `op_id` write checks the op's record, applies its effect and writes the record in ONE
-//! atomic step, the Valkey equivalent of the SQL stores' one transaction:
-//!
-//! - the usage and metering batches read nothing, so they watch only the op's record under an
-//!   optimistic `WATCH`/`MULTI`/`EXEC` (`deduped`); a concurrent writer of it aborts the `EXEC`
-//!   and the whole step re-runs against fresh state. The usage add is the floored-add script
-//!   queued as a plain `EVAL`.
-//! - `append_plane_record` under an `op_id` is one server-side script ([`crate::plane`]), so the
-//!   kind's records are never watched (see that module's doc for why).
-//!
-//! A replay with the same value fields applies nothing and answers the recorded answer; different
-//! value fields are a conflict and apply nothing; a refused or failed op writes nothing, its
-//! record included (S3).
+//! Every `op_id` write is ONE server-side script: it returns the body recorded under the op's id
+//! and applies nothing, or applies the effect and records the op's body. [`Dedupe::answer`] reads
+//! the returned body: a replay answers done, a different op's body a conflict (S1-S3).
+//! `append_plane_record`'s script is [`crate::plane`]'s.
 //!
 //! ## Every slot is one op through the host's connector
 //!
@@ -38,6 +29,8 @@
 //! answers. The body is the blocking client's body, `async`.
 
 use busbar_contract::abi::sdk::conn::Host;
+use busbar_contract::abi::sdk::store::column::{clamp, prefix_end};
+use busbar_contract::abi::sdk::store::dedupe::Dedupe;
 use busbar_contract::abi::sdk::store::wire::drive_kept;
 use busbar_contract::abi::sdk::store::{Op, OpRefused, OpResult, Scanned, Step, StoreSlots, Tail};
 use busbar_contract::abi::store::{OpId, OP_ID_RETENTION_SECS};
@@ -47,9 +40,10 @@ use busbar_contract::records::{
     PlaneSelector, RecordStoreError, RecordStoreResult, UsageDelta, UsageLedger, VirtualKey,
 };
 
-use crate::resp::{cmd, pipe, Conn, Pipeline, RedisResult};
+use crate::resp::{cmd, pipe, Conn, Script, ScriptInvocation};
 use crate::{
-    hex, plane, queue_metering, usage_fields, usage_key, ValkeyStore, ADD_FLOORED_LUA, NAME, NEEDS,
+    hex, metering_row, metering_set, plane, usage_fields, usage_key, ValkeyStore,
+    METERING_UNIT_PREFIX, NAME, NEEDS,
 };
 
 // `url` is reference-capable, not secret: a `{env:}`/`{file:}`/`{module:}` reference resolves in
@@ -118,39 +112,6 @@ macro_rules! ops {
 }
 
 impl ValkeyStore {
-    /// RUN ONE `op_id`-CARRYING WRITE (module doc, DEDUPE) on `c`: `WATCH` the op's record; a
-    /// recorded op answers from it (a replay, or a conflict on different value fields); else `queue`
-    /// puts the effect on the atomic pipeline, `EXEC`ed with the op's record. An `EXEC` a concurrent
-    /// writer aborted re-runs the whole step. A lost `EXEC` reply is never retried (it may have
-    /// committed): the op fails, and its caller retries under the same `op_id`.
-    async fn deduped(
-        &self,
-        c: &mut Conn,
-        op: OpId,
-        body: &str,
-        queue: impl Fn(&mut Pipeline),
-    ) -> OpResult<()> {
-        let opk = op_key(op);
-        let ran: RedisResult<OpResult<()>> = transaction!(c, &[opk.as_str()], |c, tx| {
-            let recorded: Option<Vec<u8>> = cmd("HGET").arg(&opk).arg("b").query(c).await?;
-            if let Some(b) = recorded {
-                return Ok(Some(if b == body.as_bytes() {
-                    Ok(())
-                } else {
-                    Err(OpRefused::Conflict)
-                }));
-            }
-            queue(tx);
-            tx.hset_multiple(&opk, &[("b", body), ("a", "")])
-                .ignore()
-                .expire(&opk, OP_ID_RETENTION_SECS as i64)
-                .ignore();
-            let committed: Option<()> = tx.query(c).await?;
-            Ok(committed.map(Ok))
-        });
-        ran.unwrap_or_else(|e| Err(OpRefused::Failed(self.err(e, "command").0)))
-    }
-
     /// `record_put` (slot 40): an upsert on `(schema, key)`. An EMPTY value removes the row:
     /// it is the host's strike, so the key leaves both the ordered key set and the values,
     /// `record_get` then answers `None` and `record_scan` never returns it.
@@ -252,13 +213,119 @@ impl ValkeyStore {
     }
 }
 
-/// The usage adds of `cells`, as the floored-add script's `(key, fields)`.
-fn usage_adds<'a>(
-    cells: impl Iterator<Item = (&'a str, u64, &'a UsageDelta)>,
-) -> Vec<(String, Vec<(String, i64)>)> {
-    cells
-        .map(|(bucket, window, delta)| (usage_key(bucket, window), usage_fields(delta)))
-        .collect()
+/// The start of an `op_id` write's script: `KEYS[1]` is the op's record; a recorded body is
+/// returned and nothing applies.
+const LUA_SEEN: &str = r"
+local prior = redis.call('HGET', KEYS[1], 'b')
+if prior then
+    return prior
+end
+local failed
+";
+
+/// The end of an `op_id` write's script: record the body (`ARGV[1]`) for `ARGV[2]` seconds. A
+/// failed command fails the op but leaves the rest applied and the op recorded, so a retry replays
+/// instead of applying twice.
+const LUA_RECORD: &str = r"
+redis.call('HSET', KEYS[1], 'b', ARGV[1])
+redis.call('EXPIRE', KEYS[1], ARGV[2])
+if failed then
+    return redis.error_reply(type(failed) == 'table' and failed.err or tostring(failed))
+end
+return false
+";
+
+/// `add_usage_batch`: per cell `KEYS[k]` = its usage hash; `ARGV` from 3 = per cell `n`, then `n`
+/// `field, delta` pairs. ADD-THEN-FLOOR: each field is `HINCRBY`'d and, below 0, pinned to 0; a
+/// counter a v6 build left negative (its unfloored HINCRBY) reads as the 0 it always reported. The
+/// add stays an integer HINCRBY (Lua numbers are doubles and would round counters past 2^53).
+static USAGE_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
+    Script::new(&format!(
+        "{LUA_SEEN}
+        local function add_floored(key, from, n)
+            for i = from, from + 2 * n - 2, 2 do
+                local cur = redis.call('HGET', key, ARGV[i])
+                if cur and tonumber(cur) < 0 then
+                    redis.call('HSET', key, ARGV[i], 0)
+                end
+                if redis.call('HINCRBY', key, ARGV[i], ARGV[i + 1]) < 0 then
+                    redis.call('HSET', key, ARGV[i], 0)
+                end
+            end
+        end
+        local a = 3
+        for k = 2, #KEYS do
+            local n = tonumber(ARGV[a])
+            local ok, e = pcall(add_floored, KEYS[k], a + 1, n)
+            if not ok and not failed then
+                failed = e
+            end
+            a = a + 1 + 2 * n
+        end
+        {LUA_RECORD}"
+    ))
+});
+
+/// `add_metering_batch`: per delta `KEYS[k], KEYS[k + 1]` = its bucket's set and its row; `ARGV`
+/// from 3 = per delta the six counters, `n`, `n` `unit field, count` pairs, then `key_id`, `model`,
+/// `provider`, `priced_from_ms`, `key_group_at_use`, `pricing_version`. The row joins its set,
+/// every count is an `HINCRBY`, the attribution snapshot is first-write-wins (`HSETNX`).
+static METERING_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
+    Script::new(&format!(
+        "{LUA_SEEN}
+        local function run(...)
+            local r = redis.pcall(...)
+            if type(r) == 'table' and r.err and not failed then
+                failed = r
+            end
+        end
+        local counters = {{'tokens_input', 'tokens_output', 'tokens_cache_read',
+                          'tokens_cache_write', 'requests', 'billable_requests'}}
+        local a = 3
+        for k = 2, #KEYS, 2 do
+            local row = KEYS[k + 1]
+            run('SADD', KEYS[k], row)
+            for i, f in ipairs(counters) do
+                run('HINCRBY', row, f, ARGV[a + i - 1])
+            end
+            local n = tonumber(ARGV[a + 6])
+            a = a + 7
+            for _ = 1, n do
+                run('HINCRBY', row, ARGV[a], ARGV[a + 1])
+                a = a + 2
+            end
+            run('HSET', row, 'key_id', ARGV[a], 'model', ARGV[a + 1], 'provider', ARGV[a + 2])
+            run('HSET', row, 'priced_from_ms', ARGV[a + 3])
+            run('HSETNX', row, 'key_group_at_use', ARGV[a + 4])
+            run('HSETNX', row, 'pricing_version', ARGV[a + 5])
+            a = a + 6
+        end
+        {LUA_RECORD}"
+    ))
+});
+
+/// An `op_id` write's script call over the op's record, with the body `d` records.
+fn op_call(script: &'static Script, op: OpId, d: &Dedupe<'_>) -> ScriptInvocation<'static> {
+    let mut inv = script.key(op_key(op));
+    inv.arg(&d.body()[..]).arg(OP_ID_RETENTION_SECS);
+    inv
+}
+
+impl ValkeyStore {
+    /// Run an `op_id` write's script once (a lost reply may have applied): the body it found.
+    fn deduped(
+        &self,
+        cx: &mut Op<'_>,
+        inv: ScriptInvocation<'static>,
+    ) -> Step<OpResult<Option<Vec<u8>>>> {
+        op!(
+            cx,
+            self,
+            |e: RecordStoreError| Err(OpRefused::Failed(e.0)),
+            |me, c| with_conn_no_retry!(me, |c| inv.invoke(c).await)
+                .map_err(|e| OpRefused::Failed(e.0))
+        )
+    }
 }
 
 impl StoreSlots for ValkeyStore {
@@ -294,7 +361,8 @@ impl StoreSlots for ValkeyStore {
         op: OpId,
         record: PlaneRecordRef<'_>,
     ) -> Step<OpResult<()>> {
-        let body = format!("append_plane_record:{record:?}");
+        let d = Dedupe::append(record);
+        let body = d.body().to_vec();
         let record = record.to_record();
         op!(
             cx,
@@ -302,6 +370,7 @@ impl StoreSlots for ValkeyStore {
             |e: RecordStoreError| Err(OpRefused::Failed(e.0)),
             |me, c| crate::plane::append_op(&me, c, &op_key(op), &body, record.view()).await
         )
+        .map(|found| d.answer(found))
     }
 
     fn record_put(
@@ -348,25 +417,16 @@ impl StoreSlots for ValkeyStore {
         op: OpId,
         cells: &[(&str, u64, UsageDelta)],
     ) -> Step<OpResult<()>> {
-        let body = format!("add_usage_batch:{cells:?}");
-        let adds = usage_adds(cells.iter().map(|(b, w, d)| (*b, *w, d)));
-        op!(
-            cx,
-            self,
-            |e: RecordStoreError| Err(OpRefused::Failed(e.0)),
-            |me, c| {
-                me.deduped(c, op, &body, |pipe| {
-                    for (key, fields) in &adds {
-                        let eval = pipe.cmd("EVAL").arg(ADD_FLOORED_LUA).arg(1).arg(key);
-                        for (f, d) in fields {
-                            eval.arg(f).arg(*d);
-                        }
-                        eval.ignore();
-                    }
-                })
-                .await
+        let d = Dedupe::usage(cells);
+        let mut inv = op_call(&USAGE_OP, op, &d);
+        for (bucket, window, delta) in cells {
+            let fields = usage_fields(delta);
+            inv.key(usage_key(bucket, *window)).arg(fields.len());
+            for (f, n) in &fields {
+                inv.arg(f).arg(*n);
             }
-        )
+        }
+        self.deduped(cx, inv).map(|found| d.answer(found))
     }
 
     fn add_metering_batch(
@@ -375,19 +435,39 @@ impl StoreSlots for ValkeyStore {
         op: OpId,
         deltas: &[MeteringDelta],
     ) -> Step<OpResult<()>> {
-        let body = format!("add_metering_batch:{deltas:?}");
-        let deltas = deltas.to_vec();
-        op!(
-            cx,
-            self,
-            |e: RecordStoreError| Err(OpRefused::Failed(e.0)),
-            |me, c| {
-                me.deduped(c, op, &body, |pipe| {
-                    deltas.iter().for_each(|d| queue_metering(pipe, d))
-                })
-                .await
+        let d = Dedupe::metering(deltas);
+        let mut inv = op_call(&METERING_OP, op, &d);
+        for m in deltas {
+            inv.key(metering_set(m.bucket)).key(metering_row(
+                m.bucket,
+                &m.key_id,
+                &m.model,
+                &m.provider,
+                m.priced_from_ms,
+            ));
+            for n in [
+                m.tokens_input,
+                m.tokens_output,
+                m.tokens_cache_read,
+                m.tokens_cache_write,
+                m.requests,
+                m.billable_requests,
+            ] {
+                inv.arg(clamp(n));
             }
-        )
+            inv.arg(m.usage_units.len());
+            for (class, n) in &m.usage_units {
+                inv.arg(format!("{METERING_UNIT_PREFIX}{class}"))
+                    .arg(clamp(*n));
+            }
+            inv.arg(&m.key_id)
+                .arg(&m.model)
+                .arg(&m.provider)
+                .arg(m.priced_from_ms)
+                .arg(&m.key_group_at_use)
+                .arg(&m.pricing_version);
+        }
+        self.deduped(cx, inv).map(|found| d.answer(found))
     }
 
     // The base op set and the plane verbs: each body is the store's own, run as one op.
@@ -463,18 +543,6 @@ impl StoreSlots for ValkeyStore {
 /// A stored record's bytes as a [`RecordBytes`].
 fn record(v: Vec<u8>) -> Result<RecordBytes, String> {
     RecordBytes::new(v).map_err(|n| format!("a stored record of {n} bytes is over the ceiling"))
-}
-
-/// The smallest key above every key that starts with `prefix`, or `None` when there is none.
-fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut end = prefix.to_vec();
-    while let Some(last) = end.pop() {
-        if last < u8::MAX {
-            end.push(last + 1);
-            return Some(end);
-        }
-    }
-    None
 }
 
 #[cfg(test)]
