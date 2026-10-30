@@ -1513,25 +1513,32 @@ impl ValkeyStore {
         reason: &str,
     ) -> RecordStoreResult<()> {
         let id_key = cred_id_key(id);
-        with_conn!(self, |c| {
-            transaction!(c, &[id_key.as_str(), REVISION_KEY], |c, pipe| {
-                let ptr: Option<String> = c.get(&id_key).await?;
-                let Some(ptr) = ptr else {
-                    // Unknown id: an ERROR (only an already-revoked id is an idempotent no-op).
-                    return Err(RedisError::refused(format!(
-                        "revoke_credential: unknown id '{id}'"
-                    )));
-                };
-                // A pointer that does not parse is corruption: never report a revocation that
-                // did not happen.
-                let Some((key_id, kind, slot)) = parse_slot_pointer(&ptr) else {
-                    return Err(RedisError::from((
-                        ErrorKind::Client,
-                        "corrupt credential pointer",
-                        format!("busbar:cred:id:{id} does not parse as <key_id>:<kind>:<slot>"),
-                    )));
-                };
-                let row_key = cred_row_key(&key_id, &kind, slot);
+        with_conn!(self, |c| loop {
+            // The row to rewrite is named by the pointer, so the pointer is read first, then BOTH
+            // are WATCHed (a pointer that moves in between reruns this from the top).
+            let ptr: Option<String> = c.get(&id_key).await?;
+            let Some(ptr) = ptr else {
+                // Unknown id: an ERROR (only an already-revoked id is an idempotent no-op).
+                return Err(RedisError::refused(format!(
+                    "revoke_credential: unknown id '{id}'"
+                )));
+            };
+            // A pointer that does not parse is corruption: never report a revocation that
+            // did not happen.
+            let Some((key_id, kind, slot)) = parse_slot_pointer(&ptr) else {
+                return Err(RedisError::from((
+                    ErrorKind::Client,
+                    "corrupt credential pointer",
+                    format!("busbar:cred:id:{id} does not parse as <key_id>:<kind>:<slot>"),
+                )));
+            };
+            let row_key = cred_row_key(&key_id, &kind, slot);
+            let watched = [id_key.as_str(), row_key.as_str(), REVISION_KEY];
+            let outcome = transaction!(c, &watched, |c, pipe| {
+                let now_ptr: Option<String> = c.get(&id_key).await?;
+                if now_ptr.as_deref() != Some(ptr.as_str()) {
+                    return Err(RedisError::retry());
+                }
                 let raw: Option<String> = c.get(&row_key).await?;
                 let Some(raw) = raw else {
                     pipe.atomic();
@@ -1554,12 +1561,15 @@ impl ValkeyStore {
                 cred.secret = String::new();
                 let json = cred_to_json(&cred)
                     .map_err(|_| RedisError::from((ErrorKind::Client, "cred encode")))?;
-                pipe.atomic();
                 pipe.set(&row_key, &json).ignore();
                 pipe.zadd(CREDS_BYREV, format!("{key_id}:{kind}:{slot}"), rev)
                     .ignore();
                 pipe.query(c).await
-            })
+            });
+            match outcome {
+                Err(e) if e.is_retry() => continue,
+                other => break other,
+            }
         })
     }
 
