@@ -956,3 +956,31 @@ fn the_v6_copy_keeps_an_event_chain_whose_position_forked() {
     let marker: i64 = c.get("busbar:schema").unwrap();
     assert_eq!(marker, 9, "the upgrade still completes");
 }
+
+/// A page is read at ONE instant: a strike landing while the scan is in flight cannot shorten it.
+/// The scan is held right after its key range is read; the row is struck; the scan is released.
+#[test]
+fn a_record_scan_page_is_not_shortened_by_a_concurrent_strike() {
+    let Some(direct) = live_store() else { return };
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let schema = fresh("scan-atomic");
+    for k in [b"a", b"b", b"c"] {
+        direct.record_put(&schema, k, b"v").unwrap();
+    }
+    // Warm the server's script cache, so the held scan sends no `SCRIPT LOAD`.
+    assert_eq!(direct.record_scan(&schema, b"", 10).unwrap().len(), 3);
+    let gate = super::interleave::gate(&url, false, |c| {
+        let has = |t: &[u8]| super::interleave::contains(c, t);
+        (has(b"ZRANGEBYLEX") || has(b"EVALSHA")) && !has(b"SCRIPT")
+    });
+    let scanner = ValkeyStore::connect(&gate.url).unwrap();
+    let name = schema.clone();
+    let page = std::thread::spawn(move || scanner.record_scan(&name, b"", 10));
+    gate.held
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the scan is in flight");
+    direct.record_put(&schema, b"b", b"").unwrap();
+    gate.release.send(()).unwrap();
+    let page = page.join().unwrap().unwrap();
+    assert_eq!(page.len(), 3, "the page was cut by a strike: {page:?}");
+}
