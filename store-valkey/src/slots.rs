@@ -22,9 +22,9 @@
 //!
 //! ## Every slot is one op through the host's connector
 //!
-//! Each slot runs its body with the store SDK's `wire::drive_kept` on the store's ONE kept
-//! connection: drawn when the op starts (dialled through the
-//! host's connector on the op's ticket when there is none), every command a write and a read that
+//! Each slot runs its body with the store SDK's `wire::drive_kept` on one of the store's kept
+//! connections: drawn when the op starts (dialled through the host's connector on the op's ticket
+//! when none is idle), every command a write and a read that
 //! may PEND (the op answers PENDING and is resumed on the connector's wake), handed back when the op
 //! answers. The body is the blocking client's body, `async`.
 
