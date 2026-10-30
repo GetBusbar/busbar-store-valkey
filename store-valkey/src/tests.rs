@@ -4630,6 +4630,26 @@ fn unknown_id_refusals_name_the_id_in_the_canonical_form() {
     assert!(!e.contains("- Client"), "{e}");
 }
 
+/// An id that spells the delete's internal retry text is just an unknown id: it answers the refusal
+/// (it never loops). The call runs on a thread so a regression fails by timeout, not by hanging.
+#[test]
+fn an_unknown_id_spelling_the_retry_sentinel_is_refused_not_retried() {
+    if live_store().is_none() {
+        return;
+    }
+    let id = uid("__internal_delete_key_retry__");
+    let want = id.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let store = live_store().expect("live");
+        let _ = tx.send(store.delete_key(&id).unwrap_err().to_string());
+    });
+    let e = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("delete_key answered instead of retrying forever");
+    assert!(e.contains(&format!("delete_key: unknown id '{want}'")), "{e}");
+}
+
 #[test]
 fn put_refusals_carry_the_reason_without_the_kind_suffix() {
     let Some(store) = live_store() else { return };
