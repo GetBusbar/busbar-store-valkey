@@ -1225,6 +1225,10 @@ impl ValkeyStore {
                         pipe.del(cred_id_key(&cred.meta.id)).ignore();
                     }
                     pipe.del(&row_key).ignore();
+                    pipe.cmd("ZREM")
+                        .arg(CREDS_BYREV)
+                        .arg(format!("{id}:{kind}:{slot}"))
+                        .ignore();
                 }
                 pipe.del(&ids_key).ignore();
                 pipe.query(c).await
