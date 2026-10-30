@@ -159,18 +159,30 @@ pub enum Value {
     Error(String),
 }
 
-/// Bytes copied into `Value::Data`, to prove a reply is materialised once.
+/// The deepest array nesting a reply may have; deeper is refused rather than recursed into.
+const MAX_REPLY_DEPTH: usize = 32;
+
+// Bytes `walk` copied into `Value::Data`, to prove a reply is materialised once.
 #[cfg(test)]
 thread_local! {
     static COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Parse one reply from the front of `buf`: the reply and how many bytes it took, or `None` when
-/// `buf` does not hold a whole reply yet.
+/// `buf` does not hold a whole reply yet. A first pass only checks that the reply is complete (it
+/// allocates and copies nothing), so a reply that arrives in many fills is built once, when whole.
 ///
 /// # Errors
-/// Bytes that are not RESP2.
+/// Bytes that are not RESP2, an array nested deeper than 32, or a length that overflows.
 pub fn parse(buf: &[u8]) -> RedisResult<Option<(Value, usize)>> {
+    match walk(buf, 0, 0, false)? {
+        None => Ok(None),
+        Some(_) => walk(buf, 0, 0, true),
+    }
+}
+
+/// One reply at `at`: built when `make`, else only measured (its value is `Nil`).
+fn walk(buf: &[u8], at: usize, depth: usize, make: bool) -> RedisResult<Option<(Value, usize)>> {
     fn line(buf: &[u8], from: usize) -> Option<(&[u8], usize)> {
         let rest = buf.get(from..)?;
         let at = rest.windows(2).position(|w| w == b"\r\n")?;
@@ -185,62 +197,91 @@ pub fn parse(buf: &[u8]) -> RedisResult<Option<(Value, usize)>> {
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| bad("a length or integer is not a number"))
     }
-    fn one(buf: &[u8], at: usize) -> RedisResult<Option<(Value, usize)>> {
-        let Some(&tag) = buf.get(at) else {
-            return Ok(None);
-        };
-        let Some((text, next)) = line(buf, at + 1) else {
-            return Ok(None);
-        };
-        match tag {
-            b'+' => Ok(Some((
-                Value::Status(String::from_utf8_lossy(text).into_owned()),
-                next,
-            ))),
-            b'-' => Ok(Some((
-                Value::Error(String::from_utf8_lossy(text).into_owned()),
-                next,
-            ))),
-            b':' => Ok(Some((Value::Int(int(text)?), next))),
-            b'$' => {
-                let n = int(text)?;
-                if n < 0 {
-                    return Ok(Some((Value::Nil, next)));
-                }
-                let n = usize::try_from(n).map_err(|_| bad("a bulk length overflows"))?;
-                let end = next + n;
-                if buf.len() < end + 2 {
-                    return Ok(None);
-                }
-                if &buf[end..end + 2] != b"\r\n" {
-                    return Err(bad("a bulk string is not terminated"));
-                }
-                #[cfg(test)]
-                COPIED.with(|c| c.set(c.get() + n));
-                Ok(Some((Value::Data(buf[next..end].to_vec()), end + 2)))
+    let Some(&tag) = buf.get(at) else {
+        return Ok(None);
+    };
+    let Some((text, next)) = line(buf, at + 1) else {
+        return Ok(None);
+    };
+    let text_of = |text: &[u8]| String::from_utf8_lossy(text).into_owned();
+    match tag {
+        b'+' => Ok(Some((
+            if make {
+                Value::Status(text_of(text))
+            } else {
+                Value::Nil
+            },
+            next,
+        ))),
+        b'-' => Ok(Some((
+            if make {
+                Value::Error(text_of(text))
+            } else {
+                Value::Nil
+            },
+            next,
+        ))),
+        b':' => Ok(Some((Value::Int(int(text)?), next))),
+        b'$' => {
+            let n = int(text)?;
+            if n < 0 {
+                return Ok(Some((Value::Nil, next)));
             }
-            b'*' => {
-                let n = int(text)?;
-                if n < 0 {
-                    return Ok(Some((Value::Nil, next)));
-                }
-                let mut items = Vec::with_capacity(usize::try_from(n).unwrap_or(0).min(4096));
-                let mut at = next;
-                for _ in 0..n {
-                    match one(buf, at)? {
-                        Some((v, after)) => {
-                            items.push(v);
-                            at = after;
-                        }
-                        None => return Ok(None),
-                    }
-                }
-                Ok(Some((Value::Array(items), at)))
+            let n = usize::try_from(n).map_err(|_| bad("a bulk length overflows"))?;
+            let end = next
+                .checked_add(n)
+                .ok_or_else(|| bad("a bulk length overflows"))?;
+            let after = end
+                .checked_add(2)
+                .ok_or_else(|| bad("a bulk length overflows"))?;
+            if buf.len() < after {
+                return Ok(None);
             }
-            _ => Err(bad("an unknown reply type")),
+            if &buf[end..after] != b"\r\n" {
+                return Err(bad("a bulk string is not terminated"));
+            }
+            if !make {
+                return Ok(Some((Value::Nil, after)));
+            }
+            #[cfg(test)]
+            COPIED.with(|c| c.set(c.get() + n));
+            Ok(Some((Value::Data(buf[next..end].to_vec()), after)))
         }
+        b'*' => {
+            let n = int(text)?;
+            if n < 0 {
+                return Ok(Some((Value::Nil, next)));
+            }
+            if depth >= MAX_REPLY_DEPTH {
+                return Err(bad("arrays are nested too deeply"));
+            }
+            let mut items = Vec::new();
+            if make {
+                items.reserve(usize::try_from(n).unwrap_or(0).min(4096));
+            }
+            let mut at = next;
+            for _ in 0..n {
+                match walk(buf, at, depth + 1, make)? {
+                    Some((v, after)) => {
+                        if make {
+                            items.push(v);
+                        }
+                        at = after;
+                    }
+                    None => return Ok(None),
+                }
+            }
+            Ok(Some((
+                if make {
+                    Value::Array(items)
+                } else {
+                    Value::Nil
+                },
+                at,
+            )))
+        }
+        _ => Err(bad("an unknown reply type")),
     }
-    one(buf, 0)
 }
 
 /// Encode one command (an array of bulk strings) onto `out`.
