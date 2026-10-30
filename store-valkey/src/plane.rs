@@ -408,7 +408,8 @@ pub(crate) async fn append_op(
             fork::chain_fork(record.kind, identity(&record), record.seq).0,
         )),
         other => Err(OpRefused::Failed(format!(
-            "valkey command: the append script answered {other:?}"
+            "valkey command: the append script answered a {}",
+            other.shape()
         ))),
     }
 }

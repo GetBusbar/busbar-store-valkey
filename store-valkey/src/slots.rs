@@ -383,7 +383,8 @@ impl ValkeyStore {
                         )),
                     },
                     other => Err(OpRefused::Failed(format!(
-                        "valkey command: the script answered {other:?}"
+                        "valkey command: the script answered a {}",
+                        other.shape()
                     ))),
                 }
             }
