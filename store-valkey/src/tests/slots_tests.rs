@@ -40,9 +40,8 @@ impl FromFailure for OpRefused {
     fn from_failure(f: StoreFailure) -> Self {
         match f {
             StoreFailure::Conflict => OpRefused::Conflict,
-            StoreFailure::Failed(t) | StoreFailure::Refused(t) | StoreFailure::Fault(t) => {
-                OpRefused::Failed(t)
-            }
+            StoreFailure::Refused(t) => OpRefused::Refused(t),
+            StoreFailure::Failed(t) | StoreFailure::Fault(t) => OpRefused::Failed(t),
             other => OpRefused::Failed(other.to_string()),
         }
     }
@@ -718,4 +717,118 @@ fn the_v9_upgrade_drops_the_money_and_dead_slot_keys() {
     );
     let got = iso.s().record_get("v9-schema", b"k").unwrap();
     assert_eq!(got.as_ref().map(RecordBytes::as_slice), Some(&b"v"[..]));
+}
+
+fn raw_conn() -> redis::Connection {
+    let url = std::env::var("VALKEY_URL").expect("live_store read it");
+    redis::Client::open(url)
+        .and_then(|c| c.get_connection())
+        .expect("an independent client")
+}
+
+fn metering_delta(bucket: u64, tokens_input: u64) -> busbar_contract::records::MeteringDelta {
+    busbar_contract::records::MeteringDelta {
+        key_id: "vk-pin".into(),
+        bucket,
+        model: "m".into(),
+        provider: "p".into(),
+        tokens_input,
+        tokens_output: 0,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 0,
+        billable_requests: 0,
+        key_group_at_use: String::new(),
+        pricing_version: String::new(),
+        priced_from_ms: 0,
+        usage_units: Default::default(),
+    }
+}
+
+/// A counter at i64::MAX plus a positive delta pins at i64::MAX (rule 8): the batch answers Ok.
+#[test]
+fn a_usage_counter_at_i64_max_pins_instead_of_failing() {
+    let Some(s) = live_store() else { return };
+    let bucket = fresh("pin-usage");
+    let key = format!("busbar:usage:{bucket}:0");
+    let mut r = raw_conn();
+    let _: () = r.hset(&key, "requests", i64::MAX).unwrap();
+    let d = UsageDelta {
+        requests: 1,
+        billable_requests: 1,
+        models: Vec::new(),
+    };
+    s.add_usage_batch(op(40), &[(bucket.as_str(), 0, d)])
+        .expect("pins, does not fail");
+    let got: String = r.hget(&key, "requests").unwrap();
+    assert_eq!(got, i64::MAX.to_string());
+    let one: String = r.hget(&key, "billable_requests").unwrap();
+    assert_eq!(one, "1");
+}
+
+#[test]
+fn a_metering_counter_at_i64_max_pins_instead_of_failing() {
+    let Some(s) = live_store() else { return };
+    let bucket = super::unique_bucket(41);
+    s.add_metering_batch(op(41), &[metering_delta(bucket, u64::MAX)])
+        .expect("fills the counter to i64::MAX");
+    s.add_metering_batch(op(42), &[metering_delta(bucket, 1)])
+        .expect("pins, does not fail");
+    let rows = s.list_metering(bucket).expect("list");
+    assert_eq!(rows[0].tokens_input, i64::MAX as u64, "{rows:?}");
+}
+
+/// A cell the batch cannot add to refuses the WHOLE batch: no other cell applies and the op is not
+/// recorded, so a retry under the same op id with the key fixed applies.
+#[test]
+fn a_batch_with_an_unusable_cell_applies_nothing_and_records_nothing() {
+    let Some(s) = live_store() else { return };
+    let (bad, good) = (fresh("atomic-bad"), fresh("atomic-good"));
+    let mut r = raw_conn();
+    let bad_key = format!("busbar:usage:{bad}:0");
+    let _: () = r.set(&bad_key, "not a hash").unwrap();
+    let d = UsageDelta {
+        requests: 2,
+        billable_requests: 0,
+        models: Vec::new(),
+    };
+    let cells = [(bad.as_str(), 0, d.clone()), (good.as_str(), 0, d)];
+    let id = op(43);
+    let e = s.add_usage_batch(id, &cells).expect_err("refused");
+    assert!(
+        matches!(&e, OpRefused::Refused(t) if t.contains(&bad_key) && !t.contains("not a hash")),
+        "{e:?}"
+    );
+    assert_eq!(s.get_usage(&good, 0).unwrap().requests, 0, "cell 2 applied");
+    let _: () = r.del(&bad_key).unwrap();
+    s.add_usage_batch(id, &cells).expect("the retry applies");
+    assert_eq!(s.get_usage(&good, 0).unwrap().requests, 2);
+    assert_eq!(s.get_usage(&bad, 0).unwrap().requests, 2);
+}
+
+/// A non-integer field refuses the batch the same way, and names the field, not its value.
+#[test]
+fn a_non_integer_counter_field_refuses_the_batch_without_echoing_it() {
+    let Some(s) = live_store() else { return };
+    let (bad, good) = (fresh("field-bad"), fresh("field-good"));
+    let mut r = raw_conn();
+    let _: () = r
+        .hset(format!("busbar:usage:{bad}:0"), "requests", "secret-text")
+        .unwrap();
+    let d = UsageDelta {
+        requests: 1,
+        billable_requests: 0,
+        models: Vec::new(),
+    };
+    let e = s
+        .add_usage_batch(
+            op(44),
+            &[(bad.as_str(), 0, d.clone()), (good.as_str(), 0, d)],
+        )
+        .expect_err("refused");
+    assert!(
+        matches!(&e, OpRefused::Refused(t) if t.contains("requests") && !t.contains("secret-text")),
+        "{e:?}"
+    );
+    assert_eq!(s.get_usage(&good, 0).unwrap().requests, 0);
 }
