@@ -864,12 +864,15 @@ impl ValkeyStore {
         ))
     }
 
-    /// Allocate the next revision — a plain `INCR`. Called once per key/credential mutation, inside
-    /// whatever pipe/transaction performs the write, so the stamped value and the write are never
-    /// observed apart.
-    async fn next_revision(&self, c: &mut Conn) -> RedisResult<u64> {
-        let v: i64 = c.incr(REVISION_KEY, 1).await?;
-        Ok(v.max(0) as u64)
+    /// Reserve `n` consecutive revisions and return the first. Called inside a `transaction!` that
+    /// WATCHes [`REVISION_KEY`]: the counter is read here and written back by the same `EXEC` as
+    /// the stamped rows, so a writer overtaken since the read aborts and restamps. Stamps then
+    /// become visible in revision order, which the `ZRANGEBYSCORE '(since'` readers rely on.
+    async fn next_revision(&self, c: &mut Conn, pipe: &mut Pipeline, n: u64) -> RedisResult<u64> {
+        let cur: Option<i64> = c.get(REVISION_KEY).await?;
+        let first = u64::try_from(cur.unwrap_or(0)).unwrap_or(0) + 1;
+        pipe.set(REVISION_KEY, first + n - 1).ignore();
+        Ok(first)
     }
 }
 
@@ -1044,7 +1047,7 @@ impl ValkeyStore {
         with_conn!(self, |c| {
             // A live-shaped write must not clear a tombstone (an id is never reissued), WATCHed so
             // a `delete_key` committing in between aborts and retries this.
-            transaction!(c, &[row_key.as_str()], |c, pipe| {
+            transaction!(c, &[row_key.as_str(), REVISION_KEY], |c, pipe| {
                 if key.deleted_at.is_none() && tombstoned(c, &row_key).await? {
                     return Err(RedisError::refused(format!(
                         "put_key: '{}' is tombstoned and its id is never reissued; \
@@ -1053,7 +1056,8 @@ impl ValkeyStore {
                     )));
                 }
                 let mut key = key.clone();
-                let rev = self.next_revision(c).await?;
+                pipe.atomic();
+                let rev = self.next_revision(c, pipe, 1).await?;
                 key.revision = rev;
                 let json = serde_json::to_string(&key)
                     .map_err(|_e| RedisError::from((ErrorKind::Client, "encode")))?;
@@ -1144,7 +1148,7 @@ impl ValkeyStore {
                 .filter_map(|m| parse_slot_pointer(&format!("{id}:{m}")))
                 .map(|(_, kind, slot)| cred_row_key(id, &kind, slot))
                 .collect();
-            let mut watch_keys: Vec<&str> = vec![key_row.as_str(), ids_key.as_str()];
+            let mut watch_keys: Vec<&str> = vec![key_row.as_str(), ids_key.as_str(), REVISION_KEY];
             watch_keys.extend(row_keys.iter().map(String::as_str));
 
             let outcome = transaction!(c, &watch_keys, |c, pipe| {
@@ -1170,7 +1174,8 @@ impl ValkeyStore {
                 {
                     return Err(RedisError::retry());
                 }
-                let rev = self.next_revision(c).await?;
+                pipe.atomic();
+                let rev = self.next_revision(c, pipe, 1).await?;
                 key.enabled = false;
                 key.deleted_at = Some(crate::now());
                 key.revision = rev;
@@ -1382,7 +1387,12 @@ impl ValkeyStore {
         with_conn!(self, |c| {
             // WATCHed: the owning key's row (a `delete_key` in between must abort this, never slip
             // under it), the slot's row and the public id pointer.
-            let watched = [row_key.as_str(), pub_key.as_str(), key_row.as_str()];
+            let watched = [
+                row_key.as_str(),
+                pub_key.as_str(),
+                key_row.as_str(),
+                REVISION_KEY,
+            ];
             transaction!(c, &watched, |c, pipe| {
                 owner_is_live(c, &key_row, &m.key_id).await?;
                 let prior = match read_slot(c, secret, "put_credential").await? {
@@ -1390,8 +1400,9 @@ impl ValkeyStore {
                     Slot::Free(prior) => prior,
                 };
                 let mut secret = secret.clone();
-                secret.meta.revision = self.next_revision(c).await?;
-                queue_credential(pipe.atomic(), &secret, &prior)?;
+                pipe.atomic();
+                secret.meta.revision = self.next_revision(c, pipe, 1).await?;
+                queue_credential(pipe, &secret, &prior)?;
                 pipe.query(c).await
             })
         })
@@ -1419,7 +1430,12 @@ impl ValkeyStore {
         with_conn!(self, |c| {
             transaction!(
                 c,
-                &[key_row.as_str(), row_key.as_str(), pub_key.as_str()],
+                &[
+                    key_row.as_str(),
+                    row_key.as_str(),
+                    pub_key.as_str(),
+                    REVISION_KEY
+                ],
                 |c, pipe| {
                     if key.deleted_at.is_none() && tombstoned(c, &key_row).await? {
                         return Err(RedisError::refused(format!(
@@ -1433,8 +1449,9 @@ impl ValkeyStore {
                         Slot::Free(prior) => prior,
                     };
                     let (mut key, mut secret) = (key.clone(), secret.clone());
-                    key.revision = self.next_revision(c).await?;
-                    secret.meta.revision = self.next_revision(c).await?;
+                    pipe.atomic();
+                    key.revision = self.next_revision(c, pipe, 2).await?;
+                    secret.meta.revision = key.revision + 1;
                     let key_json = serde_json::to_string(&key)
                         .map_err(|_| RedisError::from((ErrorKind::Client, "key encode")))?;
                     pipe.atomic();
@@ -1477,7 +1494,7 @@ impl ValkeyStore {
     ) -> RecordStoreResult<()> {
         let id_key = cred_id_key(id);
         with_conn!(self, |c| {
-            transaction!(c, &[id_key.as_str()], |c, pipe| {
+            transaction!(c, &[id_key.as_str(), REVISION_KEY], |c, pipe| {
                 let ptr: Option<String> = c.get(&id_key).await?;
                 let Some(ptr) = ptr else {
                     // Unknown id: an ERROR (only an already-revoked id is an idempotent no-op).
@@ -1507,7 +1524,8 @@ impl ValkeyStore {
                     pipe.atomic();
                     return pipe.query(c).await;
                 }
-                let rev = self.next_revision(c).await?;
+                pipe.atomic();
+                let rev = self.next_revision(c, pipe, 1).await?;
                 cred.meta.revoked_at = Some(crate::now());
                 cred.meta.revoke_reason = Some(reason.to_string());
                 cred.meta.revision = rev;

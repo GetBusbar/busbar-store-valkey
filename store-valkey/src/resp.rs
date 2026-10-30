@@ -641,15 +641,6 @@ impl Conn {
             .await
     }
 
-    /// `INCRBY`.
-    pub async fn incr<K: ToArgs, V: ToArgs, RV: FromValue>(
-        &mut self,
-        key: K,
-        delta: V,
-    ) -> RedisResult<RV> {
-        cmd("INCRBY").arg(key).arg(delta).query(self).await
-    }
-
     /// Every key matching `pattern` (`SCAN ... MATCH`, followed to the end).
     pub async fn scan_match(&mut self, pattern: &str) -> RedisResult<Vec<String>> {
         let mut cursor = String::from("0");
