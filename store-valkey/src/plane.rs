@@ -292,14 +292,18 @@ static DELETE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     ))
 });
 
-/// PURGE: `KEYS = rec, body, byts, pcount` of the kind, then (cascade only) `rec, body, byts,
-/// pcount` of the cascaded kind; `ARGV = before, terminal_only ('1'|'0'), idx_prefix,
-/// cascade_idx_prefix ('' = no cascade)`. Returns how many records OF THE KIND went.
+/// PURGE, one batch: `KEYS = rec, body, byts, pcount` of the kind, then (cascade only) `rec, body,
+/// byts, pcount` of the cascaded kind; `ARGV = before, terminal_only ('1'|'0'), idx_prefix,
+/// cascade_idx_prefix ('' = no cascade), offset, limit`. Looks at the `limit` candidates from
+/// `offset` (a kept candidate stays in the index, so the caller advances `offset` past them) and
+/// returns `{removed, kept, seen}`: records OF THE KIND removed, candidates kept, candidates seen.
 static PURGE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_LINK}{LUA_DROP_IDENTITY}
         local removed = 0
-        local cands = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', '(' .. ARGV[1])
+        local kept = 0
+        local cands = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', '(' .. ARGV[1],
+                                 'LIMIT', ARGV[5], ARGV[6])
         for _, f in ipairs(cands) do
             local side = redis.call('HGET', KEYS[1], f)
             if not side then
@@ -317,9 +321,11 @@ static PURGE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
                     drop_identity(KEYS[5], KEYS[6], KEYS[7], KEYS[8], ARGV[4] .. tohex(ident),
                                   ident, ARGV[4])
                 end
+            else
+                kept = kept + 1
             end
         end
-        return removed"
+        return {{removed, kept, #cands}}"
     ))
 });
 
@@ -523,6 +529,9 @@ pub(crate) async fn purge_before(
     purge(store, c, kind, before, kind == CASCADING_KIND).await
 }
 
+/// Candidates one purge script call examines, so no call holds the server for a whole backlog.
+const PURGE_BATCH: usize = 1000;
+
 /// `purge_plane_records`: STRICTLY older than the cutoff, and the count actually performed. WHICH
 /// rows go is the rule the call carries (never one inferred from the kind's name), read off the
 /// typed disposition, never out of the body: `terminal_only` drops only TERMINAL rows (an
@@ -539,29 +548,44 @@ pub(crate) async fn purge(
     let keys = Keys::of(kind);
     let cascade = (kind == CASCADING_KIND).then(|| Keys::of(CASCADED_KIND));
     let terminal_only = if terminal_only { "1" } else { "0" };
-    let removed: i64 = with_conn_no_retry!(store, |c| {
-        let mut inv = PURGE.key(&keys.rec);
-        inv.key(&keys.body).key(&keys.byts).key(&keys.pcount);
-        match &cascade {
-            Some(k) => {
-                inv.key(&k.rec).key(&k.body).key(&k.byts).key(&k.pcount);
+    let mut removed = 0u64;
+    let mut offset = 0u64;
+    loop {
+        let answer: Vec<i64> = with_conn_no_retry!(store, |c| {
+            let mut inv = PURGE.key(&keys.rec);
+            inv.key(&keys.body).key(&keys.byts).key(&keys.pcount);
+            match &cascade {
+                Some(k) => {
+                    inv.key(&k.rec).key(&k.body).key(&k.byts).key(&k.pcount);
+                }
+                None => {
+                    // Unused placeholders keep the script's KEYS positions fixed.
+                    inv.key(&keys.rec)
+                        .key(&keys.body)
+                        .key(&keys.byts)
+                        .key(&keys.pcount);
+                }
             }
-            None => {
-                // Unused placeholders keep the script's KEYS positions fixed.
-                inv.key(&keys.rec)
-                    .key(&keys.body)
-                    .key(&keys.byts)
-                    .key(&keys.pcount);
-            }
+            inv.arg(clamp(before))
+                .arg(terminal_only)
+                .arg(&keys.idx_prefix)
+                .arg(cascade.as_ref().map_or("", |k| k.idx_prefix.as_str()))
+                .arg(offset)
+                .arg(PURGE_BATCH)
+                .invoke(c)
+                .await
+        })?;
+        let [gone, kept, seen] = answer[..] else {
+            return Err(RecordStoreError(format!(
+                "valkey command: the purge script answered {answer:?}"
+            )));
+        };
+        removed += gone.max(0) as u64;
+        offset += kept.max(0) as u64;
+        if seen < PURGE_BATCH as i64 {
+            return Ok(removed);
         }
-        inv.arg(clamp(before))
-            .arg(terminal_only)
-            .arg(&keys.idx_prefix)
-            .arg(cascade.as_ref().map_or("", |k| k.idx_prefix.as_str()))
-            .invoke(c)
-            .await
-    })?;
-    Ok(removed.max(0) as u64)
+    }
 }
 
 /// `delete_plane_record`: every `seq` under the identity goes, so a delete can never leave part of a
