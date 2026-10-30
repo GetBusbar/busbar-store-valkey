@@ -159,6 +159,12 @@ pub enum Value {
     Error(String),
 }
 
+/// Bytes copied into `Value::Data`, to prove a reply is materialised once.
+#[cfg(test)]
+thread_local! {
+    static COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Parse one reply from the front of `buf`: the reply and how many bytes it took, or `None` when
 /// `buf` does not hold a whole reply yet.
 ///
@@ -209,6 +215,8 @@ pub fn parse(buf: &[u8]) -> RedisResult<Option<(Value, usize)>> {
                 if &buf[end..end + 2] != b"\r\n" {
                     return Err(bad("a bulk string is not terminated"));
                 }
+                #[cfg(test)]
+                COPIED.with(|c| c.set(c.get() + n));
                 Ok(Some((Value::Data(buf[next..end].to_vec()), end + 2)))
             }
             b'*' => {
@@ -1061,5 +1069,43 @@ mod tests {
         let e = RedisError::refused("delete_key: unknown id 'vk_x'");
         assert_eq!(e.to_string(), "delete_key: unknown id 'vk_x'");
         assert!(!e.is_connection_error());
+    }
+
+    #[test]
+    fn nested_arrays_past_the_depth_cap_are_refused_not_recursed_into() {
+        let deep = "*1\r\n".repeat(100_000);
+        assert!(parse(deep.as_bytes()).is_err());
+        let ok = format!("{}:1\r\n", "*1\r\n".repeat(30));
+        assert!(parse(ok.as_bytes()).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_huge_declared_length_waits_and_never_overflows() {
+        assert_eq!(
+            parse(format!("${}\r\n", i64::MAX).as_bytes()).unwrap(),
+            None
+        );
+        assert!(parse(format!("${}\r\n", u64::MAX).as_bytes()).is_err());
+        assert_eq!(parse(b"*9223372036854775807\r\n:1\r\n").unwrap(), None);
+    }
+
+    #[test]
+    fn a_reply_delivered_in_many_fills_is_materialised_once() {
+        let mut reply = b"*40\r\n".to_vec();
+        for _ in 0..40 {
+            reply.extend_from_slice(b"$1000\r\n");
+            reply.extend_from_slice(&[b'x'; 1000]);
+            reply.extend_from_slice(b"\r\n");
+        }
+        COPIED.with(|c| c.set(0));
+        let mut got = None;
+        for end in (100..=reply.len() + 99).step_by(100) {
+            got = parse(&reply[..end.min(reply.len())]).unwrap();
+            if got.is_some() {
+                break;
+            }
+        }
+        assert_eq!(got.expect("whole").1, reply.len());
+        assert_eq!(COPIED.with(std::cell::Cell::get), 40_000);
     }
 }
