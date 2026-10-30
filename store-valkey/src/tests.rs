@@ -4665,7 +4665,7 @@ fn a_writer_overtaken_between_its_revision_read_and_commit_restamps_above_the_wi
         return;
     }
     let url = std::env::var("VALKEY_URL").unwrap();
-    let gate = interleave::gate(&url, |c| {
+    let gate = interleave::gate(&url, false, |c| {
         interleave::contains(c, b"busbar:revision") && !interleave::contains(c, b"WATCH")
     });
     let (a, b) = (uid("vk_rev_a"), uid("vk_rev_b"));
@@ -4744,6 +4744,40 @@ fn a_refused_handshake_does_not_leave_a_connection_kept() {
         !in_db0,
         "the op ran on db 0, on a connection that skipped its handshake"
     );
+}
+
+/// One op in flight must not block the next: the store keeps several connections, one per op.
+#[test]
+fn a_held_op_does_not_block_a_second_op_on_the_same_store() {
+    if live_store().is_none() {
+        return;
+    }
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let (a, b) = (uid("vk_pool_a"), uid("vk_pool_b"));
+    let direct = live_store().unwrap();
+    direct.put_key(&vk(&a)).unwrap();
+    direct.put_key(&vk(&b)).unwrap();
+    let held_row = format!("busbar:key:{a}");
+    let gate = interleave::gate(&url, true, move |c| {
+        interleave::contains(c, b"GET") && interleave::contains(c, held_row.as_bytes())
+    });
+    let store = Arc::new(ValkeyStore::connect(&gate.url).unwrap());
+    let first = store.clone();
+    let id = a.clone();
+    let holder = std::thread::spawn(move || first.get_key(&id));
+    gate.held
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the first op is held mid-flight");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let second = store.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(second.get_key(&b));
+    });
+    let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+    gate.release.send(()).unwrap();
+    holder.join().unwrap().unwrap();
+    got.expect("the second op ran while the first was held")
+        .unwrap();
 }
 
 #[test]
