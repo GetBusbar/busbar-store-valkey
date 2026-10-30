@@ -131,6 +131,14 @@ const KEPT_OP_SLOTS: [&str; 3] = [
 ];
 const FIRST_MIGRATED_SCHEMA: i64 = 6;
 
+/// Whether an op record's body belongs to a kept slot: a digest (32 bytes, or 64 lowercase hex), or
+/// the older textual form that starts with the slot's name. Only the dead slots' bodies are neither.
+fn kept_op_body(body: &[u8]) -> bool {
+    let hex64 = body.len() == 64 && body.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let name = body.split(|b| *b == b':').next().unwrap_or_default();
+    body.len() == 32 || hex64 || KEPT_OP_SLOTS.iter().any(|k| k.as_bytes() == name)
+}
+
 fn usage_key(bucket_id: &str, window_start: u64) -> String {
     format!("busbar:usage:{bucket_id}:{window_start}")
 }
@@ -828,8 +836,7 @@ impl ValkeyStore {
             })?;
             for (key, body) in chunk.iter().zip(bodies) {
                 let Some(body) = body else { continue };
-                let name = body.split(|b| *b == b':').next().unwrap_or_default();
-                if !KEPT_OP_SLOTS.iter().any(|k| k.as_bytes() == name) {
+                if !kept_op_body(&body) {
                     dead.push(key.clone());
                 }
             }
