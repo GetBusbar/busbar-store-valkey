@@ -131,9 +131,6 @@ const KEPT_OP_SLOTS: [&str; 3] = [
 ];
 const FIRST_MIGRATED_SCHEMA: i64 = 6;
 
-/// `delete_key`'s "credential membership changed; rebuild the watch set" signal.
-const DELETE_KEY_RETRY_SENTINEL: &str = "__internal_delete_key_retry__";
-
 fn usage_key(bucket_id: &str, window_start: u64) -> String {
     format!("busbar:usage:{bucket_id}:{window_start}")
 }
@@ -1164,10 +1161,7 @@ impl ValkeyStore {
                 if fresh_members.len() != members.len()
                     || !fresh_members.iter().all(|m| members.contains(m))
                 {
-                    return Err(RedisError::from((
-                        ErrorKind::Client,
-                        DELETE_KEY_RETRY_SENTINEL,
-                    )));
+                    return Err(RedisError::retry());
                 }
                 let rev = self.next_revision(c).await?;
                 key.enabled = false;
@@ -1209,7 +1203,7 @@ impl ValkeyStore {
             });
 
             match outcome {
-                Err(e) if e.to_string().contains(DELETE_KEY_RETRY_SENTINEL) => continue,
+                Err(e) if e.is_retry() => continue,
                 other => break other,
             }
         })

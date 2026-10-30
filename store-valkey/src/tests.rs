@@ -4647,7 +4647,10 @@ fn an_unknown_id_spelling_the_retry_sentinel_is_refused_not_retried() {
     let e = rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("delete_key answered instead of retrying forever");
-    assert!(e.contains(&format!("delete_key: unknown id '{want}'")), "{e}");
+    assert!(
+        e.contains(&format!("delete_key: unknown id '{want}'")),
+        "{e}"
+    );
 }
 
 #[test]
