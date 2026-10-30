@@ -4904,6 +4904,37 @@ fn a_transaction_that_always_aborts_ends_with_an_error() {
     assert!(e.contains("aborted"), "{e}");
 }
 
+/// Putting a credential again is a replay only when it is the SAME credential: one with the stored
+/// id but different content is refused, never answered as a success that wrote nothing.
+#[test]
+fn re_putting_a_credential_id_with_different_content_is_refused() {
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_replay");
+    store.put_key(&vk(&key_id)).unwrap();
+    let c0 = cred(&key_id, &uid("AKIA_REPLAY"), 0);
+    store.put_credential(&c0).unwrap();
+    store
+        .put_credential(&c0)
+        .expect("an identical re-put replays");
+    let mut other = c0.clone();
+    other.meta.public_id = uid("AKIA_OTHER");
+    let e = store.put_credential(&other).unwrap_err().to_string();
+    assert!(
+        e.contains(&format!(
+            "put_credential: credential {} already exists with different content",
+            c0.meta.id
+        )),
+        "{e}"
+    );
+    let mut third = c0.clone();
+    third.secret = "v1:plain:changed".into();
+    let e = store
+        .put_key_with_credential(&vk(&key_id), &third)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("already exists with different content"), "{e}");
+}
+
 #[test]
 fn put_refusals_carry_the_reason_without_the_kind_suffix() {
     let Some(store) = live_store() else { return };
