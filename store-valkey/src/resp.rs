@@ -36,6 +36,8 @@ enum Repr {
     Io(String),
     /// The store's own refusal, its text verbatim (no `- Kind` suffix).
     Refused(String),
+    /// A transaction body's request to rebuild its watch set and run again.
+    Retry,
 }
 
 /// A command's failure. Its text is the upstream driver's shape (`desc - Kind: detail`), so the
@@ -69,6 +71,18 @@ impl RedisError {
         Self {
             repr: Repr::Refused(text.into()),
         }
+    }
+
+    /// A body's own signal that the state it watched changed shape: the caller reruns it.
+    #[must_use]
+    pub fn retry() -> Self {
+        Self { repr: Repr::Retry }
+    }
+
+    /// Whether this is [`RedisError::retry`].
+    #[must_use]
+    pub fn is_retry(&self) -> bool {
+        matches!(self.repr, Repr::Retry)
     }
 
     /// The server's script cache does not hold the script an `EVALSHA` named.
@@ -118,6 +132,7 @@ impl fmt::Display for RedisError {
                 }
             }
             Repr::Server(t) | Repr::Io(t) | Repr::Refused(t) => f.write_str(t),
+            Repr::Retry => f.write_str("transaction retry requested"),
         }
     }
 }
