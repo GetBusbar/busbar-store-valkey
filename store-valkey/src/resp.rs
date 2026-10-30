@@ -699,6 +699,8 @@ impl Conn {
                 .arg(&cursor)
                 .arg("MATCH")
                 .arg(pattern)
+                .arg("COUNT")
+                .arg(SCAN_COUNT)
                 .query(self)
                 .await?;
             out.extend(keys);
@@ -709,6 +711,9 @@ impl Conn {
         }
     }
 }
+
+/// Keys a `SCAN` step is asked for.
+const SCAN_COUNT: usize = 1000;
 
 /// One command.
 #[derive(Debug, Clone, Default)]
