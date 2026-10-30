@@ -1012,3 +1012,27 @@ fn an_upsert_replaces_by_id_whatever_its_seq() {
         Some(b"four".to_vec())
     );
 }
+
+/// A reply that does not fit is refused by naming where and what was expected, never by echoing the
+/// stored value into the error.
+#[test]
+fn a_malformed_stored_value_is_not_echoed_into_the_error() {
+    let Some(s) = live_store() else { return };
+    let bucket = fresh("echo");
+    let mut r = raw_conn();
+    let _: () = r
+        .hset(
+            format!("busbar:usage:{bucket}:0"),
+            "requests",
+            "secret-text",
+        )
+        .unwrap();
+    let e = s
+        .get_usage(&bucket, 0)
+        .expect_err("not an integer")
+        .to_string();
+    // Debug-printed bytes are digits, so the text check alone would miss the echo.
+    let bytes = format!("{:?}", b"secret-text".to_vec());
+    assert!(!e.contains("secret-text") && !e.contains(&bytes), "{e}");
+    assert!(!e.contains("response was"), "{e}");
+}
