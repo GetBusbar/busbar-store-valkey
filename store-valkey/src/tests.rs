@@ -2842,6 +2842,27 @@ fn a_redeemed_entry_carries_a_ttl_bounded_by_the_approvals_own_life() {
     reset_trust_state(&store, &[], &[&short, &long]);
 }
 
+/// A grant that outlives the ledger's TTL cap is recorded with NO expiry: capping it would let the
+/// grant redeem again once the entry lapsed.
+#[test]
+fn a_grant_beyond_the_ttl_cap_is_recorded_without_expiry() {
+    let store = require_live_store();
+    let nonce = trust_ns("nonce_ttl_forever");
+    reset_trust_state(&store, &[], &[&nonce]);
+    let eleven_years = 11 * 365 * 86_400;
+    assert!(store
+        .redeem_ask_state(&nonce, TRUST_NOW + eleven_years, TRUST_NOW)
+        .unwrap());
+    let ttl: i64 = store
+        .with_conn(|c| c.ttl::<_, i64>(plane::token_key("ask", &nonce)))
+        .expect("TTL");
+    assert_eq!(ttl, -1, "the entry must not expire");
+    assert!(!store
+        .redeem_ask_state(&nonce, TRUST_NOW + eleven_years, TRUST_NOW)
+        .unwrap());
+    reset_trust_state(&store, &[], &[&nonce]);
+}
+
 /// AN ALREADY-LAPSED APPROVAL IS STILL ANSWERED HONESTLY, with a bounded record.
 #[test]
 fn a_lapsed_approval_still_gets_a_truthful_answer_and_a_bounded_record() {
