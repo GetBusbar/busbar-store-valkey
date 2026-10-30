@@ -1304,8 +1304,44 @@ fn url_for_db(db: u32) -> String {
     }
 }
 
+/// The database number a url selects (`/<db>` before any query; 0 when it names none).
+fn db_of_url(url: &str) -> u32 {
+    let base = url.split('?').next().unwrap_or(url);
+    let rest = base.split_once("://").map_or(base, |(_, r)| r);
+    rest.split_once('/')
+        .and_then(|(_, db)| db.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Refuse to flush `db` when it is the database `VALKEY_URL` itself selects (the shared one every
+/// other test uses).
+fn assert_private_db(db: u32) {
+    let shared = db_of_url(&std::env::var("VALKEY_URL").unwrap());
+    assert_ne!(
+        db, shared,
+        "refusing to FLUSHDB the shared database {shared}"
+    );
+}
+
+#[test]
+fn db_of_url_reads_the_selected_database() {
+    assert_eq!(db_of_url("redis://127.0.0.1:6379/0"), 0);
+    assert_eq!(db_of_url("redis://u:p@h:6379/13?x=1"), 13);
+    assert_eq!(db_of_url("redis://h:6379"), 0);
+}
+
+#[test]
+#[should_panic(expected = "refusing to FLUSHDB")]
+fn the_shared_database_is_never_flushed() {
+    let Some(_) = live_store() else {
+        panic!("refusing to FLUSHDB (no live store)");
+    };
+    assert_private_db(db_of_url(&std::env::var("VALKEY_URL").unwrap()));
+}
+
 /// An independent upstream client on database `db`, emptied first.
 fn fresh_db_client(db: u32) -> redis::Connection {
+    assert_private_db(db);
     let mut c = redis::Client::open(url_for_db(db).as_str())
         .and_then(|c| c.get_connection())
         .unwrap();
