@@ -599,6 +599,35 @@ fn an_older_builds_recorded_body_replays_and_a_different_op_conflicts() {
     );
 }
 
+/// An `op_id` write still runs, once, when the server's script cache lost its script.
+#[test]
+fn an_op_id_write_runs_after_the_script_cache_is_flushed() {
+    let Some(s) = live_store() else { return };
+    let bucket = fresh("noscript");
+    let cells = [(
+        bucket.as_str(),
+        0,
+        UsageDelta {
+            requests: 1,
+            billable_requests: 0,
+            models: Vec::new(),
+        },
+    )];
+    s.add_usage_batch(op(94), &cells).expect("applies");
+    let mut raw = redis::Client::open(std::env::var("VALKEY_URL").expect("live_store read it"))
+        .and_then(|c| c.get_connection())
+        .expect("an independent client");
+    redis::cmd("SCRIPT")
+        .arg("FLUSH")
+        .query::<()>(&mut raw)
+        .expect("SCRIPT FLUSH");
+    let id = op(95);
+    s.add_usage_batch(id, &cells)
+        .expect("applies after the flush");
+    s.add_usage_batch(id, &cells).expect("replays");
+    assert_eq!(s.get_usage(&bucket, 0).unwrap().requests, 2);
+}
+
 /// The v8 -> v9 step: every key the deleted slots kept (the money keys, the journal, the sessions)
 /// is gone after the upgrade, and so are the dedupe hashes of the deleted slots; the dedupe hash of
 /// a kept slot survives, so its op replays across the upgrade and applies nothing.
@@ -648,6 +677,10 @@ fn the_v9_upgrade_drops_the_money_and_dead_slot_keys() {
         let k = format!("busbar:op:dead{i}");
         let _: () = c.hset_multiple(&k, &[("b", *body), ("a", "")]).unwrap();
     }
+    // A v8 build recorded the kept op's body in its own form.
+    let kept_key = format!("busbar:op:{}", crate::hex(&kept.0));
+    let v8_body = format!("add_usage_batch:{:?}", &cells[..]);
+    let _: () = c.hset(&kept_key, "b", v8_body).unwrap();
     let _: () = c.set("busbar:schema", 8).unwrap();
     drop(c);
 

@@ -71,6 +71,11 @@ impl RedisError {
         }
     }
 
+    /// The server's script cache does not hold the script an `EVALSHA` named.
+    fn is_noscript(&self) -> bool {
+        matches!(&self.repr, Repr::Server(t) if t.starts_with("NOSCRIPT"))
+    }
+
     fn server(text: String) -> Self {
         Self {
             repr: Repr::Server(text),
@@ -328,6 +333,12 @@ pub trait FromValue: Sized {
 impl FromValue for () {
     fn from_value(_: Value) -> RedisResult<Self> {
         Ok(())
+    }
+}
+
+impl FromValue for Value {
+    fn from_value(v: Value) -> RedisResult<Self> {
+        Ok(v)
     }
 }
 
@@ -750,20 +761,9 @@ impl Pipeline {
     pipe_cmd!(
         /// `HSET key field value`.
         hset(k: K, f: F, v: V) => "HSET");
-    /// `HSET key field value ...` (every pair).
-    pub fn hset_multiple<K: ToArgs, F: ToArgs, V: ToArgs>(
-        &mut self,
-        k: K,
-        items: &[(F, V)],
-    ) -> &mut Self {
-        self.cmd("HSET").arg(k).arg(items)
-    }
     pipe_cmd!(
         /// `HGETALL`.
         hgetall(k: K) => "HGETALL");
-    pipe_cmd!(
-        /// `EXPIRE key seconds`.
-        expire(k: K, s: S) => "EXPIRE");
     pipe_cmd!(
         /// `TTL`.
         ttl(k: K) => "TTL");
@@ -821,10 +821,12 @@ impl Pipeline {
     }
 }
 
-/// A Lua script, run as `EVAL` (its source travels with each call: no script cache to miss).
+/// A Lua script, run as `EVALSHA` (its digest from one `SCRIPT LOAD`), and as `EVAL` when the
+/// server's script cache misses it (`NOSCRIPT`).
 #[derive(Debug, Clone)]
 pub struct Script {
     src: String,
+    sha: std::sync::OnceLock<String>,
 }
 
 impl Script {
@@ -833,6 +835,7 @@ impl Script {
     pub fn new(src: &str) -> Self {
         Self {
             src: src.to_string(),
+            sha: std::sync::OnceLock::new(),
         }
     }
 
@@ -869,18 +872,35 @@ impl ScriptInvocation<'_> {
         self
     }
 
-    /// Run it and convert its reply.
+    /// Run it and convert its reply. A `NOSCRIPT` miss never ran it, so `EVAL` runs it once.
     ///
     /// # Errors
     /// As [`Cmd::query`].
     pub async fn invoke<T: FromValue>(&self, c: &mut Conn) -> RedisResult<T> {
-        cmd("EVAL")
-            .arg(&self.script.src)
+        let sha = match self.script.sha.get() {
+            Some(sha) => sha,
+            None => {
+                let sha: String = cmd("SCRIPT")
+                    .arg("LOAD")
+                    .arg(&self.script.src)
+                    .query(c)
+                    .await?;
+                self.script.sha.get_or_init(|| sha)
+            }
+        };
+        match self.call("EVALSHA", sha).query(c).await {
+            Err(e) if e.is_noscript() => self.call("EVAL", &self.script.src).query(c).await,
+            ran => ran,
+        }
+    }
+
+    fn call(&self, how: &str, script: &str) -> Cmd {
+        let mut c = cmd(how);
+        c.arg(script)
             .arg(self.keys.len())
             .arg(&self.keys)
-            .arg(&self.args)
-            .query(c)
-            .await
+            .arg(&self.args);
+        c
     }
 }
 
