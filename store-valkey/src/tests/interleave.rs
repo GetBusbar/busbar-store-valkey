@@ -32,7 +32,7 @@ fn repoint(url: &str, addr: &str) -> String {
     format!("{scheme}://{}{addr}/{tail}", user.unwrap_or_default())
 }
 
-fn upstream_addr(url: &str) -> String {
+pub(super) fn upstream_addr(url: &str) -> String {
     let rest = url.split_once("://").expect("a tcp url").1;
     let auth = rest.split(['/', '?']).next().unwrap();
     auth.rsplit_once('@').map_or(auth, |(_, h)| h).to_string()

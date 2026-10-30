@@ -4690,6 +4690,62 @@ fn a_writer_overtaken_between_its_revision_read_and_commit_restamps_above_the_wi
     assert!(score(&a, &mut r) > score(&b, &mut r));
 }
 
+/// A handshake the server REFUSES (AUTH) must not leave its connection kept: the next op would skip
+/// the handshake and run unauthenticated on db 0. The user's password is rotated away, its
+/// connections killed, one op fails to re-authenticate, the password is restored, and the next op
+/// must land in the store's own database.
+#[test]
+fn a_refused_handshake_does_not_leave_a_connection_kept() {
+    if live_store().is_none() {
+        return;
+    }
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let addr = interleave::upstream_addr(&url);
+    let user = uid("hs_user");
+    let (pw1, pw2) = ("pw-one", "pw-two");
+    let mut admin = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_connection()
+        .unwrap();
+    let acl = |admin: &mut redis::Connection, pw: &str| {
+        let _: () = redis::cmd("ACL")
+            .arg("SETUSER")
+            .arg(&user)
+            .arg(&["on", "resetpass", "~*", "&*", "+@all"][..])
+            .arg(format!(">{pw}"))
+            .query(admin)
+            .unwrap();
+    };
+    acl(&mut admin, pw1);
+    let store = ValkeyStore::connect(&format!("redis://{user}:{pw1}@{addr}/10")).unwrap();
+    store.put_key(&vk(&uid("vk_hs_a"))).unwrap();
+    acl(&mut admin, pw2);
+    let _: i64 = redis::cmd("CLIENT")
+        .arg(&["KILL", "USER", user.as_str()][..])
+        .query(&mut admin)
+        .unwrap();
+    store
+        .put_key(&vk(&uid("vk_hs_b")))
+        .expect_err("the re-authentication is refused");
+    acl(&mut admin, pw1);
+    let id = uid("vk_hs_c");
+    let landed = store.put_key(&vk(&id));
+    let row = format!("busbar:key:{id}");
+    let in_db0: bool = admin.exists(&row).unwrap();
+    let _: () = redis::cmd("ACL")
+        .arg(&["DELUSER", user.as_str()][..])
+        .query(&mut admin)
+        .unwrap();
+    if in_db0 {
+        let _: () = admin.del(&row).unwrap();
+    }
+    landed.expect("the next op re-handshakes and succeeds");
+    assert!(
+        !in_db0,
+        "the op ran on db 0, on a connection that skipped its handshake"
+    );
+}
+
 #[test]
 fn put_refusals_carry_the_reason_without_the_kind_suffix() {
     let Some(store) = live_store() else { return };
