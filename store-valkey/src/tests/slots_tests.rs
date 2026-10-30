@@ -927,7 +927,8 @@ fn the_v6_copy_keeps_an_event_chain_whose_position_forked() {
     let id = fresh("t_fork");
     let v6 = super::sample_event(&id, 1, "task.submitted", "", "x1");
     iso.s()
-        .upsert_plane_record(
+        .append_plane_record_op(
+            op(60),
             PlaneRecord {
                 kind: "task_event".into(),
                 id: id.clone(),
