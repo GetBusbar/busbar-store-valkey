@@ -369,6 +369,9 @@ async fn put(
     with_conn_no_retry!(store, |c| inv.invoke(c).await)
 }
 
+/// The `seq` an upserted record is stored at: the contract upserts by `(kind, id)` and reads there.
+const UPSERT_SEQ: u64 = 0;
+
 /// `upsert_plane_record`: UPSERT BY `(kind, id)`, parent or not — a second write for one id
 /// replaces it, never stands a rival beside it.
 pub(crate) async fn upsert(
@@ -376,6 +379,10 @@ pub(crate) async fn upsert(
     c: &mut Conn,
     record: PlaneRecordRef<'_>,
 ) -> RecordStoreResult<()> {
+    let record = PlaneRecordRef {
+        seq: UPSERT_SEQ,
+        ..record
+    };
     put(store, c, &UPSERT, record, record.id).await.map(|_| ())
 }
 
