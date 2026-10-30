@@ -40,7 +40,7 @@ use busbar_contract::records::{
     PlaneSelector, RecordStoreError, RecordStoreResult, UsageDelta, UsageLedger, VirtualKey,
 };
 
-use crate::resp::{cmd, pipe, Conn, Script, ScriptInvocation, Value};
+use crate::resp::{pipe, Conn, Script, ScriptInvocation, Value};
 use crate::{
     hex, metering_row, metering_set, plane, usage_fields, usage_key, ValkeyStore,
     METERING_UNIT_PREFIX, NAME, NEEDS,
@@ -187,31 +187,36 @@ impl ValkeyStore {
             Some(end) => [b"(".as_slice(), end.as_slice()].concat(),
             None => b"+".to_vec(),
         };
-        let keys: Vec<Vec<u8>> = with_conn!(self, |c| {
-            cmd("ZRANGEBYLEX")
-                .arg(&k)
-                .arg(&min)
-                .arg(&max)
-                .arg("LIMIT")
-                .arg(0)
-                .arg(limit)
-                .query(c)
-                .await
-        })
-        .map_err(|e| e.0)?;
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        let values: Vec<Option<Vec<u8>>> =
-            with_conn!(self, |c| cmd("HMGET").arg(&v).arg(&keys).query(c).await)
-                .map_err(|e| e.0)?;
-        keys.into_iter()
-            .zip(values)
-            .filter_map(|(key, value)| Some((key, value?)))
+        let mut inv = SCAN_OP.key(&k);
+        inv.key(&v).arg(&min).arg(&max).arg(limit);
+        let flat: Vec<Option<Vec<u8>>> =
+            with_conn!(self, |c| inv.invoke(c).await).map_err(|e| e.0)?;
+        flat.chunks(2)
+            .filter_map(|kv| Some((kv.first()?.clone()?, kv.get(1)?.clone()?)))
             .map(|(key, value)| Ok((key, record(value)?)))
             .collect()
     }
 }
+
+/// A page of `record_scan`: `KEYS = key set, values`; `ARGV = min, max, limit`. One script, so a
+/// strike between the key range and the values cannot shorten the page. Returns `key, value` pairs
+/// flat (a key whose value is gone answers nil, and is dropped by the caller).
+static SCAN_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
+    Script::new(
+        r"
+        local keys = redis.call('ZRANGEBYLEX', KEYS[1], ARGV[1], ARGV[2], 'LIMIT', 0, ARGV[3])
+        local out = {}
+        for i = 1, #keys, 1000 do
+            local j = math.min(i + 999, #keys)
+            local vals = redis.call('HMGET', KEYS[2], unpack(keys, i, j))
+            for n = i, j do
+                out[#out + 1] = keys[n]
+                out[#out + 1] = vals[n - i + 1]
+            end
+        end
+        return out",
+    )
+});
 
 /// The start of an `op_id` write's script: `KEYS[1]` is the op's record; a recorded body is
 /// returned and nothing applies. Then the helpers the two scripts share.
