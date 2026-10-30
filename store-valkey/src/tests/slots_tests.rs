@@ -879,3 +879,41 @@ fn the_v9_upgrade_keeps_digest_bodied_op_records() {
     let there: bool = c.exists("busbar:op:deadtext").unwrap();
     assert!(!there, "a dead slot's textual record survived");
 }
+
+/// A terminal-only purge over more records than one script call handles: every terminal row goes,
+/// none of the active rows older than it (which fill the first batches) is touched, and the count is
+/// the whole sweep's.
+#[test]
+fn a_purge_larger_than_one_batch_counts_and_removes_exactly_the_terminal_rows() {
+    let Some(s) = live_store() else { return };
+    let kind = fresh("purge-batches");
+    let rec = |i: u64, ts: u64, disposition| PlaneRecord {
+        kind: kind.clone(),
+        id: format!("r{i}"),
+        parent: None,
+        seq: 0,
+        ts,
+        disposition,
+        body: b"b".to_vec(),
+    };
+    for i in 0..1200 {
+        s.upsert_plane_record(rec(i, 1, PlaneDisposition::Active).view())
+            .unwrap();
+    }
+    for i in 1200..2400 {
+        s.upsert_plane_record(rec(i, 2, PlaneDisposition::Terminal).view())
+            .unwrap();
+    }
+    let n = s
+        .purge_plane_records(&kind, 10, busbar_contract::records::Retention::TerminalOnly)
+        .unwrap();
+    assert_eq!(n, 1200);
+    let n = s
+        .purge_plane_records(&kind, 10, busbar_contract::records::Retention::Age)
+        .unwrap();
+    assert_eq!(n, 1200);
+    let n = s
+        .purge_plane_records(&kind, 10, busbar_contract::records::Retention::Age)
+        .unwrap();
+    assert_eq!(n, 0);
+}
