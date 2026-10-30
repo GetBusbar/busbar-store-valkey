@@ -52,7 +52,20 @@ use crate::{
     hex, plane, queue_metering, usage_fields, usage_key, ValkeyStore, ADD_FLOORED_LUA, NAME, NEEDS,
 };
 
-busbar_contract::store_door!(ValkeyStore, NAME, env!("CARGO_PKG_VERSION"), 64, needs: NEEDS);
+// `url` is reference-capable, not secret: a `{env:}`/`{file:}`/`{module:}` reference resolves in
+// place (a 1.5.5 `url: {env: VAR}` keeps booting) and a literal passes as written.
+busbar_contract::statement_extensions!(EXTENSIONS: [
+    (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["url"]"#),
+]);
+
+busbar_contract::store_door!(
+    ValkeyStore,
+    NAME,
+    env!("CARGO_PKG_VERSION"),
+    64,
+    needs: NEEDS,
+    extensions: EXTENSIONS
+);
 
 /// The record of one `op_id`.
 fn op_key(op: OpId) -> String {
