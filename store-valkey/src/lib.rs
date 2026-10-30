@@ -131,6 +131,9 @@ const KEPT_OP_SLOTS: [&str; 3] = [
 ];
 const FIRST_MIGRATED_SCHEMA: i64 = 6;
 
+/// The most connections the store keeps (one op, one connection; `WATCH`/`MULTI` are per op).
+const KEPT_CONNECTIONS: usize = 8;
+
 /// Whether an op record's body belongs to a kept slot: a digest (32 bytes, or 64 lowercase hex), or
 /// the older textual form that starts with the slot's name. Only the dead slots' bodies are neither.
 fn kept_op_body(body: &[u8]) -> bool {
@@ -540,7 +543,7 @@ struct Inner {
     secret: Option<String>,
     /// `connect_timeout_ms` (default [`DEFAULT_CONNECT_TIMEOUT`]): every dial's bound.
     connect_timeout: Duration,
-    /// The kept connection: ONE (there is no pool setting), so the set holds one.
+    /// The kept connections: [`KEPT_CONNECTIONS`], one per op in flight.
     pool: Arc<Pool>,
 }
 
@@ -1719,8 +1722,7 @@ impl ValkeyStore {
                 target,
                 secret,
                 connect_timeout: timeout,
-                // ONE connection (there is no pool setting).
-                pool: Pool::new(1),
+                pool: Pool::new(KEPT_CONNECTIONS),
             }),
         })
     }
