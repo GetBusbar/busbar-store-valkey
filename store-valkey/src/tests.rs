@@ -4836,6 +4836,38 @@ fn delete_key_removes_its_credentials_from_the_revision_index() {
     assert!(after.is_none(), "the destroyed credential stays indexed");
 }
 
+/// Two revokes of one credential racing: the one that commits first stands. The slower one read the
+/// live row, was overtaken, and must NOT overwrite the first's reason and time.
+#[test]
+fn a_revoke_overtaken_before_commit_does_not_overwrite_the_first_reason() {
+    if live_store().is_none() {
+        return;
+    }
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let key_id = uid("vk_revoke_race");
+    let c0 = cred(&key_id, &uid("AKIA_REVOKE_RACE"), 0);
+    let direct = live_store().unwrap();
+    direct.put_key(&vk(&key_id)).unwrap();
+    direct.put_credential(&c0).unwrap();
+    let row = format!("busbar:cred:{key_id}:{}:{}", c0.meta.kind, c0.meta.slot);
+    let gate = interleave::gate(&url, false, move |c| {
+        interleave::contains(c, b"GET")
+            && interleave::contains(c, row.as_bytes())
+            && !interleave::contains(c, b"WATCH")
+    });
+    let slow = ValkeyStore::connect(&gate.url).unwrap();
+    let id = c0.meta.id.clone();
+    let writer = std::thread::spawn(move || slow.revoke_credential(&id, "slow"));
+    gate.held
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the slow revoke has read the live row");
+    direct.revoke_credential(&c0.meta.id, "fast").unwrap();
+    gate.release.send(()).unwrap();
+    writer.join().unwrap().unwrap();
+    let metas = direct.list_credentials(&key_id).unwrap();
+    assert_eq!(metas[0].revoke_reason.as_deref(), Some("fast"), "{metas:?}");
+}
+
 #[test]
 fn put_refusals_carry_the_reason_without_the_kind_suffix() {
     let Some(store) = live_store() else { return };
