@@ -853,3 +853,29 @@ fn a_metering_batch_with_a_wrong_typed_row_applies_nothing() {
     s.add_metering_batch(id, &batch).expect("the retry applies");
     assert_eq!(s.list_metering(good).unwrap().len(), 1);
 }
+
+/// The v9 step keeps an op record whose body is a kept slot's digest (32 bytes, or 64 lowercase hex):
+/// a node upgrading concurrently with live writers must not erase their dedupe records.
+#[test]
+fn the_v9_upgrade_keeps_digest_bodied_op_records() {
+    let Some(mut iso) = Iso::new(9) else { return };
+    let mut c = iso.raw();
+    let mut raw32 = [0xABu8; 32];
+    raw32[3] = b':';
+    let hex64 = "0123456789abcdef".repeat(4);
+    let _: () = c.hset("busbar:op:digest32", "b", &raw32[..]).unwrap();
+    let _: () = c.hset("busbar:op:digest64", "b", &hex64).unwrap();
+    let _: () = c.hset("busbar:op:deadtext", "b", "reserve:0:[]").unwrap();
+    let _: () = c.set("busbar:schema", 8).unwrap();
+    drop(c);
+
+    iso.restart();
+
+    let mut c = iso.raw();
+    for k in ["busbar:op:digest32", "busbar:op:digest64"] {
+        let there: bool = c.exists(k).unwrap();
+        assert!(there, "{k} (a kept slot's digest record) was deleted");
+    }
+    let there: bool = c.exists("busbar:op:deadtext").unwrap();
+    assert!(!there, "a dead slot's textual record survived");
+}
