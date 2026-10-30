@@ -917,3 +917,40 @@ fn a_purge_larger_than_one_batch_counts_and_removes_exactly_the_terminal_rows() 
         .unwrap();
     assert_eq!(n, 0);
 }
+
+/// The v6 -> v7 copy never deletes a v6 row whose position holds a DIFFERENT record already (a fork):
+/// the v6 row is the only copy of that event, so it stays for an operator.
+#[test]
+fn the_v6_copy_keeps_a_source_row_whose_position_forked() {
+    use crate::legacy::TASK_ROW_PREFIX;
+    let Some(mut iso) = Iso::new(6) else { return };
+    let id = fresh("t_fork");
+    let v6 = super::sample_task(&id, "completed", 5);
+    iso.s()
+        .upsert_plane_record(
+            PlaneRecord {
+                kind: "task".into(),
+                id: id.clone(),
+                parent: None,
+                seq: 0,
+                ts: 9,
+                disposition: PlaneDisposition::Active,
+                body: b"a different v7 record".to_vec(),
+            }
+            .view(),
+        )
+        .unwrap();
+    let mut c = iso.raw();
+    let key = format!("{TASK_ROW_PREFIX}{id}");
+    let _: () = c.set(&key, serde_json::to_string(&v6).unwrap()).unwrap();
+    let _: () = c.set("busbar:schema", 6).unwrap();
+    drop(c);
+
+    iso.restart();
+
+    let mut c = iso.raw();
+    let there: bool = c.exists(&key).unwrap();
+    assert!(there, "the v6 row was deleted though its copy forked");
+    let marker: i64 = c.get("busbar:schema").unwrap();
+    assert_eq!(marker, 9, "the upgrade still completes");
+}
