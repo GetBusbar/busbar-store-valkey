@@ -4868,6 +4868,42 @@ fn a_revoke_overtaken_before_commit_does_not_overwrite_the_first_reason() {
     assert_eq!(metas[0].revoke_reason.as_deref(), Some("fast"), "{metas:?}");
 }
 
+/// A transaction whose watched key moves on EVERY attempt gives up with an error after a bounded
+/// number of tries instead of spinning for ever. The proxy bumps the revision counter ahead of each
+/// `EXEC`; the call runs on a thread so a regression fails by timeout.
+#[test]
+fn a_transaction_that_always_aborts_ends_with_an_error() {
+    if live_store().is_none() {
+        return;
+    }
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let bump_url = url.clone();
+    let proxied = interleave::tamper(
+        &url,
+        |c| interleave::contains(c, b"EXEC"),
+        move || {
+            let mut r = redis::Client::open(bump_url.as_str())
+                .unwrap()
+                .get_connection()
+                .unwrap();
+            let _: i64 = redis::cmd("INCR")
+                .arg("busbar:revision")
+                .query(&mut r)
+                .unwrap();
+        },
+    );
+    let id = uid("vk_always_abort");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let store = ValkeyStore::connect(&proxied).unwrap();
+        let _ = tx.send(store.put_key(&vk(&id)).unwrap_err().to_string());
+    });
+    let e = rx
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("put_key gave up instead of retrying for ever");
+    assert!(e.contains("aborted"), "{e}");
+}
+
 #[test]
 fn put_refusals_carry_the_reason_without_the_kind_suffix() {
     let Some(store) = live_store() else { return };
