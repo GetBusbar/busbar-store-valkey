@@ -110,6 +110,7 @@ fn decode<T: serde::de::DeserializeOwned>(
 }
 
 /// Copy one v6 row into the plane keyspace as `kind` at `(id, seq)`, unless that position is taken.
+/// `true` = the position holds a DIFFERENT record (a fork).
 #[allow(clippy::too_many_arguments)]
 async fn copy<T: serde::Serialize>(
     store: &ValkeyStore,
@@ -120,7 +121,7 @@ async fn copy<T: serde::Serialize>(
     (seq, ts): (u64, u64),
     disposition: PlaneDisposition,
     row: &T,
-) -> RecordStoreResult<()> {
+) -> RecordStoreResult<bool> {
     let body = serde_json::to_vec(row)
         .map_err(|e| RecordStoreError(format!("v6 -> v7 upgrade: encode a plane body: {e}")))?;
     let record = PlaneRecord {
@@ -141,23 +142,18 @@ pub(crate) async fn migrate_v6_to_v7(store: &ValkeyStore, c: &mut Conn) -> Recor
     // there is no instant at which a migrated task exists with its chain still behind.
     for key in store.scan(c, &format!("{TASK_EVENTS_PREFIX}*")).await? {
         let members: Vec<Vec<u8>> = with_conn!(store, |c| c.zrange(&key, 0, -1).await)?;
+        // A chain position that forked is evidence: its v6 source is kept for an operator.
+        let mut forked = false;
         for raw in members {
             let e: rows::TaskEvent = decode("task event", &key, &raw)?;
             let (id, at) = (e.task_id.clone(), (e.seq, e.ts));
             let active = PlaneDisposition::Active;
-            copy(
-                store,
-                c,
-                KIND_TASK_EVENT,
-                id.clone(),
-                Some(id),
-                at,
-                active,
-                &e,
-            )
-            .await?;
+            let kind = KIND_TASK_EVENT;
+            forked |= copy(store, c, kind, id.clone(), Some(id), at, active, &e).await?;
         }
-        with_conn!(store, |c| c.del::<_, ()>(&key).await)?;
+        if !forked {
+            with_conn!(store, |c| c.del::<_, ()>(&key).await)?;
+        }
     }
 
     for key in store.scan(c, &format!("{TASK_ROW_PREFIX}*")).await? {
@@ -170,6 +166,8 @@ pub(crate) async fn migrate_v6_to_v7(store: &ValkeyStore, c: &mut Conn) -> Recor
                 PlaneDisposition::Active
             };
             let (id, at) = (t.task_id.clone(), (0, t.updated_at));
+            // An upserted row: a record already at its place is the newer one, and the stale v6
+            // row goes (`v6_namespace_upgrades_in_place_to_v7`).
             copy(store, c, KIND_TASK, id, None, at, disposition, &t).await?;
         }
         with_conn!(store, |c| c.del::<_, ()>(&key).await)?;

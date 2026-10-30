@@ -408,15 +408,15 @@ pub(crate) async fn append_op(
 
 /// Append `record` only if its position is EMPTY; an occupied one (identical or not) is left as it
 /// is. The v6 → v7 migration's write: a record already in the plane keyspace is newer than any v6 row
-/// could be, and is never overwritten by one.
+/// could be, and is never overwritten by one. `true` = a DIFFERENT record holds the position (a fork).
 pub(crate) async fn append_if_absent(
     store: &ValkeyStore,
     c: &mut Conn,
     record: PlaneRecordRef<'_>,
-) -> RecordStoreResult<()> {
+) -> RecordStoreResult<bool> {
     put(store, c, &APPEND, record, identity(&record))
         .await
-        .map(|_| ())
+        .map(|forked| forked == 1)
 }
 
 /// `get_plane_record`: an upserted record lives at `(id, 0)`. No caller-scoping filter, deliberately:
