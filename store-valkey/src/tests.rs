@@ -4897,7 +4897,9 @@ fn a_transaction_that_always_aborts_ends_with_an_error() {
     if live_store().is_none() {
         return;
     }
-    let url = std::env::var("VALKEY_URL").unwrap();
+    // A database of its own: the bumps would abort every other test's transaction in db 0.
+    let mut up = fresh_db_client(7);
+    let url = url_for_db(7);
     let bump_url = url.clone();
     let proxied = interleave::tamper(
         &url,
@@ -4922,6 +4924,7 @@ fn a_transaction_that_always_aborts_ends_with_an_error() {
     let e = rx
         .recv_timeout(std::time::Duration::from_secs(20))
         .expect("put_key gave up instead of retrying for ever");
+    redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
     assert!(e.contains("aborted"), "{e}");
 }
 
