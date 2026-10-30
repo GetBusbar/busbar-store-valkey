@@ -1036,3 +1036,29 @@ fn a_malformed_stored_value_is_not_echoed_into_the_error() {
     assert!(!e.contains("secret-text") && !e.contains(&bytes), "{e}");
     assert!(!e.contains("response was"), "{e}");
 }
+
+/// A fork-refused append records nothing under its op id: the same op id retried with a record that
+/// does not fork applies, instead of conflicting with a body the refusal wrongly recorded.
+#[test]
+fn a_fork_refused_append_records_nothing_under_its_op_id() {
+    let Some(s) = live_store() else { return };
+    let parent = fresh("fork-op");
+    let rec = |seq: u64, body: &[u8]| PlaneRecord {
+        kind: "slots_test".into(),
+        id: parent.clone(),
+        parent: Some(parent.clone()),
+        seq,
+        ts: 1,
+        disposition: PlaneDisposition::Active,
+        body: body.to_vec(),
+    };
+    s.append_plane_record_op(op(70), rec(1, b"one").view())
+        .expect("first");
+    let id = op(71);
+    assert!(matches!(
+        s.append_plane_record_op(id, rec(1, b"forked").view()),
+        Err(OpRefused::Failed(_))
+    ));
+    s.append_plane_record_op(id, rec(2, b"two").view())
+        .expect("the refusal recorded nothing, so the op id is still free");
+}
