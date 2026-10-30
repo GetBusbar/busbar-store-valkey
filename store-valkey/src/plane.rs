@@ -619,9 +619,8 @@ pub(crate) fn token_key(kind: &str, token: &str) -> String {
     format!("{}tok:{}", kind_prefix(kind), hex(token.as_bytes()))
 }
 
-/// The longest a redeemed-token entry is kept: an entry whose expiry overflows the server's own
-/// millisecond arithmetic is refused outright, and a grant with a decade of life left is one whose
-/// ledger entry can be bounded without anyone noticing.
+/// The longest life a redeemed-token entry is given an expiry for: the server refuses an `EX` that
+/// overflows its own millisecond arithmetic, so a grant living longer is recorded with no expiry.
 const MAX_TOKEN_TTL_SECS: u64 = 315_360_000; // ten years
 
 /// `redeem_plane_token`: the test and set, as ONE `SET NX EX` the server orders against every other
@@ -645,17 +644,17 @@ pub(crate) async fn redeem_token(
     expires_at: u64,
     now: u64,
 ) -> RecordStoreResult<bool> {
-    let ttl = expires_at.saturating_sub(now).clamp(1, MAX_TOKEN_TTL_SECS);
+    let life = expires_at.saturating_sub(now);
     let key = token_key(kind, token);
     let set: Option<String> = with_conn_no_retry!(store, |c| {
-        cmd("SET")
-            .arg(&key)
-            .arg(expires_at)
-            .arg("NX")
-            .arg("EX")
-            .arg(ttl)
-            .query(c)
-            .await
+        let mut set = cmd("SET");
+        set.arg(&key).arg(expires_at).arg("NX");
+        // A grant that outlives the cap is kept for ever: expiring its entry would let it redeem
+        // again.
+        if life <= MAX_TOKEN_TTL_SECS {
+            set.arg("EX").arg(life.max(1));
+        }
+        set.query(c).await
     })?;
     Ok(set.is_some())
 }
