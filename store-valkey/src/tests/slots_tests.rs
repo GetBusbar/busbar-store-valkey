@@ -508,6 +508,97 @@ fn an_op_id_plane_append_dedupes_and_still_refuses_a_fork() {
     s.delete_plane_record("slots_test", &parent).unwrap();
 }
 
+/// A body an older build recorded (`<slot>:<values {:?}>`) still dedupes after the upgrade: the
+/// same op replays and applies nothing, a different op under its id conflicts.
+#[test]
+fn an_older_builds_recorded_body_replays_and_a_different_op_conflicts() {
+    let Some(s) = live_store() else { return };
+    let mut raw = redis::Client::open(std::env::var("VALKEY_URL").expect("live_store read it"))
+        .and_then(|c| c.get_connection())
+        .expect("an independent client");
+    let mut seed = |id: OpId, body: String| {
+        let k = format!("busbar:op:{}", crate::hex(&id.0));
+        let _: () = raw
+            .hset_multiple(&k, &[("b", body.as_str()), ("a", "")])
+            .unwrap();
+    };
+
+    let bucket = fresh("older-usage");
+    let d = |n| UsageDelta {
+        requests: n,
+        billable_requests: 0,
+        models: Vec::new(),
+    };
+    let cells = [(bucket.as_str(), 0, d(2))];
+    let id = op(90);
+    seed(id, format!("add_usage_batch:{:?}", &cells[..]));
+    s.add_usage_batch(id, &cells).expect("replays");
+    assert_eq!(
+        s.add_usage_batch(id, &[(bucket.as_str(), 0, d(3))]),
+        Err(OpRefused::Conflict)
+    );
+    assert_eq!(
+        s.get_usage(&bucket, 0).unwrap().requests,
+        0,
+        "nothing applied"
+    );
+
+    let mbucket = super::unique_bucket(91);
+    let m = busbar_contract::records::MeteringDelta {
+        key_id: fresh("vk"),
+        bucket: mbucket,
+        model: "m".into(),
+        provider: "p".into(),
+        tokens_input: 5,
+        tokens_output: 0,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 1,
+        billable_requests: 1,
+        key_group_at_use: String::new(),
+        pricing_version: String::new(),
+        priced_from_ms: 0,
+        usage_units: Default::default(),
+    };
+    let deltas = [m.clone()];
+    let id = op(92);
+    seed(id, format!("add_metering_batch:{:?}", &deltas[..]));
+    s.add_metering_batch(id, &deltas).expect("replays");
+    let other = busbar_contract::records::MeteringDelta {
+        tokens_input: 6,
+        ..m
+    };
+    assert_eq!(s.add_metering_batch(id, &[other]), Err(OpRefused::Conflict));
+    assert!(
+        s.list_metering(mbucket).expect("list").is_empty(),
+        "nothing applied"
+    );
+
+    let kind = fresh("older-plane");
+    let rec = |body: &[u8]| PlaneRecord {
+        kind: kind.clone(),
+        id: "r".into(),
+        parent: None,
+        seq: 0,
+        ts: 1,
+        disposition: PlaneDisposition::Active,
+        body: body.to_vec(),
+    };
+    let one = rec(b"one");
+    let id = op(93);
+    seed(id, format!("append_plane_record:{:?}", one.view()));
+    s.append_plane_record_op(id, one.view()).expect("replays");
+    assert_eq!(
+        s.append_plane_record_op(id, rec(b"two").view()),
+        Err(OpRefused::Conflict)
+    );
+    assert_eq!(
+        s.get_plane_record(&kind, "r").unwrap(),
+        None,
+        "nothing applied"
+    );
+}
+
 /// The v8 -> v9 step: every key the deleted slots kept (the money keys, the journal, the sessions)
 /// is gone after the upgrade, and so are the dedupe hashes of the deleted slots; the dedupe hash of
 /// a kept slot survives, so its op replays across the upgrade and applies nothing.
