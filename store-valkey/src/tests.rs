@@ -4780,6 +4780,40 @@ fn a_held_op_does_not_block_a_second_op_on_the_same_store() {
         .unwrap();
 }
 
+/// `delete_key` clears the key's own usage windows (`busbar:usage:<id>:<window>`) and nothing else:
+/// another bucket whose id starts with `<id>:` (a group bucket, an era bucket) is not its cleanup.
+#[test]
+fn delete_key_clears_only_its_own_usage_windows() {
+    let Some(store) = live_store() else { return };
+    let id = uid("vk_usage_scope");
+    store.put_key(&vk(&id)).unwrap();
+    let mut r = redis::Client::open(std::env::var("VALKEY_URL").unwrap())
+        .unwrap()
+        .get_connection()
+        .unwrap();
+    let (own, group, era) = (
+        format!("busbar:usage:{id}:60"),
+        format!("busbar:usage:{id}:x@1:60"),
+        format!("busbar:usage:{id}:e:ab12"),
+    );
+    for k in [&own, &group, &era] {
+        let _: () = r.hset(k, "requests", 1).unwrap();
+    }
+    store.delete_key(&id).unwrap();
+    let there = |k: &String, r: &mut redis::Connection| -> bool { r.exists(k).unwrap() };
+    let (own_left, group_left, era_left) = (
+        there(&own, &mut r),
+        there(&group, &mut r),
+        there(&era, &mut r),
+    );
+    let _: () = r.del(&[&group, &era]).unwrap();
+    assert!(!own_left, "the key's own window was not cleared");
+    assert!(
+        group_left && era_left,
+        "another bucket's window was deleted"
+    );
+}
+
 #[test]
 fn put_refusals_carry_the_reason_without_the_kind_suffix() {
     let Some(store) = live_store() else { return };
