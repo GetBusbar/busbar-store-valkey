@@ -941,6 +941,14 @@ async fn read_slot(c: &mut Conn, secret: &CredentialSecret, op: &str) -> RedisRe
             .map_err(|_| RedisError::from((ErrorKind::Client, "cred decode")))?;
         if cur.meta.revoked_at.is_none() {
             if cur.meta.id == m.id {
+                let mut same = cur;
+                same.meta.revision = m.revision;
+                if same != *secret {
+                    return Err(RedisError::refused(format!(
+                        "{op}: credential {} already exists with different content",
+                        m.id
+                    )));
+                }
                 return Ok(Slot::Replay);
             }
             return Err(RedisError::from((
