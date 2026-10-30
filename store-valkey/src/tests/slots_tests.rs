@@ -285,6 +285,7 @@ struct Iso {
 impl Iso {
     fn new(db: u32) -> Option<Self> {
         live_store()?;
+        super::assert_private_db(db);
         let url = super::url_for_db(db);
         Self::flush(&url);
         let store = Some(ValkeyStore::connect(&url).expect("connect"));
