@@ -40,7 +40,7 @@ use busbar_contract::records::{
     PlaneSelector, RecordStoreError, RecordStoreResult, UsageDelta, UsageLedger, VirtualKey,
 };
 
-use crate::resp::{cmd, pipe, Conn, Script, ScriptInvocation};
+use crate::resp::{cmd, pipe, Conn, Script, ScriptInvocation, Value};
 use crate::{
     hex, metering_row, metering_set, plane, usage_fields, usage_key, ValkeyStore,
     METERING_UNIT_PREFIX, NAME, NEEDS,
@@ -214,51 +214,81 @@ impl ValkeyStore {
 }
 
 /// The start of an `op_id` write's script: `KEYS[1]` is the op's record; a recorded body is
-/// returned and nothing applies.
+/// returned and nothing applies. Then the helpers the two scripts share.
 const LUA_SEEN: &str = r"
 local prior = redis.call('HGET', KEYS[1], 'b')
 if prior then
     return prior
 end
-local failed
+local MAX = '9223372036854775807'
+local function bad_key(key, want)
+    local t = redis.call('TYPE', key)
+    t = type(t) == 'table' and t.ok or t
+    if t ~= 'none' and t ~= want then
+        return key .. ' is not a ' .. want
+    end
+end
+local function bad_field(key, field)
+    if redis.call('HGET', key, field) and not pcall(redis.call, 'HINCRBY', key, field, 0) then
+        return key .. ' field ' .. field .. ' is not an integer'
+    end
+end
+local function add_pinned(key, field, delta)
+    local ok, v = pcall(redis.call, 'HINCRBY', key, field, delta)
+    if ok then
+        return v
+    end
+    if string.find(type(v) == 'table' and v.err or tostring(v), 'overflow', 1, true) then
+        redis.call('HSET', key, field, MAX)
+        return nil
+    end
+    error(v)
+end
 ";
 
-/// The end of an `op_id` write's script: record the body (`ARGV[1]`) for `ARGV[2]` seconds. A
-/// failed command fails the op but leaves the rest applied and the op recorded, so a retry replays
-/// instead of applying twice.
+/// The end of an `op_id` write's script: record the body (`ARGV[1]`) for `ARGV[2]` seconds. It
+/// runs only after every cell is applied, so a recorded op is a fully applied one. The script
+/// answers a refusal as `{'refused', text}` before anything is written.
 const LUA_RECORD: &str = r"
 redis.call('HSET', KEYS[1], 'b', ARGV[1])
 redis.call('EXPIRE', KEYS[1], ARGV[2])
-if failed then
-    return redis.error_reply(type(failed) == 'table' and failed.err or tostring(failed))
-end
 return false
 ";
 
 /// `add_usage_batch`: per cell `KEYS[k]` = its usage hash; `ARGV` from 3 = per cell `n`, then `n`
-/// `field, delta` pairs. ADD-THEN-FLOOR: each field is `HINCRBY`'d and, below 0, pinned to 0; a
-/// counter a v6 build left negative (its unfloored HINCRBY) reads as the 0 it always reported. The
-/// add stays an integer HINCRBY (Lua numbers are doubles and would round counters past 2^53).
+/// `field, delta` pairs. VALIDATE, THEN APPLY: every key must be a hash (or absent) and every
+/// field it adds to absent or an integer, else the batch is refused with nothing written or
+/// recorded; the apply then cannot fail. ADD-THEN-FLOOR: each field is `HINCRBY`'d and, below 0,
+/// pinned to 0; a counter a v6 build left negative reads as the 0 it always reported. An add past
+/// `i64::MAX` pins there. The add stays an integer `HINCRBY` (Lua numbers are doubles and would
+/// round counters past 2^53), and the overflow is read off its error, which is exact.
 static USAGE_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_SEEN}
-        local function add_floored(key, from, n)
-            for i = from, from + 2 * n - 2, 2 do
-                local cur = redis.call('HGET', key, ARGV[i])
-                if cur and tonumber(cur) < 0 then
-                    redis.call('HSET', key, ARGV[i], 0)
-                end
-                if redis.call('HINCRBY', key, ARGV[i], ARGV[i + 1]) < 0 then
-                    redis.call('HSET', key, ARGV[i], 0)
-                end
-            end
-        end
         local a = 3
         for k = 2, #KEYS do
             local n = tonumber(ARGV[a])
-            local ok, e = pcall(add_floored, KEYS[k], a + 1, n)
-            if not ok and not failed then
-                failed = e
+            local why = bad_key(KEYS[k], 'hash')
+            for i = a + 1, a + 2 * n - 1, 2 do
+                why = why or bad_field(KEYS[k], ARGV[i])
+            end
+            if why then
+                return {{'refused', why}}
+            end
+            a = a + 1 + 2 * n
+        end
+        a = 3
+        for k = 2, #KEYS do
+            local n = tonumber(ARGV[a])
+            for i = a + 1, a + 2 * n - 1, 2 do
+                local cur = redis.call('HGET', KEYS[k], ARGV[i])
+                if cur and tonumber(cur) < 0 then
+                    redis.call('HSET', KEYS[k], ARGV[i], 0)
+                end
+                local v = add_pinned(KEYS[k], ARGV[i], ARGV[i + 1])
+                if v and v < 0 then
+                    redis.call('HSET', KEYS[k], ARGV[i], 0)
+                end
             end
             a = a + 1 + 2 * n
         end
@@ -269,37 +299,46 @@ static USAGE_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 /// `add_metering_batch`: per delta `KEYS[k], KEYS[k + 1]` = its bucket's set and its row; `ARGV`
 /// from 3 = per delta the six counters, `n`, `n` `unit field, count` pairs, then `key_id`, `model`,
 /// `provider`, `priced_from_ms`, `key_group_at_use`, `pricing_version`. The row joins its set,
-/// every count is an `HINCRBY`, the attribution snapshot is first-write-wins (`HSETNX`).
+/// every count is an `HINCRBY` pinned at `i64::MAX`, the attribution snapshot is first-write-wins
+/// (`HSETNX`). Validate-then-apply as [`USAGE_OP`].
 static METERING_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_SEEN}
-        local function run(...)
-            local r = redis.pcall(...)
-            if type(r) == 'table' and r.err and not failed then
-                failed = r
-            end
-        end
         local counters = {{'tokens_input', 'tokens_output', 'tokens_cache_read',
                           'tokens_cache_write', 'requests', 'billable_requests'}}
-        local a = 3
-        for k = 2, #KEYS, 2 do
-            local row = KEYS[k + 1]
-            run('SADD', KEYS[k], row)
-            for i, f in ipairs(counters) do
-                run('HINCRBY', row, f, ARGV[a + i - 1])
+        local function walk(count, finish)
+            local a = 3
+            for k = 2, #KEYS, 2 do
+                local row = KEYS[k + 1]
+                for i, f in ipairs(counters) do
+                    count(KEYS[k], row, f, ARGV[a + i - 1])
+                end
+                local n = tonumber(ARGV[a + 6])
+                a = a + 7
+                for _ = 1, n do
+                    count(KEYS[k], row, ARGV[a], ARGV[a + 1])
+                    a = a + 2
+                end
+                finish(KEYS[k], row, a)
+                a = a + 6
             end
-            local n = tonumber(ARGV[a + 6])
-            a = a + 7
-            for _ = 1, n do
-                run('HINCRBY', row, ARGV[a], ARGV[a + 1])
-                a = a + 2
-            end
-            run('HSET', row, 'key_id', ARGV[a], 'model', ARGV[a + 1], 'provider', ARGV[a + 2])
-            run('HSET', row, 'priced_from_ms', ARGV[a + 3])
-            run('HSETNX', row, 'key_group_at_use', ARGV[a + 4])
-            run('HSETNX', row, 'pricing_version', ARGV[a + 5])
-            a = a + 6
         end
+        local why
+        walk(function(set, row, f)
+            why = why or bad_key(set, 'set') or bad_key(row, 'hash') or bad_field(row, f)
+        end, function() end)
+        if why then
+            return {{'refused', why}}
+        end
+        walk(function(_, row, f, n)
+            add_pinned(row, f, n)
+        end, function(set, row, a)
+            redis.call('SADD', set, row)
+            redis.call('HSET', row, 'key_id', ARGV[a], 'model', ARGV[a + 1], 'provider', ARGV[a + 2])
+            redis.call('HSET', row, 'priced_from_ms', ARGV[a + 3])
+            redis.call('HSETNX', row, 'key_group_at_use', ARGV[a + 4])
+            redis.call('HSETNX', row, 'pricing_version', ARGV[a + 5])
+        end)
         {LUA_RECORD}"
     ))
 });
@@ -312,7 +351,8 @@ fn op_call(script: &'static Script, op: OpId, d: &Dedupe<'_>) -> ScriptInvocatio
 }
 
 impl ValkeyStore {
-    /// Run an `op_id` write's script once (a lost reply may have applied): the body it found.
+    /// Run an `op_id` write's script once (a lost reply may have applied): the body it found, or
+    /// its refusal (decided before anything was written).
     fn deduped(
         &self,
         cx: &mut Op<'_>,
@@ -322,8 +362,26 @@ impl ValkeyStore {
             cx,
             self,
             |e: RecordStoreError| Err(OpRefused::Failed(e.0)),
-            |me, c| with_conn_no_retry!(me, |c| inv.invoke(c).await)
-                .map_err(|e| OpRefused::Failed(e.0))
+            |me, c| {
+                let answer: Value = with_conn_no_retry!(me, |c| inv.invoke(c).await)
+                    .map_err(|e| OpRefused::Failed(e.0))?;
+                match answer {
+                    Value::Data(prior) => Ok(Some(prior)),
+                    Value::Nil => Ok(None),
+                    Value::Array(r) => match r.as_slice() {
+                        [_, Value::Data(why)] => Err(OpRefused::Refused(format!(
+                            "valkey command: {}",
+                            String::from_utf8_lossy(why)
+                        ))),
+                        _ => Err(OpRefused::Failed(
+                            "valkey command: a malformed refusal".into(),
+                        )),
+                    },
+                    other => Err(OpRefused::Failed(format!(
+                        "valkey command: the script answered {other:?}"
+                    ))),
+                }
+            }
         )
     }
 }
