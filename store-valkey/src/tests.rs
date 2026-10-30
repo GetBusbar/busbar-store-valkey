@@ -4814,6 +4814,28 @@ fn delete_key_clears_only_its_own_usage_windows() {
     );
 }
 
+/// `delete_key` takes the key's credential pointers out of the credential revision index too: a
+/// destroyed row must not stay in `busbar:creds:byrev` for ever (the key's own tombstone is what
+/// tells hydrators to evict).
+#[test]
+fn delete_key_removes_its_credentials_from_the_revision_index() {
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_byrev");
+    store.put_key(&vk(&key_id)).unwrap();
+    let c0 = cred(&key_id, &uid("AKIA_BYREV"), 0);
+    store.put_credential(&c0).unwrap();
+    let member = format!("{key_id}:{}:{}", c0.meta.kind, c0.meta.slot);
+    let mut r = redis::Client::open(std::env::var("VALKEY_URL").unwrap())
+        .unwrap()
+        .get_connection()
+        .unwrap();
+    let before: Option<f64> = r.zscore("busbar:creds:byrev", &member).unwrap();
+    assert!(before.is_some(), "the credential was indexed by revision");
+    store.delete_key(&key_id).unwrap();
+    let after: Option<f64> = r.zscore("busbar:creds:byrev", &member).unwrap();
+    assert!(after.is_none(), "the destroyed credential stays indexed");
+}
+
 #[test]
 fn put_refusals_carry_the_reason_without_the_kind_suffix() {
     let Some(store) = live_store() else { return };
