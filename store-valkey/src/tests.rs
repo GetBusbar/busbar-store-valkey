@@ -1457,6 +1457,9 @@ mod store_conformance;
 /// kernel's records, and the v9 upgrade.
 mod slots_tests;
 
+/// A proxy that holds one client mid-op, for deterministic interleavings.
+mod interleave;
+
 mod conformance {
     use super::store_conformance::conf;
     use super::{live_store, Raw, ValkeyStore};
@@ -4651,6 +4654,40 @@ fn an_unknown_id_spelling_the_retry_sentinel_is_refused_not_retried() {
         e.contains(&format!("delete_key: unknown id '{want}'")),
         "{e}"
     );
+}
+
+/// Two writers interleaved at the revision read: the one that allocates first but commits last must
+/// still stamp the HIGHER revision (else a cursor reader that already passed the other's stamp skips
+/// its row forever). The first writer is held after its revision command, the second runs to completion.
+#[test]
+fn a_writer_overtaken_between_its_revision_read_and_commit_restamps_above_the_winner() {
+    if live_store().is_none() {
+        return;
+    }
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let gate = interleave::gate(&url, |c| {
+        interleave::contains(c, b"busbar:revision") && !interleave::contains(c, b"WATCH")
+    });
+    let (a, b) = (uid("vk_rev_a"), uid("vk_rev_b"));
+    let slow = ValkeyStore::connect(&gate.url).expect("connect through the gate");
+    let fast = live_store().unwrap();
+    let a_id = a.clone();
+    let writer = std::thread::spawn(move || slow.put_key(&vk(&a_id)));
+    gate.held
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the first writer reached its revision command");
+    fast.put_key(&vk(&b)).unwrap();
+    gate.release.send(()).unwrap();
+    writer.join().unwrap().unwrap();
+    let rev = |id: &str| fast.get_key(id).unwrap().unwrap().revision;
+    assert!(rev(&a) > rev(&b), "a={} b={}", rev(&a), rev(&b));
+    let mut r = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_connection()
+        .unwrap();
+    let score =
+        |id: &str, r: &mut redis::Connection| -> f64 { r.zscore("busbar:keys:byrev", id).unwrap() };
+    assert!(score(&a, &mut r) > score(&b, &mut r));
 }
 
 #[test]
