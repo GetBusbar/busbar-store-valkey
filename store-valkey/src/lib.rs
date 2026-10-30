@@ -1146,7 +1146,14 @@ impl ValkeyStore {
         // Usage windows: best-effort cleanup by a SCAN outside the transaction (a window raced in
         // before the EXEC is stale data, not an identity issue).
         let pattern = format!("busbar:usage:{}:*", escape(id, GLOB));
-        let usage_keys = self.scan(c, &pattern).await?;
+        let own = format!("busbar:usage:{id}:");
+        let mut usage_keys = self.scan(c, &pattern).await?;
+        // The glob also matches other buckets whose id starts `<id>:` (group, era): keep only
+        // `<own>:<decimal window>`.
+        usage_keys.retain(|k| {
+            k.strip_prefix(&own)
+                .is_some_and(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_digit()))
+        });
         // WATCH the key row, its credential-id index AND every member's credential row (a slot
         // rewritten in place changes no index). The row set depends on the membership, so a
         // membership change rebuilds the watch set from fresh state (the outer loop).
