@@ -969,15 +969,19 @@ pub fn rr<T, F: Future<Output = RedisResult<T>>>(f: F) -> F {
     f
 }
 
+/// The most times a `transaction!` reruns its body after an abort before it gives up.
+pub const MAX_TRANSACTION_ATTEMPTS: usize = 64;
+
 /// The optimistic transaction, as the upstream driver's `transaction`: `WATCH` the keys, run the
 /// body (it reads, and queues its writes on the atomic pipeline it is handed, then answers that
 /// pipeline's `query`: `None` when a watched key changed and `EXEC` aborted), and run it all again
-/// on an abort. Evaluates to the body's `Some` value, or its error (a `WATCH` left in force by a
-/// failed body is cleared).
+/// on an abort, up to [`MAX_TRANSACTION_ATTEMPTS`] times. Evaluates to the body's `Some` value, or its
+/// error (a `WATCH` left in force by a failed body is cleared).
 macro_rules! transaction {
     ($c:ident, $keys:expr, |$c2:ident, $pipe:ident| $body:expr $(,)?) => {
         $crate::resp::rr(async {
             let __keys = $keys;
+            let mut __aborts = 0usize;
             loop {
                 $crate::resp::cmd("WATCH")
                     .arg(__keys)
@@ -998,7 +1002,19 @@ macro_rules! transaction {
                         }
                         break Ok(v);
                     }
-                    Ok(None) => continue,
+                    Ok(None) => {
+                        __aborts += 1;
+                        if __aborts >= $crate::resp::MAX_TRANSACTION_ATTEMPTS {
+                            if $c.watching() {
+                                let _ = $crate::resp::cmd("UNWATCH").exec(&mut *$c).await;
+                            }
+                            break Err($crate::resp::RedisError::refused(format!(
+                                "the transaction was aborted {__aborts} times by concurrent \
+                                 writers; giving up"
+                            )));
+                        }
+                        continue;
+                    }
                     Err(e) => {
                         if $c.watching() {
                             let _ = $crate::resp::cmd("UNWATCH").exec(&mut *$c).await;
