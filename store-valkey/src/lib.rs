@@ -1660,7 +1660,10 @@ impl ValkeyStore {
         with_conn!(self, |c| {
             pipe()
                 .atomic()
-                .set(format!("{DENYLIST_PREFIX}{sub}"), reason)
+                .cmd("SET")
+                .arg(format!("{DENYLIST_PREFIX}{sub}"))
+                .arg(reason)
+                .arg("NX")
                 .ignore()
                 .sadd(DENYLIST_INDEX, sub)
                 .ignore()
