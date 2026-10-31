@@ -180,9 +180,9 @@ fn the_statement_tail_is_a_durable_store_that_refuses_forks() {
 #[test]
 fn open_refuses_settings_it_cannot_run_in_its_own_words() {
     let e = Door::open(b"", None).expect_err("no url");
-    assert!(e.contains("requires a \"url\""), "{e}");
+    assert!(e.contains("`url` is required"), "{e}");
     let e = Door::open(b"{}", None).expect_err("no url");
-    assert!(e.contains("requires a \"url\""), "{e}");
+    assert!(e.contains("`url` is required"), "{e}");
     let e = Door::open(b"{ not json", None).expect_err("bad json");
     assert!(e.contains("invalid valkey plugin config"), "{e}");
     let e =
