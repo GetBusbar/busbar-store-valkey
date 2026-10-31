@@ -1455,10 +1455,16 @@ fn a_namespace_with_keys_but_no_marker_refuses_to_connect_and_keeps_every_key() 
         err.contains("NOTHING was changed"),
         "says nothing changed: {err}"
     );
+    let sample = err
+        .split_once("holds other `busbar:*` keys (e.g. ")
+        .and_then(|(_, rest)| rest.split_once("); "))
+        .map(|(sample, _)| sample)
+        .unwrap_or_else(|| panic!("names a sample of key prefixes: {err}"));
     assert!(
-        err.contains("holds 4 other `busbar:*` key(s)"),
-        "reports the key count: {err}"
+        (1..=3).contains(&sample.split(", ").count()),
+        "at most 3 sample prefixes: {err}"
     );
+    assert!(!err.contains("4 other"), "no total count: {err}");
 
     assert!(
         !err.contains("SECRETID"),
