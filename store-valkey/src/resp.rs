@@ -73,6 +73,13 @@ impl RedisError {
         }
     }
 
+    /// Whether this is a store refusal ([`RedisError::refused`]), which reaches the caller as
+    /// written.
+    #[must_use]
+    pub fn is_refusal(&self) -> bool {
+        matches!(self.repr, Repr::Refused(_))
+    }
+
     /// A body's own signal that the state it watched changed shape: the caller reruns it.
     #[must_use]
     pub fn retry() -> Self {

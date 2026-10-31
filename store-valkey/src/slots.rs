@@ -377,10 +377,11 @@ impl ValkeyStore {
                     Value::Data(prior) => Ok(Some(prior)),
                     Value::Nil => Ok(None),
                     Value::Array(r) => match r.as_slice() {
-                        [_, Value::Data(why)] => Err(OpRefused::Refused(format!(
-                            "valkey command: {}",
-                            String::from_utf8_lossy(why)
-                        ))),
+                        [Value::Data(tag), Value::Data(why)] if tag.as_slice() == b"refused" => {
+                            Err(OpRefused::Refused(
+                                String::from_utf8_lossy(why).into_owned(),
+                            ))
+                        }
                         _ => Err(OpRefused::Failed(
                             "valkey command: a malformed refusal".into(),
                         )),
