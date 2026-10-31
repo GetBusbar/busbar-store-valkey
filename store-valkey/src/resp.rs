@@ -717,6 +717,34 @@ impl Conn {
             .await
     }
 
+    /// Up to `max` keys matching `pattern` other than `skip`, stopping the `SCAN` as soon as
+    /// that many are found.
+    pub async fn scan_some(
+        &mut self,
+        pattern: &str,
+        skip: &str,
+        max: usize,
+    ) -> RedisResult<Vec<String>> {
+        let mut cursor = String::from("0");
+        let mut out = Vec::new();
+        loop {
+            let (next, keys): (String, Vec<String>) = cmd("SCAN")
+                .arg(&cursor)
+                .arg("MATCH")
+                .arg(pattern)
+                .arg("COUNT")
+                .arg(SCAN_COUNT)
+                .query(self)
+                .await?;
+            out.extend(keys.into_iter().filter(|k| k != skip));
+            if out.len() >= max || next == "0" {
+                out.truncate(max);
+                return Ok(out);
+            }
+            cursor = next;
+        }
+    }
+
     /// Every key matching `pattern` (`SCAN ... MATCH`, followed to the end).
     pub async fn scan_match(&mut self, pattern: &str) -> RedisResult<Vec<String>> {
         let mut cursor = String::from("0");

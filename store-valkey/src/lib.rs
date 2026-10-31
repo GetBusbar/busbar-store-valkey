@@ -759,8 +759,8 @@ impl ValkeyStore {
                     .set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION)
                     .await);
             }
-            let existing = self.scan(c, "busbar:*").await?;
-            let others: Vec<&String> = existing.iter().filter(|k| *k != SCHEMA_KEY).collect();
+            let others: Vec<String> =
+                with_conn!(self, |c| c.scan_some("busbar:*", SCHEMA_KEY, 3).await)?;
             if others.is_empty() {
                 return with_conn!(self, |c| c
                     .set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION)
@@ -797,8 +797,8 @@ impl ValkeyStore {
             sample.truncate(3);
             return Err(RecordStoreError(format!(
                 "valkey schema check: {found} (a version below {FIRST_MIGRATED_SCHEMA} cannot be \
-                 upgraded in place) but the namespace holds {} other `busbar:*` key(s), key prefixes e.g. [{}]. \
-                 Refusing to start. NOTHING was changed: no key was deleted and no marker written. \
+                 upgraded in place) but the namespace holds other `busbar:*` keys (e.g. {}); \
+                 refusing to start. NOTHING was changed: no key was deleted and no marker written. \
                  If this is a current namespace whose marker was lost, restore it with \
                  `SET {SCHEMA_KEY} {FIRST_MIGRATED_SCHEMA}` and restart ({FIRST_MIGRATED_SCHEMA} is safe \
                  either way: the v6->v7 copy is append-if-absent and the v9 step deletes keys a v6/v7 namespace already lacks or no longer reads, \
@@ -806,7 +806,6 @@ impl ValkeyStore {
                  and strand its task and ask-state data). If it was written by plugin v1.0.0 or an earlier 1.5.0 \
                  development build, it cannot be migrated: back it up if needed, delete the \
                  `busbar:*` keys, and restart to start a fresh namespace.",
-                others.len(),
                 sample.join(", ")
             )));
         }
