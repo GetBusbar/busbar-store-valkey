@@ -1236,33 +1236,56 @@ impl ValkeyStore {
         c: &mut Conn,
         since: u64,
     ) -> RecordStoreResult<Vec<VirtualKey>> {
-        let ids = self.delta_members(c, KEYS_BYREV, since).await?;
-        self.get_keys(c, &ids).await
+        self.delta_rows(c, KEYS_BYREV, since, |id| Some(format!("{KEY_PREFIX}{id}")))
+            .await?
+            .into_iter()
+            .map(|(_, raw)| key_from_json(&raw))
+            .collect()
     }
 
-    /// The members of the revision index `zset` past `since`, and those at revision 0 (never
-    /// stamped), which every delta carries; in revision order.
-    async fn delta_members(
+    /// Read index membership and values from one stable revision snapshot. A writer between
+    /// enumeration and GET must abort the read, otherwise a newer row can advance the caller's
+    /// cursor beyond an intervening row the index snapshot did not include.
+    async fn delta_rows(
         &self,
         c: &mut Conn,
         zset: &str,
         since: u64,
-    ) -> RecordStoreResult<Vec<String>> {
-        let (unstamped, stamped): (Vec<String>, Vec<String>) = with_conn!(self, |c| {
-            pipe()
-                .atomic()
-                .cmd("ZRANGEBYSCORE")
-                .arg(zset)
-                .arg(0)
-                .arg(0)
-                .cmd("ZRANGEBYSCORE")
-                .arg(zset)
-                .arg(format!("({since}"))
-                .arg("+inf")
-                .query(c)
-                .await
-        })?;
-        Ok([unstamped, stamped].concat())
+        key_of: fn(&str) -> Option<String>,
+    ) -> RecordStoreResult<Vec<(String, String)>> {
+        with_conn!(self, |c| {
+            transaction!(c, &[zset, REVISION_KEY], |c, reads| {
+                let (unstamped, stamped): (Vec<String>, Vec<String>) = pipe()
+                    .cmd("ZRANGEBYSCORE")
+                    .arg(zset)
+                    .arg(0)
+                    .arg(0)
+                    .cmd("ZRANGEBYSCORE")
+                    .arg(zset)
+                    .arg(format!("({since}"))
+                    .arg("+inf")
+                    .query(c)
+                    .await?;
+                let keys: Vec<_> = unstamped
+                    .iter()
+                    .chain(&stamped)
+                    .filter_map(|m| key_of(m))
+                    .collect();
+                // An EXEC here would clear WATCH before the values are read. Keep the index
+                // queries ordinary and validate them with the final read-only EXEC, even empty.
+                reads.get(REVISION_KEY).ignore();
+                for key in &keys {
+                    reads.get(key);
+                }
+                let raw: Option<Vec<Option<String>>> = reads.query(c).await?;
+                Ok(raw.map(|values| {
+                    keys.into_iter()
+                        .zip(values)
+                        .filter_map(|(key, raw)| Some((key, raw?)))
+                        .collect()
+                }))
+            })
+        })
     }
 
     /// The key rows of `ids` (a missing row is skipped, a corrupt one refused).
@@ -1750,21 +1773,14 @@ impl ValkeyStore {
         c: &mut Conn,
         since: u64,
     ) -> RecordStoreResult<Vec<CredentialSecret>> {
-        let members = self.delta_members(c, CREDS_BYREV, since).await?;
-        let row_keys: Vec<String> = members
-            .iter()
-            .filter_map(|m| {
-                let (key_id, kind, slot) = parse_slot_pointer(m)?;
-                Some(cred_row_key(&key_id, &kind, slot))
-            })
-            .collect();
-        let raws = self.get_all(c, &row_keys).await?;
-        row_keys
-            .iter()
-            .zip(raws)
-            .filter_map(|(row, raw)| Some((row, raw?)))
-            .map(|(row, raw)| cred_from_json("list_credentials_since", row, &raw))
-            .collect()
+        self.delta_rows(c, CREDS_BYREV, since, |member| {
+            let (key_id, kind, slot) = parse_slot_pointer(member)?;
+            Some(cred_row_key(&key_id, &kind, slot))
+        })
+        .await?
+        .into_iter()
+        .map(|(row, raw)| cred_from_json("list_credentials_since", &row, &raw))
+        .collect()
     }
 
     pub(crate) async fn list_audit(&self, c: &mut Conn) -> RecordStoreResult<Vec<AuditRecord>> {
