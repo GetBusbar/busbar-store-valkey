@@ -5282,6 +5282,46 @@ fn list_metering_is_one_snapshot() {
     assert!(rows == before || rows == after, "a torn read: {rows:?}");
 }
 
+/// A write that decides nothing to write does not `EXEC`: a replayed credential put, a repeat
+/// revoke and a repeat delete leave the transaction without contending on `busbar:revision`.
+#[test]
+fn no_op_paths_do_not_exec() {
+    let Some(direct) = live_store() else { return };
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = execs.clone();
+    let proxied = interleave::tamper(
+        &url,
+        |c| interleave::contains(c, b"EXEC"),
+        move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        },
+    );
+    let store = ValkeyStore::connect(&proxied).unwrap();
+
+    let (kid, gone, revoked) = (uid("vk_noop"), uid("vk_noop_gone"), uid("vk_noop_rev"));
+    let c = cred(&kid, &uid("AKIA_NOOP"), 0);
+    direct.put_key_with_credential(&vk(&kid), &c).unwrap();
+    direct.put_key(&vk(&gone)).unwrap();
+    direct.delete_key(&gone).unwrap();
+    let r = cred(&revoked, &uid("AKIA_NOOP_REV"), 0);
+    direct.put_key_with_credential(&vk(&revoked), &r).unwrap();
+    direct.revoke_credential(&r.meta.id, "first").unwrap();
+
+    execs.store(0, std::sync::atomic::Ordering::SeqCst);
+    store.put_credential(&c).expect("a replay is Ok");
+    store
+        .put_key_with_credential(&vk(&kid), &c)
+        .expect("a replay is Ok");
+    store.revoke_credential(&r.meta.id, "again").unwrap();
+    store.delete_key(&gone).unwrap();
+    assert_eq!(
+        execs.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a no-op path sent an EXEC"
+    );
+}
+
 /// One op in flight must not block the next: the store keeps several connections, one per op.
 #[test]
 fn a_held_op_does_not_block_a_second_op_on_the_same_store() {
