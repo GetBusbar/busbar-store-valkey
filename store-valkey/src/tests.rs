@@ -509,7 +509,11 @@ fn a_revision_zero_row_is_in_every_delta() {
         .unwrap();
     for since in [0, 1, u64::MAX / 2] {
         assert!(
-            store.list_keys_since(since).unwrap().iter().any(|k| k.id == kid),
+            store
+                .list_keys_since(since)
+                .unwrap()
+                .iter()
+                .any(|k| k.id == kid),
             "key at revision 0 missing from the delta since {since}"
         );
         assert!(
@@ -924,7 +928,10 @@ fn put_key_with_credential_refuses_up_front_and_writes_nothing() {
     let c = cred(&kid, &uid("AKIA_MINT_REFUSED"), 0);
     let mut dead = vk(&kid);
     dead.deleted_at = Some(5);
-    let e = store.put_key_with_credential(&dead, &c).unwrap_err().to_string();
+    let e = store
+        .put_key_with_credential(&dead, &c)
+        .unwrap_err()
+        .to_string();
     assert_eq!(
         e,
         format!(
@@ -1034,6 +1041,21 @@ fn list_credentials_is_ordered_by_kind_then_slot() {
             ("sigv4".to_string(), 0),
             ("sigv4".to_string(), 1)
         ]
+    );
+}
+
+/// A store refusal reaches the caller exactly as written, with no backend prefix.
+#[test]
+fn store_refusals_reach_the_caller_exactly_as_written() {
+    let Some(store) = live_store() else { return };
+    let id = uid("vk_nowhere");
+    assert_eq!(
+        store.delete_key(&id).unwrap_err().to_string(),
+        format!("delete_key: unknown id '{id}'")
+    );
+    assert_eq!(
+        store.revoke_credential(&id, "n/a").unwrap_err().to_string(),
+        format!("revoke_credential: unknown id '{id}'")
     );
 }
 
