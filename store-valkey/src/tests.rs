@@ -3197,8 +3197,18 @@ fn a_redeemed_entry_carries_a_ttl_bounded_by_the_approvals_own_life() {
             .with_conn(|c| c.ttl::<_, i64>(plane::token_key("ask", nonce)))
             .expect("TTL")
     };
-    assert!((1..=30).contains(&ttl(&short)), "got {}", ttl(&short));
-    assert!((1..=10_000).contains(&ttl(&long)), "got {}", ttl(&long));
+    // The TTL is cleanup only: never shorter than the grant's life (the judgment is the stored
+    // `expires_at` against the caller's `now`), and bounded by it plus a skew allowance.
+    assert!(
+        (31..=30 + 3_600).contains(&ttl(&short)),
+        "got {}",
+        ttl(&short)
+    );
+    assert!(
+        (10_001..=10_000 + 3_600).contains(&ttl(&long)),
+        "got {}",
+        ttl(&long)
+    );
     assert!(
         ttl(&long) > ttl(&short),
         "the TTL tracks the grant's remaining life"
@@ -3227,6 +3237,31 @@ fn a_grant_beyond_the_ttl_cap_is_recorded_without_expiry() {
     reset_trust_state(&store, &[], &[&nonce]);
 }
 
+/// A stored entry is spent while its `expires_at` is at or after the CALLER'S `now`; only an entry
+/// with `expires_at < now` is lapsed and redeems afresh (the server's clock plays no part).
+#[test]
+fn a_spent_entry_is_judged_against_the_callers_now() {
+    let store = require_live_store();
+    let nonce = trust_ns("nonce_judged");
+    reset_trust_state(&store, &[], &[&nonce]);
+    let exp = TRUST_NOW + 100;
+    assert!(store.redeem_ask_state(&nonce, exp, TRUST_NOW).unwrap());
+    assert!(!store.redeem_ask_state(&nonce, exp, TRUST_NOW + 50).unwrap());
+    assert!(
+        !store.redeem_ask_state(&nonce, exp, exp).unwrap(),
+        "an entry whose expires_at equals now is still spent"
+    );
+    assert!(
+        store.redeem_ask_state(&nonce, exp + 500, exp + 1).unwrap(),
+        "an entry with expires_at < now is lapsed and redeems afresh"
+    );
+    assert!(
+        !store.redeem_ask_state(&nonce, exp + 500, exp + 2).unwrap(),
+        "and that fresh redemption is spent in turn"
+    );
+    reset_trust_state(&store, &[], &[&nonce]);
+}
+
 /// AN ALREADY-LAPSED APPROVAL IS STILL ANSWERED HONESTLY, with a bounded record.
 #[test]
 fn a_lapsed_approval_still_gets_a_truthful_answer_and_a_bounded_record() {
@@ -3239,7 +3274,7 @@ fn a_lapsed_approval_still_gets_a_truthful_answer_and_a_bounded_record() {
     let ttl: i64 = store
         .with_conn(|c| c.ttl::<_, i64>(plane::token_key("ask", &nonce)))
         .expect("TTL");
-    assert!((1..=60).contains(&ttl), "got {ttl}");
+    assert!((2..=1 + 3_600).contains(&ttl), "got {ttl}");
     reset_trust_state(&store, &[], &[&nonce]);
 }
 
@@ -3574,8 +3609,8 @@ fn v6_namespace_upgrades_in_place_to_v7() {
         .with_conn(|c| c.ttl(plane::token_key("ask", &nonce)))
         .unwrap();
     assert!(
-        (1..=600).contains(&ttl),
-        "the spent entry keeps its own remaining life: {ttl}"
+        (601..=600 + 3_600).contains(&ttl),
+        "the spent entry keeps at least its own remaining life: {ttl}"
     );
 
     // The typed keys are gone; everything else is where it was.
