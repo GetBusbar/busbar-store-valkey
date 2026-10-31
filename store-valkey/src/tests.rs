@@ -4253,10 +4253,10 @@ fn a_rediss_url_is_secured_through_the_hosts_connector() {
 
 /// Host services offering the clock alone (the dispatcher's own timebase), refusing the rest: the
 /// host clock a wire's bound runs on. Every other service answers as busbar's shared test double
-/// (`busbar_contract::services::double`) answers an unserved one: REFUSED, at once.
+/// (`busbar_test_kit::services_double`) answers an unserved one: REFUSED, at once.
 struct ClockOnly;
 
-impl busbar_contract::services::double::ServicesDouble for ClockOnly {
+impl busbar_test_kit::services_double::ServicesDouble for ClockOnly {
     fn now(&self) -> busbar_contract::services::Reading {
         busbar_contract::services::Reading {
             wall_ns: 0,
@@ -4282,7 +4282,7 @@ fn connect_timeout_ms_bounds_the_handshake_after_the_dial() {
     for url in [format!("redis://:pw@{at}/0"), format!("redis://{at}/3")] {
         let d = Arc::new(Dispatcher::with_services(
             DispatchConfig::default(),
-            Arc::new(ClockOnly),
+            Arc::new(busbar_test_kit::services_double::Double(ClockOnly)),
         ));
         let t = std::time::Instant::now();
         let (store, _) = open_on_dispatcher(

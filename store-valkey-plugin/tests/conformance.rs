@@ -64,6 +64,7 @@ busbar_test_kit::conformance_suite! {
     host: host,
     tls: conformance_host::anchors(),
     namespace: (take_fold_keyspace, drop_fold_keyspace),
+    newer_schema: stamp_newer_schema,
 }
 
 /// The live Valkey's address (`VALKEY_URL`'s authority; the service's default when unset).
@@ -108,6 +109,14 @@ fn fold_client(settings: &[u8]) -> redis::RedisResult<redis::Connection> {
             &format!("redis://{}", upstream()),
         );
     redis::Client::open(url.as_str())?.get_connection()
+}
+
+fn stamp_newer_schema(_: &str, settings: &[u8]) {
+    redis::cmd("SET")
+        .arg("busbar:schema")
+        .arg(i64::MAX)
+        .query::<()>(&mut fold_client(settings).expect("the fold's private database"))
+        .expect("stamp a newer schema in the fold's private database");
 }
 
 fn flush_fold_keyspace(settings: &[u8]) -> redis::RedisResult<()> {

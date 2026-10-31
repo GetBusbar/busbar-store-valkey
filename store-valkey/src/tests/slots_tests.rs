@@ -179,14 +179,14 @@ fn the_statement_tail_is_a_durable_store_that_refuses_forks() {
 /// The settings refusals are the 1.5.5 texts, through the door's `open`. No server needed.
 #[test]
 fn open_refuses_settings_it_cannot_run_in_its_own_words() {
-    let e = Door::open(b"", None).expect_err("no url");
+    let e = Door::open_with_secrets(b"", &[], None).expect_err("no url");
     assert!(e.contains("`url` is required"), "{e}");
-    let e = Door::open(b"{}", None).expect_err("no url");
+    let e = Door::open_with_secrets(b"{}", &[], None).expect_err("no url");
     assert!(e.contains("`url` is required"), "{e}");
-    let e = Door::open(b"{ not json", None).expect_err("bad json");
+    let e = Door::open_with_secrets(b"{ not json", &[], None).expect_err("bad json");
     assert!(e.contains("invalid valkey plugin config"), "{e}");
-    let e =
-        Door::open(br#"{"url":"not-a-valkey-url"}"#, None).expect_err("a url the driver refuses");
+    let e = Door::open_with_secrets(br#"{"url":"not-a-valkey-url"}"#, &[], None)
+        .expect_err("a url the driver refuses");
     assert!(e.contains("invalid valkey plugin config: url: "), "{e}");
     assert!(!e.contains("failed to connect"), "{e}");
 }
