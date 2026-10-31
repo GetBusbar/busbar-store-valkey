@@ -1729,6 +1729,8 @@ mod store_conformance;
 /// kernel's records, and the v9 upgrade.
 mod slots_tests;
 
+#[path = "tests/delta_reader.rs"]
+mod delta_reader;
 /// A proxy that holds one client mid-op, for deterministic interleavings.
 mod interleave;
 
