@@ -582,7 +582,7 @@ fn load_and_exercise_valkey_plugin_bad_config_fails_over_abi() {
         .err()
         .expect("a config missing url must fail to load");
     assert!(
-        err.contains("requires a \"url\""),
+        err.contains("`url` is required"),
         "expected the plugin's own missing-url message, got: {err}"
     );
 

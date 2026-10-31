@@ -654,7 +654,7 @@ fn the_linked_and_the_dropped_in_valkey_store_are_one_store() {
 
     // The transcript is about the store, not about nothing: the refusals are the store's own words,
     // and (live) the scenario did what a governance store is for.
-    assert!(linked[1].contains("requires a \\\"url\\\""), "{linked:#?}");
+    assert!(linked[1].contains("`url` is required"), "{linked:#?}");
     assert!(
         linked[2].contains("invalid valkey plugin config"),
         "{linked:#?}"
@@ -665,7 +665,7 @@ fn the_linked_and_the_dropped_in_valkey_store_are_one_store() {
         "{linked:#?}"
     );
     assert!(
-        linked[4].contains("valkey plugin: failed to connect"),
+        linked[4].contains("valkey store: failed to connect"),
         "{linked:#?}"
     );
     if url.is_some() {

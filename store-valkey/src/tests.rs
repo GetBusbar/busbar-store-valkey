@@ -4116,9 +4116,8 @@ fn a_rediss_url_is_secured_through_the_hosts_connector() {
     let err = untrusted.expect_err("no TLS without trust");
     assert!(
         err.starts_with(
-            "plugin 'busbar-store-valkey' open failed: valkey plugin: failed to connect: valkey \
-             connect: "
-        ),
+            "plugin 'busbar-store-valkey' open failed: valkey store: failed to connect: "
+        ) && !err.contains("valkey connect:"),
         "{err}"
     );
 }
@@ -4170,9 +4169,9 @@ fn connect_timeout_ms_bounds_the_handshake_after_the_dial() {
         );
         assert!(
             err.starts_with(
-                "plugin 'busbar-store-valkey' open failed: valkey plugin: failed to connect: \
-                 valkey connect: "
-            ) && err.contains("deadline passed"),
+                "plugin 'busbar-store-valkey' open failed: valkey store: failed to connect: "
+            ) && !err.contains("valkey connect:")
+                && err.contains("deadline passed"),
             "{url}: {err}"
         );
         assert!(!err.contains("pw"), "the password is scrubbed: {err}");
@@ -4217,9 +4216,8 @@ fn rediss_insecure_skips_certificate_verification() {
     let err = refused.expect_err("a self-signed certificate is not trusted");
     assert!(
         err.starts_with(
-            "plugin 'busbar-store-valkey' open failed: valkey plugin: failed to connect: valkey \
-             connect: "
-        ),
+            "plugin 'busbar-store-valkey' open failed: valkey store: failed to connect: "
+        ) && !err.contains("valkey connect:"),
         "{err}"
     );
     let (store, _) = open_on(
@@ -4837,16 +4835,25 @@ fn settings_refuse_an_unknown_top_level_key() {
 
 #[test]
 fn settings_refuse_a_connect_timeout_that_is_not_a_positive_integer() {
-    for bad in ["\"5000\"", "1.5", "-3", "0", "null", "true"] {
+    for (bad, got) in [
+        ("\"5000\"", "a string"),
+        ("1.5", "a number"),
+        ("-3", "a number"),
+        ("0", "a number"),
+        ("true", "a boolean"),
+        ("[]", "an array"),
+        ("{}", "an object"),
+    ] {
         let e = settings_err(&format!(
             r#"{{"url":"redis://127.0.0.1:6379/0","connect_timeout_ms":{bad}}}"#
         ));
-        assert!(
-            e.starts_with(
+        assert_eq!(
+            e,
+            format!(
                 "invalid valkey plugin config: `connect_timeout_ms` must be a positive integer \
-                 (milliseconds), got "
-            ) && e.contains(bad),
-            "{bad}: {e}"
+                 (milliseconds), got {got}"
+            ),
+            "{bad}"
         );
     }
     crate::ValkeyStore::from_settings(
@@ -4855,15 +4862,51 @@ fn settings_refuse_a_connect_timeout_that_is_not_a_positive_integer() {
     .expect("a positive integer is accepted");
 }
 
+/// A `null` optional setting means the setting is absent.
+#[test]
+fn a_null_optional_setting_means_absent() {
+    crate::ValkeyStore::from_settings(
+        br#"{"url":"redis://127.0.0.1:6379/0","connect_timeout_ms":null}"#,
+    )
+    .expect("a null connect_timeout_ms is the default");
+}
+
 #[test]
 fn settings_refuse_a_url_that_is_not_a_non_empty_string() {
-    for bad in ["5", "\"\"", "null", "[]"] {
+    for (bad, want) in [
+        ("5", "`url` must be a non-empty string, got a number"),
+        ("\"\"", "`url` must be a non-empty string"),
+        ("[]", "`url` must be a non-empty string, got an array"),
+    ] {
         let e = settings_err(&format!(r#"{{"url":{bad}}}"#));
+        assert_eq!(e, format!("invalid valkey plugin config: {want}"), "{bad}");
+    }
+}
+
+/// A missing (or null) `url` and a settings document that is no object are refused in the one
+/// grammar: `invalid valkey plugin config: ...`, naming the JSON type, never the value.
+#[test]
+fn every_settings_refusal_starts_with_the_one_prefix() {
+    for json in ["{}", r#"{"url":null}"#] {
         assert_eq!(
-            e, "invalid valkey plugin config: `url` must be a non-empty string",
-            "{bad}"
+            settings_err(json),
+            "invalid valkey plugin config: `url` is required (a redis:// connection string)"
         );
     }
+    for (json, got) in [
+        ("[]", "an array"),
+        ("\"redis://h\"", "a string"),
+        ("5", "a number"),
+        ("true", "a boolean"),
+        ("null", "null"),
+    ] {
+        assert_eq!(
+            settings_err(json),
+            format!("invalid valkey plugin config: expected a JSON object, got {got}"),
+            "{json}"
+        );
+    }
+    assert!(settings_err("{not json").starts_with("invalid valkey plugin config: "));
 }
 
 #[test]
