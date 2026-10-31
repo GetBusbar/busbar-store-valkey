@@ -47,7 +47,7 @@ use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringRow, ModelTokens, RecordStoreError,
     RecordStoreResult, UsageDelta, UsageLedger, VirtualKey, RESERVED_UNITS,
 };
-use resp::{cmd, pipe, Conn, ErrorKind, Pipeline, RedisError, RedisResult};
+use resp::{cmd, pipe, Conn, ErrorKind, Pipeline, RedisError, RedisResult, Script};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1105,6 +1105,19 @@ fn usage_fields(delta: &UsageDelta) -> Vec<(String, i64)> {
     fields
 }
 
+/// The rows of a metering bucket: `KEYS[1]` = the bucket's row set; each row's `HGETALL`, in one
+/// atomic step.
+static LIST_METERING: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
+    Script::new(
+        r"
+        local out = {}
+        for _, row in ipairs(redis.call('SMEMBERS', KEYS[1])) do
+            out[#out + 1] = redis.call('HGETALL', row)
+        end
+        return out",
+    )
+});
+
 /// The base op set's bodies, each over the op's one connection `c` (the store door, `slots`, runs
 /// each as one op through the host's connector). The `op_id` writes (`add_usage_batch`,
 /// `add_metering_batch`, `append_plane_record`) are the door's own slots, deduped durably.
@@ -1380,18 +1393,10 @@ impl ValkeyStore {
         bucket: u64,
     ) -> RecordStoreResult<Vec<MeteringRow>> {
         let set = metering_set(bucket);
-        let row_keys: Vec<String> = with_conn!(self, |c| c.smembers(&set).await)?;
-        if row_keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        let all_fields: Vec<Vec<(String, String)>> = with_conn!(self, |c| {
-            let mut pipe = pipe();
-            for row_key in &row_keys {
-                pipe.hgetall(row_key);
-            }
-            pipe.query(c).await
-        })?;
-        let mut out = Vec::with_capacity(row_keys.len());
+        // One script: the bucket's row set and its rows are read in one step, one snapshot.
+        let all_fields: Vec<Vec<(String, String)>> =
+            with_conn!(self, |c| LIST_METERING.key(&set).invoke(c).await)?;
+        let mut out = Vec::with_capacity(all_fields.len());
         for fields in all_fields {
             if fields.is_empty() {
                 continue;
