@@ -31,10 +31,6 @@ serde_json = { workspace = true }
 serde = { workspace = true }
 # The upstream driver's URL reading (1.5.5 parsed the store's URL with it): pure parsing, no socket.
 url = { workspace = true }
-# The store's own diagnostics (a refusal whose text the ABI drops, a skipped corrupt row): the door's
-# trampoline captures every `tracing` event a slot raises into the plugin's own log
-# (`busbar_contract::abi::sdk::capture`).
-tracing = { workspace = true }
 
 [dev-dependencies]
 # The live tests open the store the way the host does: its door through the loader (`load_linked`,
