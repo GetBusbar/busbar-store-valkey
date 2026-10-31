@@ -119,7 +119,8 @@ mod plane;
 
 const DENYLIST_PREFIX: &str = "busbar:denylist:";
 const DENYLIST_INDEX: &str = "busbar:denylist";
-/// The store-global revision counter (`INCR`), stamped on key and credential rows.
+/// The store-global revision counter, read and rewritten (`next_revision`) inside the `WATCH`ed
+/// transaction that stamps key and credential rows with it.
 const REVISION_KEY: &str = "busbar:revision";
 /// The schema marker. v6 is the oldest namespace migrated in place (older is REFUSED, never wiped);
 /// v7 copied the v6 typed task / event / demotion / spent-approval keys into the plane
@@ -819,9 +820,10 @@ impl ValkeyStore {
     /// money keys (`busbar:cap:*`, `busbar:slice:*`, `busbar:open:*`, `busbar:slices`,
     /// `busbar:epoch`), the journal (`busbar:journal:*`, its `streams` set included) and the
     /// sessions (`busbar:session:*`, `busbar:sessions:*`). The `busbar:op:*` dedupe hashes of the
-    /// deleted slots go too, told apart by the op's value fields (`b`), which start with the
-    /// slot's name; the hashes of the kept slots (`add_usage_batch`, `add_metering_batch`,
-    /// `append_plane_record`) are untouched, so a retry across the upgrade still answers its
+    /// deleted slots go too, told apart by the op's body (`b`): a kept slot's body is a 32-byte
+    /// digest (or 64 lowercase hex), or the older text that starts with the slot's name; only the
+    /// dead slots' bodies are neither. The hashes of the kept slots (`add_usage_batch`,
+    /// `add_metering_batch`, `append_plane_record`) are untouched, so a retry across the upgrade still answers its
     /// original. Idempotent (a re-run finds nothing more), so a crash before the marker is
     /// written re-runs it and two nodes upgrading at once land in the same place.
     async fn drop_dead_slot_keys(&self, c: &mut Conn) -> RecordStoreResult<()> {
