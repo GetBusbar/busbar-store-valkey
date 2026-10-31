@@ -997,7 +997,23 @@ async fn read_slot(c: &mut Conn, secret: &CredentialSecret, op: &str) -> RedisRe
 
 /// A credential's `<key_id>:<kind>:<slot>` pointer.
 fn slot_pointer(m: &CredentialMeta) -> String {
-    format!("{}:{}:{}", m.key_id, m.kind, m.slot)
+    pointer(&m.key_id, &m.kind, m.slot)
+}
+
+/// The pointer of the slot `(key_id, kind, slot)`.
+fn pointer(key_id: &str, kind: &str, slot: u8) -> String {
+    format!("{key_id}:{kind}:{slot}")
+}
+
+/// A key's credential-index member for a slot: `<kind>:<slot>`.
+fn member(kind: &str, slot: u8) -> String {
+    format!("{kind}:{slot}")
+}
+
+/// The inverse of [`member`].
+fn parse_member(m: &str) -> Option<(&str, u8)> {
+    let (kind, slot) = m.split_once(':')?;
+    Some((kind, slot.parse().ok()?))
 }
 
 /// Queue the writes of a credential row and its pointers on `pipe`, deleting a revoked previous
@@ -1024,7 +1040,7 @@ fn queue_credential(
     pipe.set(cred_id_key(&m.id), &ptr).ignore();
     pipe.set(cred_row_key(&m.key_id, &m.kind, m.slot), &json)
         .ignore();
-    pipe.sadd(cred_ids_key(&m.key_id), format!("{}:{}", m.kind, m.slot))
+    pipe.sadd(cred_ids_key(&m.key_id), member(&m.kind, m.slot))
         .ignore();
     pipe.zadd(CREDS_BYREV, &ptr, m.revision).ignore();
     Ok(())
@@ -1208,8 +1224,8 @@ impl ValkeyStore {
             let members: Vec<String> = c.smembers(&ids_key).await?;
             let row_keys: Vec<String> = members
                 .iter()
-                .filter_map(|m| parse_slot_pointer(&format!("{id}:{m}")))
-                .map(|(_, kind, slot)| cred_row_key(id, &kind, slot))
+                .filter_map(|m| parse_member(m))
+                .map(|(kind, slot)| cred_row_key(id, kind, slot))
                 .collect();
             let mut watch_keys: Vec<&str> = vec![key_row.as_str(), ids_key.as_str(), REVISION_KEY];
             watch_keys.extend(row_keys.iter().map(String::as_str));
@@ -1250,12 +1266,11 @@ impl ValkeyStore {
                 pipe.zadd(KEYS_BYREV, id, rev).ignore();
                 // Destroy every credential row and its pointers (a consumer evicts off the key's
                 // own tombstone delta).
-                for member in &members {
-                    let Some((_, kind, slot)) = parse_slot_pointer(&format!("{id}:{member}"))
-                    else {
+                for m in &members {
+                    let Some((kind, slot)) = parse_member(m) else {
                         continue;
                     };
-                    let row_key = cred_row_key(id, &kind, slot);
+                    let row_key = cred_row_key(id, kind, slot);
                     // A row that does not decode aborts the cascade: skipping it would leave its
                     // pointers dangling behind a reported success.
                     if let Some(raw) = c.get::<_, Option<String>>(&row_key).await? {
@@ -1265,13 +1280,13 @@ impl ValkeyStore {
                                 "delete_key: corrupt credential row",
                             ))
                         })?;
-                        pipe.del(cred_pub_key(&kind, &cred.meta.public_id)).ignore();
+                        pipe.del(cred_pub_key(kind, &cred.meta.public_id)).ignore();
                         pipe.del(cred_id_key(&cred.meta.id)).ignore();
                     }
                     pipe.del(&row_key).ignore();
                     pipe.cmd("ZREM")
                         .arg(CREDS_BYREV)
-                        .arg(format!("{id}:{kind}:{slot}"))
+                        .arg(pointer(id, kind, slot))
                         .ignore();
                 }
                 pipe.del(&ids_key).ignore();
@@ -1549,8 +1564,8 @@ impl ValkeyStore {
         let row_keys: Vec<String> = members
             .iter()
             .filter_map(|m| {
-                let (kind, slot) = m.split_once(':')?;
-                Some(cred_row_key(key_id, kind, slot.parse().ok()?))
+                let (kind, slot) = parse_member(m)?;
+                Some(cred_row_key(key_id, kind, slot))
             })
             .collect();
         // The metadata view is the decoded row minus its secret: there is one decode path.
@@ -1620,7 +1635,7 @@ impl ValkeyStore {
                 let json = cred_to_json(&cred)
                     .map_err(|_| RedisError::from((ErrorKind::Client, "cred encode")))?;
                 pipe.set(&row_key, &json).ignore();
-                pipe.zadd(CREDS_BYREV, format!("{key_id}:{kind}:{slot}"), rev)
+                pipe.zadd(CREDS_BYREV, pointer(&key_id, &kind, slot), rev)
                     .ignore();
                 pipe.query(c).await
             });
