@@ -29,7 +29,7 @@
 //! answers. The body is the blocking client's body, `async`.
 
 use busbar_contract::abi::sdk::conn::Host;
-use busbar_contract::abi::sdk::store::column::{clamp, prefix_end};
+use busbar_contract::abi::sdk::store::column::{clamp, prefix_end, storable_i64};
 use busbar_contract::abi::sdk::store::dedupe::Dedupe;
 use busbar_contract::abi::sdk::store::wire::drive_kept;
 use busbar_contract::abi::sdk::store::{Op, OpRefused, OpResult, Scanned, Step, StoreSlots, Tail};
@@ -429,6 +429,11 @@ impl StoreSlots for ValkeyStore {
         op: OpId,
         record: PlaneRecordRef<'_>,
     ) -> Step<OpResult<()>> {
+        for (field, v) in [("seq", record.seq), ("ts", record.ts)] {
+            if let Err(e) = storable_i64("append_plane_record", field, v) {
+                return Step::Ready(Err(OpRefused::Refused(e.0)));
+            }
+        }
         let d = Dedupe::append(record);
         let body = d.body().to_vec();
         let record = record.to_record();
@@ -503,6 +508,11 @@ impl StoreSlots for ValkeyStore {
         op: OpId,
         deltas: &[MeteringDelta],
     ) -> Step<OpResult<()>> {
+        for m in deltas {
+            if let Err(e) = storable_i64("add_metering_batch", "priced_from_ms", m.priced_from_ms) {
+                return Step::Ready(Err(OpRefused::Refused(e.0)));
+            }
+        }
         let d = Dedupe::metering(deltas);
         let mut inv = op_call(&METERING_OP, op, &d);
         for m in deltas {
@@ -583,6 +593,11 @@ impl StoreSlots for ValkeyStore {
         cx: &mut Op<'_>,
         record: PlaneRecordRef<'_>,
     ) -> Step<RecordStoreResult<()>> {
+        for (field, v) in [("seq", record.seq), ("ts", record.ts)] {
+            if let Err(e) = storable_i64("upsert_plane_record", field, v) {
+                return Step::Ready(Err(e));
+            }
+        }
         let record = record.to_record();
         op!(cx, self, Err, |me, c| plane::upsert(&me, c, record.view())
             .await)
