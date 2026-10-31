@@ -2703,6 +2703,36 @@ fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
     clear_purge_band(&store);
 }
 
+/// Deleting a task takes its provenance chain with it, and no other task's.
+#[test]
+fn deleting_a_task_takes_its_provenance_chain_with_it_and_no_other() {
+    let Some(store) = live_store() else { return };
+    let (gone, stays) = ("t_vk_del_cascade_gone", "t_vk_del_cascade_stays");
+    reset_tasks(&store, &[gone, stays]);
+    for t in [gone, stays] {
+        store
+            .put_task(&sample_task(t, "working", 4_000_000_100))
+            .unwrap();
+        store
+            .append_task_event(&sample_event(t, 1, "task.submitted", "", &format!("{t}1")))
+            .unwrap();
+    }
+    store.delete_plane_record("task", gone).unwrap();
+    assert!(store.get_task(gone).unwrap().is_none());
+    assert!(
+        store.list_task_events(gone).unwrap().is_empty(),
+        "the deleted task's events go with it"
+    );
+    let parents = store.list_plane_record_parents("task_event").unwrap();
+    assert!(!parents.contains(&gone.to_string()));
+    assert_eq!(
+        store.list_task_events(stays).unwrap().len(),
+        1,
+        "another task's chain is untouched"
+    );
+    reset_tasks(&store, &[gone, stays]);
+}
+
 /// A purged task takes ITS provenance chain with it, and no other task's.
 #[test]
 fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
