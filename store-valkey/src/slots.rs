@@ -572,6 +572,7 @@ impl StoreSlots for ValkeyStore {
             = ValkeyStore::get_usage;
         put_usage(bucket_id: &str => to_owned, window_start: u64, ledger: &UsageLedger => clone)
             -> () = ValkeyStore::put_usage;
+        purge_usage_before(before: u64) -> u64 = ValkeyStore::purge_usage_before;
         list_metering(bucket: u64) -> Vec<MeteringRow> = ValkeyStore::list_metering;
         put_credential(secret: &CredentialSecret => clone) -> () = ValkeyStore::put_credential;
         put_key_with_credential(key: &VirtualKey => clone, secret: &CredentialSecret => clone)

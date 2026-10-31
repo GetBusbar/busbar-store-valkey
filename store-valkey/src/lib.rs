@@ -152,6 +152,19 @@ fn usage_key(bucket_id: &str, window_start: u64) -> String {
     format!("busbar:usage:{bucket_id}:{window_start}")
 }
 
+fn expired_usage_key(key: &str, before: u64) -> bool {
+    let Some((_, stamp)) = key
+        .strip_prefix("busbar:usage:")
+        .and_then(|rest| rest.rsplit_once(':'))
+    else {
+        return false;
+    };
+    let Ok(window) = stamp.parse::<u64>() else {
+        return false;
+    };
+    window != 0 && window < before && stamp == window.to_string()
+}
+
 fn cred_row_key(key_id: &str, kind: &str, slot: u8) -> String {
     format!("busbar:cred:{key_id}:{kind}:{slot}")
 }
@@ -1403,6 +1416,37 @@ impl ValkeyStore {
         }
         ledger.models.sort_by(|a, b| a.model.cmp(&b.model));
         Ok(ledger)
+    }
+
+    pub(crate) async fn purge_usage_before(
+        &self,
+        c: &mut Conn,
+        before: u64,
+    ) -> RecordStoreResult<u64> {
+        if before == 0 {
+            return Ok(0);
+        }
+        let mut cursor = String::from("0");
+        let mut seen = std::collections::HashSet::new();
+        let mut removed = 0_u64;
+        loop {
+            let (next, keys) = with_conn!(self, |c| c.scan_page(&cursor, "busbar:usage:*").await)?;
+            let expired: Vec<String> = keys
+                .into_iter()
+                .filter(|key| expired_usage_key(key, before) && seen.insert(key.clone()))
+                .collect();
+            if !expired.is_empty() {
+                let deleted: u64 =
+                    with_conn_no_retry!(self, |c| cmd("DEL").arg(&expired).query(c).await)?;
+                removed = removed.checked_add(deleted).ok_or_else(|| {
+                    RecordStoreError("usage cleanup removed-window count overflow".into())
+                })?;
+            }
+            if next == "0" {
+                return Ok(removed);
+            }
+            cursor = next;
+        }
     }
 
     pub(crate) async fn put_usage(

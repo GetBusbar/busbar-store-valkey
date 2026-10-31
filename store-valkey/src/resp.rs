@@ -720,14 +720,7 @@ impl Conn {
         let mut cursor = String::from("0");
         let mut out = Vec::new();
         loop {
-            let (next, keys): (String, Vec<String>) = cmd("SCAN")
-                .arg(&cursor)
-                .arg("MATCH")
-                .arg(pattern)
-                .arg("COUNT")
-                .arg(SCAN_COUNT)
-                .query(self)
-                .await?;
+            let (next, keys) = self.scan_page(&cursor, pattern).await?;
             out.extend(keys.into_iter().filter(|k| k != skip));
             if out.len() >= max || next == "0" {
                 out.truncate(max);
@@ -737,19 +730,28 @@ impl Conn {
         }
     }
 
+    /// One `SCAN` page, including an empty page whose returned cursor may still be nonzero.
+    pub async fn scan_page(
+        &mut self,
+        cursor: &str,
+        pattern: &str,
+    ) -> RedisResult<(String, Vec<String>)> {
+        cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(pattern)
+            .arg("COUNT")
+            .arg(SCAN_COUNT)
+            .query(self)
+            .await
+    }
+
     /// Every key matching `pattern` (`SCAN ... MATCH`, followed to the end).
     pub async fn scan_match(&mut self, pattern: &str) -> RedisResult<Vec<String>> {
         let mut cursor = String::from("0");
         let mut out = Vec::new();
         loop {
-            let (next, keys): (String, Vec<String>) = cmd("SCAN")
-                .arg(&cursor)
-                .arg("MATCH")
-                .arg(pattern)
-                .arg("COUNT")
-                .arg(SCAN_COUNT)
-                .query(self)
-                .await?;
+            let (next, keys) = self.scan_page(&cursor, pattern).await?;
             out.extend(keys);
             if next == "0" {
                 return Ok(out);
