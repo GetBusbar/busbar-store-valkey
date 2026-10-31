@@ -236,8 +236,21 @@ local function bad_key(key, want)
         return key .. ' is not a ' .. want
     end
 end
+local function is_i64(s)
+    local neg = string.sub(s, 1, 1) == '-'
+    local digits = neg and string.sub(s, 2) or s
+    if not (string.match(digits, '^[1-9]%d*$') or (not neg and digits == '0')) then
+        return false
+    end
+    local limit = neg and '9223372036854775808' or MAX
+    if #digits ~= #limit then
+        return #digits < #limit
+    end
+    return digits <= limit
+end
 local function bad_field(key, field)
-    if redis.call('HGET', key, field) and not pcall(redis.call, 'HINCRBY', key, field, 0) then
+    local v = redis.call('HGET', key, field)
+    if v and not is_i64(v) then
         return key .. ' field ' .. field .. ' is not an integer'
     end
 end
