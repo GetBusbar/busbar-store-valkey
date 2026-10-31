@@ -15,7 +15,6 @@ The Valkey store as a droppable busbar plugin: a cdylib exporting the store C AB
 **This plugin's version: v1.6.0.** (Independently versioned from busbar
 itself — see [Versioning](#versioning) below.)
 
-[![CI](https://github.com/GetBusbar/busbar-store-valkey/actions/workflows/ci.yml/badge.svg)](https://github.com/GetBusbar/busbar-store-valkey/actions/workflows/ci.yml)
 [![Coverage](https://codecov.io/gh/GetBusbar/busbar-store-valkey/branch/dev/graph/badge.svg)](https://codecov.io/gh/GetBusbar/busbar-store-valkey)
 [![Release](https://img.shields.io/github/v/release/GetBusbar/busbar-store-valkey)](https://github.com/GetBusbar/busbar-store-valkey/releases)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
@@ -34,8 +33,8 @@ SQLite store cannot offer.
 
 This plugin, its repository, its crates, and its published artifact are now
 named for **Valkey** — the Linux-Foundation-governed, BSD-licensed store this
-plugin has always actually targeted. Two of those renames are user-visible
-breaking changes, and neither is silently compatible:
+plugin has always actually targeted. Three of those changes are user-visible
+breaking changes, and none is silently compatible:
 
 - **The config alias changed**: `store: { module: redis }` is now
   `store: { module: valkey }`. Busbar core ships a config migrator entry that
@@ -62,14 +61,28 @@ schemes that driver parses. Nothing busbar-owned says "redis" any more.
 
 ### Versioning
 
-This plugin is versioned **independently of busbar** — `v1.0.5` here says
+This plugin is versioned **independently of busbar** — `v1.6.0` here says
 nothing about which busbar release it is. Compatibility with busbar is
-stated separately: the released v1.0.x line **requires busbar 1.5.0+** (the
-release that ships the signed hybrid plugin ABI it loads over); the `dev` line
-speaks the busbar **1.6.0** record contract and builds against the busbar rev
-in [`.busbar-ref`](.busbar-ref). A v1.0.x namespace (schema v6) is upgraded in
-place on first connect. Pin both versions
+stated separately: v1.6.0 speaks the busbar **1.6.0** record contract and builds against the
+busbar rev in [`.busbar-ref`](.busbar-ref). Pin both versions
 explicitly in production; do not assume they move together.
+
+### Upgrading an existing database
+
+Open the new build on the existing Valkey: the connect step upgrades the namespace in place,
+once, and writes the `busbar:schema` marker last, so a crash mid-upgrade re-runs the step on the
+next connect (two nodes upgrading at once land in the same place).
+
+- **Schema v6** (plugin v1.0.x, busbar 1.5.x): the typed task, task-event, demotion and
+  spent-approval keys are copied into the plane keyspace, then removed, and the v9 step below runs.
+  A task event whose position holds a different record already keeps its v6 source key for an
+  operator. `busbar:mcp:*` (the v6 tool-call log) is neither migrated nor removed.
+- **Schema v7:** the v9 step only.
+- **Older than v6, or keys with no marker:** refused, with the key prefixes found, and NOTHING is
+  changed; if the marker was lost from a current namespace, `SET busbar:schema 6` and restart.
+- **Newer than this build:** refused. Run a build of that version or later.
+
+The server must run `maxmemory-policy noeviction`; the connect step refuses to start otherwise.
 
 It is a `cdylib` that implements busbar's store v3 table (`RecordStore` plus the
 `StoreSlots` additions of the store SDK in
@@ -86,7 +99,7 @@ or one server-side script for the plane append), and the kernel's records (`busb
 are an additive keyspace beside the v7 ones. The store keeps ledger counts, not money: busbar
 derives money from the counts and its rate card.
 
-Schema v9 deletes what the deleted store slots kept: on the first connect of a v6, v7 or v8
+Schema v9 deletes what the deleted store slots kept: on the first connect of a v6 or v7
 namespace it removes the money keys (`busbar:cap:*`, `busbar:slice:*`, `busbar:open:*`,
 `busbar:slices`, `busbar:epoch`), the journal (`busbar:journal:*`) and the sessions
 (`busbar:session:*`, `busbar:sessions:*`) with `SCAN` and `UNLINK`, and the `busbar:op:*` dedupe
@@ -99,8 +112,10 @@ upgrade still answers its original. A namespace newer than the build is refused.
   ledgers, and metering/audit rows — the store is the durability layer
   behind the engine's in-memory enforcement counters (boot-hydrate +
   periodic write-behind flush), not a request-hot-path dependency.
-- **Fleet-honest accrual**: `add_usage` is a real atomic server-side accumulate
-  (`HINCRBY`, each counter floored at 0), so N nodes each flushing their own
+- **Fleet-honest accrual**: `add_usage_batch` and `add_metering_batch` are
+  atomic server-side scripts (`HINCRBY`; usage counters floored at 0, every
+  counter pinned at `i64::MAX`) that validate every cell, apply them all and
+  record the op under its `op_id`, so a replay applies nothing; N nodes each flushing their own
   delta-since-last sum to the true fleet total (an absolute `put_usage`
   overwrite would be last-writer-wins across nodes).
 
@@ -112,9 +127,8 @@ directory of this repository.
 
 The store holds **no socket and no TLS stack of its own**: it declares one
 outbound `tcp` need and speaks RESP2 over the connection busbar's connector
-dials, secures and wakes for it. Like 1.5.5's one mutex-guarded connection, the
-store keeps ONE connection across ops (dialled, secured, `AUTH`, `SELECT` once);
-ops take it in turn, and a read that has nothing yet pends on the op's ticket
+dials, secures and wakes for it. The store keeps up to eight connections across ops
+(each dialled, secured, `AUTH`, `SELECT` once); one op holds one connection, and a read that has nothing yet pends on the op's ticket
 instead of blocking a thread. 1.5.5's reconnect-and-retry is kept: a dropped
 connection is re-dialled and a read (or idempotent write) retried once on the
 fresh one; the non-idempotent writes are never replayed. `open` only parses the
@@ -131,10 +145,10 @@ config, mirroring how the Postgres store plugin receives its libpq URL:
 { "url": "redis://:password@host:6379/0", "connect_timeout_ms": 10000 }
 ```
 
-| Setting | Required | Notes |
-|---|---|---|
-| `url` | yes | A `redis://` or `rediss://` (TLS) connection string (`valkey://` / `valkeys://` read the same): `[user[:password]@]host[:port][/db]`, or a unix-socket URL (`unix://`, `redis+unix://`, `valkey+unix://` `/path?db=N&user=U&pass=P`). TLS is busbar's connector's (its trust anchors); `rediss://…#insecure` skips certificate verification, as 1.5.5 did (busbar logs a WARN naming the store instance). |
-| `connect_timeout_ms` | no | Bounds every new connection's dial and handshake (TLS, `AUTH`, `SELECT`) in all, as 1.5.5's driver did (default 10000, 1.5.5's). |
+| Setting | Required | Default | Notes |
+|---|---|---|---|
+| `url` | yes | none | A `redis://` or `rediss://` (TLS) connection string (`valkey://` / `valkeys://` read the same): `[user[:password]@]host[:port][/db]`, or a unix-socket URL (`unix://`, `redis+unix://`, `valkey+unix://` `/path?db=N&user=U&pass=P`). TLS is busbar's connector's (its trust anchors); `rediss://…#insecure` skips certificate verification, as 1.5.5 did (busbar logs a WARN naming the store instance). |
+| `connect_timeout_ms` | no | `10000` | Bounds every new connection's dial and handshake (TLS, `AUTH`, `SELECT`) in all, as 1.5.5's driver did. A `null` reads as absent. |
 
 ## Build
 
@@ -196,7 +210,7 @@ for the full store config reference.
 ## Tests
 
 `cargo test` runs the pure unit tests (config parsing) and the real-ABI
-end-to-end test in [`tests/e2e.rs`](tests/e2e.rs), which `dlopen`s the
+end-to-end test in [`store-valkey-plugin/tests/e2e.rs`](store-valkey-plugin/tests/e2e.rs), which `dlopen`s the
 *built* cdylib over the real `busbar-plugin-loader` ABI seam — the same
 seam busbar's engine uses — against a **real, live Valkey** (not a mock
 or an in-process fake).
@@ -215,7 +229,8 @@ in an in-process cache.
 The live-Valkey coverage is gated on the `VALKEY_URL` environment
 variable: it skips cleanly when unset locally (no server needed for a
 default `cargo test`), but under CI (`CI` set) a missing `VALKEY_URL` is
-a **hard failure**, never a silent skip — see
+a **hard failure**, never a silent skip. The tests that wipe a namespace are `#[ignore]`d and run
+by CI's `--ignored` pass, each on a private database number — see
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml), which runs a
 real `valkey/valkey:8` GitHub Actions service container on every push and PR.
 On macOS, where GitHub runs no service containers, CI starts a brew-installed `valkey-server`

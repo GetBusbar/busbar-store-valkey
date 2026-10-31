@@ -118,38 +118,6 @@ impl ValkeyStore {
 /// explicit signing key to mint virtual keys; busbar no longer auto-generates one.
 const TEST_SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-/// Locate the cdylib THIS `cargo test` invocation just built — never a leftover artifact.
-///
-/// This looks ONLY in `target/<profile>/deps/`, never `target/<profile>/`, and that distinction is
-/// the whole point of this function.
-///
-/// `cargo` emits the lib target's cdylib into `deps/` as part of the very build graph that produces
-/// this test binary (this package's lib unit is compiled with BOTH declared crate-types — see
-/// `[lib] crate-type = ["cdylib", "rlib"]` in Cargo.toml), so `deps/libbusbar_store_valkey_plugin.dylib` is by construction up to
-/// date with the source tree under test. Cargo only *uplifts* a copy to `target/<profile>/` for
-/// `cargo build`, NEVER for `cargo test`. A lookup in `target/<profile>/` therefore reads an
-/// artifact that nothing in this test's dependency graph refreshes: whatever some earlier `cargo
-/// build` left there, from any commit — or nothing at all.
-///
-/// Both outcomes of that are lies about durability, and the second is the dangerous one:
-///   * NOTHING there  -> the old code `return`ed with a "skip:" line and reported GREEN. That is how
-///     `cargo test` can pass with ZERO over-the-ABI coverage of the durable store path.
-///   * STALE artifact -> a cdylib built before an ABI change answers every write `Ok(())` and every
-///     read empty, which is BYTE-FOR-BYTE the signature of the unrelayed-seam defect this file
-///     exists to catch (that defect was real: `DynStore`'s `impl Store` overrode 24 methods, none of
-///     them the task/call-log methods, so `put_task` took the accept-and-keep-nothing trait
-///     default). RED on a stale artifact is indistinguishable from RED on the real bug — and an
-///     artifact NEWER than a regression reports GREEN while the shipped ABI is broken. Proven, not
-///     theorised: with a regressed plugin in the tree and a good cdylib in `target/debug/`, the old
-///     lookup passed and this one fails.
-///
-/// Same hazard, and the same reasoning, as the engine's `crates/busbar/Cargo.toml` dev-dependency on
-/// `busbar-store-example-plugin`: keep the cdylib in the build graph so no test can judge a stale
-/// one. Here the plugin's lib IS this package, so that graph edge already exists — what was missing
-/// was reading the artifact that edge actually produces.
-///
-/// Panics rather than skipping: a missing cdylib under `cargo test` means the build graph changed
-/// shape, and the only honest report of that is a failure, not a silent pass.
 /// The newest mtime across every workspace crate's `src/` — "how fresh must a cdylib be to be the
 /// one this source tree describes".
 ///
@@ -187,6 +155,38 @@ fn newest_source_mtime() -> std::time::SystemTime {
     newest
 }
 
+/// Locate the cdylib THIS `cargo test` invocation just built — never a leftover artifact.
+///
+/// This looks ONLY in `target/<profile>/deps/`, never `target/<profile>/`, and that distinction is
+/// the whole point of this function.
+///
+/// `cargo` emits the lib target's cdylib into `deps/` as part of the very build graph that produces
+/// this test binary (this package's lib unit is compiled with BOTH declared crate-types — see
+/// `[lib] crate-type = ["cdylib", "rlib"]` in Cargo.toml), so `deps/libbusbar_store_valkey_plugin.dylib` is by construction up to
+/// date with the source tree under test. Cargo only *uplifts* a copy to `target/<profile>/` for
+/// `cargo build`, NEVER for `cargo test`. A lookup in `target/<profile>/` therefore reads an
+/// artifact that nothing in this test's dependency graph refreshes: whatever some earlier `cargo
+/// build` left there, from any commit — or nothing at all.
+///
+/// Both outcomes of that are lies about durability, and the second is the dangerous one:
+///   * NOTHING there  -> the old code `return`ed with a "skip:" line and reported GREEN. That is how
+///     `cargo test` can pass with ZERO over-the-ABI coverage of the durable store path.
+///   * STALE artifact -> a cdylib built before an ABI change answers every write `Ok(())` and every
+///     read empty, which is BYTE-FOR-BYTE the signature of the unrelayed-seam defect this file
+///     exists to catch (that defect was real: `DynStore`'s `impl Store` overrode 24 methods, none of
+///     them the task/call-log methods, so `put_task` took the accept-and-keep-nothing trait
+///     default). RED on a stale artifact is indistinguishable from RED on the real bug — and an
+///     artifact NEWER than a regression reports GREEN while the shipped ABI is broken. Proven, not
+///     theorised: with a regressed plugin in the tree and a good cdylib in `target/debug/`, the old
+///     lookup passed and this one fails.
+///
+/// Same hazard, and the same reasoning, as the engine's `crates/busbar/Cargo.toml` dev-dependency on
+/// `busbar-store-example-plugin`: keep the cdylib in the build graph so no test can judge a stale
+/// one. Here the plugin's lib IS this package, so that graph edge already exists — what was missing
+/// was reading the artifact that edge actually produces.
+///
+/// Panics rather than skipping: a missing cdylib under `cargo test` means the build graph changed
+/// shape, and the only honest report of that is a failure, not a silent pass.
 fn plugin_path() -> PathBuf {
     let exe = std::env::current_exe().expect("current_exe"); // .../target/<profile>/deps/<test>-<hash>
     let deps_dir = exe.parent().expect("the test binary always lives in deps/");
@@ -582,7 +582,7 @@ fn load_and_exercise_valkey_plugin_bad_config_fails_over_abi() {
         .err()
         .expect("a config missing url must fail to load");
     assert!(
-        err.contains("requires a \"url\""),
+        err.contains("`url` is required"),
         "expected the plugin's own missing-url message, got: {err}"
     );
 
@@ -775,11 +775,21 @@ fn poll_admin_up(admin: &str, token: &str, client: &reqwest::blocking::Client) -
 /// a second Valkey container (confirmed necessary: this test failed with exactly that pollution
 /// before being pointed at its own db).
 fn admin_test_valkey_url(base: &str) -> String {
+    valkey_url_in_db(base, 15)
+}
+
+/// The databases the live tests use: `/0` the url's own (shared), `/15` the admin end-to-end test,
+/// `/14` conformance's folds, `/11` to `/13` store-valkey's schema-refusal tests, and this one for
+/// the two durability proofs that sweep a whole kind (`call`, terminal `task`).
+const SWEEP_DB: u32 = 10;
+
+/// `base` pointed at database `db`.
+fn valkey_url_in_db(base: &str, db: u32) -> String {
     let without_path = match base.rfind('/') {
         Some(i) if base[..i].contains("://") => &base[..i],
         _ => base,
     };
-    format!("{without_path}/15")
+    format!("{without_path}/{db}")
 }
 
 #[test]
@@ -1127,9 +1137,10 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
 #[test]
 fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let path = plugin_path();
-    let Some(url) = valkey_url() else {
+    let Some(base_url) = valkey_url() else {
         return;
     };
+    let url = valkey_url_in_db(&base_url, SWEEP_DB);
     let cfg = serde_json::json!({ "url": url }).to_string();
 
     // Start from an EMPTY call log. `list_mcp_call_principals` and `purge_mcp_calls_before` are
@@ -1137,7 +1148,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // would make both of their exact assertions below meaningless. `purge_mcp_calls_before(MAX)` is
     // the store's own contract-level wipe (it also drops each emptied principal from the
     // enumeration — see `ValkeyStore::purge_mcp_calls_before`), so this needs no key-pattern
-    // guesswork. No other test in this file touches the `busbar:mcp:*` namespace.
+    // guesswork. The database is this test's own (`SWEEP_DB`), so no other test's `call` rows are swept.
     let direct = ValkeyStore::connect(&url).expect("connect directly to clean up and verify");
     Vocab::purge_mcp_calls_before(&direct, u64::MAX).expect("wipe the call log before this run");
 
@@ -1296,9 +1307,10 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 #[test]
 fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let path = plugin_path();
-    let Some(url) = valkey_url() else {
+    let Some(base_url) = valkey_url() else {
         return;
     };
+    let url = valkey_url_in_db(&base_url, SWEEP_DB);
     let cfg = serde_json::json!({ "url": url }).to_string();
 
     // Start from an EMPTY task keyspace. `purge_tasks_before` is GLOBAL and terminal-only, and the
@@ -1528,20 +1540,15 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 /// fleet, a drop and a reload is the restart, and a third leg reads through the plain `ValkeyStore`
 /// so a plugin answering out of its own in-process state still fails.
 ///
-/// PANICS rather than skipping when no Valkey is configured. This is the only over-the-ABI coverage
-/// of two properties whose unimplemented form is silently green, and a case that can skip is a case
-/// that will skip on the day it matters.
+/// Skips locally when no Valkey is configured and fails under CI, like its siblings
+/// ([`valkey_url`]): it is the only over-the-ABI coverage of two properties whose unimplemented form
+/// is silently green.
 #[test]
 fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let path = plugin_path();
-    let url = std::env::var("VALKEY_URL").unwrap_or_else(|_| {
-        panic!(
-            "VALKEY_URL is unset, and this case must not skip: it is the only over-the-ABI proof \
-             that a demotion and a spent approval survive a restart on this backend, and both fail \
-             SILENTLY when unrelayed — the trait defaults answer Ok(()) to a demotion and `true` to \
-             every redemption"
-        )
-    });
+    let Some(url) = valkey_url() else {
+        return;
+    };
     let cfg = serde_json::json!({ "url": url }).to_string();
 
     let direct = ValkeyStore::connect(&url).expect("connect directly to clean up and verify");

@@ -110,6 +110,7 @@ fn decode<T: serde::de::DeserializeOwned>(
 }
 
 /// Copy one v6 row into the plane keyspace as `kind` at `(id, seq)`, unless that position is taken.
+/// `true` = the position holds a DIFFERENT record (a fork).
 #[allow(clippy::too_many_arguments)]
 async fn copy<T: serde::Serialize>(
     store: &ValkeyStore,
@@ -120,7 +121,7 @@ async fn copy<T: serde::Serialize>(
     (seq, ts): (u64, u64),
     disposition: PlaneDisposition,
     row: &T,
-) -> RecordStoreResult<()> {
+) -> RecordStoreResult<bool> {
     let body = serde_json::to_vec(row)
         .map_err(|e| RecordStoreError(format!("v6 -> v7 upgrade: encode a plane body: {e}")))?;
     let record = PlaneRecord {
@@ -141,23 +142,18 @@ pub(crate) async fn migrate_v6_to_v7(store: &ValkeyStore, c: &mut Conn) -> Recor
     // there is no instant at which a migrated task exists with its chain still behind.
     for key in store.scan(c, &format!("{TASK_EVENTS_PREFIX}*")).await? {
         let members: Vec<Vec<u8>> = with_conn!(store, |c| c.zrange(&key, 0, -1).await)?;
+        // A chain position that forked is evidence: its v6 source is kept for an operator.
+        let mut forked = false;
         for raw in members {
             let e: rows::TaskEvent = decode("task event", &key, &raw)?;
             let (id, at) = (e.task_id.clone(), (e.seq, e.ts));
             let active = PlaneDisposition::Active;
-            copy(
-                store,
-                c,
-                KIND_TASK_EVENT,
-                id.clone(),
-                Some(id),
-                at,
-                active,
-                &e,
-            )
-            .await?;
+            let kind = KIND_TASK_EVENT;
+            forked |= copy(store, c, kind, id.clone(), Some(id), at, active, &e).await?;
         }
-        with_conn!(store, |c| c.del::<_, ()>(&key).await)?;
+        if !forked {
+            with_conn!(store, |c| c.del::<_, ()>(&key).await)?;
+        }
     }
 
     for key in store.scan(c, &format!("{TASK_ROW_PREFIX}*")).await? {
@@ -170,6 +166,8 @@ pub(crate) async fn migrate_v6_to_v7(store: &ValkeyStore, c: &mut Conn) -> Recor
                 PlaneDisposition::Active
             };
             let (id, at) = (t.task_id.clone(), (0, t.updated_at));
+            // An upserted row: a record already at its place is the newer one, and the stale v6
+            // row goes (`v6_namespace_upgrades_in_place_to_v7`).
             copy(store, c, KIND_TASK, id, None, at, disposition, &t).await?;
         }
         with_conn!(store, |c| c.del::<_, ()>(&key).await)?;
@@ -187,25 +185,29 @@ pub(crate) async fn migrate_v6_to_v7(store: &ValkeyStore, c: &mut Conn) -> Recor
     }
     with_conn!(store, |c| c.del::<_, ()>(MCP_DEMOTIONS_HASH).await)?;
 
-    // SPENT APPROVALS: each keeps its own remaining life. A key already past its TTL is gone on the
-    // server and needs nothing; one with no TTL (never written by v6, which always set EX) is
-    // carried with the ten-year bound the redeem verb applies.
+    // SPENT APPROVALS: each is carried as a ledger entry holding its grant's `expires_at` (v6 wrote
+    // it as the value), with its own remaining life as the cleanup `EX`. A key already past its TTL
+    // is gone on the server and needs nothing; one with no TTL (never written by v6, which always
+    // set EX) is carried with no expiry, as a grant beyond the ledger cap is.
     for key in store.scan(c, &format!("{ASK_STATE_PREFIX}*")).await? {
         let nonce = &key[ASK_STATE_PREFIX.len()..];
         let (value, ttl): (Option<String>, i64) =
             with_conn!(store, |c| pipe().get(&key).ttl(&key).query(c).await)?;
         if let Some(value) = value {
-            let ttl = if ttl > 0 { ttl } else { 315_360_000 };
+            let life = u64::try_from(ttl).ok().filter(|t| *t > 0);
+            let expires_at = value.parse::<u64>().unwrap_or_else(|_| match life {
+                Some(life) => crate::now().saturating_add(life),
+                None => i64::MAX as u64,
+            });
+            let ex = life.and_then(plane::ledger_ttl);
             let target = plane::token_key(KIND_ASK, nonce);
             with_conn!(store, |c| {
-                cmd("SET")
-                    .arg(&target)
-                    .arg(&value)
-                    .arg("NX")
-                    .arg("EX")
-                    .arg(ttl)
-                    .query::<Option<String>>(c)
-                    .await
+                let mut set = cmd("SET");
+                set.arg(&target).arg(expires_at).arg("NX");
+                if let Some(ex) = ex {
+                    set.arg("EX").arg(ex);
+                }
+                set.query::<Option<String>>(c).await
             })?;
         }
         with_conn!(store, |c| c.del::<_, ()>(&key).await)?;
