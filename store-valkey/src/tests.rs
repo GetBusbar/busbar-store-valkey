@@ -651,7 +651,7 @@ fn delete_key_cleans_up_reverse_lookup_pointers() {
 }
 
 #[test]
-fn delete_key_removes_usage_windows() {
+fn delete_key_keeps_the_usage_ledger() {
     let Some(store) = live_store() else { return };
     // This suite runs against a SHARED, PERSISTENT Valkey that is not flushed between runs, and
     // this test uses a FIXED id. It used to be self-healing only because `put_key` resurrected
@@ -675,19 +675,16 @@ fn delete_key_removes_usage_windows() {
     store.delete_key("vk_usage").unwrap();
     let after = store.get_usage("vk_usage", 1000).unwrap();
     assert_eq!(
-        after.requests, 0,
-        "usage windows must be cleaned up on delete"
+        after.requests, 1,
+        "delete_key destroys credentials only: the usage ledger is billing evidence and stays"
     );
 }
 
-/// Regression guard for the historical glob-injection finding: a key id containing glob
-/// metacharacters must not make `delete_key`'s usage-window cleanup match ANOTHER key's windows.
+/// `delete_key` touches no usage window of any key, however the id is spelled (it once swept
+/// `busbar:usage:<id>:*`, which a glob character in an id widened to other keys' windows).
 #[test]
-fn delete_key_does_not_glob_match_other_keys_usage() {
+fn delete_key_leaves_every_usage_window_alone() {
     let Some(store) = live_store() else { return };
-    // ONE suffix for both ids, so the UNESCAPED pattern `vk_evil_<s>_*` really does match the
-    // victim `vk_evil_<s>_victim` (a per-id `uid()` suffix would make the match impossible and the
-    // test vacuous).
     let s = unique_suffix();
     let evil = format!("vk_evil_{s}_*");
     let victim = format!("vk_evil_{s}_victim");
@@ -701,13 +698,8 @@ fn delete_key_does_not_glob_match_other_keys_usage() {
     store.add_usage(&evil, 1000, &d).unwrap();
     store.add_usage(&victim, 1000, &d).unwrap();
     store.delete_key(&evil).unwrap();
-    // The victim's usage must survive — an unescaped glob would have matched "vk_evil_victim"
-    // as well as the literal "vk_evil_*" pattern.
-    let victim_usage = store.get_usage(&victim, 1000).unwrap();
-    assert_eq!(
-        victim_usage.requests, 1,
-        "an unescaped '*' in the deleted key's id must not sweep another key's usage windows"
-    );
+    assert_eq!(store.get_usage(&victim, 1000).unwrap().requests, 1);
+    assert_eq!(store.get_usage(&evil, 1000).unwrap().requests, 1);
 }
 
 // ── Credentials: slot bounds, revoke, secret isolation ──────────────────────────────────────
