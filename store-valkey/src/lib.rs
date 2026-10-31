@@ -1261,9 +1261,9 @@ impl ValkeyStore {
                 let mut key: VirtualKey = serde_json::from_str(&raw)
                     .map_err(|_| RedisError::from((ErrorKind::Client, "key decode")))?;
                 if key.deleted_at.is_some() {
-                    // Already tombstoned: an idempotent no-op.
-                    pipe.atomic();
-                    return pipe.query(c).await;
+                    // Already tombstoned: an idempotent no-op, no EXEC (it would contend on the
+                    // watched revision for nothing).
+                    return Ok(Some(()));
                 }
                 // `transaction!` re-runs this body with the SAME watch set: a membership change
                 // goes back to the outer loop to rebuild it.
@@ -1489,7 +1489,7 @@ impl ValkeyStore {
             transaction!(c, &watched, |c, pipe| {
                 owner_is_live(c, &key_row, &m.key_id, OP_PUT_CREDENTIAL).await?;
                 let prior = match read_slot(c, secret, OP_PUT_CREDENTIAL).await? {
-                    Slot::Replay => return pipe.atomic().query(c).await,
+                    Slot::Replay => return Ok(Some(())),
                     Slot::Free(prior) => prior,
                 };
                 let mut secret = secret.clone();
@@ -1547,7 +1547,7 @@ impl ValkeyStore {
                         )));
                     }
                     let prior = match read_slot(c, secret, OP_PUT_KEY_WITH_CREDENTIAL).await? {
-                        Slot::Replay => return pipe.atomic().query(c).await,
+                        Slot::Replay => return Ok(Some(())),
                         Slot::Free(prior) => prior,
                     };
                     let (mut key, mut secret) = (key.clone(), secret.clone());
@@ -1627,15 +1627,13 @@ impl ValkeyStore {
                 }
                 let raw: Option<String> = c.get(&row_key).await?;
                 let Some(raw) = raw else {
-                    pipe.atomic();
-                    return pipe.query(c).await;
+                    return Ok(Some(()));
                 };
                 let mut cred: CredentialSecret = serde_json::from_str(&raw)
                     .map_err(|_| RedisError::from((ErrorKind::Client, "cred decode")))?;
                 if cred.meta.revoked_at.is_some() {
                     // Already revoked: idempotent no-op.
-                    pipe.atomic();
-                    return pipe.query(c).await;
+                    return Ok(Some(()));
                 }
                 pipe.atomic();
                 let rev = self.next_revision(c, pipe, 1).await?;
