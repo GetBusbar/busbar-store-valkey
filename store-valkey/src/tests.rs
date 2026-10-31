@@ -2898,20 +2898,6 @@ fn a_u64_a_signed_column_cannot_hold_is_refused() {
     );
     m.priced_from_ms = 0;
     assert!(store.list_metering(m.bucket).unwrap().is_empty());
-
-    let token = uid("tok_unstorable");
-    for (field, expires_at, now) in [("expires_at", big, 1), ("now", 1, big)] {
-        let e = store
-            .redeem_plane_token("ask", &token, expires_at, now)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            e.contains(&format!(
-                "redeem_plane_token: {field} {big} exceeds the storable range"
-            )),
-            "{e}"
-        );
-    }
 }
 
 /// Every `u64` field of both rows round-trips at the full range the sidecar can hold (`i64::MAX`;
@@ -5652,4 +5638,28 @@ fn a_parented_upserted_record_reads_back_by_its_own_id() {
     assert_eq!(store.get_plane_record(kind, "vk_c2").unwrap(), None);
     assert!(store.list_plane_records(kind, &parent).unwrap().is_empty());
     assert!(store.list_plane_record_parents(kind).unwrap().is_empty());
+}
+
+/// Redemption stores decimal strings, not signed columns. Permanent node claims and clocks
+/// past i64::MAX must retain exact one-use and expiry-boundary semantics.
+#[test]
+fn token_redemption_keeps_the_full_u64_range_exact() {
+    let Some(store) = live_store() else { return };
+    for expiry in [i64::MAX as u64 + 1, u64::MAX - 1, u64::MAX] {
+        let token = uid("tok_full_u64");
+        assert!(store
+            .redeem_plane_token("node-id", &token, expiry, expiry - 1)
+            .unwrap());
+        assert!(!store
+            .redeem_plane_token("node-id", &token, expiry, expiry)
+            .unwrap());
+        if let Some(after) = expiry.checked_add(1) {
+            assert!(store
+                .redeem_plane_token("node-id", &token, u64::MAX, after)
+                .unwrap());
+            assert!(!store
+                .redeem_plane_token("node-id", &token, u64::MAX, after)
+                .unwrap());
+        }
+    }
 }
