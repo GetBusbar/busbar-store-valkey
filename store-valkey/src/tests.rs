@@ -422,8 +422,35 @@ fn cred(key_id: &str, public_id: &str, slot: u8) -> CredentialSecret {
 /// wipe that was already tried and rejected for breaking intra-run parallelism.
 fn unique_suffix() -> u64 {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static RUN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let run = *RUN.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        run_salt(std::process::id(), nanos)
+    });
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    (std::process::id() as u64) * 1_000_000 + n
+    assert!(n < RUN_SPAN, "more than {RUN_SPAN} unique ids in one run");
+    run * RUN_SPAN + n
+}
+
+/// Ids one run may mint; a suffix is `run_salt * RUN_SPAN + n`, below `1e9`, so `unique_bucket`'s
+/// `base * 1e9 + suffix` stays injective in `base`.
+const RUN_SPAN: u64 = 1_000;
+
+/// A run's salt, below `1_000_000`: the pid and the start time folded together.
+fn run_salt(pid: u32, nanos: u128) -> u64 {
+    let folded = nanos ^ (nanos >> 64) ^ (u128::from(pid) << 20);
+    (folded % 1_000_000) as u64
+}
+
+#[test]
+fn unique_suffix_is_per_run_and_never_overflows_a_bucket() {
+    assert_ne!(run_salt(100, 1_000_000_007), run_salt(100, 2_000_000_011));
+    assert_ne!(run_salt(100, 1_000_000_007), run_salt(101, 1_000_000_007));
+    assert!(run_salt(u32::MAX, u128::MAX) < 1_000_000);
+    assert!(unique_suffix() < 1_000_000_000);
+    assert_ne!(unique_bucket(20260731), unique_bucket(20260801));
 }
 
 fn uid(base: &str) -> String {
@@ -873,19 +900,10 @@ fn list_credentials_since_carries_the_secret_for_hydration() {
     );
 }
 
-/// HARDEST INVARIANT #3: put_key_with_credential is atomic — a failure partway (simulated here by
-/// pre-occupying the credential slot with a LIVE row before the atomic mint attempt) must leave
-/// NEITHER the key nor the credential in a half-written state distinguishable from "never
-/// attempted". Since redis::transaction's WATCH/EXEC either commits both writes or neither, we
-/// prove this indirectly: after a forced conflict, the key must not exist at all (the whole
-/// transaction body ran and failed before either SET landed, because the conflict check happens
-/// before any command is queued in this implementation's slot-occupancy path)... this crate's
-/// put_key_with_credential does not pre-check occupancy (new mints use a fresh id/slot), so
-/// instead we prove atomicity the direct way: kill the connection mid-flight is not testable here,
-/// so we assert the STRUCTURAL guarantee — both the key row and credential row appear together or
-/// neither does, verified on the success path.
+/// `put_key_with_credential` writes the key and its credential together (the atomic-failure side
+/// is `store_conformance`'s `assert_put_key_with_credential_is_atomic`).
 #[test]
-fn put_key_with_credential_writes_both_or_neither() {
+fn put_key_with_credential_writes_the_key_and_its_credential() {
     let Some(store) = live_store() else { return };
     let key_id = uid("vk_atomic");
     let public_id = uid("AKIA_ATOMIC");
@@ -957,16 +975,8 @@ fn put_key_with_credential_replayed_with_the_same_credential_id_is_a_retry_safe_
     assert_ne!(live.secret, "", "the replay must not have wiped the secret");
 }
 
-/// `delete_key`'s credential-row cleanup silently swallows a decode failure on a single
-/// credential row (`if let Ok(Some(raw)) = c.get(...)`  / nested `if let Ok(cred) = ...`):
-/// if a row is corrupt, its `cred:pub:*`/`cred:id:*` reverse-lookup pointers are never cleaned up,
-/// yet the row itself is still deleted and the surrounding `delete_key` call still reports success
-/// — silently violating the trait's own "destroy every credential row + pointers" contract while
-/// claiming to have done so. This directly contradicts this same file's stated philosophy
-/// elsewhere (`list_metering`: "a malformed value must not silently ... under-report"). The
-/// correct behavior is to fail the whole (atomic) delete_key call loudly, matching every other
-/// decode path in this crate, rather than reporting success while leaving a dangling pointer that
-/// permanently blocks that public_id from ever being reused.
+/// A credential row that does not decode fails the whole `delete_key`, leaving the key live and
+/// the credential's pointers in place: skipping it would report success with pointers dangling.
 #[test]
 fn delete_key_fails_loud_on_a_corrupt_credential_row_instead_of_orphaning_pointers() {
     let Some(store) = live_store() else { return };
@@ -1007,9 +1017,25 @@ fn delete_key_fails_loud_on_a_corrupt_credential_row_instead_of_orphaning_pointe
     // means to exercise, not something later tests should have to survive. (Tests running
     // CONCURRENTLY with this one are covered by the de-indexing above, not by this line, which
     // cannot run until `delete_key` has already returned.)
+    let pointer_kept: bool = store
+        .with_conn(|conn| conn.exists(cred_id_key(&c.meta.id)))
+        .unwrap();
     store
         .with_conn(|conn| conn.del::<_, ()>(cred_row_key(&key_id, "sigv4", 0)))
         .unwrap();
+    assert!(
+        pointer_kept,
+        "the failed delete left the credential's pointer alone"
+    );
+    assert!(
+        store
+            .get_key(&key_id)
+            .unwrap()
+            .unwrap()
+            .deleted_at
+            .is_none(),
+        "the failed delete left the key live"
+    );
     assert!(
         result.is_err(),
         "delete_key must fail loudly on a corrupt credential row rather than silently reporting \
@@ -1267,15 +1293,9 @@ fn denylist_add_and_list_round_trips() {
 
 // ── Audit log (unchanged shape) ──────────────────────────────────────────────────────────────
 
-/// Serialises every test that writes the SHARED, fleet-wide audit zset.
-///
-/// `busbar:audit` is one global sorted set keyed by seq, so unlike every other fixture in this file
-/// it cannot be isolated by a `uid()` namespace. `audit_append_and_list_are_ordered_oldest_first`
-/// takes `max(seq) + 1_000` and then requires that record to still be in `list_audit_tail(2)`; the
-/// two sibling tests below write FIXED seqs in the 910/930-million range, so whichever of them lands
-/// between that read and the tail read pushes the record out and fails an assertion about ORDERING
-/// with something that is really a concurrency artifact. Pre-existing on dev — surfaced here because
-/// this suite now runs more tests against one shared server, not because retention changed anything.
+/// Serialises the tests that write the shared audit zset: `busbar:audit` is one global set keyed by
+/// seq, so a `uid()` namespace cannot isolate them, and a concurrent append would push another
+/// test's record out of the tail it reads back.
 pub(crate) static AUDIT_SEQ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Take `AUDIT_SEQ_LOCK`, ignoring poisoning, so one failing audit test does not convert the others
@@ -2418,7 +2438,8 @@ fn a_replayed_task_event_is_idempotent_and_a_different_one_is_a_fork() {
 }
 
 /// Retention drops TERMINAL rows only, strictly older than the cutoff, and returns a count it
-/// actually performed.
+/// actually performed. The terminal/active split is the helper's typed disposition (the store never
+/// reads the state text), so the odd state names only vary the Active rows.
 #[test]
 fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
     let _guard = purge_guard();
@@ -2480,8 +2501,8 @@ fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
             "t_vk_purge_old_unrecognised-state",
             "t_vk_purge_old_working",
         ],
-        "an active task is never dropped by retention, an unrecognised state is never terminal \
-         (`Completed` is not `completed`), and a row exactly at the cutoff is kept"
+        "a task the helper stored as Active (its disposition, not its state text, is what the \
+         store reads) is never dropped by retention, and a row exactly at the cutoff is kept"
     );
     assert_eq!(
         store.purge_tasks_before(1_000_000_200).unwrap(),
@@ -4297,6 +4318,25 @@ fn the_1_5_5_binarys_rows_read_back_through_migrate() {
     let store = ValkeyStore::connect(&url).expect("this build opens the 1.5.5 keyspace");
     assert_eq!(schema_marker(&store), SCHEMA_VERSION);
     assert_1_5_5_keys_read_back(&store);
+
+    // The revision counter carries over: a key written after the migrate is stamped past every
+    // revision the 1.5.5 rows hold, so a hydrating reader at that watermark sees it.
+    let revision = fx_num(&fixture_keys()["busbar:revision"]["value"]);
+    let counter: u64 = store
+        .with_conn(|c| redis::cmd("GET").arg(REVISION_KEY).query(c))
+        .unwrap();
+    assert_eq!(
+        counter, revision,
+        "migrate leaves the revision counter alone"
+    );
+    let id = uid("vk_after_1_5_5");
+    store.put_key(&vk(&id)).unwrap();
+    assert!(store.get_key(&id).unwrap().unwrap().revision > revision);
+    assert!(store
+        .list_keys_since(revision)
+        .unwrap()
+        .iter()
+        .any(|k| k.id == id));
 }
 
 /// A second open over the migrated 1.5.5 keyspace changes nothing.
@@ -4318,7 +4358,6 @@ fn migrate_over_the_1_5_5_rows_is_idempotent() {
     assert_eq!(read_everything_1_5_5(&store), first);
 }
 
-/// `list_audit_tail(0)` is the contract's empty tail, not the whole chain.
 #[test]
 fn audit_list_and_tail_are_ordered_oldest_first() {
     let _serialised = audit_seq_guard();
@@ -4370,6 +4409,7 @@ fn audit_row(seq: u64) -> AuditRecord {
     }
 }
 
+/// `list_audit_tail(0)` is the contract's empty tail, not the whole chain.
 #[test]
 fn list_audit_tail_zero_is_empty() {
     let _serialised = audit_seq_guard();
@@ -5012,8 +5052,6 @@ fn put_refusals_carry_the_reason_without_the_kind_suffix() {
     assert!(!e.contains("- Client"), "{e}");
 }
 
-// ── retention purges ─────────────────────────────────────────────────────────────────────────
-
 /// A unix-socket URL's `?pass=` is the scrub secret too: an error string that echoes the URL (or
 /// the password, raw or decoded) carries no credential bytes.
 #[test]
@@ -5032,6 +5070,13 @@ fn unix_url_query_password_is_scrubbed_from_errors() {
             assert!(!out.contains("CANARY"), "{url}: password leaked: {out}");
         }
     }
+    // A query value's `+` is a space in the form encoding the unix URL reads.
+    let url = "valkey+unix:///run/v.sock?pass=CANARY+vk+p4ss";
+    let out = scrub(
+        "valkey connect: AUTH CANARY vk p4ss refused".to_string(),
+        url_password(url).as_deref(),
+    );
+    assert!(!out.contains("CANARY"), "a `+` password leaked: {out}");
     // The userinfo form is unchanged; a unix URL without `pass=` has no secret.
     assert_eq!(url_password("redis://u:p@host:6379").as_deref(), Some("p"));
     assert_eq!(url_password("redis+unix:///run/v.sock?db=2"), None);
