@@ -52,11 +52,14 @@ busbar_contract::statement_extensions!(EXTENSIONS: [
     (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["url"]"#),
 ]);
 
+/// Ops admitted at once: each kept connection serves one, and up to seven more wait on it.
+const MAX_INFLIGHT: u32 = 8 * crate::KEPT_CONNECTIONS as u32;
+
 busbar_contract::store_door!(
     ValkeyStore,
     NAME,
     env!("CARGO_PKG_VERSION"),
-    64,
+    MAX_INFLIGHT,
     needs: NEEDS,
     extensions: EXTENSIONS
 );

@@ -1538,7 +1538,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         panic!(
             "VALKEY_URL is unset, and this case must not skip: it is the only over-the-ABI proof \
              that a demotion and a spent approval survive a restart on this backend, and both fail \
-             SILENTLY when unrelayed — the trait defaults answer Ok(()) to a demotion and `true` to \
+             SILENTLY when unrelayed — the trait defaults keep no demotion and answer `false` to \
              every redemption"
         )
     });
