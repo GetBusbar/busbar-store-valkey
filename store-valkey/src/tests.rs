@@ -1281,6 +1281,21 @@ fn denylist_add_and_list_round_trips() {
     assert!(list.contains(&id));
 }
 
+/// The first denylist write wins: a repeat is a no-op that keeps the first reason.
+#[test]
+fn a_repeat_denylist_add_keeps_the_first_reason() {
+    let Some(store) = live_store() else { return };
+    let id = uid("vk_denied_twice");
+    store.add_denylist(&id, "first").unwrap();
+    store.add_denylist(&id, "second").unwrap();
+    let reason: String = store
+        .with_conn(|c| c.get(format!("{DENYLIST_PREFIX}{id}")))
+        .unwrap();
+    assert_eq!(reason, "first");
+    let listed = store.list_denylist().unwrap();
+    assert_eq!(listed.iter().filter(|s| **s == id).count(), 1);
+}
+
 // ── Audit log (unchanged shape) ──────────────────────────────────────────────────────────────
 
 /// Serialises the tests that write the shared audit zset: `busbar:audit` is one global set keyed by
