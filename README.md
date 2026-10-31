@@ -61,14 +61,28 @@ schemes that driver parses. Nothing busbar-owned says "redis" any more.
 
 ### Versioning
 
-This plugin is versioned **independently of busbar** — `v1.0.5` here says
+This plugin is versioned **independently of busbar** — `v1.6.0` here says
 nothing about which busbar release it is. Compatibility with busbar is
-stated separately: the released v1.0.x line **requires busbar 1.5.0+** (the
-release that ships the signed hybrid plugin ABI it loads over); the `dev` line
-speaks the busbar **1.6.0** record contract and builds against the busbar rev
-in [`.busbar-ref`](.busbar-ref). A v1.0.x namespace (schema v6) is upgraded in
-place on first connect. Pin both versions
+stated separately: v1.6.0 speaks the busbar **1.6.0** record contract and builds against the
+busbar rev in [`.busbar-ref`](.busbar-ref). Pin both versions
 explicitly in production; do not assume they move together.
+
+### Upgrading an existing database
+
+Open the new build on the existing Valkey: the connect step upgrades the namespace in place,
+once, and writes the `busbar:schema` marker last, so a crash mid-upgrade re-runs the step on the
+next connect (two nodes upgrading at once land in the same place).
+
+- **Schema v6** (plugin v1.0.x, busbar 1.5.x): the typed task, task-event, demotion and
+  spent-approval keys are copied into the plane keyspace, then removed, and the v9 step below runs.
+  A task event whose position holds a different record already keeps its v6 source key for an
+  operator. `busbar:mcp:*` (the v6 tool-call log) is neither migrated nor removed.
+- **Schema v7:** the v9 step only.
+- **Older than v6, or keys with no marker:** refused, with the key prefixes found, and NOTHING is
+  changed; if the marker was lost from a current namespace, `SET busbar:schema 6` and restart.
+- **Newer than this build:** refused. Run a build of that version or later.
+
+The server must run `maxmemory-policy noeviction`; the connect step refuses to start otherwise.
 
 It is a `cdylib` that implements busbar's store v3 table (`RecordStore` plus the
 `StoreSlots` additions of the store SDK in
@@ -85,7 +99,7 @@ or one server-side script for the plane append), and the kernel's records (`busb
 are an additive keyspace beside the v7 ones. The store keeps ledger counts, not money: busbar
 derives money from the counts and its rate card.
 
-Schema v9 deletes what the deleted store slots kept: on the first connect of a v6, v7 or v8
+Schema v9 deletes what the deleted store slots kept: on the first connect of a v6 or v7
 namespace it removes the money keys (`busbar:cap:*`, `busbar:slice:*`, `busbar:open:*`,
 `busbar:slices`, `busbar:epoch`), the journal (`busbar:journal:*`) and the sessions
 (`busbar:session:*`, `busbar:sessions:*`) with `SCAN` and `UNLINK`, and the `busbar:op:*` dedupe
@@ -131,10 +145,10 @@ config, mirroring how the Postgres store plugin receives its libpq URL:
 { "url": "redis://:password@host:6379/0", "connect_timeout_ms": 10000 }
 ```
 
-| Setting | Required | Notes |
-|---|---|---|
-| `url` | yes | A `redis://` or `rediss://` (TLS) connection string (`valkey://` / `valkeys://` read the same): `[user[:password]@]host[:port][/db]`, or a unix-socket URL (`unix://`, `redis+unix://`, `valkey+unix://` `/path?db=N&user=U&pass=P`). TLS is busbar's connector's (its trust anchors); `rediss://…#insecure` skips certificate verification, as 1.5.5 did (busbar logs a WARN naming the store instance). |
-| `connect_timeout_ms` | no | Bounds every new connection's dial and handshake (TLS, `AUTH`, `SELECT`) in all, as 1.5.5's driver did (default 10000, 1.5.5's). |
+| Setting | Required | Default | Notes |
+|---|---|---|---|
+| `url` | yes | none | A `redis://` or `rediss://` (TLS) connection string (`valkey://` / `valkeys://` read the same): `[user[:password]@]host[:port][/db]`, or a unix-socket URL (`unix://`, `redis+unix://`, `valkey+unix://` `/path?db=N&user=U&pass=P`). TLS is busbar's connector's (its trust anchors); `rediss://…#insecure` skips certificate verification, as 1.5.5 did (busbar logs a WARN naming the store instance). |
+| `connect_timeout_ms` | no | `10000` | Bounds every new connection's dial and handshake (TLS, `AUTH`, `SELECT`) in all, as 1.5.5's driver did. A `null` reads as absent. |
 
 ## Build
 
@@ -215,7 +229,8 @@ in an in-process cache.
 The live-Valkey coverage is gated on the `VALKEY_URL` environment
 variable: it skips cleanly when unset locally (no server needed for a
 default `cargo test`), but under CI (`CI` set) a missing `VALKEY_URL` is
-a **hard failure**, never a silent skip — see
+a **hard failure**, never a silent skip. The tests that wipe a namespace are `#[ignore]`d and run
+by CI's `--ignored` pass, each on a private database number — see
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml), which runs a
 real `valkey/valkey:8` GitHub Actions service container on every push and PR.
 On macOS, where GitHub runs no service containers, CI starts a brew-installed `valkey-server`
