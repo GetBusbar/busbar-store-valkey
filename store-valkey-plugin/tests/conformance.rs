@@ -49,7 +49,7 @@
 // EACH FOLD'S KEYSPACE (Q-P4-8): the store's keys are fixed (`busbar:*`) and its settings name no key
 // prefix, and a fold namespace is no database number, so `{fold}` has nowhere to go in the url. The
 // suite's folds therefore run in a database of their own (`/14`; this repo's other live tests use the
-// url's `/0`, the admin end-to-end test `/15`, store-valkey's schema-refusal tests `/11` to `/13` and
+// url's `/0`, the admin end-to-end test `/15`, the e2e durability proofs `/10`, store-valkey's schema-refusal tests `/11` to `/13` and
 // its v9 upgrade test `/8`), one fold at a time: the namespace hooks below take
 // that database for the fold and flush it before the fold opens, and flush it and hand it on when
 // the fold ends, on an independent connection of the `redis` client. Every fold starts on an empty
@@ -195,24 +195,22 @@ fn valkey_url() -> Option<String> {
     }
 }
 
-/// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
-/// failure, never a skip.
+/// This crate's built cdylib, from `deps/` only: the copy the build graph of this very test binary
+/// refreshed (`target/<profile>/` is uplifted by `cargo build` alone and can be stale). A missing
+/// artifact is a failure, never a skip.
 fn cdylib() -> PathBuf {
     let exe = std::env::current_exe().expect("the test binary has a path");
-    let profile = exe
-        .parent()
-        .and_then(|d| d.parent())
-        .expect("target/<profile>");
+    let deps = exe.parent().expect("target/<profile>/deps");
     let file = busbar_plugin_loader::plugin_library_filename("busbar_store_valkey_plugin");
-    [profile.join(&file), profile.join("deps").join(&file)]
-        .into_iter()
-        .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
-        .max()
-        .map(|(_, p)| p)
-        .unwrap_or_else(|| panic!("the busbar-store-valkey-plugin cdylib ({file}) is not built"))
+    let path = deps.join(&file);
+    assert!(
+        path.exists(),
+        "the busbar-store-valkey-plugin cdylib ({file}) is not at {}",
+        path.display()
+    );
+    path
 }
 
-/// What a door is bound to: its own dispatcher's adopter, no envelope sink, no connections.
 /// The node's one `op_id` allocator (`LoadedStore::open` mints the bridge's writes from it): a node
 /// half no earlier run used (the dedupe is durable) and one counter.
 fn mint() -> busbar_contract::abi::store::OpId {
@@ -713,53 +711,36 @@ fn the_linked_and_the_dropped_in_valkey_store_are_one_store() {
 }
 
 /// RED ARM (live): a PERTURBED dropped-in store — its namespace already holds a different record at
-/// a chain position the scenario appends to — must not reproduce the linked transcript. Without a
-/// server the perturbation is the settings: an unreachable server is another store.
+/// a chain position the scenario appends to — must not reproduce the linked transcript. It needs a
+/// server: skipped locally without `VALKEY_URL`, a failure under CI ([`valkey_url`]); an arm that
+/// perturbed nothing would pass vacuously.
 #[test]
 fn a_perturbed_dropped_in_store_does_not_pass_for_the_linked_one() {
-    let url = valkey_url();
+    let Some(u) = valkey_url() else { return };
     let lib = cdylib();
     let stated = packed_rendering(&lib);
     let (ns_l, ns_r) = (ns("l"), ns("r"));
-    let linked = transcript(
-        linked,
-        url.as_deref().map(|u| (u, ns_l.as_str())),
-        |_, _| {},
+    let linked = transcript(linked, Some((u.as_str(), ns_l.as_str())), |_, _| {});
+    let red = transcript(
+        || dropped(&lib, &stated),
+        Some((u.as_str(), ns_r.as_str())),
+        |s, ns| {
+            RecordStore::append_plane_record(
+                s,
+                PlaneRecord {
+                    kind: format!("conf_{ns}"),
+                    id: "t1".into(),
+                    parent: Some("t1".into()),
+                    seq: 3,
+                    ts: 20,
+                    disposition: PlaneDisposition::Active,
+                    body: b"planted".to_vec(),
+                }
+                .view(),
+            )
+            .expect("plant a rival record");
+        },
     );
-    let red = match url.as_deref() {
-        Some(u) => transcript(
-            || dropped(&lib, &stated),
-            Some((u, ns_r.as_str())),
-            |s, ns| {
-                RecordStore::append_plane_record(
-                    s,
-                    PlaneRecord {
-                        kind: format!("conf_{ns}"),
-                        id: "t1".into(),
-                        parent: Some("t1".into()),
-                        seq: 3,
-                        ts: 20,
-                        disposition: PlaneDisposition::Active,
-                        body: b"planted".to_vec(),
-                    }
-                    .view(),
-                )
-                .expect("plant a rival record");
-            },
-        ),
-        None => {
-            let mut t = transcript(|| dropped(&lib, &stated), None, |_, _| {});
-            t.push(format!(
-                "open unreachable = {:?}",
-                open(
-                    &|| dropped(&lib, &stated),
-                    r#"{"url":"redis://127.0.0.1:2/0","connect_timeout_ms":300}"#
-                )
-                .map(|_| ())
-            ));
-            t
-        }
-    };
     assert_ne!(
         red, linked,
         "a perturbed store must not pass for the linked one"
