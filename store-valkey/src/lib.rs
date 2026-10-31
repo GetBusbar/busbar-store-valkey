@@ -1067,9 +1067,14 @@ fn cred_to_json(cred: &CredentialSecret) -> RecordStoreResult<String> {
     serde_json::to_string(cred)
         .map_err(|e| RecordStoreError(format!("credential encode failed: {e}")))
 }
-fn cred_from_json(raw: &str) -> RecordStoreResult<CredentialSecret> {
-    serde_json::from_str(raw)
-        .map_err(|e| RecordStoreError(format!("credential decode failed: {}", decode_text(&e))))
+/// The credential row stored at `row`, decoded for `op`; a failure names the row, never its value.
+fn cred_from_json(op: &str, row: &str, raw: &str) -> RecordStoreResult<CredentialSecret> {
+    serde_json::from_str(raw).map_err(|e| {
+        RecordStoreError(format!(
+            "{op}: credential row '{row}' does not decode: {}",
+            decode_text(&e)
+        ))
+    })
 }
 
 /// Parse a `"<key_id>:<kind>:<slot>"` pointer value back into its parts. `kind` cannot itself contain
@@ -1570,10 +1575,11 @@ impl ValkeyStore {
             .collect();
         // The metadata view is the decoded row minus its secret: there is one decode path.
         let raws = self.get_all(c, &row_keys).await?;
-        let mut metas = raws
-            .into_iter()
-            .flatten()
-            .map(|r| cred_from_json(&r).map(|c| c.meta))
+        let mut metas = row_keys
+            .iter()
+            .zip(raws)
+            .filter_map(|(row, raw)| Some((row, raw?)))
+            .map(|(row, raw)| cred_from_json("list_credentials", row, &raw).map(|c| c.meta))
             .collect::<RecordStoreResult<Vec<_>>>()?;
         metas.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.slot.cmp(&b.slot)));
         Ok(metas)
@@ -1660,25 +1666,12 @@ impl ValkeyStore {
             })
             .collect();
         let raws = self.get_all(c, &row_keys).await?;
-        // A row that does not decode is SKIPPED (and logged; the row key carries no secret): this
-        // global hydration delta must not fail whole on one corrupt row, and omitting a credential
-        // denies access, never grants it. (`delete_key` fails loud instead: it writes.)
-        let mut out = Vec::with_capacity(raws.len());
-        for (i, raw) in raws.into_iter().enumerate() {
-            let Some(raw) = raw else { continue };
-            match cred_from_json(&raw) {
-                Ok(cred) => out.push(cred),
-                Err(e) => {
-                    tracing::warn!(
-                        "busbar-store-valkey: skipping undecodable credential row {} in the \
-                         hydration delta ({e}); that credential cannot authenticate until the row \
-                         is repaired, and the rest of the delta is unaffected",
-                        row_keys.get(i).map(String::as_str).unwrap_or("<unknown>")
-                    );
-                }
-            }
-        }
-        Ok(out)
+        row_keys
+            .iter()
+            .zip(raws)
+            .filter_map(|(row, raw)| Some((row, raw?)))
+            .map(|(row, raw)| cred_from_json("list_credentials_since", row, &raw))
+            .collect()
     }
 
     pub(crate) async fn list_audit(&self, c: &mut Conn) -> RecordStoreResult<Vec<AuditRecord>> {
