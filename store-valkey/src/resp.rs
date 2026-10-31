@@ -687,21 +687,6 @@ impl Conn {
         cmd("HGETALL").arg(key).query(self).await
     }
 
-    /// `ZRANGEBYSCORE key min max`.
-    pub async fn zrangebyscore<K: ToArgs, M: ToArgs, MM: ToArgs, RV: FromValue>(
-        &mut self,
-        key: K,
-        min: M,
-        max: MM,
-    ) -> RedisResult<RV> {
-        cmd("ZRANGEBYSCORE")
-            .arg(key)
-            .arg(min)
-            .arg(max)
-            .query(self)
-            .await
-    }
-
     /// `ZRANGE key start stop`.
     pub async fn zrange<K: ToArgs, RV: FromValue>(
         &mut self,

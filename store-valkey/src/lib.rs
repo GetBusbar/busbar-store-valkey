@@ -1134,10 +1134,33 @@ impl ValkeyStore {
         c: &mut Conn,
         since: u64,
     ) -> RecordStoreResult<Vec<VirtualKey>> {
-        let ids: Vec<String> = with_conn!(self, |c| c
-            .zrangebyscore(KEYS_BYREV, format!("({since}"), "+inf")
-            .await)?;
+        let ids = self.delta_members(c, KEYS_BYREV, since).await?;
         self.get_keys(c, &ids).await
+    }
+
+    /// The members of the revision index `zset` past `since`, and those at revision 0 (never
+    /// stamped), which every delta carries; in revision order.
+    async fn delta_members(
+        &self,
+        c: &mut Conn,
+        zset: &str,
+        since: u64,
+    ) -> RecordStoreResult<Vec<String>> {
+        let (unstamped, stamped): (Vec<String>, Vec<String>) = with_conn!(self, |c| {
+            pipe()
+                .atomic()
+                .cmd("ZRANGEBYSCORE")
+                .arg(zset)
+                .arg(0)
+                .arg(0)
+                .cmd("ZRANGEBYSCORE")
+                .arg(zset)
+                .arg(format!("({since}"))
+                .arg("+inf")
+                .query(c)
+                .await
+        })?;
+        Ok([unstamped, stamped].concat())
     }
 
     /// The key rows of `ids` (a missing row is skipped, a corrupt one refused).
@@ -1589,9 +1612,7 @@ impl ValkeyStore {
         c: &mut Conn,
         since: u64,
     ) -> RecordStoreResult<Vec<CredentialSecret>> {
-        let members: Vec<String> = with_conn!(self, |c| c
-            .zrangebyscore(CREDS_BYREV, format!("({since}"), "+inf")
-            .await)?;
+        let members = self.delta_members(c, CREDS_BYREV, since).await?;
         let row_keys: Vec<String> = members
             .iter()
             .filter_map(|m| {
