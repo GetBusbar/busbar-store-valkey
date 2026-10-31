@@ -84,7 +84,7 @@ macro_rules! op {
         let pool = $me.pool().clone();
         drive_kept($cx, &pool, move |w| {
             Box::pin(async move {
-                let mut conn = match $me.conn(w, "reconnect").await {
+                let mut conn = match $me.conn(w, Some("reconnect")).await {
                     Ok(c) => c,
                     Err(e) => return ($fail)(e),
                 };
@@ -418,7 +418,7 @@ impl StoreSlots for ValkeyStore {
             Box::pin(async move {
                 me.connect_step(w)
                     .await
-                    .map_err(|e| format!("valkey plugin: failed to connect: {}", e.0))
+                    .map_err(|e| format!("valkey store: failed to connect: {}", e.0))
             })
         })
     }

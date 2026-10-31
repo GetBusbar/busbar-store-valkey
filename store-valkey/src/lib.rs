@@ -592,14 +592,16 @@ const NEED_TCP: u32 = 0;
 impl ValkeyStore {
     /// The op's connection over `wire`: the kept one when it is idle (its handshake done), else a
     /// fresh dial, secured for `rediss://`, `AUTH` and `SELECT` as the URL says — the dial AND the
-    /// handshake bounded by `connect_timeout_ms` in all. A failure reads `valkey {ctx}: …` (`connect`
-    /// at boot, `reconnect` when an op had to dial).
-    async fn conn(&self, wire: Wire, ctx: &str) -> RecordStoreResult<Conn> {
+    /// handshake bounded by `connect_timeout_ms` in all. A failure reads `valkey {ctx}: …` (`ctx`
+    /// `reconnect` when an op had to dial) or, at boot (`None`), the driver's words alone: the
+    /// door's connect step adds its one prefix.
+    async fn conn(&self, wire: Wire, ctx: Option<&str>) -> RecordStoreResult<Conn> {
         let failed = |e: String| {
-            RecordStoreError(scrub(
-                format!("valkey {ctx}: {e}"),
-                self.inner.secret.as_deref(),
-            ))
+            let text = match ctx {
+                Some(ctx) => format!("valkey {ctx}: {e}"),
+                None => e,
+            };
+            RecordStoreError(scrub(text, self.inner.secret.as_deref()))
         };
         let ms = self.inner.connect_timeout.as_millis();
         if ms == 0 {
@@ -677,7 +679,7 @@ impl ValkeyStore {
     /// `open`'s connect step: the first connection, the schema migration and the noeviction check
     /// (its failures are the load's refusal).
     async fn connect_step(&self, wire: Wire) -> RecordStoreResult<()> {
-        let mut c = self.conn(wire, "connect").await?;
+        let mut c = self.conn(wire, None).await?;
         self.migrate(&mut c).await?;
         let r = self.assert_noeviction(&mut c).await;
         c.settle();
@@ -706,7 +708,7 @@ impl ValkeyStore {
         match policy {
             Some("noeviction") => Ok(()),
             Some(other) => Err(RecordStoreError(format!(
-                "valkey maxmemory-policy is '{other}', not 'noeviction': an eviction policy \
+                "maxmemory-policy is '{other}', not 'noeviction': an eviction policy \
                  can silently drop a denylist entry (un-revoking a key) or a metering row \
                  (destroying billing evidence) under memory pressure with no error anywhere. \
                  Refusing to start. Run `CONFIG SET maxmemory-policy noeviction` (and persist it in \
@@ -714,7 +716,7 @@ impl ValkeyStore {
                  pointing busbar at this instance."
             ))),
             None => Err(RecordStoreError(
-                "valkey CONFIG GET maxmemory-policy returned no value — either this server \
+                "CONFIG GET maxmemory-policy returned no value — either this server \
                  restricts CONFIG GET via ACL, or something unexpected happened. Refusing to start: \
                  cannot verify the noeviction invariant governance data durability depends on."
                     .to_string(),
@@ -743,7 +745,7 @@ impl ValkeyStore {
             let version = marker.unwrap_or(0);
             if version > SCHEMA_VERSION {
                 return Err(RecordStoreError(format!(
-                    "valkey schema check: schema v{version} is newer than this build \
+                    "schema v{version} is newer than this build \
                      (v{SCHEMA_VERSION}); refusing to open. NOTHING was changed. An older build \
                      on a newer namespace would not know what the newer schema did to the namespace: run a build of v{version} or later."
                 )));
@@ -797,7 +799,7 @@ impl ValkeyStore {
             sample.dedup();
             sample.truncate(3);
             return Err(RecordStoreError(format!(
-                "valkey schema check: {found} (a version below {FIRST_MIGRATED_SCHEMA} cannot be \
+                "{found} (a version below {FIRST_MIGRATED_SCHEMA} cannot be \
                  upgraded in place) but the namespace holds other `busbar:*` keys (e.g. {}); \
                  refusing to start. NOTHING was changed: no key was deleted and no marker written. \
                  If this is a current namespace whose marker was lost, restore it with \
@@ -1762,41 +1764,55 @@ impl ValkeyStore {
     /// # Errors
     /// A text naming why the settings do not open a store.
     pub fn from_settings(settings: &[u8]) -> Result<Self, String> {
+        const BAD: &str = "invalid valkey plugin config";
         let v: serde_json::Value = if settings.iter().all(u8::is_ascii_whitespace) {
             serde_json::Value::Object(Default::default())
         } else {
-            serde_json::from_slice(settings)
-                .map_err(|e| format!("invalid valkey plugin config: {e}"))?
+            serde_json::from_slice(settings).map_err(|e| format!("{BAD}: {e}"))?
         };
-        const BAD: &str = "invalid valkey plugin config";
+        let serde_json::Value::Object(o) = &v else {
+            return Err(format!(
+                "{BAD}: expected a JSON object, got {}",
+                json_type(&v)
+            ));
+        };
         // A top-level key this plugin does not read is a typo or a setting for another backend; it
         // must not be swallowed into quietly opening with the defaults.
-        if let Some(unknown) = v.as_object().and_then(|o| {
-            o.keys()
-                .find(|k| !matches!(k.as_str(), "url" | "connect_timeout_ms"))
-        }) {
+        if let Some(unknown) = o
+            .keys()
+            .find(|k| !matches!(k.as_str(), "url" | "connect_timeout_ms"))
+        {
             return Err(format!(
                 "{BAD}: unknown setting `{unknown}` (accepted: url, connect_timeout_ms)"
             ));
         }
-        let url = match v.get("url") {
-            None => {
-                return Err(
-                    "valkey plugin config requires a \"url\" (a redis:// connection string)"
-                        .to_string(),
-                )
+        // A `null` optional setting is an absent one.
+        let url = match o.get("url") {
+            None | Some(serde_json::Value::Null) => {
+                return Err(format!(
+                    "{BAD}: `url` is required (a redis:// connection string)"
+                ))
             }
             Some(serde_json::Value::String(s)) if !s.trim().is_empty() => s.as_str(),
-            Some(_) => return Err(format!("{BAD}: `url` must be a non-empty string")),
+            Some(serde_json::Value::String(_)) => {
+                return Err(format!("{BAD}: `url` must be a non-empty string"))
+            }
+            Some(other) => {
+                return Err(format!(
+                    "{BAD}: `url` must be a non-empty string, got {}",
+                    json_type(other)
+                ))
+            }
         };
-        let timeout = match v.get("connect_timeout_ms") {
-            None => DEFAULT_CONNECT_TIMEOUT,
+        let timeout = match o.get("connect_timeout_ms") {
+            None | Some(serde_json::Value::Null) => DEFAULT_CONNECT_TIMEOUT,
             Some(x) => match x.as_u64().filter(|ms| *ms > 0) {
                 Some(ms) => Duration::from_millis(ms),
                 None => {
                     return Err(format!(
                         "{BAD}: `connect_timeout_ms` must be a positive integer (milliseconds), \
-                         got {x}"
+                         got {}",
+                        json_type(x)
                     ))
                 }
             },
@@ -1813,6 +1829,18 @@ impl ValkeyStore {
                 pool: Pool::new(KEPT_CONNECTIONS),
             }),
         })
+    }
+}
+
+/// A JSON value's type, as a settings refusal names it (never the value).
+fn json_type(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
     }
 }
 
