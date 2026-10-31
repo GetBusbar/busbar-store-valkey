@@ -23,7 +23,8 @@
 //!   parent; a delete takes only the positions at its own identity).
 //! - `busbar:plane:K:pcount` HASH  parent → how many records name it as their `parent` — the boot
 //!   enumeration of parents (`list_plane_record_parents`), kept exact by every write and removal.
-//! - `busbar:plane:K:tok:T`  STRING, `SET NX EX` — one redeemed single-use token (`T` = hex token).
+//! - `busbar:plane:K:tok:T`  STRING — one redeemed single-use token (`T` = hex token): its grant's
+//!   `expires_at`, with an `EX` that is cleanup only ([`redeem_token`]).
 //!
 //! ## Why every write is a script
 //!
@@ -40,7 +41,7 @@
 //! listing; every listing is re-sorted by the exact `seq` parsed out of `F`, so a `seq` past 2^53
 //! still orders correctly.
 
-use crate::resp::{cmd, pipe, Conn, Script, ScriptInvocation, Value};
+use crate::resp::{pipe, Conn, Script, ScriptInvocation, Value};
 use crate::{hex, ValkeyStore};
 use busbar_contract::abi::sdk::store::column::{clamp, storable_i64};
 use busbar_contract::abi::sdk::store::fork;
@@ -664,19 +665,63 @@ pub(crate) fn token_key(kind: &str, token: &str) -> String {
 /// overflows its own millisecond arithmetic, so a grant living longer is recorded with no expiry.
 const MAX_TOKEN_TTL_SECS: u64 = 315_360_000; // ten years
 
-/// `redeem_plane_token`: the test and set, as ONE `SET NX EX` the server orders against every other
-/// node's. It sets and reports OK, or it finds the key present and reports nil — and that reply IS the
-/// answer, never a prior read. A `GET` followed by a `SET` would tell both halves of a race they were
-/// first, and on this backend a fleet sharing one Valkey is the ORDINARY deployment.
+/// How long past its grant's life an entry's `EX` runs: a skew allowance, so a caller whose clock
+/// runs behind the redeemer's still finds the entry while its grant lives.
+const TOKEN_TTL_SLACK_SECS: u64 = 3_600;
+
+/// The `EX` of a ledger entry whose grant has `life` seconds to run: cleanup only, never shorter
+/// than the life (the judgment is the stored `expires_at` against the caller's `now`). `None` (no
+/// expiry) when it would pass the cap: expiring such an entry would let the grant redeem again.
+pub(crate) fn ledger_ttl(life: u64) -> Option<u64> {
+    let ex = life.max(1).saturating_add(TOKEN_TTL_SLACK_SECS);
+    (ex <= MAX_TOKEN_TTL_SECS).then_some(ex)
+}
+
+/// REDEEM: `KEYS[1]` = the ledger entry (its value the grant's `expires_at`); `ARGV = expires_at,
+/// now, ex ('' = no expiry)`. `1` = redeemed (no entry, or one with `expires_at < now`, lapsed),
+/// `0` = spent (an entry with `expires_at >= now`, or one that is not a number). The comparison is
+/// on the decimal strings (length, then text), exact past 2^53.
+static REDEEM: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
+    Script::new(
+        r"
+        local cur = redis.call('GET', KEYS[1])
+        if cur then
+            if not string.match(cur, '^%d+$') then
+                return 0
+            end
+            local spent
+            if #cur ~= #ARGV[2] then
+                spent = #cur > #ARGV[2]
+            else
+                spent = cur >= ARGV[2]
+            end
+            if spent then
+                return 0
+            end
+        end
+        if ARGV[3] == '' then
+            redis.call('SET', KEYS[1], ARGV[1])
+        else
+            redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3])
+        end
+        return 1",
+    )
+});
+
+/// `redeem_plane_token`: the test and set, as ONE script the server orders against every other
+/// node's. A stored entry holds its grant's `expires_at`; it is spent while that is at or after the
+/// caller's `now`, and only an entry with `expires_at < now` is lapsed and redeems afresh. The
+/// script's reply IS the answer, never a prior read: a `GET` followed by a `SET` would tell both
+/// halves of a race they were first, and on this backend a fleet sharing one Valkey is the ORDINARY
+/// deployment.
 ///
-/// TTL rather than a caller-run sweep: the entry expires with the grant it records, on the server —
-/// which matters here more than on a SQL backend, since this store refuses to run on a server that
-/// may evict (`noeviction`), so an unbounded keyspace would be an outage of the whole namespace.
-/// `max(1)`: an already-lapsed grant (`expires_at <= now`) still gets a truthful test-and-set answer.
+/// The entry's `EX` is cleanup ([`ledger_ttl`]): this store refuses to run on a server that may
+/// evict (`noeviction`), so an unbounded keyspace would be an outage of the whole namespace.
 ///
-/// NO RECONNECT-RETRY: a dropped reply is not a lost read — the SET may have landed, and a blind retry
-/// would find its own write and report `false`, refusing a grant this very call recorded. The error
-/// surfaces instead, and the engine turns it into a REFUSED redemption; both answers are closed.
+/// NO RECONNECT-RETRY: a dropped reply is not a lost read — the script may have run, and a blind
+/// retry would find its own write and report `false`, refusing a grant this very call recorded. The
+/// error surfaces instead, and the engine turns it into a REFUSED redemption; both answers are
+/// closed.
 pub(crate) async fn redeem_token(
     store: &ValkeyStore,
     c: &mut Conn,
@@ -687,19 +732,18 @@ pub(crate) async fn redeem_token(
 ) -> RecordStoreResult<bool> {
     storable_i64("redeem_plane_token", "expires_at", expires_at)?;
     storable_i64("redeem_plane_token", "now", now)?;
-    let life = expires_at.saturating_sub(now);
+    let ex = ledger_ttl(expires_at.saturating_sub(now));
     let key = token_key(kind, token);
-    let set: Option<String> = with_conn_no_retry!(store, |c| {
-        let mut set = cmd("SET");
-        set.arg(&key).arg(expires_at).arg("NX");
-        // A grant that outlives the cap is kept for ever: expiring its entry would let it redeem
-        // again.
-        if life <= MAX_TOKEN_TTL_SECS {
-            set.arg("EX").arg(life.max(1));
-        }
-        set.query(c).await
+    let redeemed: i64 = with_conn_no_retry!(store, |c| {
+        let mut inv = REDEEM.key(&key);
+        inv.arg(expires_at).arg(now);
+        match ex {
+            Some(ex) => inv.arg(ex),
+            None => inv.arg(""),
+        };
+        inv.invoke(c).await
     })?;
-    Ok(set.is_some())
+    Ok(redeemed == 1)
 }
 
 /// `plane_token_live`: MULTI-USE and SPENDS NOTHING — a plain read of the `(kind, token)` upserted
