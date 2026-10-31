@@ -42,7 +42,7 @@
 
 use crate::resp::{cmd, pipe, Conn, Script, ScriptInvocation, Value};
 use crate::{hex, ValkeyStore};
-use busbar_contract::abi::sdk::store::column::clamp;
+use busbar_contract::abi::sdk::store::column::{clamp, storable_i64};
 use busbar_contract::abi::sdk::store::fork;
 use busbar_contract::abi::sdk::store::{OpRefused, OpResult};
 use busbar_contract::abi::store::OP_ID_RETENTION_SECS;
@@ -685,6 +685,8 @@ pub(crate) async fn redeem_token(
     expires_at: u64,
     now: u64,
 ) -> RecordStoreResult<bool> {
+    storable_i64("redeem_plane_token", "expires_at", expires_at)?;
+    storable_i64("redeem_plane_token", "now", now)?;
     let life = expires_at.saturating_sub(now);
     let key = token_key(kind, token);
     let set: Option<String> = with_conn_no_retry!(store, |c| {
