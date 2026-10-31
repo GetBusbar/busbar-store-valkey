@@ -5842,3 +5842,102 @@ fn a_v9_upgrade_scrubs_revoked_credentials_and_publishes_the_repairs_once() {
     assert_eq!(raw.get::<_, i64>(SCHEMA_KEY).unwrap(), 9);
     assert_eq!(raw.get::<_, String>(&row_key).unwrap(), malformed);
 }
+
+#[test]
+fn usage_cleanup_preserves_full_width_boundaries_billing_and_other_namespaces() {
+    use busbar_contract::store_calls::StoreCalls;
+    if live_store().is_none() {
+        return;
+    }
+    let mut raw = fresh_db_client(8);
+    let url = url_for_db(8);
+    let store = ValkeyStore::connect(&url).unwrap();
+    let ledger = UsageLedger {
+        requests: 3,
+        billable_requests: 2,
+        models: ["alpha", "beta"]
+            .into_iter()
+            .map(|model| ModelTokens {
+                model: model.to_owned(),
+                usage_units: [
+                    (RESERVED_UNITS[0].to_owned(), 5),
+                    ("audio_seconds".to_owned(), 7),
+                ]
+                .into_iter()
+                .collect(),
+            })
+            .collect(),
+    };
+    for bucket in ["first", "tenant:second"] {
+        for window in [0, 9, 10, i64::MAX as u64 + 1, u64::MAX] {
+            store.put_usage(bucket, window, &ledger).unwrap();
+        }
+    }
+    let malformed = [
+        "busbar:usage:first:+9",
+        "busbar:usage:first:09",
+        "busbar:usage:first:18446744073709551616",
+        "busbar:usage:first:not-a-window",
+        "other:usage:first:9",
+    ];
+    for key in malformed {
+        redis::cmd("SET")
+            .arg(key)
+            .arg("untouched")
+            .query::<()>(&mut raw)
+            .unwrap();
+    }
+    let billed = metering_row(9, "billed", "alpha", "provider", 0);
+    redis::cmd("HSET")
+        .arg(&billed)
+        .arg("requests")
+        .arg(17)
+        .arg(format!("{METERING_UNIT_PREFIX}audio_seconds"))
+        .arg(19)
+        .query::<()>(&mut raw)
+        .unwrap();
+    let billing: std::collections::HashMap<String, String> = raw.hgetall(&billed).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let purge = |before| runtime.block_on(StoreCalls::purge_usage_before(&store, before));
+    assert_eq!(purge(0).unwrap(), 0);
+    assert_eq!(
+        purge(10).unwrap(),
+        2,
+        "count complete window hashes, never their fields"
+    );
+    assert_eq!(purge(10).unwrap(), 0);
+    for bucket in ["first", "tenant:second"] {
+        assert_eq!(store.get_usage(bucket, 9).unwrap(), UsageLedger::default());
+        assert_eq!(store.get_usage(bucket, 0).unwrap(), ledger);
+        assert_eq!(store.get_usage(bucket, 10).unwrap(), ledger);
+    }
+    assert_eq!(purge(i64::MAX as u64 + 1).unwrap(), 2);
+    assert_eq!(
+        store
+            .get_usage("tenant:second", i64::MAX as u64 + 1)
+            .unwrap(),
+        ledger,
+        "the full-width exact cutoff survives"
+    );
+    assert_eq!(purge(u64::MAX).unwrap(), 2);
+    assert_eq!(purge(u64::MAX).unwrap(), 0);
+    for key in malformed {
+        assert_eq!(raw.get::<_, String>(key).unwrap(), "untouched", "{key}");
+    }
+    assert_eq!(
+        raw.hgetall::<_, std::collections::HashMap<String, String>>(&billed)
+            .unwrap(),
+        billing
+    );
+    let reopened = ValkeyStore::connect(&url).unwrap();
+    assert_eq!(reopened.get_usage("first", 0).unwrap(), ledger);
+    assert_eq!(reopened.get_usage("first", u64::MAX).unwrap(), ledger);
+    assert_eq!(
+        reopened.get_usage("first", i64::MAX as u64 + 1).unwrap(),
+        UsageLedger::default()
+    );
+    redis::cmd("FLUSHDB").query::<()>(&mut raw).unwrap();
+}
