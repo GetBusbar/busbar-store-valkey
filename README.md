@@ -15,7 +15,6 @@ The Valkey store as a droppable busbar plugin: a cdylib exporting the store C AB
 **This plugin's version: v1.6.0.** (Independently versioned from busbar
 itself — see [Versioning](#versioning) below.)
 
-[![CI](https://github.com/GetBusbar/busbar-store-valkey/actions/workflows/ci.yml/badge.svg)](https://github.com/GetBusbar/busbar-store-valkey/actions/workflows/ci.yml)
 [![Coverage](https://codecov.io/gh/GetBusbar/busbar-store-valkey/branch/dev/graph/badge.svg)](https://codecov.io/gh/GetBusbar/busbar-store-valkey)
 [![Release](https://img.shields.io/github/v/release/GetBusbar/busbar-store-valkey)](https://github.com/GetBusbar/busbar-store-valkey/releases)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
@@ -99,8 +98,10 @@ upgrade still answers its original. A namespace newer than the build is refused.
   ledgers, and metering/audit rows — the store is the durability layer
   behind the engine's in-memory enforcement counters (boot-hydrate +
   periodic write-behind flush), not a request-hot-path dependency.
-- **Fleet-honest accrual**: `add_usage` is a real atomic server-side accumulate
-  (`HINCRBY`, each counter floored at 0), so N nodes each flushing their own
+- **Fleet-honest accrual**: `add_usage_batch` and `add_metering_batch` are
+  atomic server-side scripts (`HINCRBY`; usage counters floored at 0, every
+  counter pinned at `i64::MAX`) that validate every cell, apply them all and
+  record the op under its `op_id`, so a replay applies nothing; N nodes each flushing their own
   delta-since-last sum to the true fleet total (an absolute `put_usage`
   overwrite would be last-writer-wins across nodes).
 
@@ -112,9 +113,8 @@ directory of this repository.
 
 The store holds **no socket and no TLS stack of its own**: it declares one
 outbound `tcp` need and speaks RESP2 over the connection busbar's connector
-dials, secures and wakes for it. Like 1.5.5's one mutex-guarded connection, the
-store keeps ONE connection across ops (dialled, secured, `AUTH`, `SELECT` once);
-ops take it in turn, and a read that has nothing yet pends on the op's ticket
+dials, secures and wakes for it. The store keeps up to eight connections across ops
+(each dialled, secured, `AUTH`, `SELECT` once); one op holds one connection, and a read that has nothing yet pends on the op's ticket
 instead of blocking a thread. 1.5.5's reconnect-and-retry is kept: a dropped
 connection is re-dialled and a read (or idempotent write) retried once on the
 fresh one; the non-idempotent writes are never replayed. `open` only parses the
@@ -196,7 +196,7 @@ for the full store config reference.
 ## Tests
 
 `cargo test` runs the pure unit tests (config parsing) and the real-ABI
-end-to-end test in [`tests/e2e.rs`](tests/e2e.rs), which `dlopen`s the
+end-to-end test in [`store-valkey-plugin/tests/e2e.rs`](store-valkey-plugin/tests/e2e.rs), which `dlopen`s the
 *built* cdylib over the real `busbar-plugin-loader` ABI seam — the same
 seam busbar's engine uses — against a **real, live Valkey** (not a mock
 or an in-process fake).
