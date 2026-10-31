@@ -793,7 +793,8 @@ fn a_batch_with_an_unusable_cell_applies_nothing_and_records_nothing() {
         billable_requests: 0,
         models: Vec::new(),
     };
-    let cells = [(bad.as_str(), 0, d.clone()), (good.as_str(), 0, d)];
+    // The bad cell is LAST: a validate-and-apply cell by cell would apply the good one first.
+    let cells = [(good.as_str(), 0, d.clone()), (bad.as_str(), 0, d)];
     let id = op(43);
     let e = s.add_usage_batch(id, &cells).expect_err("refused");
     assert!(
@@ -824,7 +825,7 @@ fn a_non_integer_counter_field_refuses_the_batch_without_echoing_it() {
     let e = s
         .add_usage_batch(
             op(44),
-            &[(bad.as_str(), 0, d.clone()), (good.as_str(), 0, d)],
+            &[(good.as_str(), 0, d.clone()), (bad.as_str(), 0, d)],
         )
         .expect_err("refused");
     assert!(
