@@ -697,7 +697,7 @@ fn the_v9_upgrade_drops_the_money_and_dead_slot_keys() {
         assert!(!there, "the dedupe hash {k} of a deleted slot survived");
     }
     let marker: i64 = c.get("busbar:schema").unwrap();
-    assert_eq!(marker, 9);
+    assert_eq!(marker, 10);
     // A kept slot's op replays across the upgrade and applies nothing.
     iso.s()
         .add_usage_batch(kept, &cells)
@@ -957,7 +957,7 @@ fn the_v6_copy_keeps_an_event_chain_whose_position_forked() {
     let there: bool = c.exists(&key).unwrap();
     assert!(there, "the v6 chain was deleted though its copy forked");
     let marker: i64 = c.get("busbar:schema").unwrap();
-    assert_eq!(marker, 9, "the upgrade still completes");
+    assert_eq!(marker, 10, "the upgrade still completes");
 }
 
 /// A page is read at ONE instant: a strike landing while the scan is in flight cannot shorten it.

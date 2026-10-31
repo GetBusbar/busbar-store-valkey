@@ -69,15 +69,17 @@ explicitly in production; do not assume they move together.
 
 ### Upgrading an existing database
 
-Open the new build on the existing Valkey: the connect step upgrades the namespace in place,
+Stop older busbar nodes before opening this build on the existing Valkey. The connect step upgrades the namespace in place,
 once, and writes the `busbar:schema` marker last, so a crash mid-upgrade re-runs the step on the
 next connect (two nodes upgrading at once land in the same place).
 
 - **Schema v6** (plugin v1.0.x, busbar 1.5.x): the typed task, task-event, demotion and
-  spent-approval keys are copied into the plane keyspace, then removed, and the v9 step below runs.
+  spent-approval keys are copied into the plane keyspace, then removed, and the v9 and v10 steps below run.
   A task event whose position holds a different record already keeps its v6 source key for an
   operator. `busbar:mcp:*` (the v6 tool-call log) is neither migrated nor removed.
-- **Schema v7:** the v9 step only.
+- **Schema v7/v8:** the v9 and v10 steps.
+- **Schema v9:** the v10 step only.
+- **Schema v10:** current; no migration.
 - **Older than v6, or keys with no marker:** refused, with the key prefixes found, and NOTHING is
   changed; if the marker was lost from a current namespace, `SET busbar:schema 6` and restart.
 - **Newer than this build:** refused. Run a build of that version or later.
@@ -105,6 +107,12 @@ namespace it removes the money keys (`busbar:cap:*`, `busbar:slice:*`, `busbar:o
 (`busbar:session:*`, `busbar:sessions:*`) with `SCAN` and `UNLINK`, and the `busbar:op:*` dedupe
 hashes of the deleted slots. The dedupe hash of a kept slot is untouched, so a retry across the
 upgrade still answers its original. A namespace newer than the build is refused.
+
+Schema v10 clears secret material and resets the secret form on previously revoked credentials,
+preserving their revocation time and reason. Each repair advances the credential revision so hydrated
+caches observe it. Clean revoked rows and live credentials remain unchanged; concurrent slot remints
+are reread before a repair can commit. Retire older writers before upgrading: an already-connected
+older node could otherwise write the old revoked form again.
 
 
 - **Multi-node deployments**: a fleet of busbar nodes sharing one Valkey
