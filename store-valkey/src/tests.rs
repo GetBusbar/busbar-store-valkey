@@ -5830,4 +5830,14 @@ fn a_v9_upgrade_scrubs_revoked_credentials_and_publishes_the_repairs_once() {
     assert_eq!(found.meta.id, replacement.meta.id);
     assert!(found.meta.revoked_at.is_none());
     assert_eq!(found.secret, replacement.secret);
+
+    let malformed = r#"{"meta":"migration-private-marker","secret":"migration-private-marker"}"#;
+    raw.set::<_, _, ()>(&row_key, malformed).unwrap();
+    raw.set::<_, _, ()>(SCHEMA_KEY, 9).unwrap();
+    let error = ValkeyStore::connect(&url)
+        .err()
+        .expect("an undecodable indexed credential refuses migration");
+    assert!(!error.to_string().contains("migration-private-marker"));
+    assert_eq!(raw.get::<_, i64>(SCHEMA_KEY).unwrap(), 9);
+    assert_eq!(raw.get::<_, String>(&row_key).unwrap(), malformed);
 }
