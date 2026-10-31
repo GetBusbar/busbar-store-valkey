@@ -875,6 +875,7 @@ fn revoke_credential_destroys_secret_and_is_idempotent() {
                  gets a correct 'revoked' rejection, not 'unknown')",
         );
     assert!(resolved.meta.revoked_at.is_some());
+    assert_eq!(resolved.meta.secret_form, SecretForm::None);
     assert_eq!(
         resolved.secret, "",
         "secret material must be destroyed on revoke"
@@ -882,6 +883,12 @@ fn revoke_credential_destroys_secret_and_is_idempotent() {
 
     // Idempotent: revoking again must not error or clobber the original revoked_at reason.
     assert!(store.revoke_credential(&c.meta.id, "again").is_ok());
+    let repeated = store
+        .lookup_credential_secret("sigv4", &public_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(repeated.meta, resolved.meta);
+    assert_eq!(repeated.secret, resolved.secret);
 }
 
 #[test]
@@ -5662,4 +5669,165 @@ fn token_redemption_keeps_the_full_u64_range_exact() {
                 .unwrap());
         }
     }
+}
+
+/// Existing revoked credentials are repaired on upgrade, and the repair reaches hydrated caches.
+#[test]
+fn a_v9_upgrade_scrubs_revoked_credentials_and_publishes_the_repairs_once() {
+    let Some(_) = live_store() else { return };
+    let mut raw = fresh_db_client(5);
+    let url = url_for_db(5);
+    let store = ValkeyStore::connect(&url).unwrap();
+    let mut before = Vec::new();
+    for index in 0..4 {
+        let key_id = uid("vk_revoked_upgrade");
+        let public_id = uid("AKIA_UPGRADE");
+        let offered = cred(&key_id, &public_id, 0);
+        store
+            .put_key_with_credential(&vk(&key_id), &offered)
+            .unwrap();
+        let row_key = cred_row_key(&key_id, "sigv4", 0);
+        let text: String = raw.get(&row_key).unwrap();
+        let mut row: CredentialSecret = serde_json::from_str(&text).unwrap();
+        if index < 3 {
+            row.meta.revoked_at = Some(1234);
+            row.meta.revoke_reason = Some("legacy revoke".into());
+        }
+        if index == 1 || index == 2 {
+            row.secret.clear();
+        }
+        if index == 2 {
+            row.meta.secret_form = SecretForm::None;
+        }
+        let text = cred_to_json(&row).unwrap();
+        raw.set::<_, _, ()>(&row_key, &text).unwrap();
+        before.push((row_key, row, text));
+    }
+    let watermark = before
+        .iter()
+        .map(|(_, row, _)| row.meta.revision)
+        .max()
+        .unwrap();
+    raw.set::<_, _, ()>(SCHEMA_KEY, 9).unwrap();
+    drop(store);
+    let reopened = ValkeyStore::connect(&url).expect("the supported old namespace upgrades");
+    let mut repaired_bytes = Vec::new();
+    for (index, (key, old, old_text)) in before.iter().enumerate() {
+        let text: String = raw.get(key).unwrap();
+        let row: CredentialSecret = serde_json::from_str(&text).unwrap();
+        if index < 2 {
+            assert_eq!(
+                row.secret, "",
+                "persisted revoked material must be destroyed"
+            );
+            assert_eq!(row.meta.secret_form, SecretForm::None);
+            assert!(
+                row.meta.revision > watermark,
+                "hydrators must observe the repair"
+            );
+            let mut expected = old.meta.clone();
+            expected.secret_form = SecretForm::None;
+            expected.revision = row.meta.revision;
+            assert_eq!(
+                row.meta, expected,
+                "original revocation metadata is retained"
+            );
+            let score: u64 = raw.zscore(CREDS_BYREV, slot_pointer(&row.meta)).unwrap();
+            assert_eq!(score, row.meta.revision);
+        } else {
+            assert_eq!(
+                &text, old_text,
+                "clean revoked and live rows remain byte-identical"
+            );
+        }
+        repaired_bytes.push(text);
+    }
+    let delta = reopened.list_credentials_since(watermark).unwrap();
+    for (_, row, _) in before.iter().take(2) {
+        let repaired = delta
+            .iter()
+            .find(|candidate| candidate.meta.id == row.meta.id)
+            .expect("repair is hydrated");
+        assert!(repaired.secret.is_empty());
+        assert_eq!(repaired.meta.secret_form, SecretForm::None);
+    }
+    let marker: i64 = raw.get(SCHEMA_KEY).unwrap();
+    assert_eq!(
+        marker, 10,
+        "the completed repair advances the schema marker"
+    );
+    let revision: u64 = raw.get(REVISION_KEY).unwrap();
+    drop(reopened);
+    // A crash after data repair but before the marker write must be safe to replay.
+    raw.set::<_, _, ()>(SCHEMA_KEY, 9).unwrap();
+    let direct = ValkeyStore::connect(&url).unwrap();
+    let marker: i64 = raw.get(SCHEMA_KEY).unwrap();
+    assert_eq!(marker, 10);
+    let after_revision: u64 = raw.get(REVISION_KEY).unwrap();
+    assert_eq!(
+        after_revision, revision,
+        "replay does not allocate another revision"
+    );
+    for ((key, _, _), expected) in before.iter().zip(repaired_bytes) {
+        let actual: String = raw.get(key).unwrap();
+        assert_eq!(
+            actual, expected,
+            "a completed repair never gains another revision"
+        );
+    }
+
+    // A concurrent remint wins over a repair's old snapshot; the WATCH retry must reread it.
+    let key_id = uid("vk_repair_remint");
+    let old = cred(&key_id, &uid("AKIA_OLD"), 0);
+    direct.put_key_with_credential(&vk(&key_id), &old).unwrap();
+    direct.revoke_credential(&old.meta.id, "rotated").unwrap();
+    let row_key = cred_row_key(&key_id, "sigv4", 0);
+    let text: String = raw.get(&row_key).unwrap();
+    let mut dirty: CredentialSecret = serde_json::from_str(&text).unwrap();
+    dirty.secret = "legacy retained material".into();
+    dirty.meta.secret_form = SecretForm::Recoverable;
+    raw.set::<_, _, ()>(&row_key, cred_to_json(&dirty).unwrap())
+        .unwrap();
+    raw.set::<_, _, ()>(SCHEMA_KEY, 9).unwrap();
+    let gate = interleave::gate(&url, true, |chunk| {
+        interleave::contains(chunk, b"$4\r\nEXEC\r\n")
+    });
+    let gate_url = gate.url.clone();
+    let migrating = std::thread::spawn(move || ValkeyStore::connect(&gate_url));
+    gate.held
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("repair reached EXEC after reading the revoked row");
+    let replacement = cred(&key_id, &uid("AKIA_NEW"), 0);
+    direct.put_credential(&replacement).unwrap();
+    let minted: String = raw.get(&row_key).unwrap();
+    let new_id_key = cred_id_key(&replacement.meta.id);
+    let new_public_key = cred_pub_key("sigv4", &replacement.meta.public_id);
+    let id_pointer: String = raw.get(&new_id_key).unwrap();
+    let public_pointer: String = raw.get(&new_public_key).unwrap();
+    gate.release.send(()).unwrap();
+    let upgraded = migrating
+        .join()
+        .unwrap()
+        .expect("the repair retries the changed slot");
+    let after: String = raw.get(&row_key).unwrap();
+    assert_eq!(
+        after, minted,
+        "the live replacement is never scrubbed or reverted"
+    );
+    assert_eq!(raw.get::<_, String>(&new_id_key).unwrap(), id_pointer);
+    assert_eq!(
+        raw.get::<_, String>(&new_public_key).unwrap(),
+        public_pointer
+    );
+    assert!(!raw.exists::<_, bool>(cred_id_key(&old.meta.id)).unwrap());
+    assert!(!raw
+        .exists::<_, bool>(cred_pub_key("sigv4", &old.meta.public_id))
+        .unwrap());
+    let found = upgraded
+        .lookup_credential_secret("sigv4", &replacement.meta.public_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.meta.id, replacement.meta.id);
+    assert!(found.meta.revoked_at.is_none());
+    assert_eq!(found.secret, replacement.secret);
 }
