@@ -18,6 +18,9 @@
 //!   `u:<hex unit>:<model>`, floored at 0 server-side); **metering** `metering:<bucket>` (SET of row
 //!   hashes); **audit** `audit` (ZSET); **denylist** `denylist` / `denylist:<sub>`.
 //! - **plane records** ([`plane`]); the v6 typed keyspaces are copied into it on connect ([`legacy`]).
+//! - **records** `records:<hex schema>:k` / `:v` (the door's ordered key-value records), **op
+//!   records** `op:<hex op_id>` (HASH, the dedupe state of the `op_id` writes), `revision` (the
+//!   store-wide counter) and `schema` (the version marker).
 //!
 //! ## Atomicity
 //!
@@ -27,13 +30,14 @@
 //!
 //! ## Connections
 //!
-//! One kept connection, dialled through the host's connector
-//! for the store's one `tcp` need, secured for `rediss://` (unverified for `#insecure`), then `AUTH`
+//! Up to [`KEPT_CONNECTIONS`] kept connections, one per op in flight, dialled through the host's
+//! connector for the store's one `tcp` need, secured for `rediss://` (unverified for `#insecure`), then `AUTH`
 //! and `SELECT` as the URL says; `connect_timeout_ms` bounds dial plus handshake. A connection-level
 //! failure on a `with_conn!` call reconnects and re-runs that call once; `with_conn_no_retry!` calls
 //! (non-idempotent writes) fail instead. `open` only parses; its connect step migrates the schema and
-//! checks `noeviction`. Error strings are scrubbed of the URL password. Rows carry no TTL: retention
-//! is the engine's.
+//! checks `noeviction`. Error strings are scrubbed of the URL password. Op records
+//! (`OP_ID_RETENTION_SECS`) and redeemed-token entries carry TTLs; no other row does: retention is
+//! the engine's.
 
 #![forbid(unsafe_code)]
 
@@ -51,8 +55,8 @@ use std::time::Duration;
 #[macro_use]
 mod resp;
 
-/// `self.with_conn(|c| EXPR)` over the blocking client, now: `EXPR` on the op's one connection
-/// `c`, its failure in the store's words (`valkey command: …`, the URL password scrubbed).
+/// `with_conn!(self, |c| EXPR)`: `EXPR` on the op's one connection `c`, its failure in the store's
+/// words (`valkey command: …`, the URL password scrubbed).
 ///
 /// A CONNECTION-LEVEL failure closes the connection and runs `EXPR` once more on a fresh one (its
 /// failure then reads `valkey reconnect after drop: …` / `valkey retry after reconnect: …`); any
@@ -722,9 +726,9 @@ impl ValkeyStore {
     }
 
     /// SCHEMA MIGRATION (currently v9; see `SCHEMA_VERSION`'s own doc for what each version did).
-    /// A fresh namespace (no `busbar:*` keys) is simply marked ; one already
+    /// A fresh namespace (no `busbar:*` keys) is simply marked; one already
     /// at the current version passes through untouched; one NEWER than this build is refused; a v6
-    /// namespace is upgraded IN PLACE ([`legacy::migrate_v6_to_v7`]) and a v6, v7 or v8 one then gets
+    /// namespace is upgraded IN PLACE ([`legacy::migrate_v6_to_v7`]) and a v6 or v7 one then gets
     /// the v9 step ([`ValkeyStore::drop_dead_slot_keys`]), each idempotent, the marker written last
     /// so a crash mid-upgrade re-runs it on the next connect.
     ///
@@ -1072,8 +1076,8 @@ fn usage_fields(delta: &UsageDelta) -> Vec<(String, i64)> {
 }
 
 /// The base op set's bodies, each over the op's one connection `c` (the store door, `slots`, runs
-/// each as one op through the host's connector). The un-deduped writes (`add_usage`,
-/// `add_metering`, `append_plane_record`) reach the store as their `op_id` slots.
+/// each as one op through the host's connector). The `op_id` writes (`add_usage_batch`,
+/// `add_metering_batch`, `append_plane_record`) are the door's own slots, deduped durably.
 impl ValkeyStore {
     pub(crate) async fn put_key(&self, c: &mut Conn, key: &VirtualKey) -> RecordStoreResult<()> {
         let row_key = format!("{KEY_PREFIX}{}", key.id);
@@ -1687,9 +1691,8 @@ impl ValkeyStore {
     }
 }
 
-/// Current unix time in seconds. A thin wrapper so tests can be deterministic about "now" only via
-/// real elapsed time (no injected clock in this crate — governance timestamps are advisory metadata
-/// here, never used for admission math inside the store itself).
+/// Current unix time in seconds, stamped on tombstones and revocations (advisory metadata; the store
+/// has no injected clock and does no admission math with it).
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

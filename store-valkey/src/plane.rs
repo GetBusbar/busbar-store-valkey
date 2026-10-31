@@ -130,12 +130,29 @@ fn sidecar(record: &PlaneRecordRef<'_>) -> RecordStoreResult<String> {
         ts: record.ts,
     })
     .map_err(|e| RecordStoreError(format!("plane record sidecar encode: {e}")))?;
-    let parented = if record.parent.is_some() { '1' } else { '0' };
+    let parented = if record.parent.is_some() {
+        PARENTED
+    } else {
+        '0'
+    };
     let disposition = match record.disposition {
-        PlaneDisposition::Terminal => 't',
-        PlaneDisposition::Active => 'a',
+        PlaneDisposition::Terminal => TERMINAL,
+        PlaneDisposition::Active => ACTIVE,
     };
     Ok(format!("{parented}{disposition}{json}"))
+}
+
+/// The sidecar's first flag: the record names a parent.
+const PARENTED: char = '1';
+/// The sidecar's second flag: the record is terminal / active (the Lua reads `'t'` at position 2).
+const TERMINAL: char = 't';
+const ACTIVE: char = 'a';
+/// The sidecar's flag characters precede its JSON.
+const FLAGS: usize = 2;
+
+/// Whether a sidecar's disposition flag says the record is still active.
+fn is_active(side: &str) -> bool {
+    side.chars().nth(1) == Some(ACTIVE)
 }
 
 /// The parent a sidecar names: its JSON after the two flag characters (`None` when the parented
@@ -145,10 +162,12 @@ fn parent_of(side: &str) -> Option<String> {
     struct Named {
         parent: Option<String>,
     }
-    if !side.starts_with('1') {
+    if !side.starts_with(PARENTED) {
         return None;
     }
-    serde_json::from_str::<Named>(side.get(2..)?).ok()?.parent
+    serde_json::from_str::<Named>(side.get(FLAGS..)?)
+        .ok()?
+        .parent
 }
 
 /// Shared Lua: a record's PARENT LINK. A record that names a parent is counted under that parent in
@@ -335,7 +354,7 @@ static PURGE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 // identical replay. The failure surfaces instead.
 
 /// A write script's call for `record`: `KEYS = rec, body, byts, idx, pcount`; `ARGV = F, sidecar,
-/// body, ts, seq, identity`.
+/// body, ts, seq, parent ('' = none), idx_prefix`.
 fn write_call<'s>(
     script: &'s Script,
     record: &PlaneRecordRef<'_>,
@@ -684,7 +703,7 @@ pub(crate) async fn token_live(
     }
     let keys = Keys::of(kind);
     let side: Option<String> = with_conn!(store, |c| c.hget(&keys.rec, field(0, token)).await)?;
-    Ok(side.is_some_and(|s| s.as_bytes().get(1) == Some(&b'a')))
+    Ok(side.is_some_and(|s| is_active(&s)))
 }
 
 #[cfg(test)]

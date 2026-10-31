@@ -33,8 +33,8 @@ SQLite store cannot offer.
 
 This plugin, its repository, its crates, and its published artifact are now
 named for **Valkey** — the Linux-Foundation-governed, BSD-licensed store this
-plugin has always actually targeted. Two of those renames are user-visible
-breaking changes, and neither is silently compatible:
+plugin has always actually targeted. Three of those changes are user-visible
+breaking changes, and none is silently compatible:
 
 - **The config alias changed**: `store: { module: redis }` is now
   `store: { module: valkey }`. Busbar core ships a config migrator entry that
