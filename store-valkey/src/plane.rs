@@ -303,11 +303,17 @@ local function drop_identity(rec, body, byts, pcount, idx, ident, prefix)
 end
 ";
 
-/// DELETE one identity: `KEYS = rec, body, byts, pcount, idx`; `ARGV = identity, idx_prefix`.
+/// DELETE one identity: `KEYS = rec, body, byts, pcount, idx`, then (cascade only) the same five of
+/// the cascaded kind; `ARGV = identity, idx_prefix, cascade_idx_prefix ('' = no cascade)`. Returns
+/// the records of the kind removed.
 static DELETE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_LINK}{LUA_DROP_IDENTITY}
-        return drop_identity(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5], ARGV[1], ARGV[2])"
+        local n = drop_identity(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5], ARGV[1], ARGV[2])
+        if ARGV[3] ~= '' then
+            drop_identity(KEYS[6], KEYS[7], KEYS[8], KEYS[9], KEYS[10], ARGV[1], ARGV[3])
+        end
+        return n"
     ))
 });
 
@@ -616,7 +622,7 @@ pub(crate) async fn purge(
 }
 
 /// `delete_plane_record`: every `seq` under the identity goes, so a delete can never leave part of a
-/// chain behind. Deleting what is not there is a NO-OP, not an error: the engine clears on every
+/// chain behind; a deleted `task` takes its `task_event` chain with it, as a purge does. Deleting what is not there is a NO-OP, not an error: the engine clears on every
 /// observation that agrees with an approval rather than tracking whether it had demoted.
 pub(crate) async fn delete(
     store: &ValkeyStore,
@@ -626,15 +632,23 @@ pub(crate) async fn delete(
 ) -> RecordStoreResult<()> {
     let keys = Keys::of(kind);
     let idx = keys.idx(id);
+    let cascade = (kind == CASCADING_KIND).then(|| Keys::of(CASCADED_KIND));
     with_conn_no_retry!(store, |c| {
-        DELETE
-            .key(&keys.rec)
-            .key(&keys.body)
+        let mut inv = DELETE.key(&keys.rec);
+        inv.key(&keys.body)
             .key(&keys.byts)
             .key(&keys.pcount)
-            .key(&idx)
-            .arg(id)
+            .key(&idx);
+        if let Some(k) = &cascade {
+            inv.key(&k.rec)
+                .key(&k.body)
+                .key(&k.byts)
+                .key(&k.pcount)
+                .key(k.idx(id));
+        }
+        inv.arg(id)
             .arg(&keys.idx_prefix)
+            .arg(cascade.as_ref().map_or("", |k| k.idx_prefix.as_str()))
             .invoke::<i64>(c)
             .await
     })
