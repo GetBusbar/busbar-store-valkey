@@ -882,6 +882,36 @@ fn revoke_credential_unknown_id_errors() {
     );
 }
 
+/// `list_credentials` answers in `(kind, slot)` order, not the index set's order.
+#[test]
+fn list_credentials_is_ordered_by_kind_then_slot() {
+    let Some(store) = live_store() else { return };
+    let kid = uid("vk_order");
+    let mut first = cred(&kid, &uid("AKIA_ORD_A"), 1);
+    let mut second = cred(&kid, &uid("AKIA_ORD_B"), 0);
+    second.meta.kind = "apikey".to_string();
+    second.meta.id = format!("{}_apikey", second.meta.id);
+    let third = cred(&kid, &uid("AKIA_ORD_C"), 0);
+    first.meta.id = format!("{}_x", first.meta.id);
+    store.put_key_with_credential(&vk(&kid), &first).unwrap();
+    store.put_credential(&second).unwrap();
+    store.put_credential(&third).unwrap();
+    let got: Vec<(String, u8)> = store
+        .list_credentials(&kid)
+        .unwrap()
+        .into_iter()
+        .map(|m| (m.kind, m.slot))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("apikey".to_string(), 0),
+            ("sigv4".to_string(), 0),
+            ("sigv4".to_string(), 1)
+        ]
+    );
+}
+
 #[test]
 fn list_credentials_never_carries_the_secret() {
     let Some(store) = live_store() else { return };
