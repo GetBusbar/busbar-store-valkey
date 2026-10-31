@@ -40,9 +40,8 @@ impl FromFailure for OpRefused {
     fn from_failure(f: StoreFailure) -> Self {
         match f {
             StoreFailure::Conflict => OpRefused::Conflict,
-            StoreFailure::Failed(t) | StoreFailure::Refused(t) | StoreFailure::Fault(t) => {
-                OpRefused::Failed(t)
-            }
+            StoreFailure::Refused(t) => OpRefused::Refused(t),
+            StoreFailure::Failed(t) | StoreFailure::Fault(t) => OpRefused::Failed(t),
             other => OpRefused::Failed(other.to_string()),
         }
     }
@@ -181,9 +180,9 @@ fn the_statement_tail_is_a_durable_store_that_refuses_forks() {
 #[test]
 fn open_refuses_settings_it_cannot_run_in_its_own_words() {
     let e = Door::open(b"", None).expect_err("no url");
-    assert!(e.contains("requires a \"url\""), "{e}");
+    assert!(e.contains("`url` is required"), "{e}");
     let e = Door::open(b"{}", None).expect_err("no url");
-    assert!(e.contains("requires a \"url\""), "{e}");
+    assert!(e.contains("`url` is required"), "{e}");
     let e = Door::open(b"{ not json", None).expect_err("bad json");
     assert!(e.contains("invalid valkey plugin config"), "{e}");
     let e =
@@ -286,6 +285,7 @@ struct Iso {
 impl Iso {
     fn new(db: u32) -> Option<Self> {
         live_store()?;
+        super::assert_private_db(db);
         let url = super::url_for_db(db);
         Self::flush(&url);
         let store = Some(ValkeyStore::connect(&url).expect("connect"));
@@ -718,4 +718,349 @@ fn the_v9_upgrade_drops_the_money_and_dead_slot_keys() {
     );
     let got = iso.s().record_get("v9-schema", b"k").unwrap();
     assert_eq!(got.as_ref().map(RecordBytes::as_slice), Some(&b"v"[..]));
+}
+
+fn raw_conn() -> redis::Connection {
+    let url = std::env::var("VALKEY_URL").expect("live_store read it");
+    redis::Client::open(url)
+        .and_then(|c| c.get_connection())
+        .expect("an independent client")
+}
+
+fn metering_delta(bucket: u64, tokens_input: u64) -> busbar_contract::records::MeteringDelta {
+    busbar_contract::records::MeteringDelta {
+        key_id: "vk-pin".into(),
+        bucket,
+        model: "m".into(),
+        provider: "p".into(),
+        tokens_input,
+        tokens_output: 0,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 0,
+        billable_requests: 0,
+        key_group_at_use: String::new(),
+        pricing_version: String::new(),
+        priced_from_ms: 0,
+        usage_units: Default::default(),
+    }
+}
+
+/// A counter at i64::MAX plus a positive delta pins at i64::MAX (rule 8): the batch answers Ok.
+#[test]
+fn a_usage_counter_at_i64_max_pins_instead_of_failing() {
+    let Some(s) = live_store() else { return };
+    let bucket = fresh("pin-usage");
+    let key = format!("busbar:usage:{bucket}:0");
+    let mut r = raw_conn();
+    let _: () = r.hset(&key, "requests", i64::MAX).unwrap();
+    let d = UsageDelta {
+        requests: 1,
+        billable_requests: 1,
+        models: Vec::new(),
+    };
+    s.add_usage_batch(op(40), &[(bucket.as_str(), 0, d)])
+        .expect("pins, does not fail");
+    let got: String = r.hget(&key, "requests").unwrap();
+    assert_eq!(got, i64::MAX.to_string());
+    let one: String = r.hget(&key, "billable_requests").unwrap();
+    assert_eq!(one, "1");
+}
+
+#[test]
+fn a_metering_counter_at_i64_max_pins_instead_of_failing() {
+    let Some(s) = live_store() else { return };
+    let bucket = super::unique_bucket(41);
+    s.add_metering_batch(op(41), &[metering_delta(bucket, u64::MAX)])
+        .expect("fills the counter to i64::MAX");
+    s.add_metering_batch(op(42), &[metering_delta(bucket, 1)])
+        .expect("pins, does not fail");
+    let rows = s.list_metering(bucket).expect("list");
+    assert_eq!(rows[0].tokens_input, i64::MAX as u64, "{rows:?}");
+}
+
+/// A cell the batch cannot add to refuses the WHOLE batch: no other cell applies and the op is not
+/// recorded, so a retry under the same op id with the key fixed applies.
+#[test]
+fn a_batch_with_an_unusable_cell_applies_nothing_and_records_nothing() {
+    let Some(s) = live_store() else { return };
+    let (bad, good) = (fresh("atomic-bad"), fresh("atomic-good"));
+    let mut r = raw_conn();
+    let bad_key = format!("busbar:usage:{bad}:0");
+    let _: () = r.set(&bad_key, "secret-text").unwrap();
+    let d = UsageDelta {
+        requests: 2,
+        billable_requests: 0,
+        models: Vec::new(),
+    };
+    // The bad cell is LAST: a validate-and-apply cell by cell would apply the good one first.
+    let cells = [(good.as_str(), 0, d.clone()), (bad.as_str(), 0, d)];
+    let id = op(43);
+    let e = s.add_usage_batch(id, &cells).expect_err("refused");
+    assert!(
+        matches!(&e, OpRefused::Refused(t) if t.contains(&bad_key) && !t.contains("secret-text")),
+        "{e:?}"
+    );
+    assert_eq!(s.get_usage(&good, 0).unwrap().requests, 0, "cell 2 applied");
+    let _: () = r.del(&bad_key).unwrap();
+    s.add_usage_batch(id, &cells).expect("the retry applies");
+    assert_eq!(s.get_usage(&good, 0).unwrap().requests, 2);
+    assert_eq!(s.get_usage(&bad, 0).unwrap().requests, 2);
+}
+
+/// A non-integer field refuses the batch the same way, and names the field, not its value.
+#[test]
+fn a_non_integer_counter_field_refuses_the_batch_without_echoing_it() {
+    let Some(s) = live_store() else { return };
+    let (bad, good) = (fresh("field-bad"), fresh("field-good"));
+    let mut r = raw_conn();
+    let _: () = r
+        .hset(format!("busbar:usage:{bad}:0"), "requests", "secret-text")
+        .unwrap();
+    let d = UsageDelta {
+        requests: 1,
+        billable_requests: 0,
+        models: Vec::new(),
+    };
+    let e = s
+        .add_usage_batch(
+            op(44),
+            &[(good.as_str(), 0, d.clone()), (bad.as_str(), 0, d)],
+        )
+        .expect_err("refused");
+    assert!(
+        matches!(&e, OpRefused::Refused(t) if t.contains("requests") && !t.contains("secret-text")),
+        "{e:?}"
+    );
+    assert_eq!(s.get_usage(&good, 0).unwrap().requests, 0);
+}
+
+#[test]
+fn a_metering_batch_with_a_wrong_typed_row_applies_nothing() {
+    let Some(s) = live_store() else { return };
+    let (bad, good) = (super::unique_bucket(45), super::unique_bucket(46));
+    let mut r = raw_conn();
+    let probe = metering_delta(bad, 1);
+    s.add_metering_batch(op(47), std::slice::from_ref(&probe))
+        .expect("seed");
+    let rows: Vec<String> = r.smembers(format!("busbar:metering:{bad}")).unwrap();
+    let _: () = r.del(&rows[0]).unwrap();
+    let _: () = r.set(&rows[0], "not a hash").unwrap();
+    let id = op(48);
+    let batch = [metering_delta(good, 1), probe];
+    let e = s.add_metering_batch(id, &batch).expect_err("refused");
+    assert!(matches!(e, OpRefused::Refused(_)), "{e:?}");
+    assert!(s.list_metering(good).unwrap().is_empty(), "applied");
+    let _: () = r.del(&rows[0]).unwrap();
+    s.add_metering_batch(id, &batch).expect("the retry applies");
+    assert_eq!(s.list_metering(good).unwrap().len(), 1);
+}
+
+/// The v9 step keeps an op record whose body is a kept slot's digest (32 bytes, or 64 lowercase hex):
+/// a node upgrading concurrently with live writers must not erase their dedupe records.
+#[test]
+fn the_v9_upgrade_keeps_digest_bodied_op_records() {
+    let Some(mut iso) = Iso::new(9) else { return };
+    let mut c = iso.raw();
+    let mut raw32 = [0xABu8; 32];
+    raw32[3] = b':';
+    let hex64 = "0123456789abcdef".repeat(4);
+    let _: () = c.hset("busbar:op:digest32", "b", &raw32[..]).unwrap();
+    let _: () = c.hset("busbar:op:digest64", "b", &hex64).unwrap();
+    let _: () = c.hset("busbar:op:deadtext", "b", "reserve:0:[]").unwrap();
+    let _: () = c.set("busbar:schema", 8).unwrap();
+    drop(c);
+
+    iso.restart();
+
+    let mut c = iso.raw();
+    for k in ["busbar:op:digest32", "busbar:op:digest64"] {
+        let there: bool = c.exists(k).unwrap();
+        assert!(there, "{k} (a kept slot's digest record) was deleted");
+    }
+    let there: bool = c.exists("busbar:op:deadtext").unwrap();
+    assert!(!there, "a dead slot's textual record survived");
+}
+
+/// A terminal-only purge over more records than one script call handles: every terminal row goes,
+/// none of the active rows older than it (which fill the first batches) is touched, and the count is
+/// the whole sweep's.
+#[test]
+fn a_purge_larger_than_one_batch_counts_and_removes_exactly_the_terminal_rows() {
+    let Some(s) = live_store() else { return };
+    let kind = fresh("purge-batches");
+    let rec = |i: u64, ts: u64, disposition| PlaneRecord {
+        kind: kind.clone(),
+        id: format!("r{i}"),
+        parent: None,
+        seq: 0,
+        ts,
+        disposition,
+        body: b"b".to_vec(),
+    };
+    for i in 0..1200 {
+        s.upsert_plane_record(rec(i, 1, PlaneDisposition::Active).view())
+            .unwrap();
+    }
+    for i in 1200..2400 {
+        s.upsert_plane_record(rec(i, 2, PlaneDisposition::Terminal).view())
+            .unwrap();
+    }
+    let n = s
+        .purge_plane_records(&kind, 10, busbar_contract::records::Retention::TerminalOnly)
+        .unwrap();
+    assert_eq!(n, 1200);
+    let n = s
+        .purge_plane_records(&kind, 10, busbar_contract::records::Retention::Age)
+        .unwrap();
+    assert_eq!(n, 1200);
+    let n = s
+        .purge_plane_records(&kind, 10, busbar_contract::records::Retention::Age)
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+/// The v6 -> v7 copy never deletes a v6 task-event chain whose position holds a DIFFERENT record
+/// already (a fork): the v6 event is the only copy of that evidence, so it stays for an operator.
+#[test]
+fn the_v6_copy_keeps_an_event_chain_whose_position_forked() {
+    use crate::legacy::TASK_EVENTS_PREFIX;
+    let Some(mut iso) = Iso::new(6) else { return };
+    let id = fresh("t_fork");
+    let v6 = super::sample_event(&id, 1, "task.submitted", "", "x1");
+    iso.s()
+        .append_plane_record_op(
+            op(60),
+            PlaneRecord {
+                kind: "task_event".into(),
+                id: id.clone(),
+                parent: Some(id.clone()),
+                seq: 1,
+                ts: 9,
+                disposition: PlaneDisposition::Active,
+                body: b"a different v7 record".to_vec(),
+            }
+            .view(),
+        )
+        .unwrap();
+    let mut c = iso.raw();
+    let key = format!("{TASK_EVENTS_PREFIX}{id}");
+    let _: () = c
+        .zadd(&key, serde_json::to_string(&v6).unwrap(), 1)
+        .unwrap();
+    let _: () = c.set("busbar:schema", 6).unwrap();
+    drop(c);
+
+    iso.restart();
+
+    let mut c = iso.raw();
+    let there: bool = c.exists(&key).unwrap();
+    assert!(there, "the v6 chain was deleted though its copy forked");
+    let marker: i64 = c.get("busbar:schema").unwrap();
+    assert_eq!(marker, 9, "the upgrade still completes");
+}
+
+/// A page is read at ONE instant: a strike landing while the scan is in flight cannot shorten it.
+/// The scan is held right after its key range is read; the row is struck; the scan is released.
+#[test]
+fn a_record_scan_page_is_not_shortened_by_a_concurrent_strike() {
+    let Some(direct) = live_store() else { return };
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let schema = fresh("scan-atomic");
+    for k in [b"a", b"b", b"c"] {
+        direct.record_put(&schema, k, b"v").unwrap();
+    }
+    // Warm the server's script cache, so the held scan sends no `SCRIPT LOAD`.
+    assert_eq!(direct.record_scan(&schema, b"", 10).unwrap().len(), 3);
+    let gate = super::interleave::gate(&url, false, |c| {
+        let has = |t: &[u8]| super::interleave::contains(c, t);
+        (has(b"ZRANGEBYLEX") || has(b"EVALSHA")) && !has(b"SCRIPT")
+    });
+    let scanner = ValkeyStore::connect(&gate.url).unwrap();
+    let name = schema.clone();
+    let page = std::thread::spawn(move || scanner.record_scan(&name, b"", 10));
+    gate.held
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the scan is in flight");
+    direct.record_put(&schema, b"b", b"").unwrap();
+    gate.release.send(()).unwrap();
+    let page = page.join().unwrap().unwrap();
+    assert_eq!(page.len(), 3, "the page was cut by a strike: {page:?}");
+}
+
+/// The contract upserts by `(kind, id)` and reads at seq 0: a second upsert of an id with another
+/// `seq` replaces the first, never stands beside it.
+#[test]
+fn an_upsert_replaces_by_id_whatever_its_seq() {
+    let Some(s) = live_store() else { return };
+    let kind = fresh("upsert-seq");
+    let rec = |seq: u64, body: &[u8]| PlaneRecord {
+        kind: kind.clone(),
+        id: "a".into(),
+        parent: None,
+        seq,
+        ts: 1,
+        disposition: PlaneDisposition::Active,
+        body: body.to_vec(),
+    };
+    s.upsert_plane_record(rec(3, b"three").view()).unwrap();
+    s.upsert_plane_record(rec(4, b"four").view()).unwrap();
+    assert_eq!(
+        s.list_plane_records(&kind, &PlaneSelector::All).unwrap(),
+        vec![b"four".to_vec()]
+    );
+    assert_eq!(
+        s.get_plane_record(&kind, "a").unwrap(),
+        Some(b"four".to_vec())
+    );
+}
+
+/// A reply that does not fit is refused by naming where and what was expected, never by echoing the
+/// stored value into the error.
+#[test]
+fn a_malformed_stored_value_is_not_echoed_into_the_error() {
+    let Some(s) = live_store() else { return };
+    let bucket = fresh("echo");
+    let mut r = raw_conn();
+    let _: () = r
+        .hset(
+            format!("busbar:usage:{bucket}:0"),
+            "requests",
+            "secret-text",
+        )
+        .unwrap();
+    let e = s
+        .get_usage(&bucket, 0)
+        .expect_err("not an integer")
+        .to_string();
+    // Debug-printed bytes are digits, so the text check alone would miss the echo.
+    let bytes = format!("{:?}", b"secret-text".to_vec());
+    assert!(!e.contains("secret-text") && !e.contains(&bytes), "{e}");
+    assert!(!e.contains("response was"), "{e}");
+}
+
+/// A fork-refused append records nothing under its op id: the same op id retried with a record that
+/// does not fork applies, instead of conflicting with a body the refusal wrongly recorded.
+#[test]
+fn a_fork_refused_append_records_nothing_under_its_op_id() {
+    let Some(s) = live_store() else { return };
+    let parent = fresh("fork-op");
+    let rec = |seq: u64, body: &[u8]| PlaneRecord {
+        kind: "slots_test".into(),
+        id: parent.clone(),
+        parent: Some(parent.clone()),
+        seq,
+        ts: 1,
+        disposition: PlaneDisposition::Active,
+        body: body.to_vec(),
+    };
+    s.append_plane_record_op(op(70), rec(1, b"one").view())
+        .expect("first");
+    let id = op(71);
+    assert!(matches!(
+        s.append_plane_record_op(id, rec(1, b"forked").view()),
+        Err(OpRefused::Failed(_))
+    ));
+    s.append_plane_record_op(id, rec(2, b"two").view())
+        .expect("the refusal recorded nothing, so the op id is still free");
 }

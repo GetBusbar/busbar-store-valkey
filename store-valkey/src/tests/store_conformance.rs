@@ -58,7 +58,7 @@ pub(super) mod conf {
     //!
     //! Usage, from a store plugin's own tests:
     //! ```ignore
-    //! use busbar_plugin_testkit::store_conformance as conf;
+    //! use crate::tests::store_conformance::conf;
     //!
     //! #[test]
     //! fn put_key_does_not_resurrect_a_tombstone() {
@@ -596,7 +596,7 @@ pub(super) mod conf {
     pub fn assert_plane_call_parents_enumerated(store: &dyn Store, ns: &str) {
         let p1 = format!("{ns}_prinA");
         let p2 = format!("{ns}_prinB");
-        // ts is a fixed sentinel far above any `ns_time_band` window the purge checks below can produce
+        // ts is a fixed sentinel far above any `ns_purge_window` window the purge checks below can produce
         // (max ~200_000_100), so a purge sweep run concurrently against the same shared database can
         // never reach these rows out from under this assertion.
         const PARENT_ENUM_TS: u64 = 500_000_000_000;

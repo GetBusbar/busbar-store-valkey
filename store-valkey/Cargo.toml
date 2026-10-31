@@ -5,7 +5,7 @@ version = "1.6.0"
 publish.workspace = true  # a first-party plugin crate; shipped linked into busbar or as a signed tarball
 edition.workspace = true
 rust-version.workspace = true
-description = "The Valkey backend for busbar's durable governance store — the shared, multi-node db plugin over a KV data model. Serves the store v3 door over the host's connector (no socket of its own): RESP2 over one connection per op."
+description = "The Valkey backend for busbar's durable governance store — the shared, multi-node db plugin over a KV data model. Serves the store v3 door over the host's connector (no socket of its own): RESP2 over up to eight kept connections, one per op in flight."
 license.workspace = true
 
 [lints]
@@ -31,10 +31,6 @@ serde_json = { workspace = true }
 serde = { workspace = true }
 # The upstream driver's URL reading (1.5.5 parsed the store's URL with it): pure parsing, no socket.
 url = { workspace = true }
-# The store's own diagnostics (a refusal whose text the ABI drops, a skipped corrupt row): the door's
-# trampoline captures every `tracing` event a slot raises into the plugin's own log
-# (`busbar_contract::abi::sdk::capture`).
-tracing = { workspace = true }
 
 [dev-dependencies]
 # The live tests open the store the way the host does: its door through the loader (`load_linked`,
