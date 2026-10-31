@@ -2845,38 +2845,118 @@ fn a_task_id_containing_the_key_separator_cannot_alias_another_tasks_chain() {
     reset_tasks(&store, &[victim, attacker, c1, c2]);
 }
 
-/// Every `u64` field of both rows round-trips at the FULL range, `u64::MAX` included: the body is
-/// opaque bytes, the sidecar is JSON, and ordering reads the exact `seq`.
+/// A `u64` a signed column cannot hold is refused before any write, naming the method and field.
+#[test]
+fn a_u64_a_signed_column_cannot_hold_is_refused() {
+    let Some(store) = live_store() else { return };
+    let big = i64::MAX as u64 + 1;
+    let kind = uid("k_unstorable");
+    let rec = |seq: u64, ts: u64| PlaneRecord {
+        kind: kind.clone(),
+        id: "r1".into(),
+        parent: Some("p1".into()),
+        seq,
+        ts,
+        disposition: PlaneDisposition::Active,
+        body: b"b".to_vec(),
+    };
+    for (field, r) in [("seq", rec(big, 1)), ("ts", rec(1, big))] {
+        let e = store.append_plane_record(r.view()).unwrap_err().to_string();
+        assert!(
+            e.contains(&format!(
+                "append_plane_record: {field} {big} exceeds the storable range"
+            )),
+            "{e}"
+        );
+        let e = store.upsert_plane_record(r.view()).unwrap_err().to_string();
+        assert!(
+            e.contains(&format!(
+                "upsert_plane_record: {field} {big} exceeds the storable range"
+            )),
+            "{e}"
+        );
+    }
+    assert!(store.get_plane_record(&kind, "r1").unwrap().is_none());
+    assert!(store
+        .list_plane_records(&kind, &PlaneSelector::All)
+        .unwrap()
+        .is_empty());
+
+    let mut m = MeteringDelta {
+        key_id: uid("vk_unstorable"),
+        bucket: unique_bucket(20260803),
+        model: "m".to_string(),
+        provider: "p".to_string(),
+        tokens_input: 1,
+        tokens_output: 0,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 1,
+        billable_requests: 0,
+        key_group_at_use: String::new(),
+        pricing_version: String::new(),
+        priced_from_ms: big,
+        usage_units: Default::default(),
+    };
+    let e = store.add_metering(&m).unwrap_err().to_string();
+    assert!(
+        e.contains(&format!(
+            "add_metering_batch: priced_from_ms {big} exceeds the storable range"
+        )),
+        "{e}"
+    );
+    m.priced_from_ms = 0;
+    assert!(store.list_metering(m.bucket).unwrap().is_empty());
+
+    let token = uid("tok_unstorable");
+    for (field, expires_at, now) in [("expires_at", big, 1), ("now", 1, big)] {
+        let e = store
+            .redeem_plane_token("ask", &token, expires_at, now)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains(&format!(
+                "redeem_plane_token: {field} {big} exceeds the storable range"
+            )),
+            "{e}"
+        );
+    }
+}
+
+/// Every `u64` field of both rows round-trips at the full range the sidecar can hold (`i64::MAX`;
+/// beyond it the write is refused, see `a_u64_a_signed_column_cannot_hold_is_refused`), `u64::MAX`
+/// in the opaque body included, and ordering reads the exact `seq`.
 #[test]
 fn the_task_store_round_trips_the_full_u64_range() {
     let Some(store) = live_store() else { return };
     let t = "t_vk_full_range";
     reset_tasks(&store, &[t]);
 
-    let mut task = sample_task(t, "working", u64::MAX);
+    const TOP: u64 = i64::MAX as u64;
+    let mut task = sample_task(t, "working", TOP);
     task.artifact_cursor = u64::MAX;
     task.created_at = u64::MAX;
     store.put_task(&task).unwrap();
     let got = store.get_task(t).unwrap().expect("the task must read back");
     assert_eq!(got.artifact_cursor, u64::MAX, "the cursor must not wrap");
-    assert_eq!(got.updated_at, u64::MAX);
+    assert_eq!(got.updated_at, TOP);
 
     let mut event = sample_event(t, 1, "task.submitted", "", "e1");
-    event.seq = u64::MAX;
-    event.ts = u64::MAX;
+    event.seq = TOP;
+    event.ts = TOP;
     store.append_task_event(&event).unwrap();
     // A second event one below: past 2^53 the ZSET score cannot tell them apart, the order must
     // still be exact.
     let mut before = sample_event(t, 1, "task.working", "", "e0");
-    before.seq = u64::MAX - 1;
-    before.ts = u64::MAX;
+    before.seq = TOP - 1;
+    before.ts = TOP;
     store.append_task_event(&before).unwrap();
     let events = store.list_task_events(t).unwrap();
     assert_eq!(
         events.iter().map(|e| e.seq).collect::<Vec<_>>(),
-        vec![u64::MAX - 1, u64::MAX]
+        vec![TOP - 1, TOP]
     );
-    assert_eq!(events[1].ts, u64::MAX);
+    assert_eq!(events[1].ts, TOP);
     reset_tasks(&store, &[t]);
 }
 
@@ -3163,14 +3243,14 @@ fn a_lapsed_approval_still_gets_a_truthful_answer_and_a_bounded_record() {
     reset_trust_state(&store, &[], &[&nonce]);
 }
 
-/// THE FULL u64 RANGE ROUND-TRIPS for the demotion record too.
+/// THE FULL STORABLE RANGE (up to `i64::MAX`) round-trips for the demotion record too.
 #[test]
-fn the_demotion_record_round_trips_the_full_u64_range() {
+fn the_demotion_record_round_trips_the_full_storable_range() {
     let store = require_live_store();
     let server = trust_ns("srv_range");
     reset_trust_state(&store, &[&server], &[]);
     store
-        .put_mcp_demotion(&demotion(&server, "tool-drift", u64::MAX))
+        .put_mcp_demotion(&demotion(&server, "tool-drift", i64::MAX as u64))
         .unwrap();
     assert_eq!(
         store
@@ -3180,7 +3260,7 @@ fn the_demotion_record_round_trips_the_full_u64_range() {
             .find(|r| r.server == server)
             .expect("the record must be there")
             .recorded_at,
-        u64::MAX
+        i64::MAX as u64
     );
     reset_trust_state(&store, &[&server], &[]);
 }
