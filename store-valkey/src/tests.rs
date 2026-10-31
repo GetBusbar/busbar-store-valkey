@@ -746,9 +746,22 @@ fn put_credential_rejects_a_live_slot_but_allows_reclaiming_a_revoked_one() {
     // Minting into the SAME live slot must fail loudly, not silently overwrite.
     let pub_0b = uid("AKIA_0B");
     let c0b = cred(&vk_id, &pub_0b, 0);
+    let e = store.put_credential(&c0b).unwrap_err().to_string();
+    assert_eq!(
+        e,
+        format!(
+            "put_credential: slot 0 for key '{vk_id}' kind 'sigv4' holds a live credential; \
+             revoke it first"
+        ),
+        "minting into a slot holding a LIVE credential must be rejected, in the family's words"
+    );
+    let e = store
+        .put_key_with_credential(&key, &c0b)
+        .unwrap_err()
+        .to_string();
     assert!(
-        store.put_credential(&c0b).is_err(),
-        "minting into a slot holding a LIVE credential must be rejected"
+        e.starts_with("put_key_with_credential: slot 0 for key "),
+        "the refusal names the calling method: {e}"
     );
 
     // Revoke it, then reclaiming the slot must succeed.
@@ -831,8 +844,10 @@ fn public_id_uniqueness_is_enforced_across_slots() {
         meta: c1,
         secret: "v1:plain:different".to_string(),
     };
-    assert!(
-        store.put_credential(&c1).is_err(),
+    let e = store.put_credential(&c1).unwrap_err().to_string();
+    assert_eq!(
+        e,
+        format!("put_credential: public_id '{public_id}' is already in use for kind 'sigv4'"),
         "UNIQUE(kind, public_id) must be enforced across different slots too"
     );
 }
@@ -879,6 +894,95 @@ fn revoke_credential_unknown_id_errors() {
     assert!(
         store.revoke_credential("cred_never_existed", "n/a").is_err(),
         "revoking an id that names no credential must error, distinct from re-revoking a revoked one"
+    );
+}
+
+/// A revoked credential id is never re-minted, in the family's words.
+#[test]
+fn a_revoked_credential_id_is_never_re_minted() {
+    let Some(store) = live_store() else { return };
+    let kid = uid("vk_remint");
+    let c = cred(&kid, &uid("AKIA_REMINT"), 0);
+    store.put_key_with_credential(&vk(&kid), &c).unwrap();
+    store.revoke_credential(&c.meta.id, "gone").unwrap();
+    let e = store.put_credential(&c).unwrap_err().to_string();
+    assert_eq!(
+        e,
+        format!(
+            "put_credential: credential '{}' is revoked; a revoked credential is never re-minted",
+            c.meta.id
+        )
+    );
+}
+
+/// `put_key_with_credential` refuses up front and writes nothing: a key that carries a tombstone,
+/// a stored tombstone at the id, a credential naming another key.
+#[test]
+fn put_key_with_credential_refuses_up_front_and_writes_nothing() {
+    let Some(store) = live_store() else { return };
+    let kid = uid("vk_mint_refused");
+    let c = cred(&kid, &uid("AKIA_MINT_REFUSED"), 0);
+    let mut dead = vk(&kid);
+    dead.deleted_at = Some(5);
+    let e = store.put_key_with_credential(&dead, &c).unwrap_err().to_string();
+    assert_eq!(
+        e,
+        format!(
+            "put_key_with_credential: key '{kid}' is tombstoned; a credential is never minted \
+             onto it"
+        )
+    );
+    assert!(store.get_key(&kid).unwrap().is_none(), "nothing written");
+
+    let other = cred(&uid("vk_somebody_else"), &uid("AKIA_MINT_OTHER"), 0);
+    let e = store
+        .put_key_with_credential(&vk(&kid), &other)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        e,
+        format!(
+            "put_key_with_credential: the credential names key '{}', not the key '{kid}' being \
+             minted with it",
+            other.meta.key_id
+        )
+    );
+    assert!(store.get_key(&kid).unwrap().is_none(), "nothing written");
+
+    store.put_key(&vk(&kid)).unwrap();
+    store.delete_key(&kid).unwrap();
+    let e = store
+        .put_key_with_credential(&vk(&kid), &c)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        e,
+        format!("put_key_with_credential: '{kid}' is tombstoned and its id is never reissued")
+    );
+}
+
+/// `put_credential`'s owner refusals, in the family's words.
+#[test]
+fn put_credential_owner_refusals_read_as_the_family_writes_them() {
+    let Some(store) = live_store() else { return };
+    let kid = uid("vk_owner_missing");
+    let c = cred(&kid, &uid("AKIA_OWNER"), 0);
+    let e = store.put_credential(&c).unwrap_err().to_string();
+    assert_eq!(
+        e,
+        format!(
+            "put_credential: key '{kid}' does not exist; a credential must hang off a real key"
+        )
+    );
+    store.put_key(&vk(&kid)).unwrap();
+    store.delete_key(&kid).unwrap();
+    let e = store.put_credential(&c).unwrap_err().to_string();
+    assert_eq!(
+        e,
+        format!(
+            "put_credential: key '{kid}' is tombstoned; its credentials were revoked with it and \
+             are never reissued"
+        )
     );
 }
 
@@ -5113,7 +5217,7 @@ fn re_putting_a_credential_id_with_different_content_is_refused() {
     let e = store.put_credential(&other).unwrap_err().to_string();
     assert!(
         e.contains(&format!(
-            "put_credential: credential {} already exists with different content",
+            "put_credential: credential '{}' already exists with different content",
             c0.meta.id
         )),
         "{e}"
