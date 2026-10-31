@@ -1534,10 +1534,13 @@ impl ValkeyStore {
             .collect();
         // The metadata view is the decoded row minus its secret: there is one decode path.
         let raws = self.get_all(c, &row_keys).await?;
-        raws.into_iter()
+        let mut metas = raws
+            .into_iter()
             .flatten()
             .map(|r| cred_from_json(&r).map(|c| c.meta))
-            .collect()
+            .collect::<RecordStoreResult<Vec<_>>>()?;
+        metas.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.slot.cmp(&b.slot)));
+        Ok(metas)
     }
 
     pub(crate) async fn revoke_credential(
