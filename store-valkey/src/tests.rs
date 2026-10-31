@@ -493,6 +493,36 @@ fn list_keys_since_only_returns_keys_past_the_watermark() {
     );
 }
 
+/// A row at revision 0 (never stamped) is returned by every delta, and `since = 0` returns every
+/// row: the delta is `revision > since OR revision = 0`, for keys and credentials alike.
+#[test]
+fn a_revision_zero_row_is_in_every_delta() {
+    let Some(store) = live_store() else { return };
+    let (kid, pubid) = (uid("vk_rev0"), uid("AKIA_REV0"));
+    let c = cred(&kid, &pubid, 0);
+    store.put_key_with_credential(&vk(&kid), &c).unwrap();
+    store
+        .with_conn(|conn| {
+            conn.zadd::<_, _, _, ()>(KEYS_BYREV, &kid, 0)?;
+            conn.zadd::<_, _, _, ()>(CREDS_BYREV, slot_pointer(&c.meta), 0)
+        })
+        .unwrap();
+    for since in [0, 1, u64::MAX / 2] {
+        assert!(
+            store.list_keys_since(since).unwrap().iter().any(|k| k.id == kid),
+            "key at revision 0 missing from the delta since {since}"
+        );
+        assert!(
+            store
+                .list_credentials_since(since)
+                .unwrap()
+                .iter()
+                .any(|x| x.meta.id == c.meta.id),
+            "credential at revision 0 missing from the delta since {since}"
+        );
+    }
+}
+
 #[test]
 fn list_keys_is_unfiltered_including_tombstones() {
     let Some(store) = live_store() else { return };
