@@ -5113,6 +5113,60 @@ fn a_refused_handshake_does_not_leave_a_connection_kept() {
     );
 }
 
+/// `list_metering` reads one snapshot: a write landing after it has read the bucket's row set is
+/// either wholly in the answer or wholly out of it (never a new count on a row set that predates it).
+#[test]
+fn list_metering_is_one_snapshot() {
+    let Some(direct) = live_store() else { return };
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let bucket = unique_bucket(20260802);
+    let delta = |model: &str, requests: u64| MeteringDelta {
+        key_id: uid("vk_snapshot"),
+        bucket,
+        model: model.to_string(),
+        provider: "p".to_string(),
+        tokens_input: 0,
+        tokens_output: 0,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests,
+        billable_requests: 0,
+        key_group_at_use: String::new(),
+        pricing_version: String::new(),
+        priced_from_ms: 0,
+        usage_units: Default::default(),
+    };
+    let mut a = delta("a", 1);
+    a.key_id = "vk_snapshot".to_string();
+    let mut b = delta("b", 5);
+    b.key_id = "vk_snapshot".to_string();
+    direct.add_metering(&a).unwrap();
+
+    let set = metering_set(bucket);
+    let gate = interleave::gate(&url, false, move |c| {
+        interleave::contains(c, set.as_bytes())
+    });
+    let store = ValkeyStore::connect(&gate.url).unwrap();
+    let reader = std::thread::spawn(move || store.list_metering(bucket));
+    gate.held
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the read is held after it asked for the bucket's rows");
+    direct.add_metering(&a).unwrap();
+    direct.add_metering(&b).unwrap();
+    gate.release.send(()).unwrap();
+    let mut rows: Vec<(String, u64)> = reader
+        .join()
+        .unwrap()
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.model, r.requests))
+        .collect();
+    rows.sort();
+    let before = vec![("a".to_string(), 1)];
+    let after = vec![("a".to_string(), 2), ("b".to_string(), 5)];
+    assert!(rows == before || rows == after, "a torn read: {rows:?}");
+}
+
 /// One op in flight must not block the next: the store keeps several connections, one per op.
 #[test]
 fn a_held_op_does_not_block_a_second_op_on_the_same_store() {
