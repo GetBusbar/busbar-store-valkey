@@ -869,9 +869,6 @@ impl Pipeline {
         /// `HSET key field value`.
         hset(k: K, f: F, v: V) => "HSET");
     pipe_cmd!(
-        /// `HGETALL`.
-        hgetall(k: K) => "HGETALL");
-    pipe_cmd!(
         /// `TTL`.
         ttl(k: K) => "TTL");
 
