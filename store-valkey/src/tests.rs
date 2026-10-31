@@ -882,6 +882,27 @@ fn revoke_credential_unknown_id_errors() {
     );
 }
 
+/// A credential id is unique across slots: re-putting an existing id into another slot is refused
+/// and writes nothing.
+#[test]
+fn a_credential_id_cannot_be_put_into_a_second_slot() {
+    let Some(store) = live_store() else { return };
+    let kid = uid("vk_id_twice");
+    let c0 = cred(&kid, &uid("AKIA_TWICE_A"), 0);
+    store.put_key_with_credential(&vk(&kid), &c0).unwrap();
+    let mut c1 = cred(&kid, &uid("AKIA_TWICE_B"), 1);
+    c1.meta.id = c0.meta.id.clone();
+    let e = store.put_credential(&c1).unwrap_err().to_string();
+    assert!(
+        e.contains(&format!(
+            "put_credential: credential '{}' already exists in another slot",
+            c0.meta.id
+        )),
+        "{e}"
+    );
+    assert_eq!(store.list_credentials(&kid).unwrap().len(), 1);
+}
+
 /// `list_credentials` answers in `(kind, slot)` order, not the index set's order.
 #[test]
 fn list_credentials_is_ordered_by_kind_then_slot() {
