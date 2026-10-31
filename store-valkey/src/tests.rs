@@ -1885,57 +1885,36 @@ mod conformance {
     }
 }
 
-/// One undecodable credential row must not break the hydration delta for EVERY key.
-///
-/// `list_credentials_since` is a global scan of every credential in the store, so propagating a
-/// decode failure meant a single corrupt row made the engine hydrate NO credentials at all — a
-/// store-wide authentication outage caused by one bad row. Skipping it degrades that to exactly one
-/// credential missing, and skipping is the fail-CLOSED direction: a row that cannot be decoded
-/// cannot authenticate anyone, so omitting it denies access rather than granting it.
-///
-/// Found because a sibling test plants a corrupt row on purpose and this suite shares one live
-/// instance, so the failure surfaced as an unrelated test flaking roughly half the time.
+/// An undecodable credential row FAILS the hydration delta, naming the row's key and never echoing
+/// its value: skipping it silently would leave a credential missing with nothing said. The corrupt
+/// row is planted in a database of its own, since the delta is a global scan.
 #[test]
-fn one_corrupt_credential_row_does_not_break_the_whole_hydration_delta() {
-    let Some(store) = live_store() else { return };
-
-    // A healthy credential that MUST still come back.
-    let good_key = uid("vk_delta_good");
-    let good_pub = uid("AKIA_DELTA_GOOD");
-    let good = cred(&good_key, &good_pub, 0);
+fn a_corrupt_credential_row_fails_the_delta_naming_its_key() {
+    let Some(_) = live_store() else { return };
+    let mut up = fresh_db_client(CORRUPT_ROW_DB);
+    let store = ValkeyStore::connect(&url_for_db(CORRUPT_ROW_DB)).expect("connect");
+    let key_id = uid("vk_delta_bad");
     store
-        .put_key_with_credential(&vk(&good_key), &good)
+        .put_key_with_credential(&vk(&key_id), &cred(&key_id, &uid("AKIA_DELTA_BAD"), 0))
+        .unwrap();
+    let row = cred_row_key(&key_id, "sigv4", 0);
+    redis::cmd("SET")
+        .arg(&row)
+        .arg("CANARY-not-json")
+        .query::<()>(&mut up)
         .unwrap();
 
-    // A corrupt one, left INDEXED so the scan actually reaches it — that is the whole point.
-    let bad_key = uid("vk_delta_bad");
-    let bad_pub = uid("AKIA_DELTA_BAD");
-    store
-        .put_key_with_credential(&vk(&bad_key), &cred(&bad_key, &bad_pub, 0))
-        .unwrap();
-    store
-        .with_conn(|conn| conn.set::<_, _, ()>(cred_row_key(&bad_key, "sigv4", 0), "not json"))
-        .unwrap();
-
-    let delta = store
+    let e = store
         .list_credentials_since(0)
-        .expect("one undecodable row must not fail the entire delta");
-    assert!(
-        delta.iter().any(|c| c.meta.public_id == good_pub),
-        "the healthy credential must still hydrate"
-    );
-    assert!(
-        !delta.iter().any(|c| c.meta.public_id == bad_pub),
-        "the corrupt credential must be absent, not partially decoded"
-    );
-
-    // Leave nothing behind for the other tests sharing this instance.
-    store
-        .with_conn(|conn| conn.del::<_, ()>(cred_row_key(&bad_key, "sigv4", 0)))
-        .unwrap();
-    let _ = store.purge_key_for_test(&bad_key);
-    let _ = store.purge_key_for_test(&good_key);
+        .expect_err("one undecodable row fails the delta")
+        .to_string();
+    assert!(e.contains(&row), "names the row's key: {e}");
+    assert!(!e.contains("CANARY"), "never echoes the value: {e}");
+    redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
 }
+
+/// The database the corrupt-row test owns.
+const CORRUPT_ROW_DB: u32 = 7;
 
 /// A refused transaction must not silently swallow the NEXT write on the same connection.
 ///
