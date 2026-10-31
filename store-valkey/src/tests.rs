@@ -5941,3 +5941,200 @@ fn usage_cleanup_preserves_full_width_boundaries_billing_and_other_namespaces() 
     );
     redis::cmd("FLUSHDB").query::<()>(&mut raw).unwrap();
 }
+
+struct UsageServerResult {
+    commands: Vec<Vec<String>>,
+    applied: Vec<String>,
+}
+
+fn usage_scan_server(
+    lose_delete_reply: bool,
+) -> (String, std::thread::JoinHandle<UsageServerResult>) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("redis://{}/0", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut parser = redis::Parser::new();
+        let mut commands = Vec::new();
+        let mut applied = Vec::new();
+        let mut live_keys = std::collections::HashSet::from([
+            "busbar:usage:first:9".to_owned(),
+            "busbar:usage:third:7".to_owned(),
+        ]);
+        let (mut pages, mut deletions) = (0, 0);
+        loop {
+            let value = match parser.parse_value(&mut stream) {
+                Ok(value) => value,
+                Err(_) => return UsageServerResult { commands, applied },
+            };
+            let redis::Value::Array(fields) = value else {
+                panic!("a command is an array")
+            };
+            let fields: Vec<String> = fields
+                .into_iter()
+                .map(|field| match field {
+                    redis::Value::BulkString(bytes) => String::from_utf8(bytes).unwrap(),
+                    redis::Value::SimpleString(value) => value,
+                    other => panic!("a command field is text: {other:?}"),
+                })
+                .collect();
+            let command = fields[0].as_str();
+            let response = match command {
+                "GET" => {
+                    assert_eq!(fields[1], SCHEMA_KEY);
+                    format!(
+                        "${}\r\n{}\r\n",
+                        SCHEMA_VERSION.to_string().len(),
+                        SCHEMA_VERSION
+                    )
+                    .into_bytes()
+                }
+                "CONFIG" => b"*2\r\n$16\r\nmaxmemory-policy\r\n$10\r\nnoeviction\r\n".to_vec(),
+                "AUTH" | "SELECT" => b"+OK\r\n".to_vec(),
+                "PING" => b"+PONG\r\n".to_vec(),
+                "SCAN" => {
+                    let (cursor, keys): (&str, &[&str]) = match pages {
+                        0 => {
+                            assert_eq!(fields[1], "0");
+                            ("7", &[])
+                        }
+                        1 => {
+                            assert_eq!(fields[1], "7");
+                            (
+                                "9",
+                                &[
+                                    "busbar:usage:first:9",
+                                    "busbar:usage:first:9",
+                                    "busbar:usage:tenant:second:8",
+                                    "busbar:usage:first:0",
+                                    "busbar:usage:first:10",
+                                    "busbar:usage:first:+9",
+                                ],
+                            )
+                        }
+                        2 => {
+                            assert_eq!(fields[1], "9");
+                            ("0", &["busbar:usage:first:9", "busbar:usage:third:7"])
+                        }
+                        _ => panic!("the scan ended"),
+                    };
+                    pages += 1;
+                    let mut response =
+                        format!("*2\r\n${}\r\n{cursor}\r\n*{}\r\n", cursor.len(), keys.len())
+                            .into_bytes();
+                    for key in keys {
+                        response
+                            .extend_from_slice(format!("${}\r\n{key}\r\n", key.len()).as_bytes());
+                    }
+                    commands.push(fields.clone());
+                    response
+                }
+                "DEL" => {
+                    commands.push(fields.clone());
+                    deletions += 1;
+                    let before = applied.len();
+                    for key in &fields[1..] {
+                        if live_keys.remove(key) {
+                            applied.push(key.clone());
+                        }
+                    }
+                    let removed = applied.len() - before;
+                    if lose_delete_reply {
+                        stream.shutdown(std::net::Shutdown::Both).unwrap();
+                        return UsageServerResult { commands, applied };
+                    }
+                    format!(":{removed}\r\n").into_bytes()
+                }
+                other => panic!("unexpected command: {other}"),
+            };
+            stream.write_all(&response).unwrap();
+            if deletions == 2 {
+                return UsageServerResult { commands, applied };
+            }
+        }
+    });
+    (url, server)
+}
+
+#[test]
+fn usage_cleanup_continues_empty_scan_pages_deduplicates_and_counts_delete_replies() {
+    use busbar_contract::store_calls::StoreCalls;
+    let (url, server) = usage_scan_server(false);
+    let (store, _) = open_on(&settings_for(&url), plain);
+    let store = store.unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let removed = runtime.block_on(StoreCalls::purge_usage_before(&store, 10));
+    let UsageServerResult { commands, applied } = server.join().unwrap();
+    assert_eq!(
+        removed.unwrap(),
+        2,
+        "count actual DEL replies, not discovered keys"
+    );
+    assert_eq!(applied, ["busbar:usage:first:9", "busbar:usage:third:7"]);
+    let scans: Vec<_> = commands
+        .iter()
+        .filter(|c| c[0] == "SCAN")
+        .map(|c| c[1].as_str())
+        .collect();
+    assert_eq!(
+        scans,
+        ["0", "7", "9"],
+        "an empty nonterminal page must continue"
+    );
+    let deleted: Vec<_> = commands
+        .iter()
+        .filter(|c| c[0] == "DEL")
+        .map(|c| c[1..].to_vec())
+        .collect();
+    assert_eq!(
+        deleted,
+        [
+            vec![
+                "busbar:usage:first:9".to_owned(),
+                "busbar:usage:tenant:second:8".to_owned()
+            ],
+            vec!["busbar:usage:third:7".to_owned()],
+        ],
+        "duplicates, zero, equality and malformed keys must not be deleted"
+    );
+}
+
+#[test]
+fn usage_cleanup_never_reconnects_and_replays_a_delete_whose_reply_was_lost() {
+    use busbar_contract::store_calls::StoreCalls;
+    let (url, server) = usage_scan_server(true);
+    let (store, table) = open_on(&settings_for(&url), plain);
+    let store = store.unwrap();
+    let dials = table.dial_timeouts().len();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let removed = runtime.block_on(StoreCalls::purge_usage_before(&store, 10));
+    let UsageServerResult { commands, applied } = server.join().unwrap();
+    assert!(
+        removed.is_err(),
+        "an applied delete with a lost reply must fail without a false count"
+    );
+    assert_eq!(
+        applied,
+        ["busbar:usage:first:9"],
+        "the backend deleted before dropping its reply"
+    );
+    assert_eq!(commands.iter().filter(|c| c[0] == "DEL").count(), 1);
+    assert_eq!(
+        table.dial_timeouts().len(),
+        dials,
+        "no reconnect/replay after the ambiguous delete"
+    );
+}
