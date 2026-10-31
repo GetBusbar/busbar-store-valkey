@@ -869,11 +869,15 @@ impl ValkeyStore {
         with_conn!(self, |c| c.scan_match(pattern).await)
     }
 
+    /// `e` as the store's error: a refusal as written, anything else a backend failure under
+    /// `valkey {ctx}: `.
     fn err(&self, e: RedisError, ctx: &str) -> RecordStoreError {
-        RecordStoreError(scrub(
-            format!("valkey {ctx}: {e}"),
-            self.inner.secret.as_deref(),
-        ))
+        let text = if e.is_refusal() {
+            e.to_string()
+        } else {
+            format!("valkey {ctx}: {e}")
+        };
+        RecordStoreError(scrub(text, self.inner.secret.as_deref()))
     }
 
     /// Reserve `n` consecutive revisions and return the first. Called inside a `transaction!` that
@@ -891,22 +895,22 @@ impl ValkeyStore {
 /// `put_credential`'s owner precondition, read inside its WATCHed transaction: the key row named by
 /// `key_id` must exist and must not be tombstoned. An unparseable owner row is refused too — a
 /// credential cannot be attached to a key whose liveness cannot be established.
-async fn owner_is_live(c: &mut Conn, key_row: &str, key_id: &str) -> RedisResult<()> {
+async fn owner_is_live(c: &mut Conn, key_row: &str, key_id: &str, op: &str) -> RedisResult<()> {
     let raw: Option<String> = c.get(key_row).await?;
     let refuse = |why: String| Err(RedisError::refused(why));
     let Some(raw) = raw else {
         return refuse(format!(
-            "put_credential: key '{key_id}' does not exist; a credential must hang off a real key"
+            "{op}: key '{key_id}' does not exist; a credential must hang off a real key"
         ));
     };
     match key_from_json(&raw) {
         Ok(k) if k.deleted_at.is_none() => Ok(()),
         Ok(_) => refuse(format!(
-            "put_credential: key '{key_id}' is tombstoned; its credentials were revoked with it \
+            "{op}: key '{key_id}' is tombstoned; its credentials were revoked with it \
              and are never reissued"
         )),
         Err(_) => refuse(format!(
-            "put_credential: key '{key_id}' does not decode; refusing to attach a credential to it"
+            "{op}: key '{key_id}' does not decode; refusing to attach a credential to it"
         )),
     }
 }
@@ -921,6 +925,10 @@ async fn tombstoned(c: &mut Conn, row: &str) -> RedisResult<bool> {
         .is_some_and(|k| k.deleted_at.is_some()))
 }
 
+/// The credential mints' names, in the refusals that name the calling method.
+const OP_PUT_CREDENTIAL: &str = "put_credential";
+const OP_PUT_KEY_WITH_CREDENTIAL: &str = "put_key_with_credential";
+
 /// What a credential slot allows a mint of `secret`, read inside the WATCHed transaction.
 enum Slot {
     /// The slot already holds THIS credential, live: a reconnect-and-retry replaying an `EXEC` that
@@ -932,54 +940,56 @@ enum Slot {
 
 /// The slot checks of a credential mint (`op` names the refusals): a DIFFERENT live credential in
 /// the slot is refused (never silently destroyed mid-overlap), a revoked one is never re-minted
-/// under its own id, and `UNIQUE(kind, public_id)` is a real read of the pointer (a `SETNX` queued
-/// in an `.ignore()`d pipe would discard the "already claimed" answer).
+/// under its own id, a credential id lives in one slot, and `UNIQUE(kind, public_id)` is a real
+/// read of the pointer (a `SETNX` queued in an `.ignore()`d pipe would discard the "already
+/// claimed" answer).
 async fn read_slot(c: &mut Conn, secret: &CredentialSecret, op: &str) -> RedisResult<Slot> {
     let m = &secret.meta;
-    let solo = op == "put_credential";
-    let existing: Option<String> = c.get(cred_row_key(&m.key_id, &m.kind, m.slot)).await?;
+    let row_key = cred_row_key(&m.key_id, &m.kind, m.slot);
+    let existing: Option<String> = c.get(&row_key).await?;
     let mut prior = None;
     if let Some(raw) = &existing {
-        let cur: CredentialSecret = serde_json::from_str(raw)
-            .map_err(|_| RedisError::from((ErrorKind::Client, "cred decode")))?;
+        let cur: CredentialSecret = serde_json::from_str(raw).map_err(|_| {
+            RedisError::from((ErrorKind::Client, "credential row does not decode", row_key))
+        })?;
         if cur.meta.revoked_at.is_none() {
             if cur.meta.id == m.id {
                 let mut same = cur;
                 same.meta.revision = m.revision;
                 if same != *secret {
                     return Err(RedisError::refused(format!(
-                        "{op}: credential {} already exists with different content",
+                        "{op}: credential '{}' already exists with different content",
                         m.id
                     )));
                 }
                 return Ok(Slot::Replay);
             }
-            return Err(RedisError::from((
-                ErrorKind::Client,
-                if solo {
-                    "put_credential: slot holds a live credential; revoke it first"
-                } else {
-                    "put_key_with_credential: slot holds a live credential; revoke it first"
-                },
+            return Err(RedisError::refused(format!(
+                "{op}: slot {} for key '{}' kind '{}' holds a live credential; revoke it first",
+                m.slot, m.key_id, m.kind
             )));
         }
         if cur.meta.id == m.id {
             return Err(RedisError::refused(format!(
-                "{op}: credential {} is revoked; a revoked credential is never re-minted",
+                "{op}: credential '{}' is revoked; a revoked credential is never re-minted",
                 m.id
             )));
         }
         prior = Some((cur.meta.public_id, cur.meta.id));
     }
+    let ptr = slot_pointer(m);
+    let id_holder: Option<String> = c.get(cred_id_key(&m.id)).await?;
+    if id_holder.is_some_and(|h| h != ptr) {
+        return Err(RedisError::refused(format!(
+            "{op}: credential '{}' already exists in another slot",
+            m.id
+        )));
+    }
     let holder: Option<String> = c.get(cred_pub_key(&m.kind, &m.public_id)).await?;
-    if holder.is_some_and(|h| h != slot_pointer(m)) {
-        return Err(RedisError::from((
-            ErrorKind::Client,
-            if solo {
-                "put_credential: public_id already claimed by a different credential"
-            } else {
-                "put_key_with_credential: public_id already claimed"
-            },
+    if holder.is_some_and(|h| h != ptr) {
+        return Err(RedisError::refused(format!(
+            "{op}: public_id '{}' is already in use for kind '{}'",
+            m.public_id, m.kind
         )));
     }
     Ok(Slot::Free(prior))
@@ -1438,18 +1448,20 @@ impl ValkeyStore {
         let row_key = cred_row_key(&m.key_id, &m.kind, m.slot);
         let pub_key = cred_pub_key(&m.kind, &m.public_id);
         let key_row = format!("{KEY_PREFIX}{}", m.key_id);
+        let id_key = cred_id_key(&m.id);
         with_conn!(self, |c| {
             // WATCHed: the owning key's row (a `delete_key` in between must abort this, never slip
-            // under it), the slot's row and the public id pointer.
+            // under it), the slot's row, the public id and credential id pointers.
             let watched = [
                 row_key.as_str(),
                 pub_key.as_str(),
+                id_key.as_str(),
                 key_row.as_str(),
                 REVISION_KEY,
             ];
             transaction!(c, &watched, |c, pipe| {
-                owner_is_live(c, &key_row, &m.key_id).await?;
-                let prior = match read_slot(c, secret, "put_credential").await? {
+                owner_is_live(c, &key_row, &m.key_id, OP_PUT_CREDENTIAL).await?;
+                let prior = match read_slot(c, secret, OP_PUT_CREDENTIAL).await? {
                     Slot::Replay => return pipe.atomic().query(c).await,
                     Slot::Free(prior) => prior,
                 };
@@ -1468,10 +1480,17 @@ impl ValkeyStore {
         key: &VirtualKey,
         secret: &CredentialSecret,
     ) -> RecordStoreResult<()> {
+        if key.deleted_at.is_some() {
+            return Err(RecordStoreError(format!(
+                "{OP_PUT_KEY_WITH_CREDENTIAL}: key '{}' is tombstoned; a credential is never \
+                 minted onto it",
+                key.id
+            )));
+        }
         if secret.meta.key_id != key.id {
             return Err(RecordStoreError(format!(
-                "put_key_with_credential: the credential names key '{}', not the key '{}' being \
-                 minted with it",
+                "{OP_PUT_KEY_WITH_CREDENTIAL}: the credential names key '{}', not the key '{}' \
+                 being minted with it",
                 secret.meta.key_id, key.id
             )));
         }
@@ -1481,6 +1500,7 @@ impl ValkeyStore {
         let key_row = format!("{KEY_PREFIX}{}", key.id);
         let row_key = cred_row_key(&m.key_id, &m.kind, m.slot);
         let pub_key = cred_pub_key(&m.kind, &m.public_id);
+        let id_key = cred_id_key(&m.id);
         with_conn!(self, |c| {
             transaction!(
                 c,
@@ -1488,17 +1508,18 @@ impl ValkeyStore {
                     key_row.as_str(),
                     row_key.as_str(),
                     pub_key.as_str(),
+                    id_key.as_str(),
                     REVISION_KEY
                 ],
                 |c, pipe| {
-                    if key.deleted_at.is_none() && tombstoned(c, &key_row).await? {
+                    if tombstoned(c, &key_row).await? {
                         return Err(RedisError::refused(format!(
-                            "put_key_with_credential: '{}' is tombstoned and its id is \
-                                 never reissued",
+                            "{OP_PUT_KEY_WITH_CREDENTIAL}: '{}' is tombstoned and its id is \
+                             never reissued",
                             key.id
                         )));
                     }
-                    let prior = match read_slot(c, secret, "put_key_with_credential").await? {
+                    let prior = match read_slot(c, secret, OP_PUT_KEY_WITH_CREDENTIAL).await? {
                         Slot::Replay => return pipe.atomic().query(c).await,
                         Slot::Free(prior) => prior,
                     };
