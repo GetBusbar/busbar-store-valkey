@@ -45,7 +45,7 @@ use busbar_contract::abi::sdk::store::column::{clamp, read_u64};
 use busbar_contract::abi::sdk::store::wire::{Pool, Wire};
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringRow, ModelTokens, RecordStoreError,
-    RecordStoreResult, UsageDelta, UsageLedger, VirtualKey, RESERVED_UNITS,
+    RecordStoreResult, SecretForm, UsageDelta, UsageLedger, VirtualKey, RESERVED_UNITS,
 };
 use resp::{cmd, pipe, Conn, ErrorKind, Pipeline, RedisError, RedisResult, Script};
 use std::sync::Arc;
@@ -125,9 +125,10 @@ const REVISION_KEY: &str = "busbar:revision";
 /// The schema marker. v6 is the oldest namespace migrated in place (older is REFUSED, never wiped);
 /// v7 copied the v6 typed task / event / demotion / spent-approval keys into the plane
 /// keyspace ([`legacy`]); v8 never shipped; v9 deleted the keys of the dropped money, journal and
-/// session slots ([`ValkeyStore::drop_dead_slot_keys`]). A NEWER marker is refused.
+/// session slots ([`ValkeyStore::drop_dead_slot_keys`]); v10 scrubs retained revoked credentials.
+/// A NEWER marker is refused.
 const SCHEMA_KEY: &str = "busbar:schema";
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 /// The slots whose `busbar:op:*` dedupe hashes survive the v9 upgrade.
 const KEPT_OP_SLOTS: [&str; 3] = [
     "add_usage_batch",
@@ -725,11 +726,12 @@ impl ValkeyStore {
         }
     }
 
-    /// SCHEMA MIGRATION (currently v9; see `SCHEMA_VERSION`'s own doc for what each version did).
+    /// SCHEMA MIGRATION (see `SCHEMA_VERSION` for what each version did).
     /// A fresh namespace (no `busbar:*` keys) is simply marked; one already
     /// at the current version passes through untouched; one NEWER than this build is refused; a v6
     /// namespace is upgraded IN PLACE ([`legacy::migrate_v6_to_v7`]) and a v6 or v7 one then gets
-    /// the v9 step ([`ValkeyStore::drop_dead_slot_keys`]), each idempotent, the marker written last
+    /// the v9 step ([`ValkeyStore::drop_dead_slot_keys`]); v10 scrubs revoked credentials.
+    /// Each step is idempotent, the marker written last
     /// so a crash mid-upgrade re-runs it on the next connect.
     ///
     /// NOTHING IS EVER WIPED. A namespace with `busbar:*` keys whose marker is absent or older than
@@ -758,7 +760,10 @@ impl ValkeyStore {
                 if version < 7 {
                     legacy::migrate_v6_to_v7(self, c).await?;
                 }
-                self.drop_dead_slot_keys(c).await?;
+                if version < 9 {
+                    self.drop_dead_slot_keys(c).await?;
+                }
+                self.scrub_revoked_credentials(c).await?;
                 return with_conn!(self, |c| c
                     .set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION)
                     .await);
@@ -815,7 +820,7 @@ impl ValkeyStore {
         }
     }
 
-    /// THE v9 STEP (`SCHEMA_VERSION`): delete what the deleted slots kept. The key families go
+    /// THE v9 STEP: delete what the deleted slots kept. The key families go
     /// by `SCAN` + `UNLINK` (never `KEYS`, never a blocking `DEL`), once, at the upgrade: the
     /// money keys (`busbar:cap:*`, `busbar:slice:*`, `busbar:open:*`, `busbar:slices`,
     /// `busbar:epoch`), the journal (`busbar:journal:*`, its `streams` set included) and the
@@ -858,6 +863,42 @@ impl ValkeyStore {
             }
         }
         self.unlink_all(c, &dead).await
+    }
+
+    async fn scrub_revoked_credentials(&self, c: &mut Conn) -> RecordStoreResult<()> {
+        let members: Vec<String> = with_conn!(self, |c| c.zrange(CREDS_BYREV, 0, -1).await)?;
+        for ptr in members {
+            let (key_id, kind, slot) = parse_slot_pointer(&ptr).ok_or_else(|| {
+                RecordStoreError("credential upgrade: malformed revision-index pointer".into())
+            })?;
+            let row_key = cred_row_key(&key_id, &kind, slot);
+            let watched = [row_key.as_str(), REVISION_KEY];
+            with_conn!(self, |c| transaction!(c, &watched, |c, pipe| {
+                let raw: Option<String> = c.get(&row_key).await?;
+                let Some(raw) = raw else {
+                    return Ok(Some(()));
+                };
+                let mut cred: CredentialSecret = serde_json::from_str(&raw)
+                    .map_err(|_| RedisError::refused("credential upgrade: malformed credential"))?;
+                if slot_pointer(&cred.meta) != ptr {
+                    return Err(RedisError::refused("credential upgrade: mismatched slot"));
+                }
+                if cred.meta.revoked_at.is_none()
+                    || (cred.secret.is_empty() && cred.meta.secret_form == SecretForm::None)
+                {
+                    return Ok(Some(()));
+                }
+                cred.secret.clear();
+                cred.meta.secret_form = SecretForm::None;
+                cred.meta.revision = self.next_revision(c, pipe, 1).await?;
+                let json = cred_to_json(&cred)
+                    .map_err(|_| RedisError::refused("credential upgrade: encode failed"))?;
+                pipe.set(&row_key, &json).ignore();
+                pipe.zadd(CREDS_BYREV, &ptr, cred.meta.revision).ignore();
+                pipe.query(c).await
+            }))?;
+        }
+        Ok(())
     }
 
     /// `UNLINK` `keys`, a chunk at a time.
@@ -1645,6 +1686,7 @@ impl ValkeyStore {
                 // Destroy the secret material on revoke — defense in depth: a revoked credential's
                 // plaintext has no further legitimate reader, so there is no reason to retain it.
                 cred.secret = String::new();
+                cred.meta.secret_form = SecretForm::None;
                 let json = cred_to_json(&cred)
                     .map_err(|_| RedisError::from((ErrorKind::Client, "cred encode")))?;
                 pipe.set(&row_key, &json).ignore();
