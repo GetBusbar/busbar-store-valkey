@@ -750,7 +750,7 @@ fn put_credential_rejects_a_live_slot_but_allows_reclaiming_a_revoked_one() {
     // Minting into the SAME live slot must fail loudly, not silently overwrite.
     let pub_0b = uid("AKIA_0B");
     let c0b = cred(&vk_id, &pub_0b, 0);
-    let e = store.put_credential(&c0b).unwrap_err().to_string();
+    let e = store.put_credential(&c0b).unwrap_err().0;
     assert_eq!(
         e,
         format!(
@@ -759,10 +759,7 @@ fn put_credential_rejects_a_live_slot_but_allows_reclaiming_a_revoked_one() {
         ),
         "minting into a slot holding a LIVE credential must be rejected, in the family's words"
     );
-    let e = store
-        .put_key_with_credential(&key, &c0b)
-        .unwrap_err()
-        .to_string();
+    let e = store.put_key_with_credential(&key, &c0b).unwrap_err().0;
     assert!(
         e.starts_with("put_key_with_credential: slot 0 for key "),
         "the refusal names the calling method: {e}"
@@ -848,7 +845,7 @@ fn public_id_uniqueness_is_enforced_across_slots() {
         meta: c1,
         secret: "v1:plain:different".to_string(),
     };
-    let e = store.put_credential(&c1).unwrap_err().to_string();
+    let e = store.put_credential(&c1).unwrap_err().0;
     assert_eq!(
         e,
         format!("put_credential: public_id '{public_id}' is already in use for kind 'sigv4'"),
@@ -909,7 +906,7 @@ fn a_revoked_credential_id_is_never_re_minted() {
     let c = cred(&kid, &uid("AKIA_REMINT"), 0);
     store.put_key_with_credential(&vk(&kid), &c).unwrap();
     store.revoke_credential(&c.meta.id, "gone").unwrap();
-    let e = store.put_credential(&c).unwrap_err().to_string();
+    let e = store.put_credential(&c).unwrap_err().0;
     assert_eq!(
         e,
         format!(
@@ -928,10 +925,7 @@ fn put_key_with_credential_refuses_up_front_and_writes_nothing() {
     let c = cred(&kid, &uid("AKIA_MINT_REFUSED"), 0);
     let mut dead = vk(&kid);
     dead.deleted_at = Some(5);
-    let e = store
-        .put_key_with_credential(&dead, &c)
-        .unwrap_err()
-        .to_string();
+    let e = store.put_key_with_credential(&dead, &c).unwrap_err().0;
     assert_eq!(
         e,
         format!(
@@ -945,7 +939,7 @@ fn put_key_with_credential_refuses_up_front_and_writes_nothing() {
     let e = store
         .put_key_with_credential(&vk(&kid), &other)
         .unwrap_err()
-        .to_string();
+        .0;
     assert_eq!(
         e,
         format!(
@@ -958,10 +952,7 @@ fn put_key_with_credential_refuses_up_front_and_writes_nothing() {
 
     store.put_key(&vk(&kid)).unwrap();
     store.delete_key(&kid).unwrap();
-    let e = store
-        .put_key_with_credential(&vk(&kid), &c)
-        .unwrap_err()
-        .to_string();
+    let e = store.put_key_with_credential(&vk(&kid), &c).unwrap_err().0;
     assert_eq!(
         e,
         format!("put_key_with_credential: '{kid}' is tombstoned and its id is never reissued")
@@ -974,7 +965,7 @@ fn put_credential_owner_refusals_read_as_the_family_writes_them() {
     let Some(store) = live_store() else { return };
     let kid = uid("vk_owner_missing");
     let c = cred(&kid, &uid("AKIA_OWNER"), 0);
-    let e = store.put_credential(&c).unwrap_err().to_string();
+    let e = store.put_credential(&c).unwrap_err().0;
     assert_eq!(
         e,
         format!(
@@ -983,7 +974,7 @@ fn put_credential_owner_refusals_read_as_the_family_writes_them() {
     );
     store.put_key(&vk(&kid)).unwrap();
     store.delete_key(&kid).unwrap();
-    let e = store.put_credential(&c).unwrap_err().to_string();
+    let e = store.put_credential(&c).unwrap_err().0;
     assert_eq!(
         e,
         format!(
@@ -1050,11 +1041,11 @@ fn store_refusals_reach_the_caller_exactly_as_written() {
     let Some(store) = live_store() else { return };
     let id = uid("vk_nowhere");
     assert_eq!(
-        store.delete_key(&id).unwrap_err().to_string(),
+        store.delete_key(&id).unwrap_err().0,
         format!("delete_key: unknown id '{id}'")
     );
     assert_eq!(
-        store.revoke_credential(&id, "n/a").unwrap_err().to_string(),
+        store.revoke_credential(&id, "n/a").unwrap_err().0,
         format!("revoke_credential: unknown id '{id}'")
     );
 }
@@ -4203,7 +4194,7 @@ fn connect_timeout_ms_is_the_dial_timeout() {
     assert_eq!(
         store.expect_err("a zero timeout refuses the load"),
         "plugin 'busbar-store-valkey' open failed: invalid valkey plugin config: \
-         `connect_timeout_ms` must be a positive integer (milliseconds), got 0"
+         `connect_timeout_ms` must be a positive integer (milliseconds), got a number"
     );
 }
 
