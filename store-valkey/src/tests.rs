@@ -327,12 +327,10 @@ fn unix_socket_urls_parse_as_the_upstream_driver_read_them() {
 }
 
 #[test]
-fn glob_escaping_covers_every_metacharacter() {
-    assert_eq!(escape("*", GLOB), "\\*");
-    assert_eq!(escape("a?b", GLOB), "a\\?b");
-    assert_eq!(escape("[x]", GLOB), "\\[x\\]");
-    assert_eq!(escape("back\\slash", GLOB), "back\\\\slash");
-    assert_eq!(escape("plain-id-123", GLOB), "plain-id-123");
+fn row_escaping_quotes_the_separator_and_itself() {
+    assert_eq!(escape("a|b", ROW_SEP), "a\\|b");
+    assert_eq!(escape("back\\slash", ROW_SEP), "back\\\\slash");
+    assert_eq!(escape("plain-id-123", ROW_SEP), "plain-id-123");
 }
 
 /// End-to-end against a REAL Valkey, gated on `VALKEY_URL` (a docker service in CI). Skips
