@@ -167,8 +167,7 @@ fn cred_id_key(cred_id: &str) -> String {
 }
 
 /// `s` with a `\\` before every character of `special` (which holds `\\` itself, so the escape
-/// round-trips). Glob metacharacters for a `SCAN MATCH` that must match LITERALLY (else an id could
-/// match other ids' keys); `|` for a metering row's joined identity (else two identities collide).
+/// round-trips): `|` for a metering row's joined identity (else two identities collide).
 fn escape(s: &str, special: &[char]) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -180,8 +179,6 @@ fn escape(s: &str, special: &[char]) -> String {
     out
 }
 
-/// The glob metacharacters [`escape`] quotes in a `SCAN MATCH` pattern.
-const GLOB: &[char] = &['*', '?', '[', ']', '\\'];
 /// The characters [`escape`] quotes in a metering row's identity component.
 const ROW_SEP: &[char] = &['\\', '|'];
 
@@ -1171,17 +1168,6 @@ impl ValkeyStore {
     pub(crate) async fn delete_key(&self, c: &mut Conn, id: &str) -> RecordStoreResult<()> {
         let ids_key = cred_ids_key(id);
         let key_row = format!("{KEY_PREFIX}{id}");
-        // Usage windows: best-effort cleanup by a SCAN outside the transaction (a window raced in
-        // before the EXEC is stale data, not an identity issue).
-        let pattern = format!("busbar:usage:{}:*", escape(id, GLOB));
-        let own = format!("busbar:usage:{id}:");
-        let mut usage_keys = self.scan(c, &pattern).await?;
-        // The glob also matches other buckets whose id starts `<id>:` (group, era): keep only
-        // `<own>:<decimal window>`.
-        usage_keys.retain(|k| {
-            k.strip_prefix(&own)
-                .is_some_and(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_digit()))
-        });
         // WATCH the key row, its credential-id index AND every member's credential row (a slot
         // rewritten in place changes no index). The row set depends on the membership, so a
         // membership change rebuilds the watch set from fresh state (the outer loop).
@@ -1229,9 +1215,6 @@ impl ValkeyStore {
                 pipe.atomic();
                 pipe.set(&key_row, &key_json).ignore();
                 pipe.zadd(KEYS_BYREV, id, rev).ignore();
-                for uk in &usage_keys {
-                    pipe.del(uk).ignore();
-                }
                 // Destroy every credential row and its pointers (a consumer evicts off the key's
                 // own tombstone delta).
                 for member in &members {
