@@ -1083,9 +1083,12 @@ fn list_credentials_never_carries_the_secret() {
     let metas = store.list_credentials(&key_id).unwrap();
     assert_eq!(metas.len(), 1);
     assert_eq!(metas[0].public_id, public_id);
-    // CredentialMeta has no secret field at all — this is a compile-time guarantee, not a
-    // runtime check, but assert the shape we actually get back is the meta type.
-    let _: &CredentialMeta = &metas[0];
+    for rendered in [serde_json::to_string(&metas).unwrap(), format!("{metas:?}")] {
+        assert!(
+            !rendered.contains(&c.secret),
+            "metadata output must not carry the stored secret"
+        );
+    }
 }
 
 #[test]
@@ -1274,13 +1277,25 @@ fn metering_round_trips_all_fields_including_renamed_and_new_ones() {
             billable_requests: 1,
             key_group_at_use: "growth".to_string(),
             pricing_version: "2026-07".to_string(),
-            priced_from_ms: 0,
-            usage_units: Default::default(),
+            priced_from_ms: 1_780_000_000_123,
+            usage_units: std::collections::BTreeMap::from([("audio_seconds".into(), 7)]),
         })
         .unwrap();
     let rows = store.list_metering(bucket).unwrap();
     assert_eq!(rows.len(), 1);
     let r = &rows[0];
+    assert_eq!(r.key_id, key_id);
+    assert_eq!(r.model, "claude");
+    assert_eq!(r.provider, "anthropic");
+    assert_eq!(r.tokens_input, 10);
+    assert_eq!(r.tokens_output, 5);
+    assert_eq!(r.tokens_cache_read, 2);
+    assert_eq!(r.requests, 1);
+    assert_eq!(r.priced_from_ms, 1_780_000_000_123);
+    assert_eq!(
+        r.usage_units,
+        std::collections::BTreeMap::from([("audio_seconds".into(), 7)])
+    );
     assert_eq!(
         r.tokens_cache_write, 3,
         "renamed from tokens_cache_creation"
@@ -1427,10 +1442,12 @@ fn connect_refuses_to_start_under_an_eviction_policy() {
         .query(&mut conn)
         .unwrap();
 
+    let error = result.expect_err("connect must refuse an eviction policy");
     assert!(
-        result.is_err(),
-        "connect() must refuse to start under allkeys-lru — an eviction policy can silently drop \
-         a denylist entry or a metering row with no error anywhere"
+        error.contains("maxmemory-policy")
+            && error.contains("allkeys-lru")
+            && error.contains("noeviction"),
+        "{error}"
     );
 }
 
@@ -1576,12 +1593,17 @@ fn db_of_url_reads_the_selected_database() {
 }
 
 #[test]
-#[should_panic(expected = "refusing to FLUSHDB")]
 fn the_shared_database_is_never_flushed() {
-    let Some(_) = live_store() else {
-        panic!("refusing to FLUSHDB (no live store)");
-    };
-    assert_private_db(db_of_url(&std::env::var("VALKEY_URL").unwrap()));
+    let Some(_) = live_store() else { return };
+    let shared = db_of_url(&std::env::var("VALKEY_URL").unwrap());
+    let refused = std::panic::catch_unwind(|| assert_private_db(shared))
+        .expect_err("the actual shared-database guard must refuse");
+    let text = refused
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| refused.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(text.contains("refusing to FLUSHDB"), "{text}");
 }
 
 /// An independent upstream client on database `db`, emptied first.
@@ -2257,8 +2279,10 @@ fn mcp_call_principals_are_enumerable_after_a_reconnect() {
 /// from the boot enumeration once its chain is empty.
 #[test]
 fn purge_mcp_calls_before_deletes_and_returns_a_real_count() {
-    let _serialised = purge_guard();
-    let Some(store) = live_store() else { return };
+    let Some(_) = live_store() else { return };
+    // A kind-wide purge needs whole-database custody across nextest processes too.
+    let (_database, _raw) = fresh_db_client(8);
+    let store = ValkeyStore::connect(&url_for_db(8)).unwrap();
     let p = uid("vk_mcp_purge");
     store
         .append_mcp_call(&sample_call(&p, 1, 1_000_000_100, "", "h1"))
@@ -2271,10 +2295,7 @@ fn purge_mcp_calls_before_deletes_and_returns_a_real_count() {
         .unwrap();
 
     let purged = store.purge_mcp_calls_before(1_000_000_200).unwrap();
-    assert!(
-        purged >= 1,
-        "purge must report rows it actually removed; got {purged}"
-    );
+    assert_eq!(purged, 1, "purge must count only the row actually removed");
     assert_eq!(
         store
             .list_mcp_calls(&p)
@@ -2289,10 +2310,7 @@ fn purge_mcp_calls_before_deletes_and_returns_a_real_count() {
     assert!(store.list_mcp_call_principals().unwrap().contains(&p));
 
     let rest = store.purge_mcp_calls_before(1_000_001_000).unwrap();
-    assert!(
-        rest >= 2,
-        "the remaining two rows must actually be removed; got {rest}"
-    );
+    assert_eq!(rest, 2, "the remaining two rows must actually be removed");
     assert!(store.list_mcp_calls(&p).unwrap().is_empty());
     assert!(
         !store.list_mcp_call_principals().unwrap().contains(&p),
@@ -2364,18 +2382,17 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
 /// silently mis-splits, and the failure would surface as a purge that quietly removed nothing.
 #[test]
 fn retention_still_finds_a_principal_whose_id_contains_the_separator_characters() {
-    let _serialised = purge_guard();
-    let Some(store) = live_store() else { return };
+    let Some(_) = live_store() else { return };
+    // A kind-wide purge needs whole-database custody across nextest processes too.
+    let (_database, _raw) = fresh_db_client(8);
+    let store = ValkeyStore::connect(&url_for_db(8)).unwrap();
     let p = format!("{}:with:colons", uid("vk_mcp_sep"));
     store
         .append_mcp_call(&sample_call(&p, 1, 1_000_000_100, "", "h1"))
         .unwrap();
     assert_eq!(store.list_mcp_calls(&p).unwrap().len(), 1);
     let purged = store.purge_mcp_calls_before(1_000_000_200).unwrap();
-    assert!(
-        purged >= 1,
-        "the colon-bearing principal's record must actually be purged"
-    );
+    assert_eq!(purged, 1, "count the colon-bearing principal's record");
     assert!(
         store.list_mcp_calls(&p).unwrap().is_empty(),
         "a principal id containing the key-prefix separator must still purge correctly"
@@ -3093,29 +3110,29 @@ fn a_reconnected_store_refuses_a_second_redemption_of_the_same_approval() {
     let url = std::env::var("VALKEY_URL")
         .unwrap_or_else(|_| panic!("VALKEY_URL is unset; this case must not skip"));
     let (spent, fresh) = (trust_ns("nonce_restart"), trust_ns("nonce_restart_other"));
+    let now;
     {
         let store = ValkeyStore::connect(&url).expect("connect");
+        now = token_test_now(&store);
         reset_trust_state(&store, &[], &[&spent, &fresh]);
-        assert!(store
-            .redeem_ask_state(&spent, TRUST_NOW + 900, TRUST_NOW)
-            .unwrap());
+        assert!(store.redeem_ask_state(&spent, now + 900, now).unwrap());
     }
     let reopened = ValkeyStore::connect(&url).expect("reconnect");
     assert!(
         !reopened
-            .redeem_ask_state(&spent, TRUST_NOW + 900, TRUST_NOW + 1)
+            .redeem_ask_state(&spent, now + 900, now + 1)
             .unwrap(),
         "a restart handed a spent approval back"
     );
     assert!(
         reopened
-            .redeem_ask_state(&fresh, TRUST_NOW + 900, TRUST_NOW + 2)
+            .redeem_ask_state(&fresh, now + 900, now + 2)
             .unwrap(),
         "a different approval is not the one that was spent"
     );
     // A token of ANOTHER kind with the same spelling is another token.
     assert!(reopened
-        .redeem_plane_token("approval", &spent, TRUST_NOW + 900, TRUST_NOW + 3)
+        .redeem_plane_token("approval", &spent, now + 900, now + 3)
         .unwrap());
     let _ = reopened.with_conn(|c| c.del::<_, ()>(plane::token_key("approval", &spent)));
     reset_trust_state(&reopened, &[], &[&spent, &fresh]);
@@ -3129,14 +3146,11 @@ fn a_second_node_cannot_redeem_an_approval_the_first_already_spent() {
     let nonce = trust_ns("nonce_fleet");
     let node_a = ValkeyStore::connect(&url).expect("node A connects");
     let node_b = ValkeyStore::connect(&url).expect("node B connects");
+    let now = token_test_now(&node_a);
     reset_trust_state(&node_a, &[], &[&nonce]);
-    assert!(node_a
-        .redeem_ask_state(&nonce, TRUST_NOW + 900, TRUST_NOW)
-        .unwrap());
+    assert!(node_a.redeem_ask_state(&nonce, now + 900, now).unwrap());
     assert!(
-        !node_b
-            .redeem_ask_state(&nonce, TRUST_NOW + 900, TRUST_NOW)
-            .unwrap(),
+        !node_b.redeem_ask_state(&nonce, now + 900, now).unwrap(),
         "a second node redeemed an approval the first already spent"
     );
     reset_trust_state(&node_a, &[], &[&nonce]);
@@ -3151,20 +3165,24 @@ fn exactly_one_of_many_racing_nodes_wins_the_redemption() {
     let nonce = trust_ns("nonce_race");
     let cleanup = ValkeyStore::connect(&url).expect("connect");
     reset_trust_state(&cleanup, &[], &[&nonce]);
+    let now = token_test_now(&cleanup);
     drop(cleanup);
 
     let n = 8usize;
+    // Finish fallible setup before any worker can wait for all eight participants.
+    let nodes: Vec<_> = (0..n)
+        .map(|_| ValkeyStore::connect(&url).expect("a racing node connects"))
+        .collect();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(n));
     let winners: usize = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..n)
-            .map(|_| {
-                let url = url.clone();
+        let handles: Vec<_> = nodes
+            .into_iter()
+            .map(|node| {
                 let nonce = nonce.clone();
                 let barrier = std::sync::Arc::clone(&barrier);
                 scope.spawn(move || {
-                    let node = ValkeyStore::connect(&url).expect("a racing node connects");
                     barrier.wait();
-                    node.redeem_ask_state(&nonce, TRUST_NOW + 900, TRUST_NOW)
+                    node.redeem_ask_state(&nonce, now + 900, now)
                         .expect("redeem") as usize
                 })
             })
@@ -3182,36 +3200,27 @@ fn exactly_one_of_many_racing_nodes_wins_the_redemption() {
 /// THE LEDGER IS BOUNDED BY THE GRANT'S OWN LIFE, via the server's TTL.
 #[test]
 fn a_redeemed_entry_carries_a_ttl_bounded_by_the_approvals_own_life() {
+    const SHORT_LIFE: u64 = 30;
+    const LONG_LIFE: u64 = 10_000;
     let store = require_live_store();
+    let now = token_test_now(&store);
     let (short, long) = (trust_ns("nonce_ttl_short"), trust_ns("nonce_ttl_long"));
-    reset_trust_state(&store, &[], &[&short, &long]);
-    assert!(store
-        .redeem_ask_state(&short, TRUST_NOW + 30, TRUST_NOW)
-        .unwrap());
-    assert!(store
-        .redeem_ask_state(&long, TRUST_NOW + 10_000, TRUST_NOW)
-        .unwrap());
-    let ttl = |nonce: &str| -> i64 {
-        store
-            .with_conn(|c| c.ttl::<_, i64>(plane::token_key("ask", nonce)))
-            .expect("TTL")
-    };
-    // The TTL is cleanup only: never shorter than the grant's life (the judgment is the stored
-    // `expires_at` against the caller's `now`), and bounded by it plus a skew allowance.
-    assert!(
-        (31..=30 + 3_600).contains(&ttl(&short)),
-        "got {}",
-        ttl(&short)
-    );
-    assert!(
-        (10_001..=10_000 + 3_600).contains(&ttl(&long)),
-        "got {}",
-        ttl(&long)
-    );
-    assert!(
-        ttl(&long) > ttl(&short),
-        "the TTL tracks the grant's remaining life"
-    );
+    for (nonce, life) in [(&short, SHORT_LIFE), (&long, LONG_LIFE)] {
+        let expires = now + life;
+        assert!(store.redeem_ask_state(nonce, expires, 0).unwrap());
+        let cleanup: u64 = store
+            .with_conn(|c| {
+                redis::cmd("EXPIRETIME")
+                    .arg(plane::token_key(crate::legacy::KIND_ASK, nonce))
+                    .query(c)
+            })
+            .unwrap();
+        assert_eq!(
+            cleanup,
+            expires + 1,
+            "cleanup is the first second strictly after absolute expiry"
+        );
+    }
     reset_trust_state(&store, &[], &[&short, &long]);
 }
 
@@ -3220,60 +3229,20 @@ fn a_redeemed_entry_carries_a_ttl_bounded_by_the_approvals_own_life() {
 #[test]
 fn a_grant_beyond_the_ttl_cap_is_recorded_without_expiry() {
     let store = require_live_store();
+    let now = token_test_now(&store);
     let nonce = trust_ns("nonce_ttl_forever");
     reset_trust_state(&store, &[], &[&nonce]);
     let eleven_years = 11 * 365 * 86_400;
     assert!(store
-        .redeem_ask_state(&nonce, TRUST_NOW + eleven_years, TRUST_NOW)
+        .redeem_ask_state(&nonce, now + eleven_years, now)
         .unwrap());
     let ttl: i64 = store
         .with_conn(|c| c.ttl::<_, i64>(plane::token_key("ask", &nonce)))
         .expect("TTL");
     assert_eq!(ttl, -1, "the entry must not expire");
     assert!(!store
-        .redeem_ask_state(&nonce, TRUST_NOW + eleven_years, TRUST_NOW)
+        .redeem_ask_state(&nonce, now + eleven_years, now)
         .unwrap());
-    reset_trust_state(&store, &[], &[&nonce]);
-}
-
-/// A stored entry is spent while its `expires_at` is at or after the CALLER'S `now`; only an entry
-/// with `expires_at < now` is lapsed and redeems afresh (the server's clock plays no part).
-#[test]
-fn a_spent_entry_is_judged_against_the_callers_now() {
-    let store = require_live_store();
-    let nonce = trust_ns("nonce_judged");
-    reset_trust_state(&store, &[], &[&nonce]);
-    let exp = TRUST_NOW + 100;
-    assert!(store.redeem_ask_state(&nonce, exp, TRUST_NOW).unwrap());
-    assert!(!store.redeem_ask_state(&nonce, exp, TRUST_NOW + 50).unwrap());
-    assert!(
-        !store.redeem_ask_state(&nonce, exp, exp).unwrap(),
-        "an entry whose expires_at equals now is still spent"
-    );
-    assert!(
-        store.redeem_ask_state(&nonce, exp + 500, exp + 1).unwrap(),
-        "an entry with expires_at < now is lapsed and redeems afresh"
-    );
-    assert!(
-        !store.redeem_ask_state(&nonce, exp + 500, exp + 2).unwrap(),
-        "and that fresh redemption is spent in turn"
-    );
-    reset_trust_state(&store, &[], &[&nonce]);
-}
-
-/// AN ALREADY-LAPSED APPROVAL IS STILL ANSWERED HONESTLY, with a bounded record.
-#[test]
-fn a_lapsed_approval_still_gets_a_truthful_answer_and_a_bounded_record() {
-    let store = require_live_store();
-    let nonce = trust_ns("nonce_lapsed");
-    reset_trust_state(&store, &[], &[&nonce]);
-    assert!(store
-        .redeem_ask_state(&nonce, TRUST_NOW, TRUST_NOW + 60)
-        .unwrap());
-    let ttl: i64 = store
-        .with_conn(|c| c.ttl::<_, i64>(plane::token_key("ask", &nonce)))
-        .expect("TTL");
-    assert!((2..=1 + 3_600).contains(&ttl), "got {ttl}");
     reset_trust_state(&store, &[], &[&nonce]);
 }
 
@@ -3534,6 +3503,7 @@ fn v6_namespace_upgrades_in_place_to_v7() {
     let done = uid("t_v6_done");
     let server = uid("srv_v6");
     let nonce = uid("nonce_v6");
+    let token_expires = token_test_now(&store) + 900;
     let key_id = uid("vk_v6");
     let call_key = format!("busbar:mcp:calls:{}", uid("vk_v6_calls"));
     store.put_key(&vk(&key_id)).unwrap();
@@ -3569,7 +3539,7 @@ fn v6_namespace_upgrades_in_place_to_v7() {
             );
             p.cmd("SET")
                 .arg(format!("{ASK_STATE_PREFIX}{nonce}"))
-                .arg(TRUST_NOW + 900)
+                .arg(token_expires)
                 .arg("EX")
                 .arg(600);
             p.zadd(&call_key, "{\"v6\":\"call\"}", 1);
@@ -3602,16 +3572,21 @@ fn v6_namespace_upgrades_in_place_to_v7() {
     assert!(upgraded.list_mcp_demotions().unwrap().contains(&dem));
     assert!(
         !upgraded
-            .redeem_ask_state(&nonce, TRUST_NOW + 900, TRUST_NOW)
+            .redeem_ask_state(&nonce, token_expires, u64::MAX)
             .unwrap(),
         "a v6 spent approval stays spent across the upgrade"
     );
-    let ttl: i64 = database
-        .with_conn(|c| c.ttl(plane::token_key("ask", &nonce)))
+    let cleanup: u64 = database
+        .with_conn(|c| {
+            redis::cmd("EXPIRETIME")
+                .arg(plane::token_key(crate::legacy::KIND_ASK, &nonce))
+                .query(c)
+        })
         .unwrap();
-    assert!(
-        (601..=600 + 3_600).contains(&ttl),
-        "the spent entry keeps at least its own remaining life: {ttl}"
+    assert_eq!(
+        cleanup,
+        token_expires + 1,
+        "imported receipt survives its absolute validity boundary"
     );
 
     // The typed keys are gone; everything else is where it was.
@@ -4256,8 +4231,12 @@ fn a_rediss_url_is_secured_through_the_hosts_connector() {
     assert_eq!(proxy.accepted(), 1, "one secured connection, kept");
     let _ = store.purge_key_for_test(&id);
 
-    let (untrusted, _) = open_on(&settings_for(&url), plain);
-    let err = untrusted.expect_err("no TLS without trust");
+    let (untrusted, _) = open_on(&settings_for(&url), trusting_nothing);
+    let err = untrusted.expect_err("the TLS certificate must be trusted");
+    assert!(
+        err.contains("UnknownIssuer"),
+        "the refusal must be certificate verification: {err}"
+    );
     assert!(
         err.starts_with(
             "plugin 'busbar-store-valkey' open failed: valkey store: failed to connect: "
@@ -4612,6 +4591,7 @@ fn assert_1_5_5_keys_read_back(store: &ValkeyStore) {
         assert_eq!(g.prev_hash, fx_text(&w["prev_hash"]), "{w}");
         assert_eq!(g.hash, fx_text(&w["hash"]), "{w}");
     }
+    assert_recorded_1_5_5_readback(store);
 }
 
 /// Every read the assertions above make, as text, so two opens compare whole.
@@ -5151,7 +5131,7 @@ fn a_writer_overtaken_between_its_revision_read_and_commit_restamps_above_the_wi
     let slow = ValkeyStore::connect(&gate.url).expect("connect through the gate");
     let fast = live_store().unwrap();
     let a_id = a.clone();
-    let writer = std::thread::spawn(move || slow.put_key(&vk(&a_id)));
+    let writer = gate.spawn(move || slow.put_key(&vk(&a_id)));
     gate.held
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("the first writer reached its revision command");
@@ -5179,6 +5159,12 @@ fn a_refused_handshake_does_not_leave_a_connection_kept() {
         return;
     }
     let url = std::env::var("VALKEY_URL").unwrap();
+    let target_db = if db_of_url(&url) == 10 { 9 } else { 10 };
+    let (_database, mut target) = fresh_db_client(target_db);
+    let mut db0 = redis::Client::open(url_for_db(0))
+        .unwrap()
+        .get_connection()
+        .unwrap();
     let addr = interleave::upstream_addr(&url);
     let user = uid("hs_user");
     let (pw1, pw2) = ("pw-one", "pw-two");
@@ -5196,7 +5182,7 @@ fn a_refused_handshake_does_not_leave_a_connection_kept() {
             .unwrap();
     };
     acl(&mut admin, pw1);
-    let store = ValkeyStore::connect(&format!("redis://{user}:{pw1}@{addr}/10")).unwrap();
+    let store = ValkeyStore::connect(&format!("redis://{user}:{pw1}@{addr}/{target_db}")).unwrap();
     store.put_key(&vk(&uid("vk_hs_a"))).unwrap();
     acl(&mut admin, pw2);
     let _: i64 = redis::cmd("CLIENT")
@@ -5210,15 +5196,20 @@ fn a_refused_handshake_does_not_leave_a_connection_kept() {
     let id = uid("vk_hs_c");
     let landed = store.put_key(&vk(&id));
     let row = format!("busbar:key:{id}");
-    let in_db0: bool = admin.exists(&row).unwrap();
+    let in_db0: bool = db0.exists(&row).unwrap();
+    let in_target: bool = target.exists(&row).unwrap();
     let _: () = redis::cmd("ACL")
         .arg(&["DELUSER", user.as_str()][..])
         .query(&mut admin)
         .unwrap();
     if in_db0 {
-        let _: () = admin.del(&row).unwrap();
+        let _: () = db0.del(&row).unwrap();
     }
     landed.expect("the next op re-handshakes and succeeds");
+    assert!(
+        in_target,
+        "the selected database must contain the successful write"
+    );
     assert!(
         !in_db0,
         "the op ran on db 0, on a connection that skipped its handshake"
@@ -5259,7 +5250,7 @@ fn list_metering_is_one_snapshot() {
         interleave::contains(c, set.as_bytes())
     });
     let store = ValkeyStore::connect(&gate.url).unwrap();
-    let reader = std::thread::spawn(move || store.list_metering(bucket));
+    let reader = gate.spawn(move || store.list_metering(bucket));
     gate.held
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("the read is held after it asked for the bucket's rows");
@@ -5294,7 +5285,7 @@ fn no_op_paths_do_not_exec() {
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         },
     );
-    let store = ValkeyStore::connect(&proxied).unwrap();
+    let store = ValkeyStore::connect(&proxied.url).unwrap();
 
     let (kid, gone, revoked) = (uid("vk_noop"), uid("vk_noop_gone"), uid("vk_noop_rev"));
     let c = cred(&kid, &uid("AKIA_NOOP"), 0);
@@ -5337,18 +5328,19 @@ fn a_held_op_does_not_block_a_second_op_on_the_same_store() {
     let store = Arc::new(ValkeyStore::connect(&gate.url).unwrap());
     let first = store.clone();
     let id = a.clone();
-    let holder = std::thread::spawn(move || first.get_key(&id));
+    let holder = gate.spawn(move || first.get_key(&id));
     gate.held
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("the first op is held mid-flight");
     let (tx, rx) = std::sync::mpsc::channel();
     let second = store.clone();
-    std::thread::spawn(move || {
+    let second_worker = gate.spawn(move || {
         let _ = tx.send(second.get_key(&b));
     });
     let got = rx.recv_timeout(std::time::Duration::from_secs(5));
     gate.release.send(()).unwrap();
     holder.join().unwrap().unwrap();
+    second_worker.join().unwrap();
     got.expect("the second op ran while the first was held")
         .unwrap();
 }
@@ -5421,7 +5413,7 @@ fn a_revoke_overtaken_before_commit_does_not_overwrite_the_first_reason() {
     });
     let slow = ValkeyStore::connect(&gate.url).unwrap();
     let id = c0.meta.id.clone();
-    let writer = std::thread::spawn(move || slow.revoke_credential(&id, "slow"));
+    let writer = gate.spawn(move || slow.revoke_credential(&id, "slow"));
     gate.held
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("the slow revoke has read the live row");
@@ -5443,18 +5435,22 @@ fn a_transaction_that_always_aborts_ends_with_an_error() {
     // A database of its own: the bumps would abort every other test's transaction in db 0.
     let (database, _up) = fresh_db_client(7);
     let url = url_for_db(7);
-    let bump_url = url.clone();
+    let timeout = std::time::Duration::from_secs(10);
+    let bump = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_connection_with_timeout(timeout)
+        .unwrap();
+    bump.set_read_timeout(Some(timeout)).unwrap();
+    bump.set_write_timeout(Some(timeout)).unwrap();
+    let bump = std::sync::Mutex::new(bump);
     let proxied = interleave::tamper(
         &url,
         |c| interleave::contains(c, b"EXEC"),
         move || {
-            let mut r = redis::Client::open(bump_url.as_str())
-                .unwrap()
-                .get_connection()
-                .unwrap();
+            let mut r = bump.lock().unwrap();
             let _: i64 = redis::cmd("INCR")
                 .arg("busbar:revision")
-                .query(&mut r)
+                .query(&mut *r)
                 .unwrap();
         },
     );
@@ -5463,7 +5459,8 @@ fn a_transaction_that_always_aborts_ends_with_an_error() {
     std::thread::spawn(move || {
         // A timeout must not release the database while this writer is still running.
         let _database = database;
-        let store = ValkeyStore::connect(&proxied).unwrap();
+        let proxied = proxied;
+        let store = ValkeyStore::connect(&proxied.url).unwrap();
         let _ = tx.send(store.put_key(&vk(&id)).unwrap_err().to_string());
     });
     let e = rx
@@ -5662,7 +5659,7 @@ fn a_parented_upserted_record_reads_back_by_its_own_id() {
 }
 
 /// Redemption stores decimal strings, not signed columns. Permanent node claims and clocks
-/// past i64::MAX must retain exact one-use and expiry-boundary semantics.
+/// past i64::MAX must retain exact one-use semantics independent of caller clock skew.
 #[test]
 fn token_redemption_keeps_the_full_u64_range_exact() {
     let Some(store) = live_store() else { return };
@@ -5675,7 +5672,7 @@ fn token_redemption_keeps_the_full_u64_range_exact() {
             .redeem_plane_token("node-id", &token, expiry, expiry)
             .unwrap());
         if let Some(after) = expiry.checked_add(1) {
-            assert!(store
+            assert!(!store
                 .redeem_plane_token("node-id", &token, u64::MAX, after)
                 .unwrap());
             assert!(!store
@@ -5776,7 +5773,7 @@ fn a_v9_upgrade_scrubs_revoked_credentials_and_publishes_the_repairs_once() {
     raw.set::<_, _, ()>(SCHEMA_KEY, 9).unwrap();
     let direct = ValkeyStore::connect(&url).unwrap();
     let marker: i64 = raw.get(SCHEMA_KEY).unwrap();
-    assert_eq!(marker, 10);
+    assert_eq!(marker, SCHEMA_VERSION);
     let after_revision: u64 = raw.get(REVISION_KEY).unwrap();
     assert_eq!(
         after_revision, revision,
@@ -5807,7 +5804,7 @@ fn a_v9_upgrade_scrubs_revoked_credentials_and_publishes_the_repairs_once() {
         interleave::contains(chunk, b"$4\r\nEXEC\r\n")
     });
     let gate_url = gate.url.clone();
-    let migrating = std::thread::spawn(move || ValkeyStore::connect(&gate_url));
+    let migrating = gate.spawn(move || ValkeyStore::connect(&gate_url));
     gate.held
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("repair reached EXEC after reading the revoked row");
@@ -6150,5 +6147,1096 @@ fn usage_cleanup_never_reconnects_and_replays_a_delete_whose_reply_was_lost() {
         table.dial_timeouts().len(),
         dials,
         "no reconnect/replay after the ambiguous delete"
+    );
+}
+
+/// A live spent entry survives arbitrary caller clocks; only shared-clock expiry permits reuse.
+
+#[test]
+fn a_spent_entry_is_judged_against_the_shared_clock() {
+    const LIVE_LIFE: u64 = 900;
+    let store = require_live_store();
+    let nonce = trust_ns("nonce_judged");
+    let expires = token_test_now(&store) + LIVE_LIFE;
+    assert!(store.redeem_ask_state(&nonce, expires, 0).unwrap());
+    for caller_now in [0, expires, u64::MAX] {
+        assert!(!store
+            .redeem_ask_state(&nonce, u64::MAX, caller_now)
+            .unwrap());
+    }
+    let key = plane::token_key(crate::legacy::KIND_ASK, &nonce);
+    let stored: String = store.with_conn(|c| c.get(&key)).unwrap();
+    assert_eq!(stored, expires.to_string());
+    let _: () = store.with_conn(|c| c.set(&key, 0)).unwrap();
+    assert!(
+        store.redeem_ask_state(&nonce, expires, 0).unwrap(),
+        "a preexisting expired receipt can be reclaimed"
+    );
+    assert!(!store.redeem_ask_state(&nonce, expires, u64::MAX).unwrap());
+    reset_trust_state(&store, &[], &[&nonce]);
+}
+
+/// An already-lapsed candidate cannot claim a token and leaves no receipt.
+#[test]
+fn a_lapsed_approval_is_refused_without_a_redemption_record() {
+    let store = require_live_store();
+    let nonce = trust_ns("nonce_lapsed");
+    let expires = token_test_now(&store) - 1;
+    assert!(!store.redeem_ask_state(&nonce, expires, 0).unwrap());
+    let value: Option<String> = store
+        .with_conn(|c| c.get(plane::token_key(crate::legacy::KIND_ASK, &nonce)))
+        .unwrap();
+    assert_eq!(value, None);
+}
+
+#[test]
+fn shared_clock_ignores_caller_skew_and_refuses_expired_grants_without_mutation() {
+    const TOKEN_KIND: &str = "shared-clock-regression";
+    const PAST_EPOCH: u64 = 1;
+    let Some(store) = live_store() else { return };
+    let live = uid("clock-live");
+    let expired = uid("clock-expired");
+    assert!(store
+        .redeem_plane_token(TOKEN_KIND, &live, u64::MAX, PAST_EPOCH)
+        .unwrap());
+    assert!(!store
+        .redeem_plane_token(TOKEN_KIND, &live, u64::MAX, u64::MAX)
+        .unwrap());
+    assert!(!store
+        .redeem_plane_token(TOKEN_KIND, &expired, PAST_EPOCH, 0)
+        .unwrap());
+    let absent: Option<String> = store
+        .with_conn(|c| c.get(plane::token_key(TOKEN_KIND, &expired)))
+        .unwrap();
+    assert_eq!(absent, None, "expired input leaves no receipt");
+    drop(store);
+    let store = ValkeyStore::connect(&std::env::var("VALKEY_URL").unwrap()).unwrap();
+    assert!(!store
+        .redeem_plane_token(TOKEN_KIND, &live, u64::MAX, 0)
+        .unwrap());
+    let stored: String = store
+        .with_conn(|c| c.get(plane::token_key(TOKEN_KIND, &live)))
+        .unwrap();
+    assert_eq!(stored, u64::MAX.to_string());
+    let _: () = store
+        .with_conn(|c| c.del(plane::token_key(TOKEN_KIND, &live)))
+        .unwrap();
+}
+
+#[test]
+fn shared_clock_keeps_exact_large_stored_expiries_and_reclaims_only_lapsed_rows() {
+    const TOKEN_KIND: &str = "shared-clock-seeded";
+    const EXACT_EXPIRY: u64 = (1_u64 << 53) + 1;
+    let Some(store) = live_store() else { return };
+    let future = uid("clock-future");
+    let lapsed = uid("clock-lapsed");
+    let _: () = store
+        .with_conn(|c| c.set(plane::token_key(TOKEN_KIND, &future), EXACT_EXPIRY))
+        .unwrap();
+    let _: () = store
+        .with_conn(|c| c.set(plane::token_key(TOKEN_KIND, &lapsed), 0))
+        .unwrap();
+    assert!(!store
+        .redeem_plane_token(TOKEN_KIND, &future, u64::MAX, u64::MAX)
+        .unwrap());
+    assert!(store
+        .redeem_plane_token(TOKEN_KIND, &lapsed, u64::MAX, 0)
+        .unwrap());
+    let stored: String = store
+        .with_conn(|c| c.get(plane::token_key(TOKEN_KIND, &future)))
+        .unwrap();
+    assert_eq!(stored, EXACT_EXPIRY.to_string());
+    for token in [&future, &lapsed] {
+        let _: () = store
+            .with_conn(|c| c.del(plane::token_key(TOKEN_KIND, token)))
+            .unwrap();
+    }
+}
+
+/// TIME is the shared authority used by the token script, independent of the test process clock.
+fn token_test_now(store: &ValkeyStore) -> u64 {
+    let (seconds, _micros): (u64, u64) = store.with_conn(|c| redis::cmd("TIME").query(c)).unwrap();
+    seconds
+}
+
+#[test]
+fn ticket_expiry_records_survive_a_fast_purge_caller() {
+    use busbar_contract::records::Retention;
+    const TOKEN_CLOCK_DATABASE: u32 = 6;
+    let Some(_) = live_store() else { return };
+    let (_database, _raw) = fresh_db_client(TOKEN_CLOCK_DATABASE);
+    let store = ValkeyStore::connect(&url_for_db(TOKEN_CLOCK_DATABASE)).unwrap();
+    let now = token_test_now(&store);
+    let live = uid("live-ticket");
+    let expired = uid("expired-ticket");
+
+    const TICKET_KIND: &str = "ticket";
+    const OTHER_KIND: &str = "ordinary-retention-regression";
+    const FUTURE_OFFSET: u64 = 900;
+    let future = now + FUTURE_OFFSET;
+    let row = |kind: &str, id: &str, ts| PlaneRecord {
+        kind: kind.into(),
+        id: id.into(),
+        parent: None,
+        seq: 0,
+        ts,
+        disposition: if kind == TICKET_KIND {
+            PlaneDisposition::Terminal
+        } else {
+            PlaneDisposition::Active
+        },
+        body: id.as_bytes().to_vec(),
+    };
+    for (kind, id, ts) in [
+        (TICKET_KIND, live.as_str(), future),
+        (TICKET_KIND, expired.as_str(), 0),
+        (OTHER_KIND, live.as_str(), future),
+    ] {
+        store.upsert_plane_record(row(kind, id, ts).view()).unwrap();
+    }
+    assert_eq!(
+        store
+            .purge_plane_records(TICKET_KIND, 0, Retention::Age)
+            .unwrap(),
+        0,
+        "an exact cutoff retains equality"
+    );
+    assert_eq!(
+        store
+            .purge_plane_records(TICKET_KIND, u64::MAX, Retention::Age)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store.get_plane_record(TICKET_KIND, &live).unwrap(),
+        Some(live.as_bytes().to_vec())
+    );
+    assert_eq!(store.get_plane_record(TICKET_KIND, &expired).unwrap(), None);
+    assert_eq!(
+        store
+            .purge_plane_records(OTHER_KIND, u64::MAX, Retention::Age)
+            .unwrap(),
+        1,
+        "ordinary record age policy is unchanged"
+    );
+    store.delete_plane_record(TICKET_KIND, &live).unwrap();
+}
+
+#[test]
+fn ticket_preflight_uses_the_shared_clock_and_matching_terminal_deadline_without_spending() {
+    let Some(store) = live_store() else { return };
+    let now = token_test_now(&store);
+    let token = uid("preflight-ticket");
+
+    const TICKET_KIND: &str = "ticket";
+    const LIVE_LIFE: u64 = 900;
+    let expires = now + LIVE_LIFE;
+    let record = |ts, disposition| PlaneRecord {
+        kind: TICKET_KIND.into(),
+        id: token.clone(),
+        parent: None,
+        seq: 0,
+        ts,
+        disposition,
+        body: b"ticket-preflight".to_vec(),
+    };
+    store
+        .upsert_plane_record(record(expires, PlaneDisposition::Terminal).view())
+        .unwrap();
+    for caller in [u64::MAX, 0, u64::MAX] {
+        assert!(
+            store
+                .plane_token_live(TICKET_KIND, &token, expires, caller)
+                .unwrap(),
+            "shared clock validates a live terminal ticket"
+        );
+    }
+    assert!(
+        !store
+            .plane_token_live(TICKET_KIND, &token, expires + 1, 0)
+            .unwrap(),
+        "a different signed deadline must not match"
+    );
+    store
+        .upsert_plane_record(record(expires, PlaneDisposition::Active).view())
+        .unwrap();
+    assert!(
+        !store
+            .plane_token_live(TICKET_KIND, &token, expires, 0)
+            .unwrap(),
+        "ticket records are terminal"
+    );
+    let expired = now - 1;
+    store
+        .upsert_plane_record(record(expired, PlaneDisposition::Terminal).view())
+        .unwrap();
+    assert!(
+        !store
+            .plane_token_live(TICKET_KIND, &token, expired, 0)
+            .unwrap(),
+        "slow callers cannot keep expired tickets live"
+    );
+    store
+        .upsert_plane_record(record(expires, PlaneDisposition::Terminal).view())
+        .unwrap();
+    assert!(store
+        .plane_token_live(TICKET_KIND, &token, expires, 0)
+        .unwrap());
+    store.delete_plane_record(TICKET_KIND, &token).unwrap();
+    assert!(!store
+        .plane_token_live(TICKET_KIND, &token, expires, 0)
+        .unwrap());
+
+    let receipt: Option<String> = store
+        .with_conn(|c| c.get(plane::token_key(TICKET_KIND, &token)))
+        .unwrap();
+    assert_eq!(receipt, None, "preflight is non-consuming");
+}
+
+// The MANIFEST's recorder blob c353cf689d06222191b3f876b3e2520ca340d1c4 fixes
+// input/output/cache-read prices at 100000/200000/10000 micros and the fee at 3 cents.
+// Money is derived from actual store counters, never persisted by the store or read from keys.json.
+fn recorded_1_5_5_token_spend(
+    model: &str,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+) -> u64 {
+    assert!(
+        matches!(model, "m-chat" | "m-cache" | "m-chat-down"),
+        "recorded model {model}"
+    );
+    assert_eq!(
+        cache_write, 0,
+        "the recorded script emits no cache-creation usage"
+    );
+    if model != "m-cache" {
+        assert_eq!(
+            cache_read, 0,
+            "only m-cache has a cache-read price in the recorder"
+        );
+    }
+    input * 100_000 + output * 200_000 + cache_read * 10_000
+}
+
+fn recorded_1_5_5_breakdown(rows: &[&MeteringRow]) -> serde_json::Value {
+    let mut input = 0;
+    let mut output = 0;
+    let mut cache_read = 0;
+    let mut cache_write = 0;
+    let mut requests = 0;
+    let mut spend = 0;
+    for row in rows {
+        input += row.tokens_input;
+        output += row.tokens_output;
+        cache_read += row.tokens_cache_read;
+        cache_write += row.tokens_cache_write;
+        requests += row.requests;
+        spend += recorded_1_5_5_token_spend(
+            &row.model,
+            row.tokens_input,
+            row.tokens_output,
+            row.tokens_cache_read,
+            row.tokens_cache_write,
+        ) + row.billable_requests * 30_000;
+    }
+    serde_json::json!({
+        "requests": requests, "spend_micros": spend, "tokens_input": input,
+        "tokens_output": output, "tokens_cache_read": cache_read,
+        "tokens_cache_creation": cache_write,
+    })
+}
+
+/// Compare the loaded store's reads with all three frozen 1.5.5 HTTP response bodies. Only the
+/// recorder's fixed pricing/context is supplied here; IDs, names, groups and consumption come
+/// from real RecordStore reads after migration. The recorder removed only `as_of`.
+fn assert_recorded_1_5_5_readback(store: &ValkeyStore) {
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
+    let expected: Value =
+        serde_json::from_str(include_str!("../tests/fixtures/1.5.5/readback/usage.json")).unwrap();
+    let start = expected["window"]["start"]
+        .as_u64()
+        .expect("recorded integer UTC start");
+    let end = expected["window"]["end"]
+        .as_u64()
+        .expect("recorded integer UTC end");
+    assert_eq!(start % 86_400, 0, "metering is a pinned UTC-day bucket");
+    assert_eq!(end, start + 86_400);
+    let rows = store.list_metering(start).unwrap();
+    assert!(store.list_metering(start - 86_400).unwrap().is_empty());
+    assert!(
+        store.list_metering(end).unwrap().is_empty(),
+        "the end boundary is the next bucket"
+    );
+    let mut models: BTreeMap<(&str, &str), Vec<&MeteringRow>> = BTreeMap::new();
+    let mut keys: BTreeMap<&str, Vec<&MeteringRow>> = BTreeMap::new();
+    for row in &rows {
+        models
+            .entry((&row.model, &row.provider))
+            .or_default()
+            .push(row);
+        keys.entry(&row.key_id).or_default().push(row);
+    }
+    let by_model: Vec<Value> = models
+        .into_iter()
+        .map(|((model, provider), rows)| {
+            let mut view = recorded_1_5_5_breakdown(&rows);
+            view["model"] = json!(model);
+            view["provider"] = json!(provider);
+            view
+        })
+        .collect();
+    let mut by_key: Vec<Value> = keys
+        .into_iter()
+        .map(|(id, rows)| {
+            let key = store.get_key(id).unwrap().expect("metering key reads back");
+            let mut view = recorded_1_5_5_breakdown(&rows);
+            view["id"] = json!(key.id);
+            view["name"] = json!(key.name);
+            view
+        })
+        .collect();
+    // The recorded admin view orders keys by spend descending, then ID; models by model/provider.
+    by_key.sort_by(|a, b| {
+        b["spend_micros"]
+            .as_u64()
+            .unwrap()
+            .cmp(&a["spend_micros"].as_u64().unwrap())
+            .then_with(|| a["id"].as_str().unwrap().cmp(b["id"].as_str().unwrap()))
+    });
+    let actual = json!({
+        "window": {"start": start, "end": end}, "currency": "USD",
+        "total": recorded_1_5_5_breakdown(&rows.iter().collect::<Vec<_>>()),
+        "by_model": by_model, "by_key": by_key, "by_key_truncated": false,
+    });
+    assert_eq!(
+        actual, expected,
+        "the whole recorded usage response, including JSON field types"
+    );
+
+    for recorded in [
+        include_str!("../tests/fixtures/1.5.5/readback/key-fixture-grouped.json"),
+        include_str!("../tests/fixtures/1.5.5/readback/key-fixture-ungrouped.json"),
+    ] {
+        let expected: Value = serde_json::from_str(recorded).unwrap();
+        let id = expected["id"].as_str().expect("recorded string key ID");
+        assert_eq!(
+            expected["window_start"].as_u64(),
+            Some(0),
+            "key attribution is all-time"
+        );
+        let key = store
+            .get_key(id)
+            .unwrap()
+            .expect("the recorded key is loaded");
+        let ledger = store.get_usage(id, 0).unwrap();
+        assert_eq!(
+            store.get_usage(id, start).unwrap(),
+            UsageLedger::default(),
+            "day metering must not be mistaken for the key's all-time attribution"
+        );
+        let spend = ledger
+            .models
+            .iter()
+            .map(|model| {
+                recorded_1_5_5_token_spend(
+                    &model.model,
+                    model.tier("input"),
+                    model.tier("output"),
+                    model.tier("cache_read"),
+                    model.tier("cache_write"),
+                )
+            })
+            .sum::<u64>()
+            + ledger.billable_requests * 30_000;
+        let actual = json!({
+            "id": &key.id, "group": &key.group, "budget_period": "total", "window_start": 0,
+            "requests": ledger.requests, "tokens": ledger.total_tokens(), "spend_cents": spend / 10_000,
+            // The recorder config gives the group only a budget; it has no requests/tokens rate cap.
+            "rate_headroom": Option::<f64>::None,
+        });
+        assert_eq!(
+            actual, expected,
+            "the complete recorded key usage response for {id}"
+        );
+        if let Some(group) = key.group.as_deref() {
+            assert_eq!(store.get_usage(&format!("group:{group}@day"), start).unwrap(), ledger,
+                "the group's daily budget and the key's all-time attribution preserve the same recorded usage");
+        }
+    }
+}
+
+#[test]
+fn paired_mint_replay_refuses_a_changed_or_missing_owner_without_writing() {
+    let Some(store) = live_store() else { return };
+    let owner = uid("vk_pair_replay");
+    let public = uid("vk_pair_public");
+    let key = vk(&owner);
+    let credential = cred(&owner, &public, 0);
+    store.put_key_with_credential(&key, &credential).unwrap();
+    let before = store.get_key(&owner).unwrap().unwrap();
+    let secret = store
+        .lookup_credential_secret("sigv4", &public)
+        .unwrap()
+        .unwrap();
+    let mut changed = key.clone();
+    changed.enabled = !changed.enabled;
+    assert!(store
+        .put_key_with_credential(&changed, &credential)
+        .is_err());
+    assert_eq!(store.get_key(&owner).unwrap().unwrap(), before);
+    assert!(
+        store
+            .lookup_credential_secret("sigv4", &public)
+            .unwrap()
+            .unwrap()
+            == secret
+    );
+    store.put_key_with_credential(&key, &credential).unwrap();
+    assert_eq!(store.get_key(&owner).unwrap().unwrap(), before);
+    assert!(
+        store
+            .lookup_credential_secret("sigv4", &public)
+            .unwrap()
+            .unwrap()
+            == secret
+    );
+    store
+        .with_conn(|c| c.del::<_, ()>(format!("{KEY_PREFIX}{owner}")))
+        .unwrap();
+    assert!(store.put_key_with_credential(&key, &credential).is_err());
+    assert!(store.get_key(&owner).unwrap().is_none());
+    assert!(
+        store
+            .lookup_credential_secret("sigv4", &public)
+            .unwrap()
+            .unwrap()
+            == secret
+    );
+}
+
+/// Revision exhaustion refuses the entire write, including a two-stamp key/credential pair.
+#[test]
+fn invalid_or_exhausted_revision_counters_never_reuse_or_partially_reserve_stamps() {
+    let Some(_) = live_store() else { return };
+    let (_database, mut raw) = fresh_db_client(5);
+    let store = ValkeyStore::connect(&url_for_db(5)).unwrap();
+    for (counter, paired) in [(-1, false), (i64::MAX, false), (i64::MAX - 1, true)] {
+        raw.set::<_, _, ()>(REVISION_KEY, counter).unwrap();
+        let id = uid("vk_revision_refusal");
+        let offered = cred(&id, &uid("AKIA_REVISION_REFUSAL"), 0);
+        let result = if paired {
+            store.put_key_with_credential(&vk(&id), &offered)
+        } else {
+            store.put_key(&vk(&id))
+        };
+        let error = result.expect_err("an invalid reservation must fail before any write");
+        assert!(error.0.contains("busbar:revision"), "{error}");
+        assert_eq!(raw.get::<_, i64>(REVISION_KEY).unwrap(), counter);
+        assert!(store.get_key(&id).unwrap().is_none());
+        assert!(!raw
+            .exists::<_, bool>(cred_id_key(&offered.meta.id))
+            .unwrap());
+        assert!(!raw.sismember::<_, _, bool>(KEYS_INDEX, &id).unwrap());
+    }
+    for paired in [false, true] {
+        let count = if paired { 2 } else { 1 };
+        raw.set::<_, _, ()>(REVISION_KEY, i64::MAX - count).unwrap();
+        let id = uid("vk_revision_last");
+        let offered = cred(&id, &uid("AKIA_REVISION_LAST"), 0);
+        if paired {
+            store.put_key_with_credential(&vk(&id), &offered).unwrap();
+        } else {
+            store.put_key(&vk(&id)).unwrap();
+        }
+        let key = store.get_key(&id).unwrap().unwrap();
+        assert_eq!(key.revision, (i64::MAX - count + 1) as u64);
+        if paired {
+            assert_eq!(
+                store.list_credentials(&id).unwrap()[0].revision,
+                i64::MAX as u64
+            );
+        }
+        assert_eq!(raw.get::<_, i64>(REVISION_KEY).unwrap(), i64::MAX);
+        let before: String = raw.get(format!("{KEY_PREFIX}{id}")).unwrap();
+        assert!(store.put_key(&vk(&id)).is_err());
+        assert_eq!(
+            raw.get::<_, String>(format!("{KEY_PREFIX}{id}")).unwrap(),
+            before
+        );
+        assert_eq!(raw.get::<_, i64>(REVISION_KEY).unwrap(), i64::MAX);
+    }
+}
+
+#[test]
+fn revoke_refuses_dangling_foreign_or_incoherent_rows_without_mutation() {
+    let Some(_) = live_store() else { return };
+    let (_database, mut raw) = fresh_db_client(5);
+    let store = ValkeyStore::connect(&url_for_db(5)).unwrap();
+    let owner = uid("vk_revoke_corruption");
+    let offered = cred(&owner, &uid("AKIA_REVOKE_CORRUPTION"), 0);
+    store
+        .put_key_with_credential(&vk(&owner), &offered)
+        .unwrap();
+    let row_key = cred_row_key(&owner, &offered.meta.kind, offered.meta.slot);
+    let original: String = raw.get(&row_key).unwrap();
+    let revision: i64 = raw.get(REVISION_KEY).unwrap();
+    let foreign_id = uid("vk_foreign_credential");
+    raw.set::<_, _, ()>(cred_id_key(&foreign_id), slot_pointer(&offered.meta))
+        .unwrap();
+    for (id, replacement) in [
+        (foreign_id.as_str(), Some(original.clone())),
+        (offered.meta.id.as_str(), None),
+        (
+            offered.meta.id.as_str(),
+            Some(r#"{"meta":"RevokePrivateCanary","secret":"RevokePrivateCanary"}"#.to_owned()),
+        ),
+    ] {
+        match &replacement {
+            Some(value) => raw.set::<_, _, ()>(&row_key, value).unwrap(),
+            None => {
+                raw.del::<_, ()>(&row_key).unwrap();
+            }
+        }
+        let error = store
+            .revoke_credential(id, "requested")
+            .expect_err("a corrupt target cannot confirm a revocation")
+            .0;
+        assert!(
+            error.contains("revoke_credential") && error.contains(&row_key),
+            "{error}"
+        );
+        assert!(!error.contains("RevokePrivateCanary"), "{error}");
+        assert_eq!(raw.get::<_, Option<String>>(&row_key).unwrap(), replacement);
+        assert_eq!(raw.get::<_, i64>(REVISION_KEY).unwrap(), revision);
+    }
+    // An id match is insufficient when the row's own slot metadata disagrees with its pointer.
+    let mut incoherent: CredentialSecret = serde_json::from_str(&original).unwrap();
+    incoherent.meta.slot += 1;
+    let replacement = serde_json::to_string(&incoherent).unwrap();
+    raw.set::<_, _, ()>(&row_key, &replacement).unwrap();
+    assert!(store
+        .revoke_credential(&offered.meta.id, "requested")
+        .is_err());
+    assert_eq!(raw.get::<_, String>(&row_key).unwrap(), replacement);
+    assert_eq!(raw.get::<_, i64>(REVISION_KEY).unwrap(), revision);
+    // Intact live and already-revoked rows retain their ordinary success/idempotency behavior.
+    raw.set::<_, _, ()>(&row_key, original).unwrap();
+    store
+        .revoke_credential(&offered.meta.id, "requested")
+        .unwrap();
+    let revoked: String = raw.get(&row_key).unwrap();
+    let revision: i64 = raw.get(REVISION_KEY).unwrap();
+    store.revoke_credential(&offered.meta.id, "again").unwrap();
+    assert_eq!(raw.get::<_, String>(&row_key).unwrap(), revoked);
+    assert_eq!(raw.get::<_, i64>(REVISION_KEY).unwrap(), revision);
+}
+
+#[test]
+fn a_failed_legacy_upgrade_reports_safe_context_and_truthful_partial_progress() {
+    use crate::legacy::{TASK_EVENTS_PREFIX, TASK_ROW_PREFIX};
+    let Some(_) = live_store() else { return };
+    let (_database, mut raw) = fresh_db_client(6);
+    let url = url_for_db(6);
+    drop(ValkeyStore::connect(&url).unwrap());
+    let id = uid("vk_bad_v6");
+    let event = sample_event(&id, 1, "task.submitted", "", "h1");
+    let events_key = format!("{TASK_EVENTS_PREFIX}{id}");
+    raw.zadd::<_, _, _, ()>(&events_key, serde_json::to_string(&event).unwrap(), 1)
+        .unwrap();
+    let task_key = format!("{TASK_ROW_PREFIX}{id}");
+    let mut task = serde_json::to_value(sample_task(&id, "working", TASK_LIVE_TS)).unwrap();
+    task["artifact_cursor"] = serde_json::json!("LegacyPrivateCanary");
+    let malformed = task.to_string();
+    raw.set::<_, _, ()>(&task_key, &malformed).unwrap();
+    raw.set::<_, _, ()>(SCHEMA_KEY, 6).unwrap();
+    let error = ValkeyStore::connect(&url).expect_err("a malformed v6 task refuses the upgrade");
+    assert!(
+        error.contains("task") && error.contains(&task_key),
+        "{error}"
+    );
+    assert!(!error.contains("LegacyPrivateCanary"), "{error}");
+    assert!(error.contains("unprocessed v6 keys remain"), "{error}");
+    assert_eq!(raw.get::<_, String>(&task_key).unwrap(), malformed);
+    assert!(
+        !raw.exists::<_, bool>(&events_key).unwrap(),
+        "the earlier event phase already completed"
+    );
+    assert_eq!(raw.get::<_, i64>(SCHEMA_KEY).unwrap(), 6);
+    task["artifact_cursor"] = serde_json::json!(0);
+    raw.set::<_, _, ()>(&task_key, task.to_string()).unwrap();
+    let repaired = ValkeyStore::connect(&url).unwrap();
+    assert_eq!(repaired.list_task_events(&id).unwrap(), vec![event]);
+    assert!(repaired.get_task(&id).unwrap().is_some());
+}
+
+/// A bounded, joined RESP peer: exercise malformed transaction replies and a lost script reply
+/// through the actual loaded store door, independently of the production parser.
+fn malformed_reply_peer(exec: Option<&'static [u8]>) -> (String, std::thread::JoinHandle<usize>) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("redis://{}/0", listener.local_addr().unwrap());
+    let peer = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut accepted = 0;
+        loop {
+            let (mut stream, _) = match listener.accept() {
+                Ok(stream) => stream,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return accepted;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+                Err(e) => panic!("accept mock RESP client: {e}"),
+            };
+            accepted += 1;
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut parser = redis::Parser::new();
+            let mut queued = false;
+            loop {
+                let redis::Value::Array(fields) = (match parser.parse_value(&mut stream) {
+                    Ok(value) => value,
+                    Err(_) => break,
+                }) else {
+                    panic!("command is an array")
+                };
+                let fields: Vec<String> = fields
+                    .into_iter()
+                    .map(|value| match value {
+                        redis::Value::BulkString(bytes) => String::from_utf8(bytes).unwrap(),
+                        other => panic!("command field is bulk text: {other:?}"),
+                    })
+                    .collect();
+                let command = fields[0].as_str();
+                let mut done = false;
+                let response = match command {
+                    "AUTH" | "SELECT" | "WATCH" | "UNWATCH" => b"+OK\r\n".to_vec(),
+                    "PING" => b"+PONG\r\n".to_vec(),
+                    "CONFIG" => b"*2\r\n$16\r\nmaxmemory-policy\r\n$10\r\nnoeviction\r\n".to_vec(),
+                    "MULTI" => {
+                        queued = true;
+                        b"+OK\r\n".to_vec()
+                    }
+                    "EXEC" => {
+                        queued = false;
+                        exec.expect("transaction peer").to_vec()
+                    }
+                    _ if queued => b"+QUEUED\r\n".to_vec(),
+                    "GET" if fields[1] == SCHEMA_KEY => {
+                        format!(":{SCHEMA_VERSION}\r\n").into_bytes()
+                    }
+                    "GET" if fields[1] == REVISION_KEY => b":0\r\n".to_vec(),
+                    "GET" => {
+                        done = fields[1].ends_with("reply_probe");
+                        b"$-1\r\n".to_vec()
+                    }
+                    "SCRIPT" if exec.is_none() => {
+                        b"$40\r\n0000000000000000000000000000000000000000\r\n".to_vec()
+                    }
+                    "EVALSHA" | "EVAL" if exec.is_none() => {
+                        if accepted == 1 {
+                            stream.shutdown(std::net::Shutdown::Both).unwrap();
+                            break;
+                        }
+                        done = true;
+                        b":0\r\n".to_vec()
+                    }
+                    other => panic!("unexpected command {other}"),
+                };
+                stream.write_all(&response).unwrap();
+                if done {
+                    return accepted;
+                }
+            }
+        }
+    });
+    (url, peer)
+}
+
+#[test]
+fn exec_must_confirm_every_queued_command_and_discard_malformed_reply_connections() {
+    for exec in [
+        b"*0\r\n".as_slice(),
+        b"*9\r\n:1\r\n:1\r\n:1\r\n:1\r\n:1\r\n:1\r\n:1\r\n:1\r\n:1\r\n",
+        b":1\r\n",
+    ] {
+        let (url, peer) = malformed_reply_peer(Some(exec));
+        let store = ValkeyStore::connect(&url).unwrap();
+        let result = store.put_key(&vk("malformed_exec"));
+        let probe = store.get_key("reply_probe");
+        drop(store);
+        let accepted = peer.join().unwrap();
+        let error = result.expect_err("an EXEC reply must confirm the complete command list");
+        assert!(error.0.contains("EXEC reply"), "{error}");
+        assert!(probe.unwrap().is_none());
+        assert_eq!(
+            accepted, 2,
+            "the malformed reply connection cannot serve another operation"
+        );
+    }
+}
+
+#[test]
+fn eof_after_a_nonreplayable_script_discards_the_connection_before_the_next_write() {
+    let (url, peer) = malformed_reply_peer(None);
+    let store = ValkeyStore::connect(&url).unwrap();
+    let record = PlaneRecord {
+        kind: "eof_control".into(),
+        id: "row".into(),
+        parent: None,
+        seq: 0,
+        ts: 1,
+        disposition: PlaneDisposition::Active,
+        body: b"body".to_vec(),
+    };
+    let first = store.upsert_plane_record(record.view());
+    let second = store.upsert_plane_record(record.view());
+    drop(store);
+    let accepted = peer.join().unwrap();
+    assert!(first.is_err(), "a lost script reply must not be replayed");
+    assert!(
+        second.is_ok(),
+        "the next write must use a fresh connection: {second:?}"
+    );
+    assert_eq!(accepted, 2);
+}
+
+fn legacy_approval_peer(
+    unexpected_key: Option<&'static str>,
+    ttl: i64,
+) -> (String, std::thread::JoinHandle<Option<Vec<String>>>) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("redis://{}/0", listener.local_addr().unwrap());
+    let peer = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(stream) => break stream,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("accept legacy fixture client: {e}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut parser = redis::Parser::new();
+        let mut transaction = false;
+        let mut target = None;
+        loop {
+            let redis::Value::Array(fields) = (match parser.parse_value(&mut stream) {
+                Ok(value) => value,
+                Err(_) => return target,
+            }) else {
+                panic!("command is an array")
+            };
+            let fields: Vec<String> = fields
+                .into_iter()
+                .map(|value| match value {
+                    redis::Value::BulkString(bytes) => String::from_utf8(bytes).unwrap(),
+                    other => panic!("command field is text: {other:?}"),
+                })
+                .collect();
+            let response = match fields[0].as_str() {
+                "AUTH" | "SELECT" => b"+OK\r\n".to_vec(),
+                "PING" => b"+PONG\r\n".to_vec(),
+                "CONFIG" => b"*2\r\n$16\r\nmaxmemory-policy\r\n$10\r\nnoeviction\r\n".to_vec(),
+                "MULTI" => {
+                    transaction = true;
+                    b"+OK\r\n".to_vec()
+                }
+                "EXEC" => {
+                    transaction = false;
+                    // The key expiring during a read cannot leave GET from an older snapshot.
+                    if ttl == -2 {
+                        b"*2\r\n$-1\r\n:-2\r\n".to_vec()
+                    } else {
+                        format!("*2\r\n$10\r\n2000000900\r\n:{ttl}\r\n").into_bytes()
+                    }
+                }
+                _ if transaction => b"+QUEUED\r\n".to_vec(),
+                "GET" if fields[1] == SCHEMA_KEY => b":6\r\n".to_vec(),
+                "GET" => b"$10\r\n2000000900\r\n".to_vec(),
+                "TTL" => format!(":{ttl}\r\n").into_bytes(),
+                "SCAN" => {
+                    if fields.iter().any(|field| field == "busbar:askstate:*") {
+                        let key = unexpected_key.unwrap_or("busbar:askstate:spent");
+                        format!("*2\r\n$1\r\n0\r\n*1\r\n${}\r\n{key}\r\n", key.len()).into_bytes()
+                    } else {
+                        b"*2\r\n$1\r\n0\r\n*0\r\n".to_vec()
+                    }
+                }
+                "HGETALL" | "ZRANGE" => b"*0\r\n".to_vec(),
+                "DEL" => b":1\r\n".to_vec(),
+                "SET" => {
+                    if fields[1] != SCHEMA_KEY {
+                        target = Some(fields);
+                    }
+                    b"+OK\r\n".to_vec()
+                }
+                other => panic!("unexpected migration command: {other}"),
+            };
+            if stream.write_all(&response).is_err() {
+                return target;
+            }
+        }
+    });
+    (url, peer)
+}
+
+#[test]
+fn legacy_approval_reads_one_expiry_snapshot_and_never_makes_a_finite_entry_permanent() {
+    for ttl in [-2, 0, 1, -1] {
+        let (url, peer) = legacy_approval_peer(None, ttl);
+        let opened = ValkeyStore::connect(&url);
+        let error = opened.as_ref().err().cloned();
+        drop(opened);
+        let written = peer.join().unwrap();
+        assert!(error.is_none(), "{error:?}");
+        if ttl == -2 {
+            assert!(
+                written.is_none(),
+                "an expired source cannot become a new spent entry"
+            );
+        } else {
+            let written = written.expect("a live source is migrated");
+            assert_eq!(written[1], plane::token_key("ask", "spent"));
+            assert_eq!(written[2], "2000000900");
+            assert_eq!(written[3], "NX");
+            if ttl == -1 {
+                assert_eq!(
+                    written.len(),
+                    4,
+                    "an existing permanent entry stays permanent"
+                );
+            } else {
+                assert_eq!(&written[4..], &["EX".to_owned(), "3601".to_owned()]);
+            }
+        }
+    }
+}
+
+#[test]
+fn legacy_approval_refuses_unexpected_scan_keys_without_panicking() {
+    for key in ["x", "éééééééééé"] {
+        let (url, peer) = legacy_approval_peer(Some(key), 1);
+        let opened = std::panic::catch_unwind(|| ValkeyStore::connect(&url));
+        let target = peer.join().unwrap();
+        let error = opened
+            .expect("an unexpected SCAN key must not unwind the plugin")
+            .expect_err("an unexpected SCAN key refuses migration");
+        assert!(
+            error.contains("ask-state key") && error.contains("namespace"),
+            "{error}"
+        );
+        assert!(target.is_none());
+    }
+}
+
+#[test]
+fn malformed_plane_index_members_do_not_block_deleting_or_purging_valid_records() {
+    let Some(_) = live_store() else { return };
+    let (_database, mut raw) = fresh_db_client(8);
+    let store = ValkeyStore::connect(&url_for_db(8)).unwrap();
+    for purge in [false, true] {
+        let kind = if purge {
+            "corrupt_purge_control"
+        } else {
+            "corrupt_delete_control"
+        };
+        let record = PlaneRecord {
+            kind: kind.into(),
+            id: "valid".into(),
+            parent: None,
+            seq: 0,
+            ts: 1,
+            disposition: PlaneDisposition::Terminal,
+            body: b"valid body".to_vec(),
+        };
+        store.upsert_plane_record(record.view()).unwrap();
+        let prefix = format!("busbar:plane:{}:", hex(kind.as_bytes()));
+        let rec = format!("{prefix}rec");
+        let body = format!("{prefix}body");
+        let byts = format!("{prefix}byts");
+        let idx = format!("{prefix}idx:{}", hex(b"valid"));
+        let side: String = raw.hget(&rec, "0:valid").unwrap();
+        raw.hset::<_, _, _, ()>(&rec, "malformed", &side).unwrap();
+        raw.hset::<_, _, _, ()>(&body, "malformed", "corrupt body")
+            .unwrap();
+        raw.zadd::<_, _, _, ()>(&byts, "malformed", 1).unwrap();
+        raw.zadd::<_, _, _, ()>(&idx, "malformed", 0).unwrap();
+        if purge {
+            assert_eq!(
+                store
+                    .purge_plane_records(kind, 2, busbar_contract::records::Retention::Age)
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                store
+                    .purge_plane_records(kind, 2, busbar_contract::records::Retention::Age)
+                    .unwrap(),
+                0
+            );
+        } else {
+            store.delete_plane_record(kind, "valid").unwrap();
+        }
+        assert!(store.get_plane_record(kind, "valid").unwrap().is_none());
+        assert_eq!(raw.hget::<_, _, String>(&rec, "malformed").unwrap(), side);
+        assert_eq!(
+            raw.hget::<_, _, String>(&body, "malformed").unwrap(),
+            "corrupt body"
+        );
+        assert!(raw
+            .zscore::<_, _, Option<f64>>(&byts, "malformed")
+            .unwrap()
+            .is_some());
+    }
+}
+
+#[test]
+fn new_writes_cannot_persist_secret_material_on_an_already_revoked_credential() {
+    let Some(_) = live_store() else { return };
+    let (_database, mut raw) = fresh_db_client(5);
+    let store = ValkeyStore::connect(&url_for_db(5)).unwrap();
+    for paired in [false, true] {
+        let owner = uid("vk_revoked_input");
+        if !paired {
+            store.put_key(&vk(&owner)).unwrap();
+        }
+        let mut offered = cred(&owner, &uid("AKIA_REVOKED_INPUT"), 0);
+        offered.meta.revoked_at = Some(1);
+        let secret_canary = offered.secret.clone();
+        let revision: Option<i64> = raw.get(REVISION_KEY).unwrap();
+        for retain_bytes in [true, false] {
+            if !retain_bytes {
+                offered.secret.clear();
+            }
+            let result = if paired {
+                store.put_key_with_credential(&vk(&owner), &offered)
+            } else {
+                store.put_credential(&offered)
+            };
+            let error = result
+                .expect_err("a revoked credential cannot retain a secret or a live secret form")
+                .0;
+            assert!(
+                error.contains("revoked credential") && !error.contains(&secret_canary),
+                "{error}"
+            );
+            assert_eq!(raw.get::<_, Option<i64>>(REVISION_KEY).unwrap(), revision);
+            assert!(!raw
+                .exists::<_, bool>(cred_id_key(&offered.meta.id))
+                .unwrap());
+            assert_eq!(store.get_key(&owner).unwrap().is_some(), !paired);
+        }
+        offered.meta.secret_form = SecretForm::None;
+        if paired {
+            store
+                .put_key_with_credential(&vk(&owner), &offered)
+                .unwrap();
+        } else {
+            store.put_credential(&offered).unwrap();
+        }
+        let stored: String = raw
+            .get(cred_row_key(&owner, &offered.meta.kind, offered.meta.slot))
+            .unwrap();
+        let stored: CredentialSecret = serde_json::from_str(&stored).unwrap();
+        assert!(stored.secret.is_empty());
+        assert_eq!(stored.meta.secret_form, SecretForm::None);
+        assert!(stored.meta.revoked_at.is_some());
+    }
+}
+
+#[test]
+fn corrupt_hydration_index_members_and_plane_sidecars_refuse_without_echoing_content() {
+    let Some(_) = live_store() else { return };
+    let (_database, mut raw) = fresh_db_client(8);
+    let store = ValkeyStore::connect(&url_for_db(8)).unwrap();
+    raw.zadd::<_, _, _, ()>(CREDS_BYREV, "CorruptPrivateCanary", 0)
+        .unwrap();
+    let error = store.list_credentials_since(0).unwrap_err().0;
+    assert!(
+        error.contains("list_credentials_since") && !error.contains("CorruptPrivateCanary"),
+        "{error}"
+    );
+    raw.zrem::<_, _, ()>(CREDS_BYREV, "CorruptPrivateCanary")
+        .unwrap();
+    assert!(store.list_credentials_since(0).unwrap().is_empty());
+    let record = PlaneRecord {
+        kind: "corrupt_read".into(),
+        id: "event".into(),
+        parent: Some("chain".into()),
+        seq: 1,
+        ts: 1,
+        disposition: PlaneDisposition::Active,
+        body: b"valid body".to_vec(),
+    };
+    store.append_plane_record(record.view()).unwrap();
+    let prefix = format!("busbar:plane:{}:", hex(b"corrupt_read"));
+    let rec = format!("{prefix}rec");
+    let body = format!("{prefix}body");
+    raw.hset::<_, _, _, ()>(&body, "CorruptPrivateCanary", "private body")
+        .unwrap();
+    let error = store
+        .list_plane_records("corrupt_read", &PlaneSelector::All)
+        .unwrap_err()
+        .0;
+    assert!(
+        error.contains("list_plane_records") && !error.contains("CorruptPrivateCanary"),
+        "{error}"
+    );
+    raw.hdel::<_, _, ()>(&body, "CorruptPrivateCanary").unwrap();
+    let side: String = raw.hget(&rec, "1:chain").unwrap();
+    let selector = PlaneSelector::Parent("chain".into());
+    for malformed in [
+        "1aCorruptPrivateCanary",
+        "1a{\"parent\":7}",
+        "1a{\"parent\":null}",
+    ] {
+        raw.hset::<_, _, _, ()>(&rec, "1:chain", malformed).unwrap();
+        let error = store
+            .list_plane_records("corrupt_read", &selector)
+            .unwrap_err()
+            .0;
+        assert!(
+            error.contains("list_plane_records") && !error.contains("CorruptPrivateCanary"),
+            "{error}"
+        );
+    }
+    raw.hset::<_, _, _, ()>(&rec, "1:chain", &side).unwrap();
+    raw.hdel::<_, _, ()>(&body, "1:chain").unwrap();
+    assert!(store.list_plane_records("corrupt_read", &selector).is_err());
+    raw.hdel::<_, _, ()>(&rec, "1:chain").unwrap();
+    assert!(
+        store
+            .list_plane_records("corrupt_read", &selector)
+            .unwrap()
+            .is_empty(),
+        "an index snapshot followed by a complete concurrent deletion still skips the absent row"
+    );
+    store.append_plane_record(record.view()).unwrap();
+    assert_eq!(
+        store.list_plane_records("corrupt_read", &selector).unwrap(),
+        vec![b"valid body".to_vec()]
     );
 }

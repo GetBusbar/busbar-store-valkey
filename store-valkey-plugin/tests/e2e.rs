@@ -1594,7 +1594,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
             .expect("a later agreeing observation clears the quarantine");
         assert!(
             store
-                .redeem_ask_state(&nonce_restart, NOW + 900, NOW)
+                .redeem_ask_state(&nonce_restart, u64::MAX, NOW)
                 .expect("redeem_ask_state"),
             "the FIRST redemption must be answered `true`, or nothing below is about single use"
         );
@@ -1623,7 +1623,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 
     assert!(
         !store
-            .redeem_ask_state(&nonce_restart, NOW + 900, NOW + 1)
+            .redeem_ask_state(&nonce_restart, u64::MAX, NOW + 1)
             .expect("redeem_ask_state"),
         "a restart handed a spent approval back over the plugin ABI. The approval has not lapsed — \
          outliving a restart is the point of it — so the only thing that changed is that the \
@@ -1635,11 +1635,11 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // this one passes on both.
     let node_b = load(&path, &cfg).expect("a second node loads the same plugin");
     assert!(store
-        .redeem_ask_state(&nonce_fleet, NOW + 900, NOW + 2)
+        .redeem_ask_state(&nonce_fleet, u64::MAX, NOW + 2)
         .expect("redeem_ask_state"));
     assert!(
         !node_b
-            .redeem_ask_state(&nonce_fleet, NOW + 900, NOW + 3)
+            .redeem_ask_state(&nonce_fleet, u64::MAX, NOW + 3)
             .expect("redeem_ask_state"),
         "a second node redeemed an approval the first already spent, which is one operator \
          confirmation executing once per node"
@@ -1648,7 +1648,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // deleted the feature.
     assert!(
         node_b
-            .redeem_ask_state(&nonce_fresh, NOW + 900, NOW + 4)
+            .redeem_ask_state(&nonce_fresh, u64::MAX, NOW + 4)
             .expect("redeem_ask_state"),
         "a freshly minted approval is not the one that was spent; refusing it would make the shared \
          ledger a blanket refusal of every confirmation after the first"
@@ -1667,7 +1667,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         "the demotion must be physically present in Valkey, not merely cached in the plugin"
     );
     assert!(
-        !Vocab::redeem_ask_state(&direct, &nonce_restart, NOW + 900, NOW + 5)
+        !Vocab::redeem_ask_state(&direct, &nonce_restart, u64::MAX, NOW + 5)
             .expect("redeem_ask_state via the direct connection"),
         "the spent-approval entry must be physically present in Valkey: a direct connection that \
          never loaded the plugin has to see the redemption the plugin recorded"

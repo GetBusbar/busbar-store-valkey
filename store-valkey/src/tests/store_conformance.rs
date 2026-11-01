@@ -816,8 +816,8 @@ pub(super) mod conf {
     /// execute once across a restart and across two nodes. A different nonce is still redeemable.
     pub fn assert_plane_token_is_single_use(store: &dyn Store, ns: &str) {
         let token = format!("{ns}_asknonce");
-        let expires_at = 2_000_000_000;
-        let now = 1_700_000_000;
+        let expires_at = u64::MAX;
+        let now = 0;
         assert!(
             store
                 .redeem_plane_token("ask", &token, expires_at, now)

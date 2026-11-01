@@ -37,7 +37,7 @@ fn a_delta_cannot_advance_past_a_row_inserted_between_index_and_value_reads() {
             interleave::contains(chunk, b"GET") && interleave::contains(chunk, a_row.as_bytes())
         });
         let slow = ValkeyStore::connect(&gate.url).unwrap();
-        let reader = std::thread::spawn(move || -> RecordStoreResult<Vec<(String, u64)>> {
+        let reader = gate.spawn(move || -> RecordStoreResult<Vec<(String, u64)>> {
             if credentials {
                 slow.list_credentials_since(old_revision - 1).map(|rows| {
                     rows.into_iter()
@@ -87,5 +87,97 @@ fn a_delta_cannot_advance_past_a_row_inserted_between_index_and_value_reads() {
                 .any(|(id, rev)| id == &b_id && *rev == b_revision),
             "the returned newer A stamp must not skip the intervening B row"
         );
+    }
+}
+
+/// Scores only select candidates; adjacent revisions remain distinct beyond a double's precision.
+#[test]
+fn hydration_watermarks_compare_exact_revisions_above_double_precision() {
+    let Some(_) = live_store() else { return };
+    let (_database, mut raw) = fresh_db_client(5);
+    let url = url_for_db(5);
+    let store = ValkeyStore::connect(&url).unwrap();
+    const EDGE: u64 = 1 << 53;
+    // All three stored row shapes: live key, key tombstone and credential (live/revoked).
+    for edge in [EDGE, (1 << 54) + 4, (1 << 55) + 8] {
+        raw.set::<_, _, ()>(REVISION_KEY, edge - 2).unwrap();
+        let mut expected_keys = Vec::new();
+        let mut expected_creds = Vec::new();
+        for n in 0..4 {
+            let owner = uid("vk_exact_revision");
+            let public = uid("AKIA_EXACT_REVISION");
+            let offered = cred(&owner, &public, 0);
+            store
+                .put_key_with_credential(&vk(&owner), &offered)
+                .unwrap();
+            if n % 2 == 0 {
+                store.delete_key(&owner).unwrap();
+            } else if n == 1 {
+                store
+                    .revoke_credential(&offered.meta.id, "exact revision")
+                    .unwrap();
+            }
+            expected_keys.push(store.get_key(&owner).unwrap().unwrap());
+            // Key deletion destroys its credential rows; only live owners have credential deltas.
+            if n % 2 != 0 {
+                expected_creds.push(
+                    store
+                        .list_credentials_since(0)
+                        .unwrap()
+                        .into_iter()
+                        .find(|row| row.meta.id == offered.meta.id)
+                        .unwrap(),
+                );
+            }
+        }
+        let reopened = ValkeyStore::connect(&url).unwrap();
+        let top: u64 = raw.get(REVISION_KEY).unwrap();
+        reopened
+            .revoke_credential(&expected_creds[0].meta.id, "already revoked")
+            .unwrap();
+        // Repeated readers do not allocate revisions; a caller can advance one exact stamp at a time.
+        for since in edge - 2..=top + 1 {
+            for reader in [&store, &reopened] {
+                let keys = reader.list_keys_since(since).unwrap();
+                let creds = reader.list_credentials_since(since).unwrap();
+                for expected in &expected_keys {
+                    assert_eq!(
+                        keys.iter().any(|row| row.id == expected.id),
+                        expected.revision > since,
+                        "key revision {} since {since}",
+                        expected.revision
+                    );
+                }
+                for expected in &expected_creds {
+                    assert_eq!(
+                        creds.iter().any(|row| row.meta.id == expected.meta.id),
+                        expected.meta.revision > since,
+                        "credential revision {} since {since}",
+                        expected.meta.revision
+                    );
+                }
+            }
+        }
+        assert_eq!(raw.get::<_, u64>(REVISION_KEY).unwrap(), top);
+        // A legacy zero-score row stays visible even with a nonzero decoded revision.
+        raw.zadd::<_, _, _, ()>(KEYS_BYREV, &expected_keys[0].id, 0)
+            .unwrap();
+        raw.zadd::<_, _, _, ()>(CREDS_BYREV, slot_pointer(&expected_creds[0].meta), 0)
+            .unwrap();
+        for since in [0, top, u64::MAX] {
+            let keys = reopened.list_keys_since(since).unwrap();
+            let creds = reopened.list_credentials_since(since).unwrap();
+            assert_eq!(
+                keys.iter().filter(|r| r.id == expected_keys[0].id).count(),
+                1
+            );
+            assert_eq!(
+                creds
+                    .iter()
+                    .filter(|r| r.meta.id == expected_creds[0].meta.id)
+                    .count(),
+                1
+            );
+        }
     }
 }

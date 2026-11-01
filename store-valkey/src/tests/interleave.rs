@@ -1,30 +1,108 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! A deterministic interleaving seam: a TCP proxy in front of the live Valkey that PAUSES one
-//! client right after it sends a command naming a trigger, until the test releases it. The test
-//! runs another writer to completion in the gap.
+//! A TCP interleaving fixture whose sockets and workers retire before database custody ends.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-/// A running gate: `url` is the `VALKEY_URL` pointed at the proxy.
+#[derive(Default)]
+struct Connections {
+    stopping: AtomicBool,
+    sockets: Mutex<Vec<TcpStream>>,
+}
+
+impl Connections {
+    fn close(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        for socket in self
+            .sockets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+        {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+pub(super) struct Proxy {
+    pub url: String,
+    connections: Arc<Connections>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        self.connections.close();
+        if let Some(worker) = self.worker.take() {
+            if let Err(error) = worker.join() {
+                if !std::thread::panicking() {
+                    std::panic::resume_unwind(error);
+                }
+            }
+        }
+    }
+}
+
 pub(super) struct Gate {
     pub url: String,
-    /// Fires once, when the trigger command has been forwarded and the client is held.
     pub held: Receiver<()>,
-    /// Releases the held client.
     pub release: Sender<()>,
+    proxy: Proxy,
+}
+
+impl Gate {
+    pub fn spawn<T: Send + 'static>(&self, run: impl FnOnce() -> T + Send + 'static) -> Worker<T> {
+        Worker {
+            worker: Some(std::thread::spawn(run)),
+            release: self.release.clone(),
+            connections: self.proxy.connections.clone(),
+        }
+    }
+}
+
+impl Drop for Gate {
+    fn drop(&mut self) {
+        // Release the hook before Proxy shuts sockets and joins its forwarding threads.
+        let _ = self.release.send(());
+    }
+}
+
+pub(super) struct Worker<T> {
+    worker: Option<std::thread::JoinHandle<T>>,
+    release: Sender<()>,
+    connections: Arc<Connections>,
+}
+
+impl<T> Worker<T> {
+    pub fn join(mut self) -> std::thread::Result<T> {
+        self.worker.take().expect("operation worker").join()
+    }
+}
+
+impl<T> Drop for Worker<T> {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            // On unwind the writer can be held in the hook or waiting on the connector.
+            let _ = self.release.send(());
+            self.connections.close();
+            if let Err(error) = worker.join() {
+                if !std::thread::panicking() {
+                    std::panic::resume_unwind(error);
+                }
+            }
+        }
+    }
 }
 
 pub(super) fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
 }
 
-/// The authority of `url` swapped for `addr`.
 fn repoint(url: &str, addr: &str) -> String {
     let (scheme, rest) = url.split_once("://").expect("a tcp url");
     let (auth, tail) = rest.split_once('/').unwrap_or((rest, ""));
@@ -40,44 +118,82 @@ pub(super) fn upstream_addr(url: &str) -> String {
 
 type Hook = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
-/// A proxy to the Valkey at `valkey_url`: `before` runs on each client chunk ahead of forwarding it,
-/// `after` right after. Returns the proxy's address.
-fn proxy(valkey_url: &str, before: Hook, after: Hook) -> String {
+fn proxy(valkey_url: &str, before: Hook, after: Hook) -> Proxy {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    let upstream = upstream_addr(valkey_url);
-    std::thread::spawn(move || {
-        for client in listener.incoming() {
-            let Ok(mut client) = client else { return };
-            let mut server = TcpStream::connect(&upstream).expect("upstream");
-            let mut back = server.try_clone().unwrap();
-            let mut to_client = client.try_clone().unwrap();
-            std::thread::spawn(move || {
-                let mut buf = [0u8; 16384];
-                while let Ok(n @ 1..) = back.read(&mut buf) {
-                    if to_client.write_all(&buf[..n]).is_err() {
+    // Resolve before spawning: teardown must not join a worker stuck in DNS.
+    let upstream: Vec<_> = std::net::ToSocketAddrs::to_socket_addrs(&upstream_addr(valkey_url))
+        .expect("resolve upstream")
+        .collect();
+    let connections = Arc::new(Connections::default());
+    let running = connections.clone();
+    let worker = std::thread::spawn(move || {
+        std::thread::scope(|scope| {
+            while !running.stopping.load(Ordering::SeqCst) {
+                let mut client = match listener.accept() {
+                    Ok((client, _)) => client,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                };
+                let mut server = upstream.iter().find_map(|address| {
+                    if running.stopping.load(Ordering::SeqCst) {
+                        return None;
+                    }
+                    TcpStream::connect_timeout(address, std::time::Duration::from_secs(10)).ok()
+                });
+                if running.stopping.load(Ordering::SeqCst) {
+                    break;
+                }
+                let mut server = server.take().expect("upstream");
+                {
+                    // Registration and shutdown share this lock, so a late accept cannot
+                    // leave an untracked socket waiting after teardown began.
+                    let mut sockets = running.sockets.lock().unwrap();
+                    if running.stopping.load(Ordering::SeqCst) {
                         break;
                     }
+                    sockets.push(client.try_clone().unwrap());
+                    sockets.push(server.try_clone().unwrap());
                 }
-            });
-            let (before, after) = (before.clone(), after.clone());
-            std::thread::spawn(move || {
-                let mut buf = [0u8; 16384];
-                while let Ok(n @ 1..) = client.read(&mut buf) {
-                    before(&buf[..n]);
-                    if server.write_all(&buf[..n]).is_err() {
-                        break;
+                let mut back = server.try_clone().unwrap();
+                let mut to_client = client.try_clone().unwrap();
+                scope.spawn(move || {
+                    let mut buf = [0u8; 16384];
+                    while let Ok(n @ 1..) = back.read(&mut buf) {
+                        if to_client.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
                     }
-                    after(&buf[..n]);
-                }
-            });
-        }
+                    let _ = to_client.shutdown(Shutdown::Both);
+                    let _ = back.shutdown(Shutdown::Both);
+                });
+                let (before, after) = (before.clone(), after.clone());
+                scope.spawn(move || {
+                    let mut buf = [0u8; 16384];
+                    while let Ok(n @ 1..) = client.read(&mut buf) {
+                        before(&buf[..n]);
+                        if server.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                        after(&buf[..n]);
+                    }
+                    let _ = client.shutdown(Shutdown::Both);
+                    let _ = server.shutdown(Shutdown::Both);
+                });
+            }
+        });
     });
-    addr
+    Proxy {
+        url: repoint(valkey_url, &addr),
+        connections,
+        worker: Some(worker),
+    }
 }
 
-/// Hold the first client that sends a chunk `trigger` accepts until `release`: before
-/// forwarding that chunk when `before`, else right after it.
 pub(super) fn gate(
     valkey_url: &str,
     before: bool,
@@ -96,25 +212,24 @@ pub(super) fn gate(
     });
     let nop: Hook = Arc::new(|_| {});
     let (b, a) = if before { (hold, nop) } else { (nop, hold) };
-    let addr = proxy(valkey_url, b, a);
+    let proxy = proxy(valkey_url, b, a);
     Gate {
-        url: repoint(valkey_url, &addr),
+        url: proxy.url.clone(),
         held,
         release,
+        proxy,
     }
 }
 
-/// A proxy that runs `tamper` ahead of every client chunk `trigger` accepts; the proxy's url.
 pub(super) fn tamper(
     valkey_url: &str,
     trigger: impl Fn(&[u8]) -> bool + Send + Sync + 'static,
     tamper: impl Fn() + Send + Sync + 'static,
-) -> String {
+) -> Proxy {
     let before: Hook = Arc::new(move |chunk| {
         if trigger(chunk) {
             tamper();
         }
     });
-    let addr = proxy(valkey_url, before, Arc::new(|_| {}));
-    repoint(valkey_url, &addr)
+    proxy(valkey_url, before, Arc::new(|_| {}))
 }

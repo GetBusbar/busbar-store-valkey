@@ -694,7 +694,7 @@ fn the_v9_upgrade_drops_the_money_and_dead_slot_keys() {
         assert!(!there, "the dedupe hash {k} of a deleted slot survived");
     }
     let marker: i64 = c.get("busbar:schema").unwrap();
-    assert_eq!(marker, 10);
+    assert_eq!(marker, crate::SCHEMA_VERSION);
     // A kept slot's op replays across the upgrade and applies nothing.
     iso.s()
         .add_usage_batch(kept, &cells)
@@ -880,12 +880,13 @@ fn the_v9_upgrade_keeps_digest_bodied_op_records() {
 }
 
 /// A terminal-only purge over more records than one script call handles: every terminal row goes,
-/// none of the active rows older than it (which fill the first batches) is touched, and the count is
-/// the whole sweep's.
+/// none of the active rows at the cutoff is touched, and the count is the whole sweep's. Both
+/// timestamps round to the same ZSET score.
 #[test]
 fn a_purge_larger_than_one_batch_counts_and_removes_exactly_the_terminal_rows() {
     let Some(s) = live_store() else { return };
     let kind = fresh("purge-batches");
+    let cutoff = (1u64 << 53) + 1;
     let rec = |i: u64, ts: u64, disposition| PlaneRecord {
         kind: kind.clone(),
         id: format!("r{i}"),
@@ -896,23 +897,27 @@ fn a_purge_larger_than_one_batch_counts_and_removes_exactly_the_terminal_rows() 
         body: b"b".to_vec(),
     };
     for i in 0..1200 {
-        s.upsert_plane_record(rec(i, 1, PlaneDisposition::Active).view())
+        s.upsert_plane_record(rec(i, cutoff, PlaneDisposition::Active).view())
             .unwrap();
     }
     for i in 1200..2400 {
-        s.upsert_plane_record(rec(i, 2, PlaneDisposition::Terminal).view())
+        s.upsert_plane_record(rec(i, cutoff - 1, PlaneDisposition::Terminal).view())
             .unwrap();
     }
     let n = s
-        .purge_plane_records(&kind, 10, busbar_contract::records::Retention::TerminalOnly)
+        .purge_plane_records(
+            &kind,
+            cutoff,
+            busbar_contract::records::Retention::TerminalOnly,
+        )
         .unwrap();
     assert_eq!(n, 1200);
     let n = s
-        .purge_plane_records(&kind, 10, busbar_contract::records::Retention::Age)
+        .purge_plane_records(&kind, cutoff + 1, busbar_contract::records::Retention::Age)
         .unwrap();
     assert_eq!(n, 1200);
     let n = s
-        .purge_plane_records(&kind, 10, busbar_contract::records::Retention::Age)
+        .purge_plane_records(&kind, cutoff + 1, busbar_contract::records::Retention::Age)
         .unwrap();
     assert_eq!(n, 0);
 }
@@ -954,7 +959,7 @@ fn the_v6_copy_keeps_an_event_chain_whose_position_forked() {
     let there: bool = c.exists(&key).unwrap();
     assert!(there, "the v6 chain was deleted though its copy forked");
     let marker: i64 = c.get("busbar:schema").unwrap();
-    assert_eq!(marker, 10, "the upgrade still completes");
+    assert_eq!(marker, crate::SCHEMA_VERSION, "the upgrade still completes");
 }
 
 /// A page is read at ONE instant: a strike landing while the scan is in flight cannot shorten it.
@@ -975,7 +980,7 @@ fn a_record_scan_page_is_not_shortened_by_a_concurrent_strike() {
     });
     let scanner = ValkeyStore::connect(&gate.url).unwrap();
     let name = schema.clone();
-    let page = std::thread::spawn(move || scanner.record_scan(&name, b"", 10));
+    let page = gate.spawn(move || scanner.record_scan(&name, b"", 10));
     gate.held
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("the scan is in flight");
@@ -1060,4 +1065,749 @@ fn a_fork_refused_append_records_nothing_under_its_op_id() {
     ));
     s.append_plane_record_op(id, rec(2, b"two").view())
         .expect("the refusal recorded nothing, so the op id is still free");
+}
+
+#[test]
+fn full_width_upsert_timestamps_survive_reopen_and_exact_retention() {
+    let Some(store) = live_store() else { return };
+    let kind = fresh("upsert-full-width-ts");
+    let edge = i64::MAX as u64;
+    let records: Vec<_> = [edge, edge + 1, edge + 2, u64::MAX]
+        .into_iter()
+        .enumerate()
+        .map(|(i, ts)| PlaneRecord {
+            kind: kind.clone(),
+            id: format!("r{i}"),
+            parent: None,
+            seq: 0,
+            ts,
+            disposition: PlaneDisposition::Terminal,
+            body: format!("body-{i}").into_bytes(),
+        })
+        .collect();
+    for record in &records {
+        store.upsert_plane_record(record.view()).unwrap();
+    }
+    drop(store);
+    let store = ValkeyStore::connect(&std::env::var("VALKEY_URL").unwrap()).unwrap();
+    assert_eq!(
+        store.purge_plane_records_before(&kind, edge + 2).unwrap(),
+        2
+    );
+    for (i, record) in records.iter().enumerate() {
+        assert_eq!(
+            store.get_plane_record(&kind, &record.id).unwrap(),
+            (i >= 2).then(|| record.body.clone())
+        );
+    }
+    assert_eq!(
+        store.purge_plane_records_before(&kind, u64::MAX).unwrap(),
+        1
+    );
+    assert_eq!(
+        store.purge_plane_records_before(&kind, u64::MAX).unwrap(),
+        0
+    );
+    assert_eq!(
+        store.get_plane_record(&kind, "r3").unwrap(),
+        Some(b"body-3".to_vec())
+    );
+    store.delete_plane_record(&kind, "r3").unwrap();
+}
+
+#[test]
+fn historical_metering_attribution_survives_batch_replay_and_reopen() {
+    use busbar_contract::records::MeteringDelta;
+    let Some(mut iso) = Iso::new(12) else { return };
+    let bucket = u64::MAX;
+
+    let make = |group: &str, version: &str, n| MeteringDelta {
+        key_id: "history|key%".into(),
+        bucket,
+        model: "m|%".into(),
+        provider: "p".into(),
+        tokens_input: n,
+        tokens_output: n + 1,
+        tokens_cache_read: n + 2,
+        tokens_cache_write: n + 3,
+        requests: 1,
+        billable_requests: 1,
+        key_group_at_use: group.into(),
+        pricing_version: version.into(),
+        priced_from_ms: 17,
+        usage_units: [("tool_calls".into(), n + 4)].into_iter().collect(),
+    };
+    let cells = [
+        make("", "", 1),
+        make("a|%", "v", 10),
+        make("a", "|%v", 100),
+        make("a|%", "V", 1000),
+        make("a|%", "v", 10),
+    ];
+
+    let id = op(181);
+    iso.s().add_metering_batch(id, &cells).unwrap();
+    iso.s().add_metering_batch(id, &cells).unwrap();
+    let mut changed = cells.clone();
+    changed[0].pricing_version = "changed".into();
+    assert_eq!(
+        iso.s().add_metering_batch(id, &changed),
+        Err(OpRefused::Conflict)
+    );
+    iso.restart();
+    let s = iso.s();
+
+    let mut rows = s.list_metering(bucket).unwrap();
+    rows.sort_by(|a, b| {
+        (&a.key_group_at_use, &a.pricing_version).cmp(&(&b.key_group_at_use, &b.pricing_version))
+    });
+    assert_eq!(
+        rows.len(),
+        4,
+        "each historical attribution owns its counts: {rows:?}"
+    );
+    for (group, version, n, repeats) in [
+        ("", "", 1, 1),
+        ("a", "|%v", 100, 1),
+        ("a|%", "V", 1000, 1),
+        ("a|%", "v", 10, 2),
+    ] {
+        let r = rows
+            .iter()
+            .find(|r| r.key_group_at_use == group && r.pricing_version == version)
+            .unwrap();
+        assert_eq!(
+            (
+                r.tokens_input,
+                r.tokens_output,
+                r.tokens_cache_read,
+                r.tokens_cache_write
+            ),
+            (
+                n * repeats,
+                (n + 1) * repeats,
+                (n + 2) * repeats,
+                (n + 3) * repeats
+            )
+        );
+        assert_eq!((r.requests, r.billable_requests), (repeats, repeats));
+        assert_eq!(r.usage_units.get("tool_calls"), Some(&((n + 4) * repeats)));
+    }
+}
+
+#[test]
+fn v10_metering_migration_preserves_raw_rows_and_replays() {
+    let Some(mut iso) = Iso::new(12) else { return };
+    let bucket = u64::MAX;
+    let mut r = iso.raw();
+    let set = format!("busbar:metering:{bucket}");
+    let old = format!("{set}:history|m|p|9007199254740993");
+    let unknown = format!("{set}:unknown|m|p");
+    let _: () = redis::cmd("HSET")
+        .arg(&old)
+        .arg(&[
+            "key_id",
+            "history",
+            "model",
+            "m",
+            "provider",
+            "p",
+            "priced_from_ms",
+            "9007199254740993",
+            "key_group_at_use",
+            "old|group",
+            "pricing_version",
+            "old%version",
+            "tokens_input",
+            "7",
+            "u:tool_calls",
+            "11",
+            "opaque",
+            "kept",
+        ])
+        .query(&mut r)
+        .unwrap();
+    let _: () = redis::cmd("HSET")
+        .arg(&unknown)
+        .arg(&[
+            "key_id",
+            "unknown",
+            "model",
+            "m",
+            "provider",
+            "p",
+            "tokens_input",
+            "3",
+            "u:tool_calls",
+            "5",
+        ])
+        .query(&mut r)
+        .unwrap();
+    let _: () = r.sadd(&set, [&old, &unknown]).unwrap();
+    let _: () = r.set("busbar:schema", 10).unwrap();
+    iso.restart();
+    iso.restart();
+    let rows = iso.s().list_metering(bucket).unwrap();
+    assert_eq!(rows.len(), 2);
+    let oldrow = rows.iter().find(|r| r.key_id == "history").unwrap();
+    assert_eq!(
+        (&*oldrow.key_group_at_use, &*oldrow.pricing_version),
+        ("old|group", "old%version")
+    );
+    assert_eq!(
+        (oldrow.tokens_input, oldrow.priced_from_ms),
+        (7, 9007199254740993)
+    );
+    assert_eq!(oldrow.usage_units.get("tool_calls"), Some(&11));
+    let unknownrow = rows.iter().find(|r| r.key_id == "unknown").unwrap();
+    assert_eq!(
+        (&*unknownrow.key_group_at_use, &*unknownrow.pricing_version),
+        ("", "")
+    );
+    assert_eq!(unknownrow.usage_units.get("tool_calls"), Some(&5));
+    let mut delta = metering_delta(bucket, 2);
+    delta.key_id = "history".into();
+    delta.key_group_at_use = "new".into();
+    delta.pricing_version = "old%version".into();
+    delta.priced_from_ms = 9007199254740993;
+    delta.usage_units.insert("tool_calls".into(), 13);
+    let id = op(182);
+    iso.s().add_metering_batch(id, &[delta.clone()]).unwrap();
+    iso.s().add_metering_batch(id, &[delta]).unwrap();
+    let rows = iso.s().list_metering(bucket).unwrap();
+    assert_eq!(rows.len(), 3);
+    let oldrow = rows
+        .iter()
+        .find(|r| r.key_group_at_use == "old|group")
+        .unwrap();
+    assert_eq!(oldrow.tokens_input, 7);
+    assert_eq!(oldrow.usage_units.get("tool_calls"), Some(&11));
+    let names: Vec<String> = r.smembers(&set).unwrap();
+    let mut opaque = 0;
+    for name in names {
+        let value: Option<String> = r.hget(name, "opaque").unwrap();
+        if value.as_deref() == Some("kept") {
+            opaque += 1;
+        }
+    }
+    assert_eq!(
+        opaque, 1,
+        "unknown hash metadata survives the migration unchanged"
+    );
+}
+
+#[test]
+fn v10_metering_destination_collision_refuses_without_overwriting_evidence() {
+    let Some(mut iso) = Iso::new(12) else { return };
+    let mut r = iso.raw();
+    let set = "busbar:metering:17";
+    let old = "busbar:metering:17:k|m|p";
+    let destination = "busbar:metering:17:k|m|p|0|g|v";
+    let _: () = redis::cmd("HSET")
+        .arg(old)
+        .arg(&[
+            "key_id",
+            "k",
+            "model",
+            "m",
+            "provider",
+            "p",
+            "key_group_at_use",
+            "g",
+            "pricing_version",
+            "v",
+            "tokens_input",
+            "9007199254740993",
+        ])
+        .query(&mut r)
+        .unwrap();
+    let _: () = r.sadd(set, old).unwrap();
+    let _: () = r.set(destination, "retained collision").unwrap();
+    let _: () = r.set("busbar:schema", 10).unwrap();
+    iso.store = None;
+    assert!(ValkeyStore::connect(&iso.url).is_err());
+    let stamp: i64 = r.get("busbar:schema").unwrap();
+    assert_eq!(stamp, 10);
+    let value: String = r.get(destination).unwrap();
+    assert_eq!(value, "retained collision");
+    let count: String = r.hget(old, "tokens_input").unwrap();
+    assert_eq!(count, "9007199254740993");
+    let names: Vec<String> = r.smembers(set).unwrap();
+    assert_eq!(names, [old]);
+    let _: () = r.del(destination).unwrap();
+    iso.restart();
+    let rows = iso.s().list_metering(17).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].tokens_input, 9007199254740993);
+    assert_eq!(
+        (&*rows[0].key_group_at_use, &*rows[0].pricing_version),
+        ("g", "v")
+    );
+    // A stale schema marker is the state after an interrupted upgrade. Already moved rows are idempotent.
+    let _: () = r.set("busbar:schema", 10).unwrap();
+    iso.restart();
+    assert_eq!(iso.s().list_metering(17).unwrap(), rows);
+}
+
+#[test]
+fn v10_metering_upgrade_keeps_the_existing_replay_receipt_and_same_cell() {
+    let Some(mut iso) = Iso::new(12) else { return };
+    let bucket = 19;
+    let mut delta = metering_delta(bucket, 7);
+    delta.key_id = "history".into();
+    delta.key_group_at_use = "g".into();
+    delta.pricing_version = "v".into();
+    delta.usage_units.insert("tool_calls".into(), 11);
+    let id = op(183);
+    iso.s().add_metering_batch(id, &[delta.clone()]).unwrap();
+    let mut r = iso.raw();
+    let set = format!("busbar:metering:{bucket}");
+    let names: Vec<String> = r.smembers(&set).unwrap();
+    assert_eq!(names.len(), 1);
+    let old = format!("{set}:history|m|p");
+    // Put the hash in its pre-upgrade location while preserving the real committed op receipt.
+    if names[0] != old {
+        let _: () = redis::cmd("RENAME")
+            .arg(&names[0])
+            .arg(&old)
+            .query(&mut r)
+            .unwrap();
+    }
+    let _: () = r.del(&set).unwrap();
+    let _: () = r.sadd(&set, &old).unwrap();
+    let _: () = r.set("busbar:schema", 10).unwrap();
+    iso.restart();
+    iso.s().add_metering_batch(id, &[delta.clone()]).unwrap();
+    let rows = iso.s().list_metering(bucket).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].tokens_input, 7);
+    assert_eq!(rows[0].usage_units.get("tool_calls"), Some(&11));
+    iso.s().add_metering_batch(op(184), &[delta]).unwrap();
+    let rows = iso.s().list_metering(bucket).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].tokens_input, 14);
+    assert_eq!(rows[0].usage_units.get("tool_calls"), Some(&22));
+}
+
+/// A fresh op id that successfully replays an existing position is spent durably too.
+#[test]
+fn an_identical_append_under_a_fresh_op_id_records_the_success() {
+    let Some(s) = live_store() else { return };
+    let kind = fresh("append-replay-op");
+    let rec = |seq, body: &[u8]| PlaneRecord {
+        kind: kind.clone(),
+        id: "row".into(),
+        parent: Some("parent".into()),
+        seq,
+        ts: 1,
+        disposition: PlaneDisposition::Active,
+        body: body.to_vec(),
+    };
+    let mut raw = raw_conn();
+    let prefix = format!("busbar:plane:{}:", crate::hex(kind.as_bytes()));
+    let keys = ["rec", "body", "byts", "idx:706172656e74", "pcount"]
+        .map(|suffix| format!("{prefix}{suffix}"));
+    s.append_plane_record_op(op(130), rec(1, b"one").view())
+        .unwrap();
+    let before = plane_key_snapshot(&mut raw, &keys);
+    let replay = op(131);
+    s.append_plane_record_op(replay, rec(1, b"one").view())
+        .unwrap();
+    assert_eq!(
+        plane_key_snapshot(&mut raw, &keys),
+        before,
+        "replay changed the record"
+    );
+    let op_key = format!("busbar:op:{}", crate::hex(&replay.0));
+    let recorded: Option<Vec<u8>> = raw.hget(&op_key, "b").unwrap();
+    assert!(
+        recorded.is_some(),
+        "successful replay did not record its op id"
+    );
+    let ttl: i64 = raw.ttl(&op_key).unwrap();
+    assert!(ttl > 0 && ttl as u64 <= busbar_contract::abi::store::OP_ID_RETENTION_SECS);
+    let again = ValkeyStore::connect(&std::env::var("VALKEY_URL").unwrap()).unwrap();
+    again
+        .append_plane_record_op(replay, rec(1, b"one").view())
+        .unwrap();
+    for changed in [rec(2, b"two"), rec(1, b"changed")] {
+        assert_eq!(
+            again.append_plane_record_op(replay, changed.view()),
+            Err(OpRefused::Conflict)
+        );
+    }
+    assert_eq!(
+        plane_key_snapshot(&mut raw, &keys),
+        before,
+        "conflict applied another row"
+    );
+    assert_eq!(
+        again
+            .list_plane_records(&kind, &PlaneSelector::All)
+            .unwrap(),
+        vec![b"one".to_vec()]
+    );
+    s.delete_plane_record(&kind, "parent").unwrap();
+}
+
+/// Inspect exact backend state independently, including malformed keys that public reads refuse.
+fn plane_key_snapshot(raw: &mut redis::Connection, keys: &[String]) -> Vec<Option<Vec<u8>>> {
+    keys.iter()
+        .map(|key| redis::cmd("DUMP").arg(key).query(raw).unwrap())
+        .collect()
+}
+
+/// A script error must precede every mutation: repairing the bad target lets the same op retry.
+#[test]
+fn a_plane_append_validates_all_targets_before_writing_anything() {
+    let Some(s) = live_store() else { return };
+    let mut raw = raw_conn();
+    for fault in [
+        "rec",
+        "body",
+        "byts",
+        "idx:706172656e74",
+        "pcount",
+        "op",
+        "counter",
+        "overflow",
+    ] {
+        let kind = fresh("append-atomic");
+        let prefix = format!("busbar:plane:{}:", crate::hex(kind.as_bytes()));
+        let id = op(132);
+        let op_key = format!("busbar:op:{}", crate::hex(&id.0));
+        let mut keys: Vec<_> = ["rec", "body", "byts", "idx:706172656e74", "pcount"]
+            .map(|suffix| format!("{prefix}{suffix}"))
+            .into();
+        keys.push(op_key.clone());
+        let bad = match fault {
+            "op" => op_key.clone(),
+            "counter" | "overflow" => format!("{prefix}pcount"),
+            _ => format!("{prefix}{fault}"),
+        };
+        if matches!(fault, "counter" | "overflow") {
+            let value = if fault == "counter" {
+                "not-an-integer"
+            } else {
+                "9223372036854775807"
+            };
+            let _: () = raw.hset(&bad, "parent", value).unwrap();
+        } else {
+            let _: () = raw.set(&bad, "wrong-type").unwrap();
+        }
+        let record = PlaneRecord {
+            kind: kind.clone(),
+            id: "row".into(),
+            parent: Some("parent".into()),
+            seq: 1,
+            ts: 1,
+            disposition: PlaneDisposition::Active,
+            body: b"one".to_vec(),
+        };
+        let before = plane_key_snapshot(&mut raw, &keys);
+        assert!(
+            matches!(
+                s.append_plane_record_op(id, record.view()),
+                Err(OpRefused::Failed(_))
+            ),
+            "{fault}"
+        );
+        assert_eq!(
+            plane_key_snapshot(&mut raw, &keys),
+            before,
+            "partial append after {fault}"
+        );
+        let _: () = raw.del(&bad).unwrap();
+        s.append_plane_record_op(id, record.view())
+            .expect("repair permits the original op");
+        assert_eq!(
+            s.list_plane_records(&kind, &PlaneSelector::Parent("parent".into()))
+                .unwrap(),
+            vec![b"one".to_vec()]
+        );
+        let count: i64 = raw.hget(format!("{prefix}pcount"), "parent").unwrap();
+        assert_eq!(count, 1, "{fault}");
+        let retained: u64 = raw.zcard(format!("{prefix}byts")).unwrap();
+        assert_eq!(retained, 1, "missing retention index after {fault}");
+        assert!(raw.hexists::<_, _, bool>(&op_key, "b").unwrap());
+        s.delete_plane_record(&kind, "parent").unwrap();
+    }
+}
+
+/// Upserts share the writer: validate old links as well as the new parent's late index/counter.
+#[test]
+fn a_plane_replacement_validates_old_and_new_links_before_unlinking() {
+    let Some(s) = live_store() else { return };
+    let mut raw = raw_conn();
+    for fault in [
+        "old-index",
+        "new-index",
+        "old-counter",
+        "new-counter",
+        "underflow",
+        "sidecar",
+    ] {
+        let kind = fresh("upsert-atomic");
+        let prefix = format!("busbar:plane:{}:", crate::hex(kind.as_bytes()));
+        let keys = [
+            "rec",
+            "body",
+            "byts",
+            "idx:726f77",
+            "pcount",
+            "idx:6f6c64",
+            "idx:6e6577",
+        ]
+        .map(|suffix| format!("{prefix}{suffix}"));
+        let record = |parent: &str, body: &[u8]| PlaneRecord {
+            kind: kind.clone(),
+            id: "row".into(),
+            parent: Some(parent.into()),
+            seq: 0,
+            ts: 1,
+            disposition: PlaneDisposition::Active,
+            body: body.to_vec(),
+        };
+        s.upsert_plane_record(record("old", b"before").view())
+            .unwrap();
+        let sidecar: Vec<u8> = raw.hget(&keys[0], "0:row").unwrap();
+        match fault {
+            "old-index" | "new-index" => {
+                let key = &keys[if fault == "old-index" { 5 } else { 6 }];
+                let _: () = raw.del(key).unwrap();
+                let _: () = raw.set(key, "wrong-type").unwrap();
+            }
+            "sidecar" => {
+                let _: () = raw.hset(&keys[0], "0:row", "1a{broken").unwrap();
+            }
+            _ => {
+                let parent = if fault == "new-counter" { "new" } else { "old" };
+                let value = if fault == "underflow" {
+                    "-9223372036854775808"
+                } else {
+                    "not-an-integer"
+                };
+                let _: () = raw.hset(&keys[4], parent, value).unwrap();
+            }
+        }
+        let before = plane_key_snapshot(&mut raw, &keys);
+        assert!(
+            s.upsert_plane_record(record("new", b"after").view())
+                .is_err(),
+            "{fault}"
+        );
+        assert_eq!(
+            plane_key_snapshot(&mut raw, &keys),
+            before,
+            "partial replacement after {fault}"
+        );
+        match fault {
+            "old-index" | "new-index" => {
+                let _: () = raw
+                    .del(&keys[if fault == "old-index" { 5 } else { 6 }])
+                    .unwrap();
+                let _: () = raw.zadd(&keys[5], "0:row", 0).unwrap();
+            }
+            "sidecar" => {
+                let _: () = raw.hset(&keys[0], "0:row", &sidecar).unwrap();
+            }
+            "new-counter" => {
+                let _: () = raw.hdel(&keys[4], "new").unwrap();
+            }
+            _ => {
+                let _: () = raw.hset(&keys[4], "old", 1).unwrap();
+            }
+        }
+        s.upsert_plane_record(record("new", b"after").view())
+            .expect("repair permits replacement");
+        assert_eq!(
+            s.get_plane_record(&kind, "row").unwrap(),
+            Some(b"after".to_vec())
+        );
+        assert!(s
+            .list_plane_records(&kind, &PlaneSelector::Parent("old".into()))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            s.list_plane_records(&kind, &PlaneSelector::Parent("new".into()))
+                .unwrap(),
+            vec![b"after".to_vec()]
+        );
+        assert_eq!(
+            s.list_plane_record_parents(&kind).unwrap(),
+            vec!["new".to_string()]
+        );
+        s.delete_plane_record(&kind, "row").unwrap();
+    }
+}
+
+#[test]
+fn plane_retention_uses_exact_timestamps_and_cleans_every_index() {
+    use busbar_contract::records::Retention;
+
+    let Some(s) = live_store() else { return };
+    let mut raw = raw_conn();
+    let large = 1u64 << 53;
+    let max = i64::MAX as u64;
+    let timestamps = [
+        0,
+        large - 1,
+        large,
+        large + 1,
+        large + 2,
+        large + 3,
+        max - 1,
+        max,
+        max + 1,
+        u64::MAX - 1,
+        u64::MAX,
+    ];
+    for terminal_only in [false, true] {
+        for before in [
+            0,
+            large,
+            large + 1,
+            large + 3,
+            large + 4,
+            max,
+            max + 1,
+            u64::MAX - 1,
+            u64::MAX,
+        ] {
+            let kind = fresh("purge-exact-ts");
+            let prefix = format!("busbar:plane:{}:", crate::hex(kind.as_bytes()));
+            let records: Vec<_> = timestamps
+                .iter()
+                .flat_map(|&ts| {
+                    [PlaneDisposition::Active, PlaneDisposition::Terminal]
+                        .into_iter()
+                        .map(move |disposition| (ts, disposition))
+                })
+                .enumerate()
+                .map(|(i, (ts, disposition))| PlaneRecord {
+                    kind: kind.clone(),
+                    id: format!("r{i}"),
+                    parent: Some(format!("p{i}")),
+                    seq: large + i as u64,
+                    ts,
+                    disposition,
+                    body: format!("body-{i}").into_bytes(),
+                })
+                .collect();
+            for record in records.iter().rev() {
+                s.append_plane_record_op(op(80), record.view()).unwrap();
+            }
+            let should_remove = |record: &PlaneRecord| {
+                record.ts < before
+                    && (!terminal_only || record.disposition == PlaneDisposition::Terminal)
+            };
+            let expected: Vec<_> = records
+                .iter()
+                .filter(|r| !should_remove(r))
+                .map(|r| r.body.clone())
+                .collect();
+            let gone = if terminal_only {
+                s.purge_plane_records(&kind, before, Retention::TerminalOnly)
+            } else {
+                s.purge_plane_records_before(&kind, before)
+            }
+            .unwrap();
+            assert_eq!(
+                gone as usize,
+                records.len() - expected.len(),
+                "{before}, {terminal_only}"
+            );
+            assert_eq!(
+                s.list_plane_records(&kind, &PlaneSelector::All).unwrap(),
+                expected
+            );
+            let mut parents: Vec<_> = records
+                .iter()
+                .filter(|r| !should_remove(r))
+                .map(|r| r.parent.clone().unwrap())
+                .collect();
+            parents.sort();
+            assert_eq!(s.list_plane_record_parents(&kind).unwrap(), parents);
+            for record in &records {
+                let parent = record.parent.as_deref().unwrap();
+                let kept = !should_remove(record);
+                let rows = s
+                    .list_plane_records(&kind, &PlaneSelector::Parent(parent.into()))
+                    .unwrap();
+                assert_eq!(
+                    rows,
+                    if kept {
+                        vec![record.body.clone()]
+                    } else {
+                        Vec::new()
+                    }
+                );
+                let field = format!("{}:{parent}", record.seq);
+                for suffix in ["rec", "body"] {
+                    let present: bool = raw.hexists(format!("{prefix}{suffix}"), &field).unwrap();
+                    assert_eq!(present, kept, "{suffix}: {field}");
+                }
+                let score: Option<f64> = raw.zscore(format!("{prefix}byts"), &field).unwrap();
+                assert_eq!(score.is_some(), kept, "timestamp index: {field}");
+                let index_len: usize = raw
+                    .zcard(format!("{prefix}idx:{}", crate::hex(parent.as_bytes())))
+                    .unwrap();
+                assert_eq!(index_len, usize::from(kept), "parent index: {field}");
+            }
+            assert_eq!(
+                s.purge_plane_records(
+                    &kind,
+                    before,
+                    if terminal_only {
+                        Retention::TerminalOnly
+                    } else {
+                        Retention::Age
+                    },
+                )
+                .unwrap(),
+                0,
+                "repeated cutoff is a no-op"
+            );
+            for record in &records {
+                s.delete_plane_record(&kind, record.parent.as_deref().unwrap())
+                    .unwrap();
+            }
+            let keys: Vec<String> = raw.keys(format!("{prefix}*")).unwrap();
+            assert!(
+                keys.is_empty(),
+                "plane keys survived full cleanup: {keys:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_missing_indexed_record_value_refuses_instead_of_falsely_ending_a_scan() {
+    use super::Raw;
+    use redis::Commands;
+    let Some(store) = live_store() else { return };
+    let schema = fresh("orphan_scan");
+    store.record_put(&schema, b"a", b"first").unwrap();
+    store.record_put(&schema, b"b", b"second").unwrap();
+    let values = format!("busbar:records:{}:v", crate::hex(schema.as_bytes()));
+    store
+        .with_conn(|raw| raw.hdel::<_, _, ()>(&values, b"a"))
+        .unwrap();
+    let error = store
+        .record_scan(&schema, b"", 1)
+        .expect_err("a missing value must not masquerade as a successful end of iteration");
+    assert!(
+        error.contains("record_scan") && error.contains("missing"),
+        "{error}"
+    );
+    assert_eq!(
+        store.record_get(&schema, b"b").unwrap().unwrap().as_slice(),
+        b"second"
+    );
+    store.record_put(&schema, b"a", b"repaired").unwrap();
+    let page = store.record_scan(&schema, b"", 2).unwrap();
+    assert_eq!(page.len(), 2);
+    assert_eq!(page[0].0, b"a");
+    assert_eq!(page[0].1.as_slice(), b"repaired");
+    assert_eq!(page[1].0, b"b");
 }
