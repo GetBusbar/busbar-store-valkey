@@ -56,6 +56,8 @@
 // keyspace and leaves none; nothing in the store's behaviour changes.
 #[path = "support/conformance_host.rs"]
 mod conformance_host;
+#[path = "../../test-support/database.rs"]
+mod database;
 
 busbar_test_kit::conformance_suite! {
     door: busbar_store_valkey::door,
@@ -98,17 +100,20 @@ fn host(
 
 /// The fold's database on the live server, on a connection of the `redis` client's own: straight to
 /// the server, in the clear (the TLS front is the store's, not this client's).
-fn fold_client(settings: &[u8]) -> redis::RedisResult<redis::Connection> {
+fn fold_url(settings: &[u8]) -> String {
     let v: serde_json::Value =
         serde_json::from_slice(settings).expect("conformance.json's settings are JSON");
-    let url = v["url"]
+    v["url"]
         .as_str()
         .expect("conformance.json's settings name a url")
         .replace(
             &format!("rediss://{}", conformance_host::FAR_END),
             &format!("redis://{}", upstream()),
-        );
-    redis::Client::open(url.as_str())?.get_connection()
+        )
+}
+
+fn fold_client(settings: &[u8]) -> redis::RedisResult<redis::Connection> {
+    redis::Client::open(fold_url(settings))?.get_connection()
 }
 
 fn stamp_newer_schema(_: &str, settings: &[u8]) {
@@ -119,14 +124,13 @@ fn stamp_newer_schema(_: &str, settings: &[u8]) {
         .expect("stamp a newer schema in the fold's private database");
 }
 
-fn flush_fold_keyspace(settings: &[u8]) -> redis::RedisResult<()> {
-    redis::cmd("FLUSHDB").query::<()>(&mut fold_client(settings)?)
-}
-
 /// The suite's database, held by one fold at a time: the namespace of the fold holding it.
-fn fold_gate() -> &'static (std::sync::Mutex<Option<String>>, std::sync::Condvar) {
-    static GATE: std::sync::OnceLock<(std::sync::Mutex<Option<String>>, std::sync::Condvar)> =
-        std::sync::OnceLock::new();
+type FoldGate = (
+    std::sync::Mutex<Option<(String, database::Database)>>,
+    std::sync::Condvar,
+);
+fn fold_gate() -> &'static FoldGate {
+    static GATE: std::sync::OnceLock<FoldGate> = std::sync::OnceLock::new();
     GATE.get_or_init(Default::default)
 }
 
@@ -136,10 +140,14 @@ fn release_fold_keyspace(namespace: &str) {
     let mut held = held
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if held.as_deref() == Some(namespace) {
-        *held = None;
-    }
+    let released = if held.as_ref().is_some_and(|(name, _)| name == namespace) {
+        held.take()
+    } else {
+        None
+    };
+    drop(held);
     freed.notify_all();
+    drop(released); // Flush before the OS lock becomes available to another fold/process.
 }
 
 /// The suite's namespace hook, before the fold's open: the fold takes the suite's database (waiting
@@ -154,21 +162,14 @@ fn take_fold_keyspace(namespace: &str, settings: &[u8]) {
             .wait(slot)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
-    *slot = Some(namespace.to_owned());
-    drop(slot);
-    if let Err(e) = flush_fold_keyspace(settings) {
-        // No fold runs, so no drop hook will hand the database on: hand it on here.
-        release_fold_keyspace(namespace);
-        panic!("the fold's keyspace is not flushed before its open: {e}");
-    }
+    let database = database::Database::take(&fold_url(settings));
+    *slot = Some((namespace.to_owned(), database));
 }
 
 /// The suite's namespace hook, after the fold (its failure included): everything the store wrote in
 /// the fold is flushed, and the database is handed to the next fold.
-fn drop_fold_keyspace(namespace: &str, settings: &[u8]) {
-    let flushed = flush_fold_keyspace(settings);
+fn drop_fold_keyspace(namespace: &str, _: &[u8]) {
     release_fold_keyspace(namespace);
-    flushed.unwrap_or_else(|e| panic!("the fold's keyspace is not flushed after the fold: {e}"));
 }
 
 use std::path::{Path, PathBuf};

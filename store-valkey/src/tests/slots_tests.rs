@@ -275,11 +275,12 @@ fn a_usage_and_a_metering_batch_apply_once() {
 
 /// A store over a DATABASE of its own (`VALKEY_URL` re-pointed at `db`, emptied first and on drop):
 /// a test that seeds whole key families and asserts they are gone must not do it in the shared
-/// database 0. Each test below owns one database number (the suite's other live tests use 0 and 11 to
-/// 15), so the tests run in parallel without sharing a namespace.
+/// database 0. The guard holds an OS lock for the complete lifetime, including across test binaries
+/// and nextest processes that reuse the same private database number.
 struct Iso {
     url: String,
     store: Option<ValkeyStore>,
+    _database: super::database::Database,
 }
 
 impl Iso {
@@ -287,16 +288,13 @@ impl Iso {
         live_store()?;
         super::assert_private_db(db);
         let url = super::url_for_db(db);
-        Self::flush(&url);
+        let database = super::database::Database::take(&url);
         let store = Some(ValkeyStore::connect(&url).expect("connect"));
-        Some(Iso { url, store })
-    }
-
-    fn flush(url: &str) {
-        let mut c = redis::Client::open(url)
-            .and_then(|c| c.get_connection())
-            .expect("an independent client");
-        redis::cmd("FLUSHDB").query::<()>(&mut c).expect("FLUSHDB");
+        Some(Iso {
+            url,
+            store,
+            _database: database,
+        })
     }
 
     fn s(&self) -> &ValkeyStore {
@@ -320,7 +318,6 @@ impl Iso {
 impl Drop for Iso {
     fn drop(&mut self) {
         self.store = None;
-        Self::flush(&self.url);
     }
 }
 

@@ -7,6 +7,9 @@ use busbar_contract::records::{MeteringDelta, PlaneDisposition, RecordStore, Sec
 use redis::Commands;
 use std::sync::OnceLock;
 
+#[path = "../../test-support/database.rs"]
+mod database;
+
 use busbar_contract::abi::store::OpId;
 use busbar_plugin_loader::dispatch::kinds::store::Store;
 use busbar_plugin_loader::dispatch::{
@@ -183,6 +186,18 @@ impl Raw for LoadedStore {
             .and_then(|c| c.get_connection())
             .map_err(|e| RecordStoreError(format!("valkey connect: {e}")))?;
         f(&mut c).map_err(|e| RecordStoreError(format!("valkey command: {e}")))
+    }
+}
+
+impl Raw for database::Database {
+    fn with_conn<T>(
+        &self,
+        f: impl FnOnce(&mut redis::Connection) -> redis::RedisResult<T>,
+    ) -> RecordStoreResult<T> {
+        let mut c = self
+            .connection()
+            .map_err(|_| RecordStoreError("private test connection failed".into()))?;
+        f(&mut c).map_err(|_| RecordStoreError("private test command failed".into()))
     }
 }
 
@@ -1570,13 +1585,11 @@ fn the_shared_database_is_never_flushed() {
 }
 
 /// An independent upstream client on database `db`, emptied first.
-fn fresh_db_client(db: u32) -> redis::Connection {
+fn fresh_db_client(db: u32) -> (database::Database, redis::Connection) {
     assert_private_db(db);
-    let mut c = redis::Client::open(url_for_db(db).as_str())
-        .and_then(|c| c.get_connection())
-        .unwrap();
-    redis::cmd("FLUSHDB").query::<()>(&mut c).unwrap();
-    c
+    let held = database::Database::take(&url_for_db(db));
+    let c = held.connection().expect("connect to private test database");
+    (held, c)
 }
 
 /// A namespace marked NEWER than this build is REFUSED at open, and left as found: an older build
@@ -1584,7 +1597,7 @@ fn fresh_db_client(db: u32) -> redis::Connection {
 #[test]
 fn a_namespace_newer_than_this_build_is_refused() {
     let Some(_) = live_store() else { return };
-    let mut up = fresh_db_client(11);
+    let (_database, mut up) = fresh_db_client(11);
     let newer = SCHEMA_VERSION + 1;
     redis::cmd("SET")
         .arg("busbar:schema")
@@ -1617,7 +1630,7 @@ fn a_namespace_newer_than_this_build_is_refused() {
 #[ignore]
 fn a_pre_v6_namespace_is_refused_not_wiped_and_keeps_refund_shaped_data() {
     let Some(_) = live_store() else { return };
-    let mut up = fresh_db_client(13);
+    let (_database, mut up) = fresh_db_client(13);
     let bucket = "vk_migrate_v6_refund_shaped";
     let row_key = format!("busbar:usage:{bucket}:1700000000");
     redis::cmd("SET")
@@ -1661,7 +1674,7 @@ fn a_pre_v6_namespace_is_refused_not_wiped_and_keeps_refund_shaped_data() {
 #[ignore]
 fn a_namespace_with_keys_but_no_marker_refuses_to_connect_and_keeps_every_key() {
     let Some(_) = live_store() else { return };
-    let mut up = fresh_db_client(12);
+    let (_database, mut up) = fresh_db_client(12);
     let seeded = [
         "busbar:key:vk_no_marker",
         "busbar:usage:vk_no_marker:1700000000",
@@ -1891,7 +1904,7 @@ mod conformance {
 #[test]
 fn a_corrupt_credential_row_fails_the_delta_naming_its_key() {
     let Some(_) = live_store() else { return };
-    let mut up = fresh_db_client(CORRUPT_ROW_DB);
+    let (_database, mut up) = fresh_db_client(CORRUPT_ROW_DB);
     let store = ValkeyStore::connect(&url_for_db(CORRUPT_ROW_DB)).expect("connect");
     let key_id = uid("vk_delta_bad");
     store
@@ -3505,15 +3518,18 @@ fn a_key_round_trips_its_idp_provider() {
 /// wrote them, come back through the 1.6.0 verbs after a connect — as the bodies the planes decode,
 /// with the sidecar the planes write (a replay of a migrated event is the identical append, not a
 /// fork) — and the typed keys are gone. Everything else in the namespace (keys, usage, the v6 call
-/// log) is untouched. Safe beside the rest of the suite: the upgrade only reads and removes v6 keys
-/// and appends into empty positions.
+/// log) is untouched. The complete migration runs in a locked private database because later
+/// migration steps also remove whole key families.
 #[test]
 fn v6_namespace_upgrades_in_place_to_v7() {
     use crate::legacy::{
         ASK_STATE_PREFIX, MCP_DEMOTIONS_HASH, TASKS_BY_UPDATED, TASKS_INDEX, TASK_EVENTS_PREFIX,
         TASK_ROW_PREFIX,
     };
-    let Some(store) = live_store() else { return };
+    let Some(_) = live_store() else { return };
+    let (database, _raw) = fresh_db_client(6);
+    let url = url_for_db(6);
+    let store = ValkeyStore::connect(&url).unwrap();
     let t = uid("t_v6_live");
     let done = uid("t_v6_done");
     let server = uid("srv_v6");
@@ -3528,7 +3544,7 @@ fn v6_namespace_upgrades_in_place_to_v7() {
     let e1 = sample_event(&t, 1, "task.submitted", "", "x1");
     let e2 = sample_event(&t, 2, "task.working", "x1", "x2");
     let dem = demotion(&server, "tool-drift", TRUST_NOW);
-    store
+    database
         .with_conn(|c| {
             let mut p = redis::pipe();
             for task in [&live, &finished] {
@@ -3562,7 +3578,6 @@ fn v6_namespace_upgrades_in_place_to_v7() {
         })
         .unwrap();
 
-    let url = std::env::var("VALKEY_URL").unwrap();
     let upgraded = ValkeyStore::connect(&url).expect("a v6 namespace upgrades on connect");
 
     assert_eq!(upgraded.get_task(&t).unwrap(), Some(live.clone()));
@@ -3591,7 +3606,7 @@ fn v6_namespace_upgrades_in_place_to_v7() {
             .unwrap(),
         "a v6 spent approval stays spent across the upgrade"
     );
-    let ttl: i64 = upgraded
+    let ttl: i64 = database
         .with_conn(|c| c.ttl(plane::token_key("ask", &nonce)))
         .unwrap();
     assert!(
@@ -3600,7 +3615,7 @@ fn v6_namespace_upgrades_in_place_to_v7() {
     );
 
     // The typed keys are gone; everything else is where it was.
-    let left: Vec<String> = upgraded
+    let left: Vec<String> = database
         .with_conn(|c| {
             let mut v = Vec::new();
             for k in [
@@ -3617,11 +3632,11 @@ fn v6_namespace_upgrades_in_place_to_v7() {
         })
         .unwrap();
     assert!(left.is_empty(), "v6 typed keys left behind: {left:?}");
-    assert!(!upgraded
+    assert!(!database
         .with_conn(|c| c.hexists::<_, _, bool>(MCP_DEMOTIONS_HASH, &server))
         .unwrap());
     assert!(
-        upgraded
+        database
             .with_conn(|c| c.exists::<_, bool>(&call_key))
             .unwrap(),
         "the v6 call log is left in place, unread — no evidence is destroyed"
@@ -3630,12 +3645,12 @@ fn v6_namespace_upgrades_in_place_to_v7() {
         upgraded.get_key(&key_id).unwrap().is_some(),
         "keys are untouched"
     );
-    let marker: i64 = upgraded.with_conn(|c| c.get(SCHEMA_KEY)).unwrap();
+    let marker: i64 = database.with_conn(|c| c.get(SCHEMA_KEY)).unwrap();
     assert_eq!(marker, SCHEMA_VERSION);
 
     // Idempotent: a second pass over an already-upgraded namespace changes nothing (the marker set
     // back to v6, the next open's connect step runs the upgrade again).
-    upgraded
+    database
         .with_conn(|c| c.set::<_, _, ()>(SCHEMA_KEY, 6i64))
         .unwrap();
     let upgraded = ValkeyStore::connect(&url).expect("a second upgrade pass on open");
@@ -3649,7 +3664,7 @@ fn v6_namespace_upgrades_in_place_to_v7() {
     // record: the copy is append-if-absent, and the stale v6 key is still removed.
     let stale = sample_task(&t, "working", TASK_LIVE_TS + 1);
     assert_ne!(stale, live);
-    upgraded
+    database
         .with_conn(|c| {
             let mut p = redis::pipe();
             p.set(
@@ -3669,16 +3684,14 @@ fn v6_namespace_upgrades_in_place_to_v7() {
         "the v7 record must not be overwritten by a stale v6 row"
     );
     assert!(
-        !upgraded
+        !database
             .with_conn(|c| c.exists::<_, bool>(format!("{TASK_ROW_PREFIX}{t}")))
             .unwrap(),
         "the stale v6 row is removed"
     );
     assert_eq!(upgraded.list_task_events(&t).unwrap(), vec![e1, e2]);
 
-    reset_tasks(&upgraded, &[&t, &done]);
-    reset_trust_state(&upgraded, &[&server], &[&nonce]);
-    let _ = upgraded.with_conn(|c| c.del::<_, ()>(&call_key));
+    // The database guard cleans this entire private fixture, including spent-token entries.
 }
 
 // ── THE CONNECTION, through the host's connector (ARCHITECT rulings 2026-10-03 12:10Z) ─────────
@@ -4373,8 +4386,8 @@ fn rediss_insecure_skips_certificate_verification() {
 // v1.5.5 binary and the v1.0.7 plugin against valkey/valkey:8@sha256:495e4fec... (the image plugin-ci
 // runs); the binary, plugin and image digests and every file's sha256 are in its `MANIFEST.tsv`.
 // `keys.json` (= `rows.json`) is every key 1.5.5 wrote: `{key: {type, value, has_ttl}}`, hashes as
-// field -> value maps, zsets as [[member, score], ...]. Destructive (it clears `busbar:*`), so
-// `#[ignore]`d like the other namespace-wiping tests and run by plugin-ci's `--ignored` pass.
+// field -> value maps, zsets as [[member, score], ...]. Replay owns a guarded private database;
+// the recorded fixture bytes and the shared live namespace are left unchanged.
 const FIXTURE_KEYS_1_5_5: &str = include_str!("../tests/fixtures/1.5.5/keys.json");
 
 /// A TTL comfortably longer than any test run, as 1.5.5 gave its metering rows.
@@ -4400,14 +4413,10 @@ fn fx_num(v: &serde_json::Value) -> u64 {
         .unwrap_or_else(|_| panic!("{v} is not an unsigned integer"))
 }
 
-/// Clear `busbar:*`, then write every key of `keys.json` with the crate's own test client.
-fn replay_1_5_5(store: &ValkeyStore) {
-    store
+/// Write `keys.json` through the raw endpoint of an already-emptied, guarded private database.
+fn replay_1_5_5(database: &database::Database) {
+    database
         .with_conn(|c| {
-            let existing: Vec<String> = redis::cmd("KEYS").arg("busbar:*").query(c)?;
-            for k in &existing {
-                redis::cmd("DEL").arg(k).query::<()>(c)?;
-            }
             for (key, row) in fixture_keys() {
                 let value = &row["value"];
                 match row["type"].as_str().unwrap() {
@@ -4464,8 +4473,8 @@ fn replay_1_5_5(store: &ValkeyStore) {
         .unwrap();
 }
 
-fn schema_marker(store: &ValkeyStore) -> i64 {
-    store.with_conn(|c| c.get("busbar:schema")).unwrap()
+fn schema_marker(database: &database::Database) -> i64 {
+    database.with_conn(|c| c.get("busbar:schema")).unwrap()
 }
 
 /// The 1.6.0 surface read back, against values derived from `keys.json` here and now.
@@ -4629,20 +4638,23 @@ fn read_everything_1_5_5(store: &ValkeyStore) -> Vec<String> {
 
 /// Keys written by the 1.5.5 binary read back through this build's migrate, field for field.
 #[test]
-#[ignore]
 fn the_1_5_5_binarys_rows_read_back_through_migrate() {
-    let Some(setup) = live_store() else { return };
-    replay_1_5_5(&setup);
-    assert_eq!(schema_marker(&setup), 6, "the replayed marker is 1.5.5's");
-    let url = std::env::var("VALKEY_URL").unwrap();
+    let url = url_for_db(6);
+    let database = database::Database::take(&url);
+    replay_1_5_5(&database);
+    assert_eq!(
+        schema_marker(&database),
+        6,
+        "the replayed marker is 1.5.5's"
+    );
     let store = ValkeyStore::connect(&url).expect("this build opens the 1.5.5 keyspace");
-    assert_eq!(schema_marker(&store), SCHEMA_VERSION);
+    assert_eq!(schema_marker(&database), SCHEMA_VERSION);
     assert_1_5_5_keys_read_back(&store);
 
     // The revision counter carries over: a key written after the migrate is stamped past every
     // revision the 1.5.5 rows hold, so a hydrating reader at that watermark sees it.
     let revision = fx_num(&fixture_keys()["busbar:revision"]["value"]);
-    let counter: u64 = store
+    let counter: u64 = database
         .with_conn(|c| redis::cmd("GET").arg(REVISION_KEY).query(c))
         .unwrap();
     assert_eq!(
@@ -4661,19 +4673,18 @@ fn the_1_5_5_binarys_rows_read_back_through_migrate() {
 
 /// A second open over the migrated 1.5.5 keyspace changes nothing.
 #[test]
-#[ignore]
 fn migrate_over_the_1_5_5_rows_is_idempotent() {
-    let Some(setup) = live_store() else { return };
-    replay_1_5_5(&setup);
-    let url = std::env::var("VALKEY_URL").unwrap();
+    let url = url_for_db(6);
+    let database = database::Database::take(&url);
+    replay_1_5_5(&database);
     let first = {
         let store = ValkeyStore::connect(&url).expect("first open");
-        assert_eq!(schema_marker(&store), SCHEMA_VERSION);
+        assert_eq!(schema_marker(&database), SCHEMA_VERSION);
         assert_1_5_5_keys_read_back(&store);
         read_everything_1_5_5(&store)
     };
     let store = ValkeyStore::connect(&url).expect("second open");
-    assert_eq!(schema_marker(&store), SCHEMA_VERSION);
+    assert_eq!(schema_marker(&database), SCHEMA_VERSION);
     assert_1_5_5_keys_read_back(&store);
     assert_eq!(read_everything_1_5_5(&store), first);
 }
@@ -5430,7 +5441,7 @@ fn a_transaction_that_always_aborts_ends_with_an_error() {
         return;
     }
     // A database of its own: the bumps would abort every other test's transaction in db 0.
-    let mut up = fresh_db_client(7);
+    let (database, _up) = fresh_db_client(7);
     let url = url_for_db(7);
     let bump_url = url.clone();
     let proxied = interleave::tamper(
@@ -5450,13 +5461,14 @@ fn a_transaction_that_always_aborts_ends_with_an_error() {
     let id = uid("vk_always_abort");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        // A timeout must not release the database while this writer is still running.
+        let _database = database;
         let store = ValkeyStore::connect(&proxied).unwrap();
         let _ = tx.send(store.put_key(&vk(&id)).unwrap_err().to_string());
     });
     let e = rx
         .recv_timeout(std::time::Duration::from_secs(20))
         .expect("put_key gave up instead of retrying for ever");
-    redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
     assert!(e.contains("aborted"), "{e}");
 }
 
@@ -5677,7 +5689,7 @@ fn token_redemption_keeps_the_full_u64_range_exact() {
 #[test]
 fn a_v9_upgrade_scrubs_revoked_credentials_and_publishes_the_repairs_once() {
     let Some(_) = live_store() else { return };
-    let mut raw = fresh_db_client(5);
+    let (_database, mut raw) = fresh_db_client(5);
     let url = url_for_db(5);
     let store = ValkeyStore::connect(&url).unwrap();
     let mut before = Vec::new();
@@ -5851,7 +5863,7 @@ fn usage_cleanup_preserves_full_width_boundaries_billing_and_other_namespaces() 
     if live_store().is_none() {
         return;
     }
-    let mut raw = fresh_db_client(8);
+    let (_database, mut raw) = fresh_db_client(8);
     let url = url_for_db(8);
     let store = ValkeyStore::connect(&url).unwrap();
     let ledger = UsageLedger {
