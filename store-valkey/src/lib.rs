@@ -41,7 +41,7 @@
 
 #![forbid(unsafe_code)]
 
-use busbar_contract::abi::sdk::store::column::{clamp, read_u64};
+use busbar_contract::abi::sdk::store::column::read_u64;
 use busbar_contract::abi::sdk::store::wire::{Pool, Wire};
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringRow, ModelTokens, RecordStoreError,
@@ -1209,6 +1209,102 @@ static LIST_METERING: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| 
     )
 });
 
+/// Decode exact unsigned ledger counters while retaining the legacy negative-as-zero read rule.
+fn ledger_count(value: &str) -> RecordStoreResult<u64> {
+    value
+        .parse::<u64>()
+        .or_else(|_| value.parse::<i64>().map(read_u64))
+        .map_err(|_| RecordStoreError("invalid ledger counter".into()))
+}
+
+/// The ordinary reader and correction predicate use the same canonical raw ledger.
+fn usage_from_fields(fields: Vec<(String, String)>) -> RecordStoreResult<UsageLedger> {
+    let mut ledger = UsageLedger::default();
+    for (name, v) in fields {
+        let count = ledger_count(&v)?;
+        if name == "requests" {
+            ledger.requests = count;
+            continue;
+        }
+        if name == "billable_requests" {
+            ledger.billable_requests = count;
+            continue;
+        }
+        let Some((model, unit)) = parse_usage_field(&name) else {
+            continue;
+        };
+        let entry = match ledger.models.iter_mut().find(|m| m.model == model) {
+            Some(m) => m,
+            None => {
+                ledger.models.push(ModelTokens {
+                    model,
+                    ..Default::default()
+                });
+                ledger.models.last_mut().expect("just pushed")
+            }
+        };
+        // A zero counter is not carried: the map is sparse (`ModelTokens::is_zero` reads an
+        // absent key and a zero one the same), and a v6 row wrote all four tiers, zeros included.
+        if count != 0 {
+            entry.usage_units.insert(unit, count);
+        }
+    }
+    ledger.models.sort_by(|a, b| a.model.cmp(&b.model));
+    Ok(ledger)
+}
+
+/// Decode all C4 counts and historical pricing fields without signed narrowing.
+fn metering_from_fields(fields: Vec<(String, String)>) -> RecordStoreResult<MeteringRow> {
+    let mut m = MeteringRow {
+        key_id: String::new(),
+        model: String::new(),
+        provider: String::new(),
+        tokens_input: 0,
+        tokens_output: 0,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 0,
+        billable_requests: 0,
+        key_group_at_use: String::new(),
+        pricing_version: String::new(),
+        priced_from_ms: 0,
+        usage_units: Default::default(),
+    };
+    for (name, val) in fields {
+        // Every other decode path in this file (key_from_json, cred_from_json, audit
+        // records) propagates a RecordStoreError on a corrupt value rather than silently
+        // substituting a default -- a malformed numeric field here must not silently
+        // read back as 0 and under-report billing/usage data.
+        if let Some(class) = name.strip_prefix(METERING_UNIT_PREFIX) {
+            let n = ledger_count(&val)?;
+            if n != 0 {
+                m.usage_units.insert(class.to_string(), n);
+            }
+            continue;
+        }
+        match name.as_str() {
+            "key_id" => m.key_id = val.clone(),
+            "model" => m.model = val.clone(),
+            "provider" => m.provider = val.clone(),
+            "tokens_input" => m.tokens_input = ledger_count(&val)?,
+            "tokens_output" => m.tokens_output = ledger_count(&val)?,
+            "tokens_cache_read" => m.tokens_cache_read = ledger_count(&val)?,
+            "tokens_cache_write" => m.tokens_cache_write = ledger_count(&val)?,
+            "requests" => m.requests = ledger_count(&val)?,
+            "billable_requests" => m.billable_requests = ledger_count(&val)?,
+            "priced_from_ms" => {
+                m.priced_from_ms = val.parse::<u64>().map_err(|e| {
+                    RecordStoreError(format!("list_metering: bad priced_from_ms value: {e}"))
+                })?
+            }
+            "key_group_at_use" => m.key_group_at_use = val.clone(),
+            "pricing_version" => m.pricing_version = val.clone(),
+            _ => {}
+        }
+    }
+    Ok(m)
+}
+
 /// The base op set's bodies, each over the op's one connection `c` (the store door, `slots`, runs
 /// each as one op through the host's connector). The `op_id` writes (`add_usage_batch`,
 /// `add_metering_batch`, `append_plane_record`) are the door's own slots, deduped durably.
@@ -1453,39 +1549,8 @@ impl ValkeyStore {
         window_start: u64,
     ) -> RecordStoreResult<UsageLedger> {
         let k = usage_key(bucket_id, window_start);
-        let fields: Vec<(String, i64)> = with_conn!(self, |c| c.hgetall(&k).await)?;
-        let mut ledger = UsageLedger::default();
-        for (name, v) in fields {
-            if name == "requests" {
-                ledger.requests = read_u64(v);
-                continue;
-            }
-            if name == "billable_requests" {
-                ledger.billable_requests = read_u64(v);
-                continue;
-            }
-            let Some((model, unit)) = parse_usage_field(&name) else {
-                continue;
-            };
-            let entry = match ledger.models.iter_mut().find(|m| m.model == model) {
-                Some(m) => m,
-                None => {
-                    ledger.models.push(ModelTokens {
-                        model,
-                        ..Default::default()
-                    });
-                    ledger.models.last_mut().expect("just pushed")
-                }
-            };
-            // A zero counter is not carried: the map is sparse (`ModelTokens::is_zero` reads an
-            // absent key and a zero one the same), and a v6 row wrote all four tiers, zeros included.
-            let n = read_u64(v);
-            if n != 0 {
-                entry.usage_units.insert(unit, n);
-            }
-        }
-        ledger.models.sort_by(|a, b| a.model.cmp(&b.model));
-        Ok(ledger)
+        let fields: Vec<(String, String)> = with_conn!(self, |c| c.hgetall(&k).await)?;
+        usage_from_fields(fields)
     }
 
     pub(crate) async fn purge_usage_before(
@@ -1526,18 +1591,22 @@ impl ValkeyStore {
         window_start: u64,
         ledger: &UsageLedger,
     ) -> RecordStoreResult<()> {
+        if busbar_contract::abi::sdk::store::correction::reserved_bucket(bucket_id) {
+            return Err(RecordStoreError(
+                "reserved adjustment rows require atomic usage correction".into(),
+            ));
+        }
         let k = usage_key(bucket_id, window_start);
         with_conn!(self, |c| {
             let mut pipe = pipe();
             pipe.atomic();
             pipe.del(&k).ignore();
-            pipe.hset(&k, "requests", clamp(ledger.requests)).ignore();
-            pipe.hset(&k, "billable_requests", clamp(ledger.billable_requests))
+            pipe.hset(&k, "requests", ledger.requests).ignore();
+            pipe.hset(&k, "billable_requests", ledger.billable_requests)
                 .ignore();
             for m in &ledger.models {
                 for (unit, n) in &m.usage_units {
-                    pipe.hset(&k, usage_field(&m.model, unit), clamp(*n))
-                        .ignore();
+                    pipe.hset(&k, usage_field(&m.model, unit), *n).ignore();
                 }
             }
             pipe.query(c).await
@@ -1553,74 +1622,11 @@ impl ValkeyStore {
         // One script: the bucket's row set and its rows are read in one step, one snapshot.
         let all_fields: Vec<Vec<(String, String)>> =
             with_conn!(self, |c| LIST_METERING.key(&set).invoke(c).await)?;
-        let mut out = Vec::with_capacity(all_fields.len());
-        for fields in all_fields {
-            if fields.is_empty() {
-                continue;
-            }
-            let mut m = MeteringRow {
-                key_id: String::new(),
-                model: String::new(),
-                provider: String::new(),
-                tokens_input: 0,
-                tokens_output: 0,
-                tokens_cache_read: 0,
-                tokens_cache_write: 0,
-                requests: 0,
-                billable_requests: 0,
-                key_group_at_use: String::new(),
-                pricing_version: String::new(),
-                priced_from_ms: 0,
-                usage_units: Default::default(),
-            };
-            for (name, val) in fields {
-                // Every other decode path in this file (key_from_json, cred_from_json, audit
-                // records) propagates a RecordStoreError on a corrupt value rather than silently
-                // substituting a default -- a malformed numeric field here must not silently
-                // read back as 0 and under-report billing/usage data.
-                let num = |field: &str, val: &str| {
-                    val.parse::<i64>().map_err(|e| {
-                        RecordStoreError(format!("list_metering: bad {field} value: {e}"))
-                    })
-                };
-                if let Some(class) = name.strip_prefix(METERING_UNIT_PREFIX) {
-                    let n = read_u64(num(&name, &val)?);
-                    if n != 0 {
-                        m.usage_units.insert(class.to_string(), n);
-                    }
-                    continue;
-                }
-                match name.as_str() {
-                    "key_id" => m.key_id = val.clone(),
-                    "model" => m.model = val.clone(),
-                    "provider" => m.provider = val.clone(),
-                    "tokens_input" => m.tokens_input = read_u64(num("tokens_input", &val)?),
-                    "tokens_output" => m.tokens_output = read_u64(num("tokens_output", &val)?),
-                    "tokens_cache_read" => {
-                        m.tokens_cache_read = read_u64(num("tokens_cache_read", &val)?)
-                    }
-                    "tokens_cache_write" => {
-                        m.tokens_cache_write = read_u64(num("tokens_cache_write", &val)?)
-                    }
-                    "requests" => m.requests = read_u64(num("requests", &val)?),
-                    "billable_requests" => {
-                        m.billable_requests = read_u64(num("billable_requests", &val)?)
-                    }
-                    "priced_from_ms" => {
-                        m.priced_from_ms = val.parse::<u64>().map_err(|e| {
-                            RecordStoreError(format!(
-                                "list_metering: bad priced_from_ms value: {e}"
-                            ))
-                        })?
-                    }
-                    "key_group_at_use" => m.key_group_at_use = val.clone(),
-                    "pricing_version" => m.pricing_version = val.clone(),
-                    _ => {}
-                }
-            }
-            out.push(m);
-        }
-        Ok(out)
+        all_fields
+            .into_iter()
+            .filter(|fields| !fields.is_empty())
+            .map(metering_from_fields)
+            .collect()
     }
 
     pub(crate) async fn put_credential(

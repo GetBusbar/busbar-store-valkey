@@ -262,18 +262,18 @@ fn wrong_types_and_invalid_requests_never_partially_execute() {
 }
 
 #[derive(Clone, Copy)]
-enum Mode {
+pub(super) enum Mode {
     HoldExec,
     HoldPredicate,
     DropExec,
     CrossSlot,
 }
-struct Proxy {
-    url: String,
+pub(super) struct Proxy {
+    pub(super) url: String,
     held: Receiver<()>,
     release: Option<Sender<()>>,
-    execs: Arc<AtomicUsize>,
-    multis: Arc<AtomicUsize>,
+    pub(super) execs: Arc<AtomicUsize>,
+    pub(super) multis: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     stream: Arc<Mutex<Option<TcpStream>>>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -303,7 +303,7 @@ fn encode(value: redis::Value, out: &mut Vec<u8>) {
     }
 }
 impl Proxy {
-    fn start(upstream: String, mode: Mode) -> Self {
+    pub(super) fn start(upstream: String, mode: Mode) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("redis://{}/6", listener.local_addr().unwrap());

@@ -18,9 +18,10 @@
 //! Usage, metering and append `op_id` writes use ONE server-side script: it returns the body recorded under the op's id
 //! and applies nothing, or applies the effect and records the op's body. [`Dedupe::answer`] reads
 //! the returned body: a replay answers done, a different op's body a conflict (S1-S3).
-//! `append_plane_record`'s script is [`crate::plane`]'s. Conditional records instead WATCH every
-//! schema hash/index and the receipt, then commit one MULTI/EXEC. Condition conflicts write
-//! nothing; lost EXEC answers require exact id/body replay within the existing receipt lifetime.
+//! `append_plane_record`'s script is [`crate::plane`]'s. Conditional records WATCH every schema
+//! hash/index and the receipt. Usage corrections WATCH the live key, day index, metering hashes,
+//! usage hashes and receipt. Both commit one MULTI/EXEC; condition conflicts write nothing, and
+//! lost EXEC answers require exact id/body replay within the existing receipt lifetime.
 //!
 //! ## Every slot is one op through the host's connector
 //!
@@ -32,9 +33,9 @@
 
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::store::column::{clamp, prefix_end, storable_i64};
-use busbar_contract::abi::sdk::store::conditional;
 use busbar_contract::abi::sdk::store::dedupe::Dedupe;
 use busbar_contract::abi::sdk::store::wire::drive_kept;
+use busbar_contract::abi::sdk::store::{conditional, correction};
 use busbar_contract::abi::sdk::store::{Op, OpRefused, OpResult, Scanned, Step, StoreSlots, Tail};
 use busbar_contract::abi::store::{OpId, OP_ID_RETENTION_SECS};
 use busbar_contract::kinds::RecordBytes;
@@ -49,12 +50,16 @@ use crate::{
     METERING_UNIT_PREFIX, NAME, NEEDS,
 };
 
+#[path = "correction.rs"]
+mod correction_backend;
+
 // `url` is reference-capable, not secret: a `{env:}`/`{file:}`/`{module:}` reference resolves in
 // place (a 1.5.5 `url: {env: VAR}` keeps booting) and a literal passes as written.
 busbar_contract::statement_extensions!(EXTENSIONS: [
     (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["url"]"#),
     (busbar_contract::abi::sdk::store::rewrap::INTENT, b"1"),
     (conditional::CAPABILITY, b"1"),
+    (correction::CAPABILITY, correction::CAPABILITY_VALUE),
 ]);
 
 /// Ops admitted at once: each kept connection serves one, and up to seven more wait on it.
@@ -487,40 +492,94 @@ redis.call('EXPIRE', KEYS[1], ARGV[2])
 return false
 ";
 
-/// `add_usage_batch`: per cell `KEYS[k]` = its usage hash; `ARGV` from 3 = per cell `n`, then `n`
-/// `field, delta` pairs. VALIDATE, THEN APPLY: every key must be a hash (or absent) and every
-/// field it adds to absent or an integer, else the batch is refused with nothing written or
-/// recorded; the apply then cannot fail. ADD-THEN-FLOOR: each field is `HINCRBY`'d and, below 0,
-/// pinned to 0; a counter a v6 build left negative reads as the 0 it always reported. An add past
-/// `i64::MAX` pins there. The add stays an integer `HINCRBY` (Lua numbers are doubles and would
-/// round counters past 2^53), and the overflow is read off its error, which is exact.
+/// Exact decimal arithmetic for unsigned usage counters. Only individual decimal digits enter
+/// Lua arithmetic; whole counters never pass through Lua's floating-point number representation.
+/// This matches `UsageLedger::apply_delta`: saturating unsigned addition and zero-floored refunds.
+const LUA_USAGE_COUNTS: &str = r"
+local USAGE_MAX = '18446744073709551615'
+local RADIX = 10
+local ZERO_BYTE = string.byte('0')
+local function usage_cmp(a, b)
+    if #a ~= #b then return #a < #b and -1 or 1 end
+    if a == b then return 0 end
+    return a < b and -1 or 1
+end
+local function is_usage_count(value)
+    return (value == '0' or string.match(value, '^[1-9]%d*$'))
+        and usage_cmp(value, USAGE_MAX) <= 0
+end
+local function usage_bad_field(key, field)
+    local value = redis.call('HGET', key, field)
+    if value and not is_usage_count(value)
+        and not (string.sub(value, 1, 1) == '-' and is_i64(value)) then
+        return key .. ' field ' .. field .. ' is not an unsigned usage counter'
+    end
+end
+local function usage_add(a, b)
+    local i, j, carry, out = #a, #b, 0, {}
+    while i > 0 or j > 0 or carry > 0 do
+        local left = i > 0 and string.byte(a, i) - ZERO_BYTE or 0
+        local right = j > 0 and string.byte(b, j) - ZERO_BYTE or 0
+        local sum = left + right + carry
+        out[#out + 1] = string.char(ZERO_BYTE + sum % RADIX)
+        carry = math.floor(sum / RADIX)
+        i, j = i - 1, j - 1
+    end
+    local result = string.reverse(table.concat(out))
+    return usage_cmp(result, USAGE_MAX) > 0 and USAGE_MAX or result
+end
+local function usage_sub(a, b)
+    if usage_cmp(a, b) <= 0 then return '0' end
+    local i, j, borrow, out = #a, #b, 0, {}
+    while i > 0 do
+        local right = j > 0 and string.byte(b, j) - ZERO_BYTE or 0
+        local digit = string.byte(a, i) - ZERO_BYTE - right - borrow
+        borrow = digit < 0 and 1 or 0
+        if digit < 0 then digit = digit + RADIX end
+        out[#out + 1] = string.char(ZERO_BYTE + digit)
+        i, j = i - 1, j - 1
+    end
+    return (string.gsub(string.reverse(table.concat(out)), '^0+', ''))
+end
+local function usage_apply(key, field, delta)
+    local current = redis.call('HGET', key, field) or '0'
+    if string.sub(current, 1, 1) == '-' then current = '0' end
+    local next
+    if string.sub(delta, 1, 1) == '-' then
+        next = usage_sub(current, string.sub(delta, 2))
+    else
+        next = usage_add(current, delta)
+    end
+    redis.call('HSET', key, field, next)
+end
+";
+
+/// `add_usage_batch`: per cell `KEYS[k]` = its usage hash; `ARGV` from 4 = per cell `n`, then `n`
+/// `field, delta` pairs. ARGV[3] refuses fresh reserved-adjustment writes after receipt lookup.
+/// Validate every target before applying; exact decimal arithmetic preserves the full u64 range.
 static USAGE_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
-        "{LUA_SEEN}
-        local a = 3
+        "{LUA_SEEN}{LUA_USAGE_COUNTS}
+        if ARGV[3] == '1' then
+            return {{'refused', 'reserved adjustment rows require atomic usage correction'}}
+        end
+        local a = 4
         for k = 2, #KEYS do
             local n = tonumber(ARGV[a])
             local why = bad_key(KEYS[k], 'hash')
             for i = a + 1, a + 2 * n - 1, 2 do
-                why = why or bad_field(KEYS[k], ARGV[i])
+                why = why or usage_bad_field(KEYS[k], ARGV[i])
             end
             if why then
                 return {{'refused', why}}
             end
             a = a + 1 + 2 * n
         end
-        a = 3
+        a = 4
         for k = 2, #KEYS do
             local n = tonumber(ARGV[a])
             for i = a + 1, a + 2 * n - 1, 2 do
-                local cur = redis.call('HGET', KEYS[k], ARGV[i])
-                if cur and tonumber(cur) < 0 then
-                    redis.call('HSET', KEYS[k], ARGV[i], 0)
-                end
-                local v = add_pinned(KEYS[k], ARGV[i], ARGV[i + 1])
-                if v and v < 0 then
-                    redis.call('HSET', KEYS[k], ARGV[i], 0)
-                end
+                usage_apply(KEYS[k], ARGV[i], ARGV[i + 1])
             end
             a = a + 1 + 2 * n
         end
@@ -621,6 +680,25 @@ impl ValkeyStore {
 }
 
 impl StoreSlots for ValkeyStore {
+    const USAGE_CORRECTION: bool = true;
+
+    fn apply_usage_correction(
+        &self,
+        cx: &mut Op<'_>,
+        request: &correction::Request,
+    ) -> Step<OpResult<correction::Decision>> {
+        if let Err(error) = request.encode() {
+            return Step::Ready(Err(OpRefused::Refused(error.into())));
+        }
+        let request = request.clone();
+        op!(
+            cx,
+            self,
+            |error: RecordStoreError| Err(OpRefused::Failed(error.0)),
+            |me, c| me.v3_usage_correction(c, &request).await
+        )
+    }
+
     const RECORD_TRANSACTION: bool = true;
 
     fn record_transaction(
@@ -734,6 +812,17 @@ impl StoreSlots for ValkeyStore {
     ) -> Step<OpResult<()>> {
         let d = Dedupe::usage(cells);
         let mut inv = op_call(&USAGE_OP, op, &d);
+        // The Lua receipt lookup precedes this fresh-write refusal, preserving exact old replay.
+        inv.arg(
+            if cells
+                .iter()
+                .any(|(bucket, _, _)| correction::reserved_bucket(bucket))
+            {
+                1
+            } else {
+                0
+            },
+        );
         for (bucket, window, delta) in cells {
             let fields = usage_fields(delta);
             inv.key(usage_key(bucket, *window)).arg(fields.len());

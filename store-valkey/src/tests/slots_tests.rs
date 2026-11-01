@@ -995,9 +995,9 @@ fn metering_delta(bucket: u64, tokens_input: u64) -> busbar_contract::records::M
     }
 }
 
-/// A counter at i64::MAX plus a positive delta pins at i64::MAX (rule 8): the batch answers Ok.
+/// Usage retains the unsigned range: adding above the old signed boundary preserves the count.
 #[test]
-fn a_usage_counter_at_i64_max_pins_instead_of_failing() {
+fn a_usage_counter_crosses_i64_max_without_narrowing() {
     let Some(s) = live_store() else { return };
     let bucket = fresh("pin-usage");
     let key = format!("busbar:usage:{bucket}:0");
@@ -1009,9 +1009,9 @@ fn a_usage_counter_at_i64_max_pins_instead_of_failing() {
         models: Vec::new(),
     };
     s.add_usage_batch(op(40), &[(bucket.as_str(), 0, d)])
-        .expect("pins, does not fail");
+        .expect("unsigned usage addition succeeds");
     let got: String = r.hget(&key, "requests").unwrap();
-    assert_eq!(got, i64::MAX.to_string());
+    assert_eq!(got, (i64::MAX as u64 + 1).to_string());
     let one: String = r.hget(&key, "billable_requests").unwrap();
     assert_eq!(one, "1");
 }
@@ -1461,6 +1461,8 @@ fn a_fork_refused_append_records_nothing_under_its_op_id() {
 
 #[path = "conditional_records.rs"]
 mod conditional_records;
+#[path = "usage_correction.rs"]
+mod usage_correction;
 
 #[test]
 fn a_missing_indexed_record_value_refuses_instead_of_falsely_ending_a_scan() {
