@@ -14,6 +14,7 @@ use std::fmt;
 use std::future::Future;
 
 use busbar_contract::abi::sdk::conn::ConnFailure;
+use busbar_contract::abi::sdk::cred::Cred;
 use busbar_contract::abi::sdk::store::wire::Wire;
 
 /// What kind of failure a [`RedisError`] is.
@@ -570,6 +571,20 @@ impl Conn {
             .write_all(&out)
             .await
             .map_err(|e| RedisError::io(&e))
+    }
+
+    /// Authenticate with one SDK-owned complete RESP command. Neither the credential nor its
+    /// packet enters the public command encoder; the wire retains the seal across partial writes
+    /// and Pending, and discards an interrupted exchange before it can be reused.
+    pub async fn authenticate(&mut self, password: &Cred, user: Option<&str>) -> RedisResult<()> {
+        self.wire
+            .write_sealed(password.resp_auth(user))
+            .await
+            .map_err(|e| RedisError::io(&e))?;
+        match self.read().await? {
+            Value::Error(e) => Err(RedisError::server(e)),
+            _ => Ok(()),
+        }
     }
 
     async fn read(&mut self) -> RedisResult<Value> {

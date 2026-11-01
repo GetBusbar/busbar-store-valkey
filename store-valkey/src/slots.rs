@@ -728,8 +728,12 @@ impl StoreSlots for ValkeyStore {
         Self::from_settings(settings).map(drop)
     }
 
-    fn open(settings: &[u8], _host: Option<Host>) -> Result<Self, String> {
-        Self::from_settings(settings)
+    fn open_with_secrets(
+        settings: &[u8],
+        secrets: &[&[u8]],
+        _host: Option<Host>,
+    ) -> Result<Self, String> {
+        Self::from_settings_lent(settings, secrets)
     }
 
     fn connect(&self, cx: &mut Op<'_>) -> Step<Result<(), String>> {

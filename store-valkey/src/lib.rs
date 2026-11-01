@@ -41,6 +41,7 @@
 
 #![forbid(unsafe_code)]
 
+use busbar_contract::abi::sdk::cred::{settings_lent, Cred, ValkeyUrl};
 use busbar_contract::abi::sdk::store::column::read_u64;
 use busbar_contract::abi::sdk::store::wire::{Pool, Wire};
 use busbar_contract::records::{
@@ -287,79 +288,24 @@ fn metering_row(
 /// the fixed `u:` prefix is the class name, verbatim, so no class name can collide with a fixed field.
 const METERING_UNIT_PREFIX: &str = "u:";
 
-/// Extract the PASSWORD from a valkey URL, if any - the secret that must never appear in an error
-/// string or a Debug print. Two forms carry one: the userinfo (`redis://user:pass@host/...`,
-/// `redis://:pass@host/...`) and the query (`valkey+unix:///path?pass=secret`, or `password=`),
-/// which is how a unix-socket URL states it ([`parse_unix`]). The value is returned as written in
-/// the URL (percent-escapes intact); [`scrub`] redacts it in both that and its decoded form.
-fn url_password(url: &str) -> Option<String> {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let (before_query, query) = match rest.split_once('?') {
-        Some((b, q)) => (b, Some(q)),
-        None => (rest, None),
-    };
-    // The userinfo lives in the authority only (up to the first `/`), never in the path or query.
-    let authority = before_query.split('/').next().unwrap_or("");
-    if let Some((userinfo, _)) = authority.rsplit_once('@') {
-        if let Some((_, pass)) = userinfo.split_once(':') {
-            if !pass.is_empty() {
-                return Some(pass.to_string());
+/// Percent-decode public URL components (the upstream driver's username reading).
+fn percent_decode_utf8(s: &str) -> Option<String> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut bytes = s.bytes();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            let mut rest = bytes.clone();
+            if let (Some(h), Some(l)) = (rest.next(), rest.next()) {
+                if let (Some(h), Some(l)) = ((h as char).to_digit(16), (l as char).to_digit(16)) {
+                    out.push((h * 16 + l) as u8);
+                    bytes = rest;
+                    continue;
+                }
             }
         }
+        out.push(b);
     }
-    query?
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .find(|(k, v)| matches!(*k, "pass" | "password") && !v.is_empty())
-        .map(|(_, v)| v.to_string())
-}
-
-/// Percent-DECODE a URL component (`%40` -> `@`); a malformed escape is left verbatim.
-fn percent_bytes(s: &str) -> Vec<u8> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(hi), Some(lo)) = (hi, lo) {
-                out.push((hi * 16 + lo) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    out
-}
-
-/// [`percent_bytes`], lossily as text: the scrub redacts both the raw and decoded password.
-fn percent_decode(s: &str) -> String {
-    String::from_utf8_lossy(&percent_bytes(s)).into_owned()
-}
-
-/// Replace every occurrence of `secret` (in BOTH its raw and percent-decoded forms) in `msg` with
-/// `<redacted>` - the password-in-error scrub.
-fn scrub(msg: String, secret: Option<&str>) -> String {
-    let Some(s) = secret.filter(|s| !s.is_empty()) else {
-        return msg;
-    };
-    let mut out = msg;
-    if out.contains(s) {
-        out = out.replace(s, "<redacted>");
-    }
-    let decoded = percent_decode(s);
-    if decoded != s && !decoded.is_empty() && out.contains(&decoded) {
-        out = out.replace(&decoded, "<redacted>");
-    }
-    // A query value's `+` reads as a space (form encoding: the unix URL's `?pass=`).
-    let spaced = percent_decode(&s.replace('+', " "));
-    if spaced != decoded && !spaced.is_empty() && out.contains(&spaced) {
-        out = out.replace(&spaced, "<redacted>");
-    }
-    out
+    String::from_utf8(out).ok()
 }
 
 /// What the store connects to, parsed once from its settings' URL.
@@ -377,7 +323,7 @@ struct Target {
     /// instance).
     insecure: bool,
     /// `AUTH` (`user`, `password`), when the URL carries a password.
-    auth: Option<(Option<String>, String)>,
+    auth: Option<(Option<String>, Cred)>,
     /// `SELECT`, when the URL names a database other than 0.
     db: i64,
 }
@@ -402,11 +348,6 @@ impl std::fmt::Debug for Target {
 /// The upstream driver's refusal of a URL, word for word.
 fn url_refused(why: &'static str) -> RedisError {
     RedisError::from((ErrorKind::InvalidClientConfig, why))
-}
-
-/// Percent-decode `s` as UTF-8 (the upstream driver's user/password reading).
-fn percent_decode_utf8(s: &str) -> Option<String> {
-    String::from_utf8(percent_bytes(s)).ok()
 }
 
 /// Every query parameter a URL form reads is named in `known`; any other one is REFUSED (the
@@ -445,8 +386,14 @@ fn check_protocol(url: &url::Url) -> RedisResult<()> {
 /// `IntoConnectionInfo for &str`): `redis://[user[:password]@]host[:port][/db]`, `rediss://` for TLS
 /// (`#insecure` the one fragment it took), the `valkey://` / `valkeys://` spellings, and the
 /// unix-socket URLs `unix://`, `redis+unix://`, `valkey+unix://` (`?db=`, `?user=`, `?pass=`).
-fn parse_url(input: &str) -> RedisResult<Target> {
-    let url = url::Url::parse(input)
+fn parse_target(input: &ValkeyUrl) -> RedisResult<Target> {
+    if let Some(why) = input
+        .parsing_error()
+        .filter(|why| *why != "Password is not valid UTF-8 string")
+    {
+        return Err(url_refused(why));
+    }
+    let url = url::Url::parse(input.public())
         .ok()
         .filter(|u| {
             matches!(
@@ -456,7 +403,7 @@ fn parse_url(input: &str) -> RedisResult<Target> {
         })
         .ok_or_else(|| url_refused("Redis URL did not parse"))?;
     if matches!(url.scheme(), "unix" | "redis+unix" | "valkey+unix") {
-        return parse_unix(&url);
+        return parse_unix(&url, input);
     }
     let host = match url.host() {
         Some(url::Host::Domain(d)) => d.to_string(),
@@ -483,7 +430,14 @@ fn parse_url(input: &str) -> RedisResult<Target> {
         false
     };
     check_protocol(&url)?;
-    check_query(&url, &["protocol"], url_password(input).is_some())?;
+    check_query(
+        &url,
+        &["protocol"],
+        input.password().is_some()
+            || url
+                .query_pairs()
+                .any(|(key, _)| matches!(key.as_ref(), "pass" | "password")),
+    )?;
     let db = match url.path().trim_matches('/') {
         "" => 0,
         path => path
@@ -498,13 +452,9 @@ fn parse_url(input: &str) -> RedisResult<Target> {
                 .ok_or_else(|| url_refused("Username is not valid UTF-8 string"))?,
         )
     };
-    let pass = match url.password() {
-        Some(pw) => Some(
-            percent_decode_utf8(pw)
-                .ok_or_else(|| url_refused("Password is not valid UTF-8 string"))?,
-        ),
-        None => None,
-    };
+    if let Some(why) = input.parsing_error() {
+        return Err(url_refused(why));
+    }
     let addr = if host.contains(':') {
         format!("[{host}]:{port}")
     } else {
@@ -515,14 +465,14 @@ fn parse_url(input: &str) -> RedisResult<Target> {
         host,
         tls,
         insecure,
-        auth: pass.map(|p| (user, p)),
+        auth: input.password().cloned().map(|p| (user, p)),
         db,
     })
 }
 
 /// A unix-socket URL, as the upstream driver read it: its path, and `db` / `user` / `pass` from
 /// the query.
-fn parse_unix(url: &url::Url) -> RedisResult<Target> {
+fn parse_unix(url: &url::Url, input: &ValkeyUrl) -> RedisResult<Target> {
     let path = url
         .to_file_path()
         .map_err(|()| url_refused("Missing path"))?;
@@ -540,13 +490,12 @@ fn parse_unix(url: &url::Url) -> RedisResult<Target> {
         query.contains_key("pass") || query.contains_key("password"),
     )?;
     let user = query.get("user").map(|u| u.to_string());
-    let pass = query.get("pass").map(|p| p.to_string());
     Ok(Target {
         addr: format!("unix:{}", path.display()),
         host: String::new(),
         tls: false,
         insecure: false,
-        auth: pass.map(|p| (user, p)),
+        auth: input.password().cloned().map(|p| (user, p)),
         db,
     })
 }
@@ -562,8 +511,8 @@ pub struct ValkeyStore {
 
 struct Inner {
     target: Target,
-    /// The URL password (if any), scrubbed out of every error string this crate emits.
-    secret: Option<String>,
+    /// Public URL metadata and SDK-held redaction material; no plaintext password is retained.
+    url: ValkeyUrl,
     /// `connect_timeout_ms` (default [`DEFAULT_CONNECT_TIMEOUT`]): every dial's bound.
     connect_timeout: Duration,
     /// The kept connections: [`KEPT_CONNECTIONS`], one per op in flight.
@@ -571,17 +520,17 @@ struct Inner {
 }
 
 impl std::fmt::Debug for Inner {
-    /// Every field but the URL password (`secret`), which prints as `<redacted>`.
+    /// The URL credential prints only its redaction marker.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self {
             target,
-            secret,
+            url,
             connect_timeout,
             pool,
         } = self;
         f.debug_struct("Inner")
             .field("target", target)
-            .field("secret", &secret.as_ref().map(|_| "<redacted>"))
+            .field("secret", &url.password().map(|_| "<redacted>"))
             .field("connect_timeout", connect_timeout)
             .field("pool", pool)
             .finish()
@@ -620,7 +569,7 @@ impl ValkeyStore {
                 Some(ctx) => format!("valkey {ctx}: {e}"),
                 None => e,
             };
-            RecordStoreError(scrub(text, self.inner.secret.as_deref()))
+            RecordStoreError(self.inner.url.redact_echo(&text))
         };
         let ms = self.inner.connect_timeout.as_millis();
         if ms == 0 {
@@ -659,11 +608,7 @@ impl ValkeyStore {
             secured.map_err(|e| RedisError::io(&e))?;
         }
         if let Some((user, pass)) = &t.auth {
-            let mut auth = cmd("AUTH");
-            if let Some(u) = user {
-                auth.arg(u);
-            }
-            auth.arg(pass).exec(c).await?;
+            c.authenticate(pass, user.as_deref()).await?;
         }
         if t.db != 0 {
             cmd("SELECT").arg(t.db).exec(c).await?;
@@ -943,7 +888,7 @@ impl ValkeyStore {
         } else {
             format!("valkey {ctx}: {e}")
         };
-        RecordStoreError(scrub(text, self.inner.secret.as_deref()))
+        RecordStoreError(self.inner.url.redact_echo(&text))
     }
 
     /// Reserve `n` consecutive revisions and return the first. Called inside a `transaction!` that
@@ -2037,67 +1982,122 @@ impl ValkeyStore {
     /// # Errors
     /// A text naming why the settings do not open a store.
     pub fn from_settings(settings: &[u8]) -> Result<Self, String> {
+        Self::from_settings_lent(settings, &[])
+    }
+
+    fn from_settings_lent(settings: &[u8], secrets: &[&[u8]]) -> Result<Self, String> {
         const BAD: &str = "invalid valkey plugin config";
-        let v: serde_json::Value = if settings.iter().all(u8::is_ascii_whitespace) {
-            serde_json::Value::Object(Default::default())
-        } else {
-            serde_json::from_slice(settings).map_err(|e| format!("{BAD}: {e}"))?
-        };
-        let serde_json::Value::Object(o) = &v else {
-            return Err(format!(
-                "{BAD}: expected a JSON object, got {}",
-                json_type(&v)
-            ));
-        };
-        // A top-level key this plugin does not read is a typo or a setting for another backend; it
-        // must not be swallowed into quietly opening with the defaults.
-        if let Some(unknown) = o
-            .keys()
-            .find(|k| !matches!(k.as_str(), "url" | "connect_timeout_ms"))
-        {
-            return Err(format!(
-                "{BAD}: unknown setting `{unknown}` (accepted: url, connect_timeout_ms)"
-            ));
+        // The SDK captures URL credentials while it reads the document and wipes its parse tree.
+        // In particular, a host marker is resolved here, before any retained plugin config exists.
+        struct Settings {
+            url: Option<ValkeyUrl>,
+            connect_timeout_ms: Option<serde_json::Value>,
         }
-        // A `null` optional setting is an absent one.
-        let url = match o.get("url") {
-            None | Some(serde_json::Value::Null) => {
-                return Err(format!(
-                    "{BAD}: `url` is required (a redis:// connection string)"
-                ))
+        impl<'de> serde::Deserialize<'de> for Settings {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                struct SettingsVisitor;
+                impl<'de> serde::de::Visitor<'de> for SettingsVisitor {
+                    type Value = Settings;
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        f.write_str("a JSON object")
+                    }
+                    fn visit_map<M: serde::de::MapAccess<'de>>(
+                        self,
+                        mut map: M,
+                    ) -> Result<Settings, M::Error> {
+                        let mut out = Settings {
+                            url: None,
+                            connect_timeout_ms: None,
+                        };
+                        let mut unknown = None;
+                        let mut url_error = None;
+                        while let Some(key) = map.next_key::<String>()? {
+                            match key.as_str() {
+                                "url" => match map.next_value() {
+                                    Ok(url) => out.url = url,
+                                    Err(error) => url_error = Some(error),
+                                },
+                                "connect_timeout_ms" => {
+                                    out.connect_timeout_ms = map.next_value()?
+                                }
+                                _ => {
+                                    map.next_value::<serde::de::IgnoredAny>()?;
+                                    unknown.get_or_insert(key);
+                                }
+                            }
+                        }
+                        // Keep the existing refusal order: unknown setting, URL shape, timeout,
+                        // then URL parsing. The SDK map owns each value even when it was refused.
+                        if let Some(key) = unknown {
+                            return Err(serde::de::Error::unknown_field(
+                                &key,
+                                &["url", "connect_timeout_ms"],
+                            ));
+                        }
+                        if let Some(error) = url_error {
+                            return Err(error);
+                        }
+                        Ok(out)
+                    }
+                }
+                d.deserialize_map(SettingsVisitor)
             }
-            Some(serde_json::Value::String(s)) if !s.trim().is_empty() => s.as_str(),
-            Some(serde_json::Value::String(_)) => {
-                return Err(format!("{BAD}: `url` must be a non-empty string"))
-            }
-            Some(other) => {
-                return Err(format!(
-                    "{BAD}: `url` must be a non-empty string, got {}",
-                    json_type(other)
-                ))
-            }
+        }
+        let settings = if settings.iter().all(u8::is_ascii_whitespace) {
+            b"{}"
+        } else {
+            settings
         };
-        let timeout = match o.get("connect_timeout_ms") {
+        let parsed: Settings = settings_lent(settings, secrets).map_err(|e| {
+            let text = e.to_string();
+            let shape = if text.contains("integer") || text.contains("floating point") {
+                "a number"
+            } else if text.contains("boolean") {
+                "a boolean"
+            } else if text.contains("sequence") {
+                "an array"
+            } else if text.contains("map") {
+                "an object"
+            } else if text.contains("string") {
+                "a string"
+            } else {
+                "null"
+            };
+            if let Some(rest) = text.strip_prefix("settings: unknown field `") {
+                let key = rest.split('`').next().unwrap_or("");
+                format!("{BAD}: unknown setting `{key}` (accepted: url, connect_timeout_ms)")
+            } else if e.path() == "url" && text.contains("invalid type") {
+                format!("{BAD}: `url` must be a non-empty string, got {shape}")
+            } else if e.path().is_empty() && text.contains("invalid type") {
+                format!("{BAD}: expected a JSON object, got {shape}")
+            } else {
+                format!("{BAD}: {e}")
+            }
+        })?;
+        let url = parsed
+            .url
+            .ok_or_else(|| format!("{BAD}: `url` is required (a redis:// connection string)"))?;
+        if url.public().trim().is_empty() && url.parsing_error().is_none() {
+            return Err(format!("{BAD}: `url` must be a non-empty string"));
+        }
+        let timeout = match parsed.connect_timeout_ms {
             None | Some(serde_json::Value::Null) => DEFAULT_CONNECT_TIMEOUT,
             Some(x) => match x.as_u64().filter(|ms| *ms > 0) {
                 Some(ms) => Duration::from_millis(ms),
                 None => {
                     return Err(format!(
-                        "{BAD}: `connect_timeout_ms` must be a positive integer (milliseconds), \
-                         got {}",
-                        json_type(x)
-                    ))
+                    "{BAD}: `connect_timeout_ms` must be a positive integer (milliseconds), got {}",
+                    json_type(&x)
+                ))
                 }
             },
         };
-        // A URL that does not parse is a settings refusal: nothing was connected.
-        let secret = url_password(url);
         let target =
-            parse_url(url).map_err(|e| scrub(format!("{BAD}: url: {e}"), secret.as_deref()))?;
+            parse_target(&url).map_err(|e| url.redact_echo(&format!("{BAD}: url: {e}")))?;
         Ok(Self {
             inner: Arc::new(Inner {
                 target,
-                secret,
+                url,
                 connect_timeout: timeout,
                 pool: Pool::new(KEPT_CONNECTIONS),
             }),

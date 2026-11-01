@@ -171,6 +171,10 @@ config, mirroring how the Postgres store plugin receives its libpq URL:
 | `url` | yes | none | A `redis://` or `rediss://` (TLS) connection string (`valkey://` / `valkeys://` read the same): `[user[:password]@]host[:port][/db]`, or a unix-socket URL (`unix://`, `redis+unix://`, `valkey+unix://` `/path?db=N&user=U&pass=P`). TLS is busbar's connector's (its trust anchors); `rediss://…#insecure` skips certificate verification, as 1.5.5 did (busbar logs a WARN naming the store instance). |
 | `connect_timeout_ms` | no | `10000` | Bounds every new connection's dial and handshake (TLS, `AUTH`, `SELECT`) in all, as 1.5.5's driver did. A `null` reads as absent. |
 
+The SDK captures URL passwords while parsing settings, including host-lent secret markers. The
+store retains opaque credentials and sends the SDK's complete sealed RESP `AUTH` command through
+the host wire. Error redaction covers the raw and decoded password spellings.
+
 ## Build
 
 Needs a Rust toolchain ([rustup](https://rustup.rs); `rust-toolchain.toml` pins the version CI uses).
