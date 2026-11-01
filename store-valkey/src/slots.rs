@@ -6,7 +6,7 @@
 //! and the plane-record append) and the kernel's records. The store keeps ledger counts and
 //! records, not money: busbar derives money from the counts and its rate card.
 //!
-//! ## Layout (schema v9, `crate::SCHEMA_VERSION`)
+//! ## Layout (schema v10, `crate::SCHEMA_VERSION`)
 //!
 //! - `busbar:op:<hex op_id>`            HASH `b` = the op's body ([`Dedupe`]); expires
 //!   [`OP_ID_RETENTION_SECS`] after it is written (S4).
@@ -15,10 +15,12 @@
 //!
 //! ## Dedupe (`abi::store` S1-S4), durable and atomic
 //!
-//! Every `op_id` write is ONE server-side script: it returns the body recorded under the op's id
+//! Usage, metering and append `op_id` writes use ONE server-side script: it returns the body recorded under the op's id
 //! and applies nothing, or applies the effect and records the op's body. [`Dedupe::answer`] reads
 //! the returned body: a replay answers done, a different op's body a conflict (S1-S3).
-//! `append_plane_record`'s script is [`crate::plane`]'s.
+//! `append_plane_record`'s script is [`crate::plane`]'s. Conditional records instead WATCH every
+//! schema hash/index and the receipt, then commit one MULTI/EXEC. Condition conflicts write
+//! nothing; lost EXEC answers require exact id/body replay within the existing receipt lifetime.
 //!
 //! ## Every slot is one op through the host's connector
 //!
@@ -30,6 +32,7 @@
 
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::store::column::{clamp, prefix_end, storable_i64};
+use busbar_contract::abi::sdk::store::conditional;
 use busbar_contract::abi::sdk::store::dedupe::Dedupe;
 use busbar_contract::abi::sdk::store::wire::drive_kept;
 use busbar_contract::abi::sdk::store::{Op, OpRefused, OpResult, Scanned, Step, StoreSlots, Tail};
@@ -42,7 +45,7 @@ use busbar_contract::records::{
 
 use crate::resp::{pipe, Conn, Script, ScriptInvocation, Value};
 use crate::{
-    hex, metering_row, metering_set, plane, usage_fields, usage_key, ValkeyStore,
+    attributed_metering_row, hex, metering_set, plane, usage_fields, usage_key, ValkeyStore,
     METERING_UNIT_PREFIX, NAME, NEEDS,
 };
 
@@ -50,6 +53,8 @@ use crate::{
 // place (a 1.5.5 `url: {env: VAR}` keeps booting) and a literal passes as written.
 busbar_contract::statement_extensions!(EXTENSIONS: [
     (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["url"]"#),
+    (busbar_contract::abi::sdk::store::rewrap::INTENT, b"1"),
+    (conditional::CAPABILITY, b"1"),
 ]);
 
 /// Ops admitted at once: each kept connection serves one, and up to seven more wait on it.
@@ -115,6 +120,209 @@ macro_rules! ops {
 }
 
 impl ValkeyStore {
+    /// Compare one watched pre-state, then write the rows and their applied-only receipt in a
+    /// single EXEC. Only a definitive WATCH abort retries here. A transport error never dials
+    /// again inside this operation: its caller must reconcile the same op id and fingerprint.
+    async fn v3_record_transaction(
+        &self,
+        c: &mut Conn,
+        request: &conditional::Request,
+    ) -> OpResult<conditional::Decision> {
+        use busbar_contract::abi::sdk::store::dedupe::Seen;
+        use conditional::{Decision, Expected, Mutation};
+
+        let receipt = op_key(request.op_id);
+        let dedupe = Dedupe::record_transaction(request);
+        let mut schemas = std::collections::BTreeMap::new();
+        for predicate in &request.predicates {
+            schemas
+                .entry(predicate.schema.as_str())
+                .or_insert_with(|| records_keys(&predicate.schema));
+        }
+        for mutation in &request.mutations {
+            let (schema, _) = mutation.address();
+            schemas
+                .entry(schema)
+                .or_insert_with(|| records_keys(schema));
+        }
+        let mut watched = vec![receipt.as_str()];
+        for (keys, values) in schemas.values() {
+            watched.extend([keys.as_str(), values.as_str()]);
+        }
+
+        // Reuse the ordinary optimistic transaction's existing contention bound. WATCH names
+        // every key in ONE command: a cluster rejects CROSSSLOT before any MULTI or mutation.
+        // These existing schema keys have no shared hash tag; cluster atomicity is not promised.
+        for _ in 0..crate::resp::MAX_TRANSACTION_ATTEMPTS {
+            if let Err(error) = crate::resp::cmd("WATCH").arg(&watched).exec(c).await {
+                return Err(if error.to_string().starts_with("CROSSSLOT") {
+                    OpRefused::Refused(
+                        "record transaction requires keys on one Valkey node; cross-slot keys are unsupported".into(),
+                    )
+                } else {
+                    OpRefused::Failed(self.err(error, "record transaction WATCH").0)
+                });
+            }
+            let attempted = crate::resp::rr(async {
+                // An exact receipt wins over today's predicates, even if another operation has
+                // subsequently changed the records. Replaying never renews the receipt's TTL.
+                let kind: String = crate::resp::cmd("TYPE").arg(&receipt).query(c).await?;
+                if kind != "none" && kind != "hash" {
+                    return Ok(Some(Err(OpRefused::Refused(
+                        "record transaction receipt has the wrong type".into(),
+                    ))));
+                }
+                let prior: Option<Vec<u8>> = c.hget(&receipt, "b").await?;
+                match dedupe.seen(prior.as_deref()) {
+                    Seen::Replay => return Ok(Some(Ok(Decision::Applied))),
+                    Seen::Conflict => return Ok(Some(Err(OpRefused::Conflict))),
+                    Seen::New => {}
+                }
+                // MULTI/EXEC cannot roll back runtime WRONGTYPE. Validate every physical target
+                // while WATCH still covers it, including indexes for predicate-only schemas.
+                for (keys, values) in schemas.values() {
+                    for (key, expected) in [(keys, "zset"), (values, "hash")] {
+                        let kind: String = crate::resp::cmd("TYPE").arg(key).query(c).await?;
+                        if kind != "none" && kind != expected {
+                            return Ok(Some(Err(OpRefused::Refused(
+                                "record transaction schema storage has the wrong type".into(),
+                            ))));
+                        }
+                    }
+                }
+                for predicate in &request.predicates {
+                    let (_, values) = &schemas[predicate.schema.as_str()];
+                    let actual: Option<Vec<u8>> = c.hget(values, &predicate.key).await?;
+                    let matches = match &predicate.expected {
+                        Expected::Absent => actual.is_none(),
+                        Expected::Bytes(bytes) => actual.as_ref() == Some(bytes),
+                    };
+                    if !matches {
+                        // A concurrent identical request may have committed after our receipt
+                        // read and made this predicate false. Confirm the watched snapshot
+                        // before allowing the caller to replan. An empty Pipeline skips EXEC,
+                        // so PING supplies a read-only validation command, with no receipt.
+                        let mut validation = pipe();
+                        validation.atomic().cmd("PING").ignore();
+                        return validation
+                            .query::<Option<()>>(c)
+                            .await
+                            .map(|stable| stable.map(|()| Ok(Decision::ConditionConflict)));
+                    }
+                }
+                let mut transaction = pipe();
+                transaction.atomic();
+                for mutation in &request.mutations {
+                    let (schema, key) = mutation.address();
+                    let (keys, values) = &schemas[schema];
+                    match mutation {
+                        Mutation::Put { value, .. } => {
+                            transaction
+                                .hset(values, key, value)
+                                .ignore()
+                                .zadd(keys, key, 0)
+                                .ignore();
+                        }
+                        Mutation::Delete { .. } => {
+                            transaction
+                                .cmd("HDEL")
+                                .arg(values)
+                                .arg(key)
+                                .ignore()
+                                .cmd("ZREM")
+                                .arg(keys)
+                                .arg(key)
+                                .ignore();
+                        }
+                        Mutation::DeleteRange {
+                            prefix,
+                            exact_key_length,
+                            ..
+                        } => {
+                            let length = usize::try_from(*exact_key_length).map_err(|_| {
+                                crate::resp::RedisError::refused(
+                                    "record range key length is not representable",
+                                )
+                            })?;
+                            // Read both physical collections under the same schema-wide WATCH.
+                            // A matching insertion before EXEC aborts this entire candidate and
+                            // forces re-enumeration, so prefix phantoms cannot survive a commit.
+                            let mut members: std::collections::BTreeSet<Vec<u8>> =
+                                crate::resp::cmd("HKEYS")
+                                    .arg(values)
+                                    .query::<Vec<Vec<u8>>>(c)
+                                    .await?
+                                    .into_iter()
+                                    .collect();
+                            members.extend(
+                                crate::resp::cmd("ZRANGE")
+                                    .arg(keys)
+                                    .arg(0)
+                                    .arg(-1)
+                                    .query::<Vec<Vec<u8>>>(c)
+                                    .await?,
+                            );
+                            for member in members.into_iter().filter(|member| {
+                                member.len() == length && member.starts_with(prefix)
+                            }) {
+                                transaction
+                                    .cmd("HDEL")
+                                    .arg(values)
+                                    .arg(&member)
+                                    .ignore()
+                                    .cmd("ZREM")
+                                    .arg(keys)
+                                    .arg(&member)
+                                    .ignore();
+                            }
+                        }
+                    }
+                }
+                transaction
+                    .hset(&receipt, "b", &dedupe.body()[..])
+                    .ignore()
+                    .cmd("EXPIRE")
+                    .arg(&receipt)
+                    .arg(OP_ID_RETENTION_SECS)
+                    .ignore();
+                transaction
+                    .query::<Option<()>>(c)
+                    .await
+                    .map(|committed| committed.map(|()| Ok(Decision::Applied)))
+            })
+            .await;
+            match attempted {
+                Ok(None) => continue, // EXEC definitively aborted: no effects and same candidate.
+                Ok(Some(answer)) => {
+                    if c.watching() {
+                        crate::resp::cmd("UNWATCH").exec(c).await.map_err(|error| {
+                            OpRefused::Failed(self.err(error, "record transaction UNWATCH").0)
+                        })?;
+                    }
+                    return answer;
+                }
+                Err(error) => {
+                    // Do not issue another command on a broken stream; settle discards a
+                    // connection with an outstanding WATCH. Never translate this into a
+                    // ConditionConflict: EXEC may have committed before its answer was lost.
+                    if !error.is_connection_error() && c.watching() {
+                        let _ = crate::resp::cmd("UNWATCH").exec(c).await;
+                    }
+                    return Err(OpRefused::Failed(
+                        self.err(
+                            error,
+                            "record transaction outcome unknown; replay exact id and body",
+                        )
+                        .0,
+                    ));
+                }
+            }
+        }
+        Err(OpRefused::Failed(
+            "record transaction contention exhausted; replay the same id and body".into(),
+        ))
+    }
+
     /// `record_put` (slot 26): an upsert on `(schema, key)`. An EMPTY value removes the row:
     /// it is the host's strike, so the key leaves both the ordered key set and the values,
     /// `record_get` then answers `None` and `record_scan` never returns it.
@@ -203,7 +411,7 @@ impl ValkeyStore {
 
 /// A page of `record_scan`: `KEYS = key set, values`; `ARGV = min, max, limit`. One script, so a
 /// strike between the key range and the values cannot shorten the page. Returns `key, value` pairs
-/// flat (a key whose value is gone answers nil, and is dropped by the caller).
+/// flat; an indexed key missing its value is corruption, refused rather than a false short page.
 static SCAN_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(
         r"
@@ -213,6 +421,9 @@ static SCAN_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
             local j = math.min(i + 999, #keys)
             local vals = redis.call('HMGET', KEYS[2], unpack(keys, i, j))
             for n = i, j do
+                if not vals[n - i + 1] then
+                    return redis.error_reply('record_scan: an indexed record value is missing')
+                end
                 out[#out + 1] = keys[n]
                 out[#out + 1] = vals[n - i + 1]
             end
@@ -320,8 +531,8 @@ static USAGE_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 /// `add_metering_batch`: per delta `KEYS[k], KEYS[k + 1]` = its bucket's set and its row; `ARGV`
 /// from 3 = per delta the six counters, `n`, `n` `unit field, count` pairs, then `key_id`, `model`,
 /// `provider`, `priced_from_ms`, `key_group_at_use`, `pricing_version`. The row joins its set,
-/// every count is an `HINCRBY` pinned at `i64::MAX`, the attribution snapshot is first-write-wins
-/// (`HSETNX`). Validate-then-apply as [`USAGE_OP`].
+/// every count is an `HINCRBY` pinned at `i64::MAX`, the attribution snapshot is in the row key
+/// (including empty values). Validate-then-apply as [`USAGE_OP`].
 static METERING_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_SEEN}
@@ -357,8 +568,8 @@ static METERING_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
             redis.call('SADD', set, row)
             redis.call('HSET', row, 'key_id', ARGV[a], 'model', ARGV[a + 1], 'provider', ARGV[a + 2])
             redis.call('HSET', row, 'priced_from_ms', ARGV[a + 3])
-            redis.call('HSETNX', row, 'key_group_at_use', ARGV[a + 4])
-            redis.call('HSETNX', row, 'pricing_version', ARGV[a + 5])
+            redis.call('HSET', row, 'key_group_at_use', ARGV[a + 4])
+            redis.call('HSET', row, 'pricing_version', ARGV[a + 5])
         end)
         {LUA_RECORD}"
     ))
@@ -410,6 +621,25 @@ impl ValkeyStore {
 }
 
 impl StoreSlots for ValkeyStore {
+    const RECORD_TRANSACTION: bool = true;
+
+    fn record_transaction(
+        &self,
+        cx: &mut Op<'_>,
+        request: &conditional::Request,
+    ) -> Step<OpResult<conditional::Decision>> {
+        if let Err(error) = request.validate() {
+            return Step::Ready(Err(OpRefused::Refused(error.into())));
+        }
+        let request = request.clone();
+        op!(
+            cx,
+            self,
+            |error: RecordStoreError| Err(OpRefused::Failed(error.0)),
+            |me, c| me.v3_record_transaction(c, &request).await
+        )
+    }
+
     const TAIL: Tail = Tail {
         ephemeral: false,
         durable_plane: true,
@@ -442,10 +672,9 @@ impl StoreSlots for ValkeyStore {
         op: OpId,
         record: PlaneRecordRef<'_>,
     ) -> Step<OpResult<()>> {
-        for (field, v) in [("seq", record.seq), ("ts", record.ts)] {
-            if let Err(e) = storable_i64("append_plane_record", field, v) {
-                return Step::Ready(Err(OpRefused::Refused(e.0)));
-            }
+        // Timestamp digits live in the sidecar; the ZSET score only selects candidates.
+        if let Err(e) = storable_i64("append_plane_record", "seq", record.seq) {
+            return Step::Ready(Err(OpRefused::Refused(e.0)));
         }
         let d = Dedupe::append(record);
         let body = d.body().to_vec();
@@ -529,12 +758,14 @@ impl StoreSlots for ValkeyStore {
         let d = Dedupe::metering(deltas);
         let mut inv = op_call(&METERING_OP, op, &d);
         for m in deltas {
-            inv.key(metering_set(m.bucket)).key(metering_row(
+            inv.key(metering_set(m.bucket)).key(attributed_metering_row(
                 m.bucket,
                 &m.key_id,
                 &m.model,
                 &m.provider,
                 m.priced_from_ms,
+                &m.key_group_at_use,
+                &m.pricing_version,
             ));
             for n in [
                 m.tokens_input,
@@ -575,6 +806,8 @@ impl StoreSlots for ValkeyStore {
         purge_usage_before(before: u64) -> u64 = ValkeyStore::purge_usage_before;
         list_metering(bucket: u64) -> Vec<MeteringRow> = ValkeyStore::list_metering;
         put_credential(secret: &CredentialSecret => clone) -> () = ValkeyStore::put_credential;
+        rewrap_credential(expected: &CredentialSecret => clone, replacement: &str => to_owned)
+            -> bool = ValkeyStore::rewrap_credential;
         put_key_with_credential(key: &VirtualKey => clone, secret: &CredentialSecret => clone)
             -> () = ValkeyStore::put_key_with_credential;
         list_credentials(key_id: &str => to_owned) -> Vec<CredentialMeta>
@@ -607,10 +840,9 @@ impl StoreSlots for ValkeyStore {
         cx: &mut Op<'_>,
         record: PlaneRecordRef<'_>,
     ) -> Step<RecordStoreResult<()>> {
-        for (field, v) in [("seq", record.seq), ("ts", record.ts)] {
-            if let Err(e) = storable_i64("upsert_plane_record", field, v) {
-                return Step::Ready(Err(e));
-            }
+        // Timestamp digits live in the sidecar; the ZSET score only selects candidates.
+        if let Err(e) = storable_i64("upsert_plane_record", "seq", record.seq) {
+            return Step::Ready(Err(e));
         }
         let record = record.to_record();
         op!(cx, self, Err, |me, c| plane::upsert(&me, c, record.view())

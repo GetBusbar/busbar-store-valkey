@@ -505,6 +505,258 @@ fn an_op_id_plane_append_dedupes_and_still_refuses_a_fork() {
     s.delete_plane_record("slots_test", &parent).unwrap();
 }
 
+/// A fresh op id that successfully replays an existing position is spent durably too.
+#[test]
+fn an_identical_append_under_a_fresh_op_id_records_the_success() {
+    let Some(s) = live_store() else { return };
+    let kind = fresh("append-replay-op");
+    let rec = |seq, body: &[u8]| PlaneRecord {
+        kind: kind.clone(),
+        id: "row".into(),
+        parent: Some("parent".into()),
+        seq,
+        ts: 1,
+        disposition: PlaneDisposition::Active,
+        body: body.to_vec(),
+    };
+    let mut raw = raw_conn();
+    let prefix = format!("busbar:plane:{}:", crate::hex(kind.as_bytes()));
+    let keys = ["rec", "body", "byts", "idx:706172656e74", "pcount"]
+        .map(|suffix| format!("{prefix}{suffix}"));
+    s.append_plane_record_op(op(130), rec(1, b"one").view())
+        .unwrap();
+    let before = plane_key_snapshot(&mut raw, &keys);
+    let replay = op(131);
+    s.append_plane_record_op(replay, rec(1, b"one").view())
+        .unwrap();
+    assert_eq!(
+        plane_key_snapshot(&mut raw, &keys),
+        before,
+        "replay changed the record"
+    );
+    let op_key = format!("busbar:op:{}", crate::hex(&replay.0));
+    let recorded: Option<Vec<u8>> = raw.hget(&op_key, "b").unwrap();
+    assert!(
+        recorded.is_some(),
+        "successful replay did not record its op id"
+    );
+    let ttl: i64 = raw.ttl(&op_key).unwrap();
+    assert!(ttl > 0 && ttl as u64 <= busbar_contract::abi::store::OP_ID_RETENTION_SECS);
+    let again = ValkeyStore::connect(&std::env::var("VALKEY_URL").unwrap()).unwrap();
+    again
+        .append_plane_record_op(replay, rec(1, b"one").view())
+        .unwrap();
+    for changed in [rec(2, b"two"), rec(1, b"changed")] {
+        assert_eq!(
+            again.append_plane_record_op(replay, changed.view()),
+            Err(OpRefused::Conflict)
+        );
+    }
+    assert_eq!(
+        plane_key_snapshot(&mut raw, &keys),
+        before,
+        "conflict applied another row"
+    );
+    assert_eq!(
+        again
+            .list_plane_records(&kind, &PlaneSelector::All)
+            .unwrap(),
+        vec![b"one".to_vec()]
+    );
+    s.delete_plane_record(&kind, "parent").unwrap();
+}
+
+/// Inspect exact backend state independently, including malformed keys that public reads refuse.
+fn plane_key_snapshot(raw: &mut redis::Connection, keys: &[String]) -> Vec<Option<Vec<u8>>> {
+    keys.iter()
+        .map(|key| redis::cmd("DUMP").arg(key).query(raw).unwrap())
+        .collect()
+}
+
+/// A script error must precede every mutation: repairing the bad target lets the same op retry.
+#[test]
+fn a_plane_append_validates_all_targets_before_writing_anything() {
+    let Some(s) = live_store() else { return };
+    let mut raw = raw_conn();
+    for fault in [
+        "rec",
+        "body",
+        "byts",
+        "idx:706172656e74",
+        "pcount",
+        "op",
+        "counter",
+        "overflow",
+    ] {
+        let kind = fresh("append-atomic");
+        let prefix = format!("busbar:plane:{}:", crate::hex(kind.as_bytes()));
+        let id = op(132);
+        let op_key = format!("busbar:op:{}", crate::hex(&id.0));
+        let mut keys: Vec<_> = ["rec", "body", "byts", "idx:706172656e74", "pcount"]
+            .map(|suffix| format!("{prefix}{suffix}"))
+            .into();
+        keys.push(op_key.clone());
+        let bad = match fault {
+            "op" => op_key.clone(),
+            "counter" | "overflow" => format!("{prefix}pcount"),
+            _ => format!("{prefix}{fault}"),
+        };
+        if matches!(fault, "counter" | "overflow") {
+            let value = if fault == "counter" {
+                "not-an-integer"
+            } else {
+                "9223372036854775807"
+            };
+            let _: () = raw.hset(&bad, "parent", value).unwrap();
+        } else {
+            let _: () = raw.set(&bad, "wrong-type").unwrap();
+        }
+        let record = PlaneRecord {
+            kind: kind.clone(),
+            id: "row".into(),
+            parent: Some("parent".into()),
+            seq: 1,
+            ts: 1,
+            disposition: PlaneDisposition::Active,
+            body: b"one".to_vec(),
+        };
+        let before = plane_key_snapshot(&mut raw, &keys);
+        assert!(
+            matches!(
+                s.append_plane_record_op(id, record.view()),
+                Err(OpRefused::Failed(_))
+            ),
+            "{fault}"
+        );
+        assert_eq!(
+            plane_key_snapshot(&mut raw, &keys),
+            before,
+            "partial append after {fault}"
+        );
+        let _: () = raw.del(&bad).unwrap();
+        s.append_plane_record_op(id, record.view())
+            .expect("repair permits the original op");
+        assert_eq!(
+            s.list_plane_records(&kind, &PlaneSelector::Parent("parent".into()))
+                .unwrap(),
+            vec![b"one".to_vec()]
+        );
+        let count: i64 = raw.hget(format!("{prefix}pcount"), "parent").unwrap();
+        assert_eq!(count, 1, "{fault}");
+        let retained: u64 = raw.zcard(format!("{prefix}byts")).unwrap();
+        assert_eq!(retained, 1, "missing retention index after {fault}");
+        assert!(raw.hexists::<_, _, bool>(&op_key, "b").unwrap());
+        s.delete_plane_record(&kind, "parent").unwrap();
+    }
+}
+
+/// Upserts share the writer: validate old links as well as the new parent's late index/counter.
+#[test]
+fn a_plane_replacement_validates_old_and_new_links_before_unlinking() {
+    let Some(s) = live_store() else { return };
+    let mut raw = raw_conn();
+    for fault in [
+        "old-index",
+        "new-index",
+        "old-counter",
+        "new-counter",
+        "underflow",
+        "sidecar",
+    ] {
+        let kind = fresh("upsert-atomic");
+        let prefix = format!("busbar:plane:{}:", crate::hex(kind.as_bytes()));
+        let keys = [
+            "rec",
+            "body",
+            "byts",
+            "idx:726f77",
+            "pcount",
+            "idx:6f6c64",
+            "idx:6e6577",
+        ]
+        .map(|suffix| format!("{prefix}{suffix}"));
+        let record = |parent: &str, body: &[u8]| PlaneRecord {
+            kind: kind.clone(),
+            id: "row".into(),
+            parent: Some(parent.into()),
+            seq: 0,
+            ts: 1,
+            disposition: PlaneDisposition::Active,
+            body: body.to_vec(),
+        };
+        s.upsert_plane_record(record("old", b"before").view())
+            .unwrap();
+        let sidecar: Vec<u8> = raw.hget(&keys[0], "0:row").unwrap();
+        match fault {
+            "old-index" | "new-index" => {
+                let key = &keys[if fault == "old-index" { 5 } else { 6 }];
+                let _: () = raw.del(key).unwrap();
+                let _: () = raw.set(key, "wrong-type").unwrap();
+            }
+            "sidecar" => {
+                let _: () = raw.hset(&keys[0], "0:row", "1a{broken").unwrap();
+            }
+            _ => {
+                let parent = if fault == "new-counter" { "new" } else { "old" };
+                let value = if fault == "underflow" {
+                    "-9223372036854775808"
+                } else {
+                    "not-an-integer"
+                };
+                let _: () = raw.hset(&keys[4], parent, value).unwrap();
+            }
+        }
+        let before = plane_key_snapshot(&mut raw, &keys);
+        assert!(
+            s.upsert_plane_record(record("new", b"after").view())
+                .is_err(),
+            "{fault}"
+        );
+        assert_eq!(
+            plane_key_snapshot(&mut raw, &keys),
+            before,
+            "partial replacement after {fault}"
+        );
+        match fault {
+            "old-index" | "new-index" => {
+                let _: () = raw
+                    .del(&keys[if fault == "old-index" { 5 } else { 6 }])
+                    .unwrap();
+                let _: () = raw.zadd(&keys[5], "0:row", 0).unwrap();
+            }
+            "sidecar" => {
+                let _: () = raw.hset(&keys[0], "0:row", &sidecar).unwrap();
+            }
+            "new-counter" => {
+                let _: () = raw.hdel(&keys[4], "new").unwrap();
+            }
+            _ => {
+                let _: () = raw.hset(&keys[4], "old", 1).unwrap();
+            }
+        }
+        s.upsert_plane_record(record("new", b"after").view())
+            .expect("repair permits replacement");
+        assert_eq!(
+            s.get_plane_record(&kind, "row").unwrap(),
+            Some(b"after".to_vec())
+        );
+        assert!(s
+            .list_plane_records(&kind, &PlaneSelector::Parent("old".into()))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            s.list_plane_records(&kind, &PlaneSelector::Parent("new".into()))
+                .unwrap(),
+            vec![b"after".to_vec()]
+        );
+        assert_eq!(
+            s.list_plane_record_parents(&kind).unwrap(),
+            vec!["new".to_string()]
+        );
+        s.delete_plane_record(&kind, "row").unwrap();
+    }
+}
+
 /// A body an older build recorded (`<slot>:<values {:?}>`) still dedupes after the upgrade: the
 /// same op replays and applies nothing, a different op under its id conflicts.
 #[test]
@@ -922,6 +1174,146 @@ fn a_purge_larger_than_one_batch_counts_and_removes_exactly_the_terminal_rows() 
     assert_eq!(n, 0);
 }
 
+#[test]
+fn plane_retention_uses_exact_timestamps_and_cleans_every_index() {
+    use busbar_contract::records::Retention;
+
+    let Some(s) = live_store() else { return };
+    let mut raw = raw_conn();
+    let large = 1u64 << 53;
+    let max = i64::MAX as u64;
+    let timestamps = [
+        0,
+        large - 1,
+        large,
+        large + 1,
+        large + 2,
+        large + 3,
+        max - 1,
+        max,
+        max + 1,
+        u64::MAX - 1,
+        u64::MAX,
+    ];
+    for terminal_only in [false, true] {
+        for before in [
+            0,
+            large,
+            large + 1,
+            large + 3,
+            large + 4,
+            max,
+            max + 1,
+            u64::MAX - 1,
+            u64::MAX,
+        ] {
+            let kind = fresh("purge-exact-ts");
+            let prefix = format!("busbar:plane:{}:", crate::hex(kind.as_bytes()));
+            let records: Vec<_> = timestamps
+                .iter()
+                .flat_map(|&ts| {
+                    [PlaneDisposition::Active, PlaneDisposition::Terminal]
+                        .into_iter()
+                        .map(move |disposition| (ts, disposition))
+                })
+                .enumerate()
+                .map(|(i, (ts, disposition))| PlaneRecord {
+                    kind: kind.clone(),
+                    id: format!("r{i}"),
+                    parent: Some(format!("p{i}")),
+                    seq: large + i as u64,
+                    ts,
+                    disposition,
+                    body: format!("body-{i}").into_bytes(),
+                })
+                .collect();
+            for record in records.iter().rev() {
+                s.append_plane_record_op(op(80), record.view()).unwrap();
+            }
+            let should_remove = |record: &PlaneRecord| {
+                record.ts < before
+                    && (!terminal_only || record.disposition == PlaneDisposition::Terminal)
+            };
+            let expected: Vec<_> = records
+                .iter()
+                .filter(|r| !should_remove(r))
+                .map(|r| r.body.clone())
+                .collect();
+            let gone = if terminal_only {
+                s.purge_plane_records(&kind, before, Retention::TerminalOnly)
+            } else {
+                s.purge_plane_records_before(&kind, before)
+            }
+            .unwrap();
+            assert_eq!(
+                gone as usize,
+                records.len() - expected.len(),
+                "{before}, {terminal_only}"
+            );
+            assert_eq!(
+                s.list_plane_records(&kind, &PlaneSelector::All).unwrap(),
+                expected
+            );
+            let mut parents: Vec<_> = records
+                .iter()
+                .filter(|r| !should_remove(r))
+                .map(|r| r.parent.clone().unwrap())
+                .collect();
+            parents.sort();
+            assert_eq!(s.list_plane_record_parents(&kind).unwrap(), parents);
+            for record in &records {
+                let parent = record.parent.as_deref().unwrap();
+                let kept = !should_remove(record);
+                let rows = s
+                    .list_plane_records(&kind, &PlaneSelector::Parent(parent.into()))
+                    .unwrap();
+                assert_eq!(
+                    rows,
+                    if kept {
+                        vec![record.body.clone()]
+                    } else {
+                        Vec::new()
+                    }
+                );
+                let field = format!("{}:{parent}", record.seq);
+                for suffix in ["rec", "body"] {
+                    let present: bool = raw.hexists(format!("{prefix}{suffix}"), &field).unwrap();
+                    assert_eq!(present, kept, "{suffix}: {field}");
+                }
+                let score: Option<f64> = raw.zscore(format!("{prefix}byts"), &field).unwrap();
+                assert_eq!(score.is_some(), kept, "timestamp index: {field}");
+                let index_len: usize = raw
+                    .zcard(format!("{prefix}idx:{}", crate::hex(parent.as_bytes())))
+                    .unwrap();
+                assert_eq!(index_len, usize::from(kept), "parent index: {field}");
+            }
+            assert_eq!(
+                s.purge_plane_records(
+                    &kind,
+                    before,
+                    if terminal_only {
+                        Retention::TerminalOnly
+                    } else {
+                        Retention::Age
+                    },
+                )
+                .unwrap(),
+                0,
+                "repeated cutoff is a no-op"
+            );
+            for record in &records {
+                s.delete_plane_record(&kind, record.parent.as_deref().unwrap())
+                    .unwrap();
+            }
+            let keys: Vec<String> = raw.keys(format!("{prefix}*")).unwrap();
+            assert!(
+                keys.is_empty(),
+                "plane keys survived full cleanup: {keys:?}"
+            );
+        }
+    }
+}
+
 /// The v6 -> v7 copy never deletes a v6 task-event chain whose position holds a DIFFERENT record
 /// already (a fork): the v6 event is the only copy of that evidence, so it stays for an operator.
 #[test]
@@ -1065,6 +1457,40 @@ fn a_fork_refused_append_records_nothing_under_its_op_id() {
     ));
     s.append_plane_record_op(id, rec(2, b"two").view())
         .expect("the refusal recorded nothing, so the op id is still free");
+}
+
+#[path = "conditional_records.rs"]
+mod conditional_records;
+
+#[test]
+fn a_missing_indexed_record_value_refuses_instead_of_falsely_ending_a_scan() {
+    use super::Raw;
+    use redis::Commands;
+    let Some(store) = live_store() else { return };
+    let schema = fresh("orphan_scan");
+    store.record_put(&schema, b"a", b"first").unwrap();
+    store.record_put(&schema, b"b", b"second").unwrap();
+    let values = format!("busbar:records:{}:v", crate::hex(schema.as_bytes()));
+    store
+        .with_conn(|raw| raw.hdel::<_, _, ()>(&values, b"a"))
+        .unwrap();
+    let error = store
+        .record_scan(&schema, b"", 1)
+        .expect_err("a missing value must not masquerade as a successful end of iteration");
+    assert!(
+        error.contains("record_scan") && error.contains("missing"),
+        "{error}"
+    );
+    assert_eq!(
+        store.record_get(&schema, b"b").unwrap().unwrap().as_slice(),
+        b"second"
+    );
+    store.record_put(&schema, b"a", b"repaired").unwrap();
+    let page = store.record_scan(&schema, b"", 2).unwrap();
+    assert_eq!(page.len(), 2);
+    assert_eq!(page[0].0, b"a");
+    assert_eq!(page[0].1.as_slice(), b"repaired");
+    assert_eq!(page[1].0, b"b");
 }
 
 #[test]
@@ -1387,427 +1813,4 @@ fn v10_metering_upgrade_keeps_the_existing_replay_receipt_and_same_cell() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].tokens_input, 14);
     assert_eq!(rows[0].usage_units.get("tool_calls"), Some(&22));
-}
-
-/// A fresh op id that successfully replays an existing position is spent durably too.
-#[test]
-fn an_identical_append_under_a_fresh_op_id_records_the_success() {
-    let Some(s) = live_store() else { return };
-    let kind = fresh("append-replay-op");
-    let rec = |seq, body: &[u8]| PlaneRecord {
-        kind: kind.clone(),
-        id: "row".into(),
-        parent: Some("parent".into()),
-        seq,
-        ts: 1,
-        disposition: PlaneDisposition::Active,
-        body: body.to_vec(),
-    };
-    let mut raw = raw_conn();
-    let prefix = format!("busbar:plane:{}:", crate::hex(kind.as_bytes()));
-    let keys = ["rec", "body", "byts", "idx:706172656e74", "pcount"]
-        .map(|suffix| format!("{prefix}{suffix}"));
-    s.append_plane_record_op(op(130), rec(1, b"one").view())
-        .unwrap();
-    let before = plane_key_snapshot(&mut raw, &keys);
-    let replay = op(131);
-    s.append_plane_record_op(replay, rec(1, b"one").view())
-        .unwrap();
-    assert_eq!(
-        plane_key_snapshot(&mut raw, &keys),
-        before,
-        "replay changed the record"
-    );
-    let op_key = format!("busbar:op:{}", crate::hex(&replay.0));
-    let recorded: Option<Vec<u8>> = raw.hget(&op_key, "b").unwrap();
-    assert!(
-        recorded.is_some(),
-        "successful replay did not record its op id"
-    );
-    let ttl: i64 = raw.ttl(&op_key).unwrap();
-    assert!(ttl > 0 && ttl as u64 <= busbar_contract::abi::store::OP_ID_RETENTION_SECS);
-    let again = ValkeyStore::connect(&std::env::var("VALKEY_URL").unwrap()).unwrap();
-    again
-        .append_plane_record_op(replay, rec(1, b"one").view())
-        .unwrap();
-    for changed in [rec(2, b"two"), rec(1, b"changed")] {
-        assert_eq!(
-            again.append_plane_record_op(replay, changed.view()),
-            Err(OpRefused::Conflict)
-        );
-    }
-    assert_eq!(
-        plane_key_snapshot(&mut raw, &keys),
-        before,
-        "conflict applied another row"
-    );
-    assert_eq!(
-        again
-            .list_plane_records(&kind, &PlaneSelector::All)
-            .unwrap(),
-        vec![b"one".to_vec()]
-    );
-    s.delete_plane_record(&kind, "parent").unwrap();
-}
-
-/// Inspect exact backend state independently, including malformed keys that public reads refuse.
-fn plane_key_snapshot(raw: &mut redis::Connection, keys: &[String]) -> Vec<Option<Vec<u8>>> {
-    keys.iter()
-        .map(|key| redis::cmd("DUMP").arg(key).query(raw).unwrap())
-        .collect()
-}
-
-/// A script error must precede every mutation: repairing the bad target lets the same op retry.
-#[test]
-fn a_plane_append_validates_all_targets_before_writing_anything() {
-    let Some(s) = live_store() else { return };
-    let mut raw = raw_conn();
-    for fault in [
-        "rec",
-        "body",
-        "byts",
-        "idx:706172656e74",
-        "pcount",
-        "op",
-        "counter",
-        "overflow",
-    ] {
-        let kind = fresh("append-atomic");
-        let prefix = format!("busbar:plane:{}:", crate::hex(kind.as_bytes()));
-        let id = op(132);
-        let op_key = format!("busbar:op:{}", crate::hex(&id.0));
-        let mut keys: Vec<_> = ["rec", "body", "byts", "idx:706172656e74", "pcount"]
-            .map(|suffix| format!("{prefix}{suffix}"))
-            .into();
-        keys.push(op_key.clone());
-        let bad = match fault {
-            "op" => op_key.clone(),
-            "counter" | "overflow" => format!("{prefix}pcount"),
-            _ => format!("{prefix}{fault}"),
-        };
-        if matches!(fault, "counter" | "overflow") {
-            let value = if fault == "counter" {
-                "not-an-integer"
-            } else {
-                "9223372036854775807"
-            };
-            let _: () = raw.hset(&bad, "parent", value).unwrap();
-        } else {
-            let _: () = raw.set(&bad, "wrong-type").unwrap();
-        }
-        let record = PlaneRecord {
-            kind: kind.clone(),
-            id: "row".into(),
-            parent: Some("parent".into()),
-            seq: 1,
-            ts: 1,
-            disposition: PlaneDisposition::Active,
-            body: b"one".to_vec(),
-        };
-        let before = plane_key_snapshot(&mut raw, &keys);
-        assert!(
-            matches!(
-                s.append_plane_record_op(id, record.view()),
-                Err(OpRefused::Failed(_))
-            ),
-            "{fault}"
-        );
-        assert_eq!(
-            plane_key_snapshot(&mut raw, &keys),
-            before,
-            "partial append after {fault}"
-        );
-        let _: () = raw.del(&bad).unwrap();
-        s.append_plane_record_op(id, record.view())
-            .expect("repair permits the original op");
-        assert_eq!(
-            s.list_plane_records(&kind, &PlaneSelector::Parent("parent".into()))
-                .unwrap(),
-            vec![b"one".to_vec()]
-        );
-        let count: i64 = raw.hget(format!("{prefix}pcount"), "parent").unwrap();
-        assert_eq!(count, 1, "{fault}");
-        let retained: u64 = raw.zcard(format!("{prefix}byts")).unwrap();
-        assert_eq!(retained, 1, "missing retention index after {fault}");
-        assert!(raw.hexists::<_, _, bool>(&op_key, "b").unwrap());
-        s.delete_plane_record(&kind, "parent").unwrap();
-    }
-}
-
-/// Upserts share the writer: validate old links as well as the new parent's late index/counter.
-#[test]
-fn a_plane_replacement_validates_old_and_new_links_before_unlinking() {
-    let Some(s) = live_store() else { return };
-    let mut raw = raw_conn();
-    for fault in [
-        "old-index",
-        "new-index",
-        "old-counter",
-        "new-counter",
-        "underflow",
-        "sidecar",
-    ] {
-        let kind = fresh("upsert-atomic");
-        let prefix = format!("busbar:plane:{}:", crate::hex(kind.as_bytes()));
-        let keys = [
-            "rec",
-            "body",
-            "byts",
-            "idx:726f77",
-            "pcount",
-            "idx:6f6c64",
-            "idx:6e6577",
-        ]
-        .map(|suffix| format!("{prefix}{suffix}"));
-        let record = |parent: &str, body: &[u8]| PlaneRecord {
-            kind: kind.clone(),
-            id: "row".into(),
-            parent: Some(parent.into()),
-            seq: 0,
-            ts: 1,
-            disposition: PlaneDisposition::Active,
-            body: body.to_vec(),
-        };
-        s.upsert_plane_record(record("old", b"before").view())
-            .unwrap();
-        let sidecar: Vec<u8> = raw.hget(&keys[0], "0:row").unwrap();
-        match fault {
-            "old-index" | "new-index" => {
-                let key = &keys[if fault == "old-index" { 5 } else { 6 }];
-                let _: () = raw.del(key).unwrap();
-                let _: () = raw.set(key, "wrong-type").unwrap();
-            }
-            "sidecar" => {
-                let _: () = raw.hset(&keys[0], "0:row", "1a{broken").unwrap();
-            }
-            _ => {
-                let parent = if fault == "new-counter" { "new" } else { "old" };
-                let value = if fault == "underflow" {
-                    "-9223372036854775808"
-                } else {
-                    "not-an-integer"
-                };
-                let _: () = raw.hset(&keys[4], parent, value).unwrap();
-            }
-        }
-        let before = plane_key_snapshot(&mut raw, &keys);
-        assert!(
-            s.upsert_plane_record(record("new", b"after").view())
-                .is_err(),
-            "{fault}"
-        );
-        assert_eq!(
-            plane_key_snapshot(&mut raw, &keys),
-            before,
-            "partial replacement after {fault}"
-        );
-        match fault {
-            "old-index" | "new-index" => {
-                let _: () = raw
-                    .del(&keys[if fault == "old-index" { 5 } else { 6 }])
-                    .unwrap();
-                let _: () = raw.zadd(&keys[5], "0:row", 0).unwrap();
-            }
-            "sidecar" => {
-                let _: () = raw.hset(&keys[0], "0:row", &sidecar).unwrap();
-            }
-            "new-counter" => {
-                let _: () = raw.hdel(&keys[4], "new").unwrap();
-            }
-            _ => {
-                let _: () = raw.hset(&keys[4], "old", 1).unwrap();
-            }
-        }
-        s.upsert_plane_record(record("new", b"after").view())
-            .expect("repair permits replacement");
-        assert_eq!(
-            s.get_plane_record(&kind, "row").unwrap(),
-            Some(b"after".to_vec())
-        );
-        assert!(s
-            .list_plane_records(&kind, &PlaneSelector::Parent("old".into()))
-            .unwrap()
-            .is_empty());
-        assert_eq!(
-            s.list_plane_records(&kind, &PlaneSelector::Parent("new".into()))
-                .unwrap(),
-            vec![b"after".to_vec()]
-        );
-        assert_eq!(
-            s.list_plane_record_parents(&kind).unwrap(),
-            vec!["new".to_string()]
-        );
-        s.delete_plane_record(&kind, "row").unwrap();
-    }
-}
-
-#[test]
-fn plane_retention_uses_exact_timestamps_and_cleans_every_index() {
-    use busbar_contract::records::Retention;
-
-    let Some(s) = live_store() else { return };
-    let mut raw = raw_conn();
-    let large = 1u64 << 53;
-    let max = i64::MAX as u64;
-    let timestamps = [
-        0,
-        large - 1,
-        large,
-        large + 1,
-        large + 2,
-        large + 3,
-        max - 1,
-        max,
-        max + 1,
-        u64::MAX - 1,
-        u64::MAX,
-    ];
-    for terminal_only in [false, true] {
-        for before in [
-            0,
-            large,
-            large + 1,
-            large + 3,
-            large + 4,
-            max,
-            max + 1,
-            u64::MAX - 1,
-            u64::MAX,
-        ] {
-            let kind = fresh("purge-exact-ts");
-            let prefix = format!("busbar:plane:{}:", crate::hex(kind.as_bytes()));
-            let records: Vec<_> = timestamps
-                .iter()
-                .flat_map(|&ts| {
-                    [PlaneDisposition::Active, PlaneDisposition::Terminal]
-                        .into_iter()
-                        .map(move |disposition| (ts, disposition))
-                })
-                .enumerate()
-                .map(|(i, (ts, disposition))| PlaneRecord {
-                    kind: kind.clone(),
-                    id: format!("r{i}"),
-                    parent: Some(format!("p{i}")),
-                    seq: large + i as u64,
-                    ts,
-                    disposition,
-                    body: format!("body-{i}").into_bytes(),
-                })
-                .collect();
-            for record in records.iter().rev() {
-                s.append_plane_record_op(op(80), record.view()).unwrap();
-            }
-            let should_remove = |record: &PlaneRecord| {
-                record.ts < before
-                    && (!terminal_only || record.disposition == PlaneDisposition::Terminal)
-            };
-            let expected: Vec<_> = records
-                .iter()
-                .filter(|r| !should_remove(r))
-                .map(|r| r.body.clone())
-                .collect();
-            let gone = if terminal_only {
-                s.purge_plane_records(&kind, before, Retention::TerminalOnly)
-            } else {
-                s.purge_plane_records_before(&kind, before)
-            }
-            .unwrap();
-            assert_eq!(
-                gone as usize,
-                records.len() - expected.len(),
-                "{before}, {terminal_only}"
-            );
-            assert_eq!(
-                s.list_plane_records(&kind, &PlaneSelector::All).unwrap(),
-                expected
-            );
-            let mut parents: Vec<_> = records
-                .iter()
-                .filter(|r| !should_remove(r))
-                .map(|r| r.parent.clone().unwrap())
-                .collect();
-            parents.sort();
-            assert_eq!(s.list_plane_record_parents(&kind).unwrap(), parents);
-            for record in &records {
-                let parent = record.parent.as_deref().unwrap();
-                let kept = !should_remove(record);
-                let rows = s
-                    .list_plane_records(&kind, &PlaneSelector::Parent(parent.into()))
-                    .unwrap();
-                assert_eq!(
-                    rows,
-                    if kept {
-                        vec![record.body.clone()]
-                    } else {
-                        Vec::new()
-                    }
-                );
-                let field = format!("{}:{parent}", record.seq);
-                for suffix in ["rec", "body"] {
-                    let present: bool = raw.hexists(format!("{prefix}{suffix}"), &field).unwrap();
-                    assert_eq!(present, kept, "{suffix}: {field}");
-                }
-                let score: Option<f64> = raw.zscore(format!("{prefix}byts"), &field).unwrap();
-                assert_eq!(score.is_some(), kept, "timestamp index: {field}");
-                let index_len: usize = raw
-                    .zcard(format!("{prefix}idx:{}", crate::hex(parent.as_bytes())))
-                    .unwrap();
-                assert_eq!(index_len, usize::from(kept), "parent index: {field}");
-            }
-            assert_eq!(
-                s.purge_plane_records(
-                    &kind,
-                    before,
-                    if terminal_only {
-                        Retention::TerminalOnly
-                    } else {
-                        Retention::Age
-                    },
-                )
-                .unwrap(),
-                0,
-                "repeated cutoff is a no-op"
-            );
-            for record in &records {
-                s.delete_plane_record(&kind, record.parent.as_deref().unwrap())
-                    .unwrap();
-            }
-            let keys: Vec<String> = raw.keys(format!("{prefix}*")).unwrap();
-            assert!(
-                keys.is_empty(),
-                "plane keys survived full cleanup: {keys:?}"
-            );
-        }
-    }
-}
-
-#[test]
-fn a_missing_indexed_record_value_refuses_instead_of_falsely_ending_a_scan() {
-    use super::Raw;
-    use redis::Commands;
-    let Some(store) = live_store() else { return };
-    let schema = fresh("orphan_scan");
-    store.record_put(&schema, b"a", b"first").unwrap();
-    store.record_put(&schema, b"b", b"second").unwrap();
-    let values = format!("busbar:records:{}:v", crate::hex(schema.as_bytes()));
-    store
-        .with_conn(|raw| raw.hdel::<_, _, ()>(&values, b"a"))
-        .unwrap();
-    let error = store
-        .record_scan(&schema, b"", 1)
-        .expect_err("a missing value must not masquerade as a successful end of iteration");
-    assert!(
-        error.contains("record_scan") && error.contains("missing"),
-        "{error}"
-    );
-    assert_eq!(
-        store.record_get(&schema, b"b").unwrap().unwrap().as_slice(),
-        b"second"
-    );
-    store.record_put(&schema, b"a", b"repaired").unwrap();
-    let page = store.record_scan(&schema, b"", 2).unwrap();
-    assert_eq!(page.len(), 2);
-    assert_eq!(page[0].0, b"a");
-    assert_eq!(page[0].1.as_slice(), b"repaired");
-    assert_eq!(page[1].0, b"b");
 }

@@ -25,9 +25,12 @@ governance store, packaged as a droppable `cdylib`. Build it, drop the
 resulting `.so`/`.dylib`/`.dll` into the engine's plugins folder, and set
 `store: { module: valkey, settings: { url: "redis://..." } }`; the engine
 loads it in-process at boot. One
-Valkey behind a fleet of busbar nodes means shared virtual keys, budgets,
-usage, and audit across the cluster — the multi-node story a single-file
+Valkey behind a fleet of busbar nodes means shared virtual keys, credentials,
+usage ledgers, metering, and audit across the fleet — the multi-node story a single-file
 SQLite store cannot offer.
+
+Use a standalone or replicated Valkey endpoint. Valkey Cluster is unsupported: the store's
+multi-key transactions and scripts span keys without a shared cluster hash tag.
 
 ### Renamed: `redis` → `valkey` (BREAKING)
 
@@ -74,15 +77,26 @@ once, and writes the `busbar:schema` marker last, so a crash mid-upgrade re-runs
 next connect (two nodes upgrading at once land in the same place).
 
 - **Schema v6** (plugin v1.0.x, busbar 1.5.x): the typed task, task-event, demotion and
-  spent-approval keys are copied into the plane keyspace, then removed, and the v9 and v10 steps below run.
+  spent-approval keys are copied into the plane keyspace, then removed, and the v9–v11 steps below run.
   A task event whose position holds a different record already keeps its v6 source key for an
   operator. `busbar:mcp:*` (the v6 tool-call log) is neither migrated nor removed.
-- **Schema v7/v8:** the v9 and v10 steps.
-- **Schema v9:** the v10 step only.
-- **Schema v10:** current; no migration.
+- **Schema v7/v8:** the v9–v11 steps.
+- **Schema v9:** the v10 and v11 steps.
+- **Schema v10:** v11 renames metering hashes to include their recorded group and price version; counters, unknown hash fields and existing replay receipts remain unchanged. Ambiguous destinations or missing indexed rows refuse migration without guessing.
+- **Schema v11:** v12 repairs spent-token cleanup against each stored absolute expiry, using server TIME.
+- **Schema v12:** current; no migration.
 - **Older than v6, or keys with no marker:** refused, with the key prefixes found, and NOTHING is
   changed; if the marker was lost from a current namespace, `SET busbar:schema 6` and restart.
 - **Newer than this build:** refused. Run a build of that version or later.
+
+Metering rows preserve their recorded historical attribution through v11. Previously combined history cannot be reconstructed. Each hash rename and index update is atomic and repeatable after a lost reply; the schema marker advances only after all rows have moved. Keep older nodes stopped throughout the upgrade and subsequent operation.
+
+Single-use token redemption reads server TIME inside its atomic script. Caller `now` cannot expire
+or reclaim a receipt. A candidate expires only after its absolute second; cleanup is scheduled at
+the first second after that boundary. Grants beyond the existing TTL cap remain without TTL.
+Schema v12 repairs surviving older receipts, including imported v6 approvals, before admitting new
+operations. Receipts already deleted by an older writer's early TTL cannot be reconstructed. Drain
+older nodes before upgrade. Generic multi-use token checks retain their separate policy. Reserved ticket preflight reads a terminal record with the exact signed deadline against the store clock and never spends the token. The reserved kernel `ticket` record kind stores an absolute deadline in `ts`; its age cleanup is capped at the same store clock. Other record kinds keep their existing retention policy.
 
 The server must run `maxmemory-policy noeviction`; the connect step refuses to start otherwise.
 
@@ -96,8 +110,8 @@ build can LINK the same door (`LinkedRow::of(door)`). Both doors run the same co
 [`tests/conformance.rs`](store-valkey-plugin/tests/conformance.rs) proves they behave as one store.
 
 The store v3 additions are durable in Valkey: every `op_id` write is deduped by a record
-(`busbar:op:*`, kept 24 h) written in the same atomic step as its effect (`WATCH`/`MULTI`/`EXEC`,
-or one server-side script for the plane append), and the kernel's records (`busbar:records:*`)
+(`busbar:op:*`, kept 24 h) written in the same atomic step as its effect (one server-side script
+for usage, metering and plane append, or `WATCH`/`MULTI`/`EXEC` for conditional records), and the kernel's records (`busbar:records:*`)
 are an additive keyspace beside the v7 ones. The store keeps ledger counts, not money: busbar
 derives money from the counts and its rate card.
 
@@ -116,8 +130,7 @@ older node could otherwise write the old revoked form again.
 
 
 - **Multi-node deployments**: a fleet of busbar nodes sharing one Valkey
-  instance share virtual keys, per-key/per-group budgets, token usage
-  ledgers, and metering/audit rows — the store is the durability layer
+  instance share virtual keys, credentials, token usage ledgers, and metering/audit rows — the store is the durability layer
   behind the engine's in-memory enforcement counters (boot-hydrate +
   periodic write-behind flush), not a request-hot-path dependency.
 - **Fleet-honest accrual**: `add_usage_batch` and `add_metering_batch` are
@@ -228,17 +241,20 @@ persistence check available — so this crate's coverage proves
 persistence the way that's actually meaningful for a shared backend:
 write a key/usage through the `dlopen`'d plugin over the C ABI, drop the
 plugin (closing its connection), then read the SAME Valkey instance back
-through a **totally independent connection** — the plain
-`busbar-store-valkey` library crate, used directly, never touching the
-cdylib, the C ABI, or the loader at all. That is the proof that
+through a **fresh connection** — the same library's linked door opened
+through `busbar-plugin-loader` and the same store ABI. The admin e2e test
+also reads the stored bytes through the independent upstream RESP client. These checks prove that
 `store: valkey` operations over the ABI actually land in Valkey, not just
 in an in-process cache.
 
 The live-Valkey coverage is gated on the `VALKEY_URL` environment
 variable: it skips cleanly when unset locally (no server needed for a
 default `cargo test`), but under CI (`CI` set) a missing `VALKEY_URL` is
-a **hard failure**, never a silent skip. The tests that wipe a namespace are `#[ignore]`d and run
-by CI's `--ignored` pass, each on a private database number — see
+a **hard failure**, never a silent skip. Some durable MCP cases require the URL even locally.
+Destructive namespace tests run in both the normal suite and CI's `--ignored` pass.
+Their private databases are protected for the complete fixture lifetime by endpoint-and-database
+file locks shared across test binaries and nextest processes. They flush before use and on drop,
+including panic unwinding; the shared database selected by `VALKEY_URL` is never flushed. See
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml), which runs a
 real `valkey/valkey:8` GitHub Actions service container on every push and PR.
 On macOS, where GitHub runs no service containers, CI starts a brew-installed `valkey-server`

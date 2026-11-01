@@ -19,7 +19,7 @@ use busbar_contract::abi::sdk::store::wire::Wire;
 /// What kind of failure a [`RedisError`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
-    /// A refusal or failure the store itself raised.
+    /// A client-side failure the store itself raised; verbatim refusals use `RedisError::refused`.
     Client,
     /// A reply that does not convert to the type asked for.
     TypeError,
@@ -194,7 +194,7 @@ impl Value {
 /// allocates and copies nothing), so a reply that arrives in many fills is built once, when whole.
 ///
 /// # Errors
-/// Bytes that are not RESP2, an array nested deeper than 32, or a length that overflows.
+/// Bytes that are not RESP2, nesting beyond [`MAX_REPLY_DEPTH`], or a length that overflows.
 pub fn parse(buf: &[u8]) -> RedisResult<Option<(Value, usize)>> {
     match walk(buf, 0, 0, false)? {
         None => Ok(None),
@@ -595,6 +595,7 @@ impl Conn {
             }
             let n = self.wire.fill().await.map_err(|e| RedisError::io(&e))?;
             if n == 0 {
+                self.wire.discard();
                 return Err(RedisError {
                     repr: Repr::Io("the server closed the connection".into()),
                 });
@@ -908,8 +909,14 @@ impl Pipeline {
             match exec {
                 Value::Nil => return T::from_value(Value::Nil),
                 Value::Error(e) => return Err(RedisError::server(e)),
-                Value::Array(items) => items,
-                other => vec![other],
+                Value::Array(items) if items.len() == self.cmds.len() => items,
+                _ => {
+                    c.wire.discard();
+                    return Err(RedisError::from((
+                        ErrorKind::Parse,
+                        "EXEC reply does not match the queued command count",
+                    )));
+                }
             }
         } else {
             replies
@@ -954,6 +961,10 @@ impl Script {
         };
         inv.key(k);
         inv
+    }
+    #[cfg(test)]
+    pub(crate) fn source_for_test(&self) -> &str {
+        &self.src
     }
 }
 
@@ -1015,13 +1026,13 @@ pub fn rr<T, F: Future<Output = RedisResult<T>>>(f: F) -> F {
     f
 }
 
-/// The most times a `transaction!` reruns its body after an abort before it gives up.
+/// The most attempts a `transaction!` makes, including the first, before it gives up.
 pub const MAX_TRANSACTION_ATTEMPTS: usize = 64;
 
 /// The optimistic transaction, as the upstream driver's `transaction`: `WATCH` the keys, run the
 /// body (it reads, and queues its writes on the atomic pipeline it is handed, then answers that
 /// pipeline's `query`: `None` when a watched key changed and `EXEC` aborted), and run it all again
-/// on an abort, up to [`MAX_TRANSACTION_ATTEMPTS`] times. Evaluates to the body's `Some` value, or its
+/// on an abort, for at most [`MAX_TRANSACTION_ATTEMPTS`] attempts in total. Evaluates to the body's `Some` value, or its
 /// error (a `WATCH` left in force by a failed body is cleared).
 macro_rules! transaction {
     ($c:ident, $keys:expr, |$c2:ident, $pipe:ident| $body:expr $(,)?) => {

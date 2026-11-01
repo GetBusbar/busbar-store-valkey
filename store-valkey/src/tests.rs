@@ -7,8 +7,10 @@ use busbar_contract::records::{MeteringDelta, PlaneDisposition, RecordStore, Sec
 use redis::Commands;
 use std::sync::OnceLock;
 
+#[path = "tests/credential_rewrap.rs"]
+mod credential_rewrap;
 #[path = "../../test-support/database.rs"]
-mod database;
+pub(crate) mod database;
 
 use busbar_contract::abi::store::OpId;
 use busbar_plugin_loader::dispatch::kinds::store::Store;
@@ -1548,7 +1550,7 @@ pub(crate) fn audit_seq_guard() -> std::sync::MutexGuard<'static, ()> {
 
 /// `VALKEY_URL` re-pointed at database `db`, so a refusal test owns a whole namespace and never
 /// leaves a stale marker in the shared one the rest of the suite uses.
-fn url_for_db(db: u32) -> String {
+pub(crate) fn url_for_db(db: u32) -> String {
     let url = std::env::var("VALKEY_URL").unwrap();
     let base = url.split('?').next().unwrap();
     let (head, _) = base
@@ -1607,7 +1609,7 @@ fn the_shared_database_is_never_flushed() {
 }
 
 /// An independent upstream client on database `db`, emptied first.
-fn fresh_db_client(db: u32) -> (database::Database, redis::Connection) {
+pub(crate) fn fresh_db_client(db: u32) -> (database::Database, redis::Connection) {
     assert_private_db(db);
     let held = database::Database::take(&url_for_db(db));
     let c = held.connection().expect("connect to private test database");
@@ -3246,6 +3248,45 @@ fn a_grant_beyond_the_ttl_cap_is_recorded_without_expiry() {
     reset_trust_state(&store, &[], &[&nonce]);
 }
 
+/// A live spent entry survives arbitrary caller clocks; only shared-clock expiry permits reuse.
+
+#[test]
+fn a_spent_entry_is_judged_against_the_shared_clock() {
+    const LIVE_LIFE: u64 = 900;
+    let store = require_live_store();
+    let nonce = trust_ns("nonce_judged");
+    let expires = token_test_now(&store) + LIVE_LIFE;
+    assert!(store.redeem_ask_state(&nonce, expires, 0).unwrap());
+    for caller_now in [0, expires, u64::MAX] {
+        assert!(!store
+            .redeem_ask_state(&nonce, u64::MAX, caller_now)
+            .unwrap());
+    }
+    let key = plane::token_key(crate::legacy::KIND_ASK, &nonce);
+    let stored: String = store.with_conn(|c| c.get(&key)).unwrap();
+    assert_eq!(stored, expires.to_string());
+    let _: () = store.with_conn(|c| c.set(&key, 0)).unwrap();
+    assert!(
+        store.redeem_ask_state(&nonce, expires, 0).unwrap(),
+        "a preexisting expired receipt can be reclaimed"
+    );
+    assert!(!store.redeem_ask_state(&nonce, expires, u64::MAX).unwrap());
+    reset_trust_state(&store, &[], &[&nonce]);
+}
+
+/// An already-lapsed candidate cannot claim a token and leaves no receipt.
+#[test]
+fn a_lapsed_approval_is_refused_without_a_redemption_record() {
+    let store = require_live_store();
+    let nonce = trust_ns("nonce_lapsed");
+    let expires = token_test_now(&store) - 1;
+    assert!(!store.redeem_ask_state(&nonce, expires, 0).unwrap());
+    let value: Option<String> = store
+        .with_conn(|c| c.get(plane::token_key(crate::legacy::KIND_ASK, &nonce)))
+        .unwrap();
+    assert_eq!(value, None);
+}
+
 /// THE FULL STORABLE RANGE (up to `i64::MAX`) round-trips for the demotion record too.
 #[test]
 fn the_demotion_record_round_trips_the_full_storable_range() {
@@ -4371,6 +4412,181 @@ const FIXTURE_KEYS_1_5_5: &str = include_str!("../tests/fixtures/1.5.5/keys.json
 
 /// A TTL comfortably longer than any test run, as 1.5.5 gave its metering rows.
 const FIXTURE_TTL_SECS: u64 = 31 * 24 * 3600;
+
+// The MANIFEST's recorder blob c353cf689d06222191b3f876b3e2520ca340d1c4 fixes
+// input/output/cache-read prices at 100000/200000/10000 micros and the fee at 3 cents.
+// Money is derived from actual store counters, never persisted by the store or read from keys.json.
+fn recorded_1_5_5_token_spend(
+    model: &str,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+) -> u64 {
+    assert!(
+        matches!(model, "m-chat" | "m-cache" | "m-chat-down"),
+        "recorded model {model}"
+    );
+    assert_eq!(
+        cache_write, 0,
+        "the recorded script emits no cache-creation usage"
+    );
+    if model != "m-cache" {
+        assert_eq!(
+            cache_read, 0,
+            "only m-cache has a cache-read price in the recorder"
+        );
+    }
+    input * 100_000 + output * 200_000 + cache_read * 10_000
+}
+
+fn recorded_1_5_5_breakdown(rows: &[&MeteringRow]) -> serde_json::Value {
+    let mut input = 0;
+    let mut output = 0;
+    let mut cache_read = 0;
+    let mut cache_write = 0;
+    let mut requests = 0;
+    let mut spend = 0;
+    for row in rows {
+        input += row.tokens_input;
+        output += row.tokens_output;
+        cache_read += row.tokens_cache_read;
+        cache_write += row.tokens_cache_write;
+        requests += row.requests;
+        spend += recorded_1_5_5_token_spend(
+            &row.model,
+            row.tokens_input,
+            row.tokens_output,
+            row.tokens_cache_read,
+            row.tokens_cache_write,
+        ) + row.billable_requests * 30_000;
+    }
+    serde_json::json!({
+        "requests": requests, "spend_micros": spend, "tokens_input": input,
+        "tokens_output": output, "tokens_cache_read": cache_read,
+        "tokens_cache_creation": cache_write,
+    })
+}
+
+/// Compare the loaded store's reads with all three frozen 1.5.5 HTTP response bodies. Only the
+/// recorder's fixed pricing/context is supplied here; IDs, names, groups and consumption come
+/// from real RecordStore reads after migration. The recorder removed only `as_of`.
+fn assert_recorded_1_5_5_readback(store: &ValkeyStore) {
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
+    let expected: Value =
+        serde_json::from_str(include_str!("../tests/fixtures/1.5.5/readback/usage.json")).unwrap();
+    let start = expected["window"]["start"]
+        .as_u64()
+        .expect("recorded integer UTC start");
+    let end = expected["window"]["end"]
+        .as_u64()
+        .expect("recorded integer UTC end");
+    assert_eq!(start % 86_400, 0, "metering is a pinned UTC-day bucket");
+    assert_eq!(end, start + 86_400);
+    let rows = store.list_metering(start).unwrap();
+    assert!(store.list_metering(start - 86_400).unwrap().is_empty());
+    assert!(
+        store.list_metering(end).unwrap().is_empty(),
+        "the end boundary is the next bucket"
+    );
+    let mut models: BTreeMap<(&str, &str), Vec<&MeteringRow>> = BTreeMap::new();
+    let mut keys: BTreeMap<&str, Vec<&MeteringRow>> = BTreeMap::new();
+    for row in &rows {
+        models
+            .entry((&row.model, &row.provider))
+            .or_default()
+            .push(row);
+        keys.entry(&row.key_id).or_default().push(row);
+    }
+    let by_model: Vec<Value> = models
+        .into_iter()
+        .map(|((model, provider), rows)| {
+            let mut view = recorded_1_5_5_breakdown(&rows);
+            view["model"] = json!(model);
+            view["provider"] = json!(provider);
+            view
+        })
+        .collect();
+    let mut by_key: Vec<Value> = keys
+        .into_iter()
+        .map(|(id, rows)| {
+            let key = store.get_key(id).unwrap().expect("metering key reads back");
+            let mut view = recorded_1_5_5_breakdown(&rows);
+            view["id"] = json!(key.id);
+            view["name"] = json!(key.name);
+            view
+        })
+        .collect();
+    // The recorded admin view orders keys by spend descending, then ID; models by model/provider.
+    by_key.sort_by(|a, b| {
+        b["spend_micros"]
+            .as_u64()
+            .unwrap()
+            .cmp(&a["spend_micros"].as_u64().unwrap())
+            .then_with(|| a["id"].as_str().unwrap().cmp(b["id"].as_str().unwrap()))
+    });
+    let actual = json!({
+        "window": {"start": start, "end": end}, "currency": "USD",
+        "total": recorded_1_5_5_breakdown(&rows.iter().collect::<Vec<_>>()),
+        "by_model": by_model, "by_key": by_key, "by_key_truncated": false,
+    });
+    assert_eq!(
+        actual, expected,
+        "the whole recorded usage response, including JSON field types"
+    );
+
+    for recorded in [
+        include_str!("../tests/fixtures/1.5.5/readback/key-fixture-grouped.json"),
+        include_str!("../tests/fixtures/1.5.5/readback/key-fixture-ungrouped.json"),
+    ] {
+        let expected: Value = serde_json::from_str(recorded).unwrap();
+        let id = expected["id"].as_str().expect("recorded string key ID");
+        assert_eq!(
+            expected["window_start"].as_u64(),
+            Some(0),
+            "key attribution is all-time"
+        );
+        let key = store
+            .get_key(id)
+            .unwrap()
+            .expect("the recorded key is loaded");
+        let ledger = store.get_usage(id, 0).unwrap();
+        assert_eq!(
+            store.get_usage(id, start).unwrap(),
+            UsageLedger::default(),
+            "day metering must not be mistaken for the key's all-time attribution"
+        );
+        let spend = ledger
+            .models
+            .iter()
+            .map(|model| {
+                recorded_1_5_5_token_spend(
+                    &model.model,
+                    model.tier("input"),
+                    model.tier("output"),
+                    model.tier("cache_read"),
+                    model.tier("cache_write"),
+                )
+            })
+            .sum::<u64>()
+            + ledger.billable_requests * 30_000;
+        let actual = json!({
+            "id": &key.id, "group": &key.group, "budget_period": "total", "window_start": 0,
+            "requests": ledger.requests, "tokens": ledger.total_tokens(), "spend_cents": spend / 10_000,
+            // The recorder config gives the group only a budget; it has no requests/tokens rate cap.
+            "rate_headroom": Option::<f64>::None,
+        });
+        assert_eq!(
+            actual, expected,
+            "the complete recorded key usage response for {id}"
+        );
+        if let Some(group) = key.group.as_deref() {
+            assert_eq!(store.get_usage(&format!("group:{group}@day"), start).unwrap(), ledger,
+                "the group's daily budget and the key's all-time attribution preserve the same recorded usage");
+        }
+    }
+}
 
 fn fixture_keys() -> serde_json::Map<String, serde_json::Value> {
     serde_json::from_str::<serde_json::Value>(FIXTURE_KEYS_1_5_5)
@@ -6150,424 +6366,6 @@ fn usage_cleanup_never_reconnects_and_replays_a_delete_whose_reply_was_lost() {
     );
 }
 
-/// A live spent entry survives arbitrary caller clocks; only shared-clock expiry permits reuse.
-
-#[test]
-fn a_spent_entry_is_judged_against_the_shared_clock() {
-    const LIVE_LIFE: u64 = 900;
-    let store = require_live_store();
-    let nonce = trust_ns("nonce_judged");
-    let expires = token_test_now(&store) + LIVE_LIFE;
-    assert!(store.redeem_ask_state(&nonce, expires, 0).unwrap());
-    for caller_now in [0, expires, u64::MAX] {
-        assert!(!store
-            .redeem_ask_state(&nonce, u64::MAX, caller_now)
-            .unwrap());
-    }
-    let key = plane::token_key(crate::legacy::KIND_ASK, &nonce);
-    let stored: String = store.with_conn(|c| c.get(&key)).unwrap();
-    assert_eq!(stored, expires.to_string());
-    let _: () = store.with_conn(|c| c.set(&key, 0)).unwrap();
-    assert!(
-        store.redeem_ask_state(&nonce, expires, 0).unwrap(),
-        "a preexisting expired receipt can be reclaimed"
-    );
-    assert!(!store.redeem_ask_state(&nonce, expires, u64::MAX).unwrap());
-    reset_trust_state(&store, &[], &[&nonce]);
-}
-
-/// An already-lapsed candidate cannot claim a token and leaves no receipt.
-#[test]
-fn a_lapsed_approval_is_refused_without_a_redemption_record() {
-    let store = require_live_store();
-    let nonce = trust_ns("nonce_lapsed");
-    let expires = token_test_now(&store) - 1;
-    assert!(!store.redeem_ask_state(&nonce, expires, 0).unwrap());
-    let value: Option<String> = store
-        .with_conn(|c| c.get(plane::token_key(crate::legacy::KIND_ASK, &nonce)))
-        .unwrap();
-    assert_eq!(value, None);
-}
-
-#[test]
-fn shared_clock_ignores_caller_skew_and_refuses_expired_grants_without_mutation() {
-    const TOKEN_KIND: &str = "shared-clock-regression";
-    const PAST_EPOCH: u64 = 1;
-    let Some(store) = live_store() else { return };
-    let live = uid("clock-live");
-    let expired = uid("clock-expired");
-    assert!(store
-        .redeem_plane_token(TOKEN_KIND, &live, u64::MAX, PAST_EPOCH)
-        .unwrap());
-    assert!(!store
-        .redeem_plane_token(TOKEN_KIND, &live, u64::MAX, u64::MAX)
-        .unwrap());
-    assert!(!store
-        .redeem_plane_token(TOKEN_KIND, &expired, PAST_EPOCH, 0)
-        .unwrap());
-    let absent: Option<String> = store
-        .with_conn(|c| c.get(plane::token_key(TOKEN_KIND, &expired)))
-        .unwrap();
-    assert_eq!(absent, None, "expired input leaves no receipt");
-    drop(store);
-    let store = ValkeyStore::connect(&std::env::var("VALKEY_URL").unwrap()).unwrap();
-    assert!(!store
-        .redeem_plane_token(TOKEN_KIND, &live, u64::MAX, 0)
-        .unwrap());
-    let stored: String = store
-        .with_conn(|c| c.get(plane::token_key(TOKEN_KIND, &live)))
-        .unwrap();
-    assert_eq!(stored, u64::MAX.to_string());
-    let _: () = store
-        .with_conn(|c| c.del(plane::token_key(TOKEN_KIND, &live)))
-        .unwrap();
-}
-
-#[test]
-fn shared_clock_keeps_exact_large_stored_expiries_and_reclaims_only_lapsed_rows() {
-    const TOKEN_KIND: &str = "shared-clock-seeded";
-    const EXACT_EXPIRY: u64 = (1_u64 << 53) + 1;
-    let Some(store) = live_store() else { return };
-    let future = uid("clock-future");
-    let lapsed = uid("clock-lapsed");
-    let _: () = store
-        .with_conn(|c| c.set(plane::token_key(TOKEN_KIND, &future), EXACT_EXPIRY))
-        .unwrap();
-    let _: () = store
-        .with_conn(|c| c.set(plane::token_key(TOKEN_KIND, &lapsed), 0))
-        .unwrap();
-    assert!(!store
-        .redeem_plane_token(TOKEN_KIND, &future, u64::MAX, u64::MAX)
-        .unwrap());
-    assert!(store
-        .redeem_plane_token(TOKEN_KIND, &lapsed, u64::MAX, 0)
-        .unwrap());
-    let stored: String = store
-        .with_conn(|c| c.get(plane::token_key(TOKEN_KIND, &future)))
-        .unwrap();
-    assert_eq!(stored, EXACT_EXPIRY.to_string());
-    for token in [&future, &lapsed] {
-        let _: () = store
-            .with_conn(|c| c.del(plane::token_key(TOKEN_KIND, token)))
-            .unwrap();
-    }
-}
-
-/// TIME is the shared authority used by the token script, independent of the test process clock.
-fn token_test_now(store: &ValkeyStore) -> u64 {
-    let (seconds, _micros): (u64, u64) = store.with_conn(|c| redis::cmd("TIME").query(c)).unwrap();
-    seconds
-}
-
-#[test]
-fn ticket_expiry_records_survive_a_fast_purge_caller() {
-    use busbar_contract::records::Retention;
-    const TOKEN_CLOCK_DATABASE: u32 = 6;
-    let Some(_) = live_store() else { return };
-    let (_database, _raw) = fresh_db_client(TOKEN_CLOCK_DATABASE);
-    let store = ValkeyStore::connect(&url_for_db(TOKEN_CLOCK_DATABASE)).unwrap();
-    let now = token_test_now(&store);
-    let live = uid("live-ticket");
-    let expired = uid("expired-ticket");
-
-    const TICKET_KIND: &str = "ticket";
-    const OTHER_KIND: &str = "ordinary-retention-regression";
-    const FUTURE_OFFSET: u64 = 900;
-    let future = now + FUTURE_OFFSET;
-    let row = |kind: &str, id: &str, ts| PlaneRecord {
-        kind: kind.into(),
-        id: id.into(),
-        parent: None,
-        seq: 0,
-        ts,
-        disposition: if kind == TICKET_KIND {
-            PlaneDisposition::Terminal
-        } else {
-            PlaneDisposition::Active
-        },
-        body: id.as_bytes().to_vec(),
-    };
-    for (kind, id, ts) in [
-        (TICKET_KIND, live.as_str(), future),
-        (TICKET_KIND, expired.as_str(), 0),
-        (OTHER_KIND, live.as_str(), future),
-    ] {
-        store.upsert_plane_record(row(kind, id, ts).view()).unwrap();
-    }
-    assert_eq!(
-        store
-            .purge_plane_records(TICKET_KIND, 0, Retention::Age)
-            .unwrap(),
-        0,
-        "an exact cutoff retains equality"
-    );
-    assert_eq!(
-        store
-            .purge_plane_records(TICKET_KIND, u64::MAX, Retention::Age)
-            .unwrap(),
-        1
-    );
-    assert_eq!(
-        store.get_plane_record(TICKET_KIND, &live).unwrap(),
-        Some(live.as_bytes().to_vec())
-    );
-    assert_eq!(store.get_plane_record(TICKET_KIND, &expired).unwrap(), None);
-    assert_eq!(
-        store
-            .purge_plane_records(OTHER_KIND, u64::MAX, Retention::Age)
-            .unwrap(),
-        1,
-        "ordinary record age policy is unchanged"
-    );
-    store.delete_plane_record(TICKET_KIND, &live).unwrap();
-}
-
-#[test]
-fn ticket_preflight_uses_the_shared_clock_and_matching_terminal_deadline_without_spending() {
-    let Some(store) = live_store() else { return };
-    let now = token_test_now(&store);
-    let token = uid("preflight-ticket");
-
-    const TICKET_KIND: &str = "ticket";
-    const LIVE_LIFE: u64 = 900;
-    let expires = now + LIVE_LIFE;
-    let record = |ts, disposition| PlaneRecord {
-        kind: TICKET_KIND.into(),
-        id: token.clone(),
-        parent: None,
-        seq: 0,
-        ts,
-        disposition,
-        body: b"ticket-preflight".to_vec(),
-    };
-    store
-        .upsert_plane_record(record(expires, PlaneDisposition::Terminal).view())
-        .unwrap();
-    for caller in [u64::MAX, 0, u64::MAX] {
-        assert!(
-            store
-                .plane_token_live(TICKET_KIND, &token, expires, caller)
-                .unwrap(),
-            "shared clock validates a live terminal ticket"
-        );
-    }
-    assert!(
-        !store
-            .plane_token_live(TICKET_KIND, &token, expires + 1, 0)
-            .unwrap(),
-        "a different signed deadline must not match"
-    );
-    store
-        .upsert_plane_record(record(expires, PlaneDisposition::Active).view())
-        .unwrap();
-    assert!(
-        !store
-            .plane_token_live(TICKET_KIND, &token, expires, 0)
-            .unwrap(),
-        "ticket records are terminal"
-    );
-    let expired = now - 1;
-    store
-        .upsert_plane_record(record(expired, PlaneDisposition::Terminal).view())
-        .unwrap();
-    assert!(
-        !store
-            .plane_token_live(TICKET_KIND, &token, expired, 0)
-            .unwrap(),
-        "slow callers cannot keep expired tickets live"
-    );
-    store
-        .upsert_plane_record(record(expires, PlaneDisposition::Terminal).view())
-        .unwrap();
-    assert!(store
-        .plane_token_live(TICKET_KIND, &token, expires, 0)
-        .unwrap());
-    store.delete_plane_record(TICKET_KIND, &token).unwrap();
-    assert!(!store
-        .plane_token_live(TICKET_KIND, &token, expires, 0)
-        .unwrap());
-
-    let receipt: Option<String> = store
-        .with_conn(|c| c.get(plane::token_key(TICKET_KIND, &token)))
-        .unwrap();
-    assert_eq!(receipt, None, "preflight is non-consuming");
-}
-
-// The MANIFEST's recorder blob c353cf689d06222191b3f876b3e2520ca340d1c4 fixes
-// input/output/cache-read prices at 100000/200000/10000 micros and the fee at 3 cents.
-// Money is derived from actual store counters, never persisted by the store or read from keys.json.
-fn recorded_1_5_5_token_spend(
-    model: &str,
-    input: u64,
-    output: u64,
-    cache_read: u64,
-    cache_write: u64,
-) -> u64 {
-    assert!(
-        matches!(model, "m-chat" | "m-cache" | "m-chat-down"),
-        "recorded model {model}"
-    );
-    assert_eq!(
-        cache_write, 0,
-        "the recorded script emits no cache-creation usage"
-    );
-    if model != "m-cache" {
-        assert_eq!(
-            cache_read, 0,
-            "only m-cache has a cache-read price in the recorder"
-        );
-    }
-    input * 100_000 + output * 200_000 + cache_read * 10_000
-}
-
-fn recorded_1_5_5_breakdown(rows: &[&MeteringRow]) -> serde_json::Value {
-    let mut input = 0;
-    let mut output = 0;
-    let mut cache_read = 0;
-    let mut cache_write = 0;
-    let mut requests = 0;
-    let mut spend = 0;
-    for row in rows {
-        input += row.tokens_input;
-        output += row.tokens_output;
-        cache_read += row.tokens_cache_read;
-        cache_write += row.tokens_cache_write;
-        requests += row.requests;
-        spend += recorded_1_5_5_token_spend(
-            &row.model,
-            row.tokens_input,
-            row.tokens_output,
-            row.tokens_cache_read,
-            row.tokens_cache_write,
-        ) + row.billable_requests * 30_000;
-    }
-    serde_json::json!({
-        "requests": requests, "spend_micros": spend, "tokens_input": input,
-        "tokens_output": output, "tokens_cache_read": cache_read,
-        "tokens_cache_creation": cache_write,
-    })
-}
-
-/// Compare the loaded store's reads with all three frozen 1.5.5 HTTP response bodies. Only the
-/// recorder's fixed pricing/context is supplied here; IDs, names, groups and consumption come
-/// from real RecordStore reads after migration. The recorder removed only `as_of`.
-fn assert_recorded_1_5_5_readback(store: &ValkeyStore) {
-    use serde_json::{json, Value};
-    use std::collections::BTreeMap;
-    let expected: Value =
-        serde_json::from_str(include_str!("../tests/fixtures/1.5.5/readback/usage.json")).unwrap();
-    let start = expected["window"]["start"]
-        .as_u64()
-        .expect("recorded integer UTC start");
-    let end = expected["window"]["end"]
-        .as_u64()
-        .expect("recorded integer UTC end");
-    assert_eq!(start % 86_400, 0, "metering is a pinned UTC-day bucket");
-    assert_eq!(end, start + 86_400);
-    let rows = store.list_metering(start).unwrap();
-    assert!(store.list_metering(start - 86_400).unwrap().is_empty());
-    assert!(
-        store.list_metering(end).unwrap().is_empty(),
-        "the end boundary is the next bucket"
-    );
-    let mut models: BTreeMap<(&str, &str), Vec<&MeteringRow>> = BTreeMap::new();
-    let mut keys: BTreeMap<&str, Vec<&MeteringRow>> = BTreeMap::new();
-    for row in &rows {
-        models
-            .entry((&row.model, &row.provider))
-            .or_default()
-            .push(row);
-        keys.entry(&row.key_id).or_default().push(row);
-    }
-    let by_model: Vec<Value> = models
-        .into_iter()
-        .map(|((model, provider), rows)| {
-            let mut view = recorded_1_5_5_breakdown(&rows);
-            view["model"] = json!(model);
-            view["provider"] = json!(provider);
-            view
-        })
-        .collect();
-    let mut by_key: Vec<Value> = keys
-        .into_iter()
-        .map(|(id, rows)| {
-            let key = store.get_key(id).unwrap().expect("metering key reads back");
-            let mut view = recorded_1_5_5_breakdown(&rows);
-            view["id"] = json!(key.id);
-            view["name"] = json!(key.name);
-            view
-        })
-        .collect();
-    // The recorded admin view orders keys by spend descending, then ID; models by model/provider.
-    by_key.sort_by(|a, b| {
-        b["spend_micros"]
-            .as_u64()
-            .unwrap()
-            .cmp(&a["spend_micros"].as_u64().unwrap())
-            .then_with(|| a["id"].as_str().unwrap().cmp(b["id"].as_str().unwrap()))
-    });
-    let actual = json!({
-        "window": {"start": start, "end": end}, "currency": "USD",
-        "total": recorded_1_5_5_breakdown(&rows.iter().collect::<Vec<_>>()),
-        "by_model": by_model, "by_key": by_key, "by_key_truncated": false,
-    });
-    assert_eq!(
-        actual, expected,
-        "the whole recorded usage response, including JSON field types"
-    );
-
-    for recorded in [
-        include_str!("../tests/fixtures/1.5.5/readback/key-fixture-grouped.json"),
-        include_str!("../tests/fixtures/1.5.5/readback/key-fixture-ungrouped.json"),
-    ] {
-        let expected: Value = serde_json::from_str(recorded).unwrap();
-        let id = expected["id"].as_str().expect("recorded string key ID");
-        assert_eq!(
-            expected["window_start"].as_u64(),
-            Some(0),
-            "key attribution is all-time"
-        );
-        let key = store
-            .get_key(id)
-            .unwrap()
-            .expect("the recorded key is loaded");
-        let ledger = store.get_usage(id, 0).unwrap();
-        assert_eq!(
-            store.get_usage(id, start).unwrap(),
-            UsageLedger::default(),
-            "day metering must not be mistaken for the key's all-time attribution"
-        );
-        let spend = ledger
-            .models
-            .iter()
-            .map(|model| {
-                recorded_1_5_5_token_spend(
-                    &model.model,
-                    model.tier("input"),
-                    model.tier("output"),
-                    model.tier("cache_read"),
-                    model.tier("cache_write"),
-                )
-            })
-            .sum::<u64>()
-            + ledger.billable_requests * 30_000;
-        let actual = json!({
-            "id": &key.id, "group": &key.group, "budget_period": "total", "window_start": 0,
-            "requests": ledger.requests, "tokens": ledger.total_tokens(), "spend_cents": spend / 10_000,
-            // The recorder config gives the group only a budget; it has no requests/tokens rate cap.
-            "rate_headroom": Option::<f64>::None,
-        });
-        assert_eq!(
-            actual, expected,
-            "the complete recorded key usage response for {id}"
-        );
-        if let Some(group) = key.group.as_deref() {
-            assert_eq!(store.get_usage(&format!("group:{group}@day"), start).unwrap(), ledger,
-                "the group's daily budget and the key's all-time attribution preserve the same recorded usage");
-        }
-    }
-}
-
 #[test]
 fn paired_mint_replay_refuses_a_changed_or_missing_owner_without_writing() {
     let Some(store) = live_store() else { return };
@@ -7240,3 +7038,257 @@ fn corrupt_hydration_index_members_and_plane_sidecars_refuse_without_echoing_con
         vec![b"valid body".to_vec()]
     );
 }
+
+#[test]
+fn shared_clock_ignores_caller_skew_and_refuses_expired_grants_without_mutation() {
+    const TOKEN_KIND: &str = "shared-clock-regression";
+    const PAST_EPOCH: u64 = 1;
+    let Some(store) = live_store() else { return };
+    let live = uid("clock-live");
+    let expired = uid("clock-expired");
+    assert!(store
+        .redeem_plane_token(TOKEN_KIND, &live, u64::MAX, PAST_EPOCH)
+        .unwrap());
+    assert!(!store
+        .redeem_plane_token(TOKEN_KIND, &live, u64::MAX, u64::MAX)
+        .unwrap());
+    assert!(!store
+        .redeem_plane_token(TOKEN_KIND, &expired, PAST_EPOCH, 0)
+        .unwrap());
+    let absent: Option<String> = store
+        .with_conn(|c| c.get(plane::token_key(TOKEN_KIND, &expired)))
+        .unwrap();
+    assert_eq!(absent, None, "expired input leaves no receipt");
+    drop(store);
+    let store = ValkeyStore::connect(&std::env::var("VALKEY_URL").unwrap()).unwrap();
+    assert!(!store
+        .redeem_plane_token(TOKEN_KIND, &live, u64::MAX, 0)
+        .unwrap());
+    let stored: String = store
+        .with_conn(|c| c.get(plane::token_key(TOKEN_KIND, &live)))
+        .unwrap();
+    assert_eq!(stored, u64::MAX.to_string());
+    let _: () = store
+        .with_conn(|c| c.del(plane::token_key(TOKEN_KIND, &live)))
+        .unwrap();
+}
+
+#[test]
+fn shared_clock_keeps_exact_large_stored_expiries_and_reclaims_only_lapsed_rows() {
+    const TOKEN_KIND: &str = "shared-clock-seeded";
+    const EXACT_EXPIRY: u64 = (1_u64 << 53) + 1;
+    let Some(store) = live_store() else { return };
+    let future = uid("clock-future");
+    let lapsed = uid("clock-lapsed");
+    let _: () = store
+        .with_conn(|c| c.set(plane::token_key(TOKEN_KIND, &future), EXACT_EXPIRY))
+        .unwrap();
+    let _: () = store
+        .with_conn(|c| c.set(plane::token_key(TOKEN_KIND, &lapsed), 0))
+        .unwrap();
+    assert!(!store
+        .redeem_plane_token(TOKEN_KIND, &future, u64::MAX, u64::MAX)
+        .unwrap());
+    assert!(store
+        .redeem_plane_token(TOKEN_KIND, &lapsed, u64::MAX, 0)
+        .unwrap());
+    let stored: String = store
+        .with_conn(|c| c.get(plane::token_key(TOKEN_KIND, &future)))
+        .unwrap();
+    assert_eq!(stored, EXACT_EXPIRY.to_string());
+    for token in [&future, &lapsed] {
+        let _: () = store
+            .with_conn(|c| c.del(plane::token_key(TOKEN_KIND, token)))
+            .unwrap();
+    }
+}
+
+/// TIME is the shared authority used by the token script, independent of the test process clock.
+fn token_test_now(store: &ValkeyStore) -> u64 {
+    let (seconds, _micros): (u64, u64) = store.with_conn(|c| redis::cmd("TIME").query(c)).unwrap();
+    seconds
+}
+
+#[test]
+fn caller_clock_token_ttls_are_repaired_before_reopening_the_store() {
+    const TOKEN_KIND: &str = "clock-upgrade";
+    const LIVE_LIFE: u64 = 900;
+    const EARLY_CLEANUP: u64 = 60;
+    const CALLER_CLOCK_SCHEMA: i64 = 11;
+    let Some(_) = live_store() else { return };
+    let (database, _raw) = fresh_db_client(TOKEN_CLOCK_DATABASE);
+    let url = url_for_db(TOKEN_CLOCK_DATABASE);
+    let store = ValkeyStore::connect(&url).unwrap();
+    let expires = token_test_now(&store) + LIVE_LIFE;
+    let normal = plane::token_key(TOKEN_KIND, "normal");
+    let forever = plane::token_key(TOKEN_KIND, "forever");
+    database
+        .with_conn(|c| {
+            redis::pipe()
+                .set_ex(&normal, expires, EARLY_CLEANUP)
+                .set_ex(&forever, u64::MAX, EARLY_CLEANUP)
+                .set(SCHEMA_KEY, CALLER_CLOCK_SCHEMA)
+                .query::<()>(c)
+        })
+        .unwrap();
+    drop(store);
+    let store = ValkeyStore::connect(&url).unwrap();
+    for caller in [0, u64::MAX] {
+        assert!(!store
+            .redeem_plane_token(TOKEN_KIND, "normal", expires, caller)
+            .unwrap());
+        assert!(!store
+            .redeem_plane_token(TOKEN_KIND, "forever", u64::MAX, caller)
+            .unwrap());
+    }
+    let cleanup: u64 = database
+        .with_conn(|c| redis::cmd("EXPIRETIME").arg(&normal).query(c))
+        .unwrap();
+    assert_eq!(cleanup, expires + 1);
+    let ttl: i64 = database.with_conn(|c| c.ttl(&forever)).unwrap();
+    const NO_EXPIRY: i64 = -1;
+    assert_eq!(ttl, NO_EXPIRY);
+    let stored: String = database.with_conn(|c| c.get(&forever)).unwrap();
+    assert_eq!(stored, u64::MAX.to_string());
+    drop(store);
+    let store = ValkeyStore::connect(&url).unwrap();
+    assert!(!store
+        .redeem_plane_token(TOKEN_KIND, "normal", expires, 0)
+        .unwrap());
+}
+
+#[test]
+fn ticket_expiry_records_survive_a_fast_purge_caller() {
+    use busbar_contract::records::Retention;
+    let Some(_) = live_store() else { return };
+    let (_database, _raw) = fresh_db_client(TOKEN_CLOCK_DATABASE);
+    let store = ValkeyStore::connect(&url_for_db(TOKEN_CLOCK_DATABASE)).unwrap();
+    let now = token_test_now(&store);
+    let live = uid("live-ticket");
+    let expired = uid("expired-ticket");
+
+    const TICKET_KIND: &str = "ticket";
+    const OTHER_KIND: &str = "ordinary-retention-regression";
+    const FUTURE_OFFSET: u64 = 900;
+    let future = now + FUTURE_OFFSET;
+    let row = |kind: &str, id: &str, ts| PlaneRecord {
+        kind: kind.into(),
+        id: id.into(),
+        parent: None,
+        seq: 0,
+        ts,
+        disposition: if kind == TICKET_KIND {
+            PlaneDisposition::Terminal
+        } else {
+            PlaneDisposition::Active
+        },
+        body: id.as_bytes().to_vec(),
+    };
+    for (kind, id, ts) in [
+        (TICKET_KIND, live.as_str(), future),
+        (TICKET_KIND, expired.as_str(), 0),
+        (OTHER_KIND, live.as_str(), future),
+    ] {
+        store.upsert_plane_record(row(kind, id, ts).view()).unwrap();
+    }
+    assert_eq!(
+        store
+            .purge_plane_records(TICKET_KIND, 0, Retention::Age)
+            .unwrap(),
+        0,
+        "an exact cutoff retains equality"
+    );
+    assert_eq!(
+        store
+            .purge_plane_records(TICKET_KIND, u64::MAX, Retention::Age)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store.get_plane_record(TICKET_KIND, &live).unwrap(),
+        Some(live.as_bytes().to_vec())
+    );
+    assert_eq!(store.get_plane_record(TICKET_KIND, &expired).unwrap(), None);
+    assert_eq!(
+        store
+            .purge_plane_records(OTHER_KIND, u64::MAX, Retention::Age)
+            .unwrap(),
+        1,
+        "ordinary record age policy is unchanged"
+    );
+    store.delete_plane_record(TICKET_KIND, &live).unwrap();
+}
+
+#[test]
+fn ticket_preflight_uses_the_shared_clock_and_matching_terminal_deadline_without_spending() {
+    let Some(store) = live_store() else { return };
+    let now = token_test_now(&store);
+    let token = uid("preflight-ticket");
+
+    const TICKET_KIND: &str = "ticket";
+    const LIVE_LIFE: u64 = 900;
+    let expires = now + LIVE_LIFE;
+    let record = |ts, disposition| PlaneRecord {
+        kind: TICKET_KIND.into(),
+        id: token.clone(),
+        parent: None,
+        seq: 0,
+        ts,
+        disposition,
+        body: b"ticket-preflight".to_vec(),
+    };
+    store
+        .upsert_plane_record(record(expires, PlaneDisposition::Terminal).view())
+        .unwrap();
+    for caller in [u64::MAX, 0, u64::MAX] {
+        assert!(
+            store
+                .plane_token_live(TICKET_KIND, &token, expires, caller)
+                .unwrap(),
+            "shared clock validates a live terminal ticket"
+        );
+    }
+    assert!(
+        !store
+            .plane_token_live(TICKET_KIND, &token, expires + 1, 0)
+            .unwrap(),
+        "a different signed deadline must not match"
+    );
+    store
+        .upsert_plane_record(record(expires, PlaneDisposition::Active).view())
+        .unwrap();
+    assert!(
+        !store
+            .plane_token_live(TICKET_KIND, &token, expires, 0)
+            .unwrap(),
+        "ticket records are terminal"
+    );
+    let expired = now - 1;
+    store
+        .upsert_plane_record(record(expired, PlaneDisposition::Terminal).view())
+        .unwrap();
+    assert!(
+        !store
+            .plane_token_live(TICKET_KIND, &token, expired, 0)
+            .unwrap(),
+        "slow callers cannot keep expired tickets live"
+    );
+    store
+        .upsert_plane_record(record(expires, PlaneDisposition::Terminal).view())
+        .unwrap();
+    assert!(store
+        .plane_token_live(TICKET_KIND, &token, expires, 0)
+        .unwrap());
+    store.delete_plane_record(TICKET_KIND, &token).unwrap();
+    assert!(!store
+        .plane_token_live(TICKET_KIND, &token, expires, 0)
+        .unwrap());
+
+    let receipt: Option<String> = store
+        .with_conn(|c| c.get(plane::token_key(TICKET_KIND, &token)))
+        .unwrap();
+    assert_eq!(receipt, None, "preflight is non-consuming");
+}
+
+/// Existing isolated database lease used by the shared-clock fixtures.
+pub(crate) const TOKEN_CLOCK_DATABASE: u32 = 6;

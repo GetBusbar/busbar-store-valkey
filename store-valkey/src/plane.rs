@@ -24,7 +24,7 @@
 //! - `busbar:plane:K:pcount` HASH  parent → how many records name it as their `parent` — the boot
 //!   enumeration of parents (`list_plane_record_parents`), kept exact by every write and removal.
 //! - `busbar:plane:K:tok:T`  STRING — one redeemed single-use token (`T` = hex token): its grant's
-//!   `expires_at`, with an `EX` that is cleanup only ([`redeem_token`]).
+//!   `expires_at`, with absolute cleanup after that boundary ([`redeem_token`]).
 //!
 //! ## Why every write is a script
 //!
@@ -39,7 +39,8 @@
 //!
 //! ZSET scores are IEEE doubles. They only ever FILTER (retention candidates) or pre-order a
 //! listing; every listing is re-sorted by the exact `seq` parsed out of `F`, so a `seq` past 2^53
-//! still orders correctly.
+//! still orders correctly. Retention includes the rounded cutoff's score, then compares the exact
+//! decimal timestamp in the sidecar before deleting a candidate.
 
 use crate::resp::{pipe, Conn, Script, ScriptInvocation, Value};
 use crate::{hex, ValkeyStore};
@@ -50,6 +51,9 @@ use busbar_contract::abi::store::OP_ID_RETENTION_SECS;
 use busbar_contract::records::{
     PlaneDisposition, PlaneRecordRef, PlaneSelector, RecordStoreError, RecordStoreResult,
 };
+
+/// Reserved kernel ticket records carry their absolute expiry in ts (governance::tickets).
+const TICKET_RECORD_KIND: &str = "ticket";
 
 /// The kind a purge of which CASCADES: a purged `task` takes its `task_event` chain with it, and only
 /// its own. Nothing else ever removes a task's events, so leaving them would keep chains whose task
@@ -156,19 +160,22 @@ fn is_active(side: &str) -> bool {
     side.chars().nth(1) == Some(ACTIVE)
 }
 
-/// The parent a sidecar names: its JSON after the two flag characters (`None` when the parented
-/// flag is `0`, or the sidecar does not read).
-fn parent_of(side: &str) -> Option<String> {
+/// The parent a sidecar names. A non-parented row is distinct from a corrupt sidecar.
+fn parent_of(side: &str) -> RecordStoreResult<Option<String>> {
     #[derive(serde::Deserialize)]
     struct Named {
         parent: Option<String>,
     }
-    if !side.starts_with(PARENTED) {
-        return None;
+    let bad = || RecordStoreError("list_plane_records: a stored sidecar does not decode".into());
+    if !matches!(side.get(..FLAGS), Some("0a" | "0t" | "1a" | "1t")) {
+        return Err(bad());
     }
-    serde_json::from_str::<Named>(side.get(FLAGS..)?)
-        .ok()?
-        .parent
+    let named: Named =
+        serde_json::from_str(side.get(FLAGS..).ok_or_else(bad)?).map_err(|_| bad())?;
+    if side.starts_with(PARENTED) != named.parent.is_some() {
+        return Err(bad());
+    }
+    Ok(named.parent)
 }
 
 /// Shared Lua: a record's PARENT LINK. A record that names a parent is counted under that parent in
@@ -205,8 +212,65 @@ end
 /// put the record at `F` on its own index `idx`, replacing whatever was there, and link it to
 /// `parent` (`''` = none), keeping `pcount` and the parent indexes exact across the replacement.
 const LUA_WRITE: &str = r"
+local function require_type(key, want)
+    local t = redis.call('TYPE', key)
+    t = type(t) == 'table' and t.ok or t
+    if t ~= 'none' and t ~= want then
+        error(key .. ' is not a ' .. want)
+    end
+end
+local function checked_parent(side)
+    local ok, value = pcall(cjson.decode, string.sub(side, 3))
+    local flag = string.sub(side, 1, 1)
+    local disposition = string.sub(side, 2, 2)
+    if not ok or type(value) ~= 'table'
+        or (disposition ~= 'a' and disposition ~= 't') then
+        error('invalid plane sidecar')
+    end
+    if flag == '0' and value.parent == cjson.null then
+        return ''
+    end
+    if flag == '1' and type(value.parent) == 'string' then
+        return value.parent
+    end
+    error('invalid plane sidecar parent')
+end
+local function check_count(key, parent, delta)
+    if parent == '' then return end
+    local v = redis.call('HGET', key, parent)
+    if not v then return end
+    local neg = string.sub(v, 1, 1) == '-'
+    local digits = neg and string.sub(v, 2) or v
+    local limit = neg and '9223372036854775808' or '9223372036854775807'
+    if not (string.match(digits, '^[1-9]%d*$') or (not neg and digits == '0'))
+        or #digits > #limit or (#digits == #limit and digits > limit) then
+        error('plane parent count is not an integer')
+    end
+    if (delta == -1 and v == '-9223372036854775808')
+        or (delta == 1 and v == '9223372036854775807') then
+        error('plane parent count would overflow')
+    end
+end
 local function write(rec, body, byts, idx, pcount, f, side, b, ts, seq, parent, prefix)
+    -- Scripts do not roll back on error: validate every target before unlinking or writing.
+    require_type(rec, 'hash')
+    require_type(body, 'hash')
+    require_type(byts, 'zset')
+    require_type(idx, 'zset')
+    require_type(pcount, 'hash')
+    if checked_parent(side) ~= parent then error('plane parent mismatch') end
+    if not tonumber(ts) or not tonumber(seq) then error('invalid plane score') end
     local old = redis.call('HGET', rec, f)
+    local old_parent = old and checked_parent(old) or ''
+    if old_parent ~= '' then
+        require_type(prefix .. tohex(old_parent), 'zset')
+        check_count(pcount, old_parent, -1)
+    end
+    if parent ~= '' then
+        require_type(prefix .. tohex(parent), 'zset')
+        -- Replacing the same parent's link decrements it before incrementing it.
+        check_count(pcount, parent, old_parent == parent and 0 or 1)
+    end
     if old then
         unlink(pcount, idx, prefix, f, old)
     end
@@ -257,7 +321,8 @@ static APPEND: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 /// [`APPEND`], then `KEYS[6]` = the op's record (a hash: `b` = the op's body); `ARGV` as [`APPEND`],
 /// then `ARGV[8]` = the op's body, `ARGV[9]` = the record's lifetime in seconds. Returns the body
 /// recorded under the op's id (nothing written), or `0` = written or the identical record already
-/// at the position, `1` = a fork. Only a write records the op, in the same script.
+/// at the position, `1` = a fork. Every successful append records the op, including an identical
+/// record under a fresh op id; a fork or error records nothing.
 static APPEND_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_LINK}{LUA_WRITE}
@@ -268,6 +333,8 @@ static APPEND_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
         local old = redis.call('HGET', KEYS[1], ARGV[1])
         if old then
             if old == ARGV[2] and redis.call('HGET', KEYS[2], ARGV[1]) == ARGV[3] then
+                redis.call('HSET', KEYS[6], 'b', ARGV[8])
+                redis.call('EXPIRE', KEYS[6], ARGV[9])
                 return 0
             end
             return 1
@@ -288,7 +355,8 @@ local function drop_identity(rec, body, byts, pcount, idx, ident, prefix)
     local fs = redis.call('ZRANGE', idx, 0, -1)
     local n = 0
     for _, f in ipairs(fs) do
-        if string.sub(f, string.find(f, ':', 1, true) + 1) == ident then
+        local separator = string.find(f, ':', 1, true)
+        if separator and string.sub(f, separator + 1) == ident then
             local side = redis.call('HGET', rec, f)
             if side then
                 unlink(pcount, idx, prefix, f, side)
@@ -320,21 +388,32 @@ static DELETE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 
 /// PURGE, one batch: `KEYS = rec, body, byts, pcount` of the kind, then (cascade only) `rec, body,
 /// byts, pcount` of the cascaded kind; `ARGV = before, terminal_only ('1'|'0'), idx_prefix,
-/// cascade_idx_prefix ('' = no cascade), offset, limit`. Looks at the `limit` candidates from
+/// cascade_idx_prefix ('' = no cascade), offset, limit, kind`. Looks at the `limit` candidates from
 /// `offset` (a kept candidate stays in the index, so the caller advances `offset` past them) and
 /// returns `{removed, kept, seen}`: records OF THE KIND removed, candidates kept, candidates seen.
+/// `sidecar` writes `ts` as the final decimal integer: read its digits without cjson's f64 decode.
 static PURGE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_LINK}{LUA_DROP_IDENTITY}
+        local before = ARGV[1]
+        if ARGV[7] == '{TICKET_RECORD_KIND}' then
+            local stamp = {SHARED_TIME_COMMAND}
+            local now = stamp[1]
+            if not now or not string.match(now, '^%d+$') then error('ticket server clock is not an unsigned epoch') end
+            if #now < #before or (#now == #before and now < before) then before = now end
+        end
         local removed = 0
         local kept = 0
-        local cands = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', '(' .. ARGV[1],
+        local cands = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', before,
                                  'LIMIT', ARGV[5], ARGV[6])
         for _, f in ipairs(cands) do
             local side = redis.call('HGET', KEYS[1], f)
+            local ts = side and string.match(side, ',\"ts\":(%d+)}}$')
             if not side then
                 redis.call('ZREM', KEYS[3], f)
-            elseif ARGV[2] ~= '1' or string.sub(side, 2, 2) == 't' then
+            elseif ts and string.find(f, ':', 1, true)
+                and (#ts < #before or (#ts == #before and ts < before))
+                and (ARGV[2] ~= '1' or string.sub(side, 2, 2) == 't') then
                 local ident = string.sub(f, string.find(f, ':', 1, true) + 1)
                 local idx = ARGV[3] .. tohex(ident)
                 redis.call('HDEL', KEYS[1], f)
@@ -484,11 +563,15 @@ pub(crate) async fn list(
         PlaneSelector::All => {
             let all: Vec<(String, Vec<u8>)> = with_conn!(store, |c| c.hgetall(&keys.body).await)?;
             all.into_iter()
-                .filter_map(|(f, body)| {
-                    let (seq, ident) = parse_field(&f)?;
-                    Some((seq, ident.to_string(), body))
+                .map(|(f, body)| {
+                    let (seq, ident) = parse_field(&f).ok_or_else(|| {
+                        RecordStoreError(
+                            "list_plane_records: a stored position does not parse".into(),
+                        )
+                    })?;
+                    Ok((seq, ident.to_string(), body))
                 })
-                .collect()
+                .collect::<RecordStoreResult<Vec<_>>>()?
         }
         PlaneSelector::Parent(parent) => {
             let idx = keys.idx(parent);
@@ -514,20 +597,27 @@ pub(crate) async fn list(
                             .query(c).await?;
                 Ok((fs, sides, bodies))
             })?;
-            fs.into_iter()
-                .zip(sides)
-                .zip(bodies)
-                .filter_map(|((f, side), body)| {
-                    // Only the records whose `parent` IS this parent: a record whose own id equals
-                    // the parent's shares its index, and is not a child of it.
-                    let side = side?;
-                    if parent_of(&side).as_deref() != Some(&**parent) {
-                        return None;
+            let mut rows = Vec::new();
+            for ((f, side), body) in fs.into_iter().zip(sides).zip(bodies) {
+                let (side, body) = match (side, body) {
+                    (None, None) => continue, // A concurrent deletion removed the whole row.
+                    (Some(side), Some(body)) => (side, body),
+                    _ => {
+                        return Err(RecordStoreError(
+                            "list_plane_records: a stored row is missing its sidecar or body"
+                                .into(),
+                        ))
                     }
-                    let (seq, ident) = parse_field(&f)?;
-                    Some((seq, ident.to_string(), body?))
-                })
-                .collect()
+                };
+                let (seq, ident) = parse_field(&f).ok_or_else(|| {
+                    RecordStoreError("list_plane_records: a stored position does not parse".into())
+                })?;
+                // An upserted row can share this index through its own id without being a child.
+                if parent_of(&side)?.as_deref() == Some(&**parent) {
+                    rows.push((seq, ident.to_string(), body));
+                }
+            }
+            rows
         }
     };
     rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
@@ -600,12 +690,13 @@ pub(crate) async fn purge(
                         .key(&keys.pcount);
                 }
             }
-            inv.arg(clamp(before))
+            inv.arg(before)
                 .arg(terminal_only)
                 .arg(&keys.idx_prefix)
                 .arg(cascade.as_ref().map_or("", |k| k.idx_prefix.as_str()))
                 .arg(offset)
                 .arg(PURGE_BATCH)
+                .arg(kind)
                 .invoke(c)
                 .await
         })?;
@@ -656,6 +747,9 @@ pub(crate) async fn delete(
     .map(|_| ())
 }
 
+/// Token receipt namespace; both encoded components exclude delimiter collisions.
+pub(crate) const TOKEN_PATTERN: &str = "busbar:plane:*:tok:*";
+
 /// The ledger key of one redeemed token of `kind`.
 pub(crate) fn token_key(kind: &str, token: &str) -> String {
     format!("{}tok:{}", kind_prefix(kind), hex(token.as_bytes()))
@@ -663,59 +757,119 @@ pub(crate) fn token_key(kind: &str, token: &str) -> String {
 
 /// The longest life a redeemed-token entry is given an expiry for: the server refuses an `EX` that
 /// overflows its own millisecond arithmetic, so a grant living longer is recorded with no expiry.
-const MAX_TOKEN_TTL_SECS: u64 = 315_360_000; // ten years
+// Existing ten-year cleanup cap; larger grants retain no TTL.
+const MAX_TOKEN_TTL_SECS: u64 = 315_360_000;
 
-/// How long past its grant's life an entry's `EX` runs: a skew allowance, so a caller whose clock
-/// runs behind the redeemer's still finds the entry while its grant lives.
-const TOKEN_TTL_SLACK_SECS: u64 = 3_600;
+const SHARED_TIME_COMMAND: &str = "redis.call('TIME')";
 
-/// The `EX` of a ledger entry whose grant has `life` seconds to run: cleanup only, never shorter
-/// than the life (the judgment is the stored `expires_at` against the caller's `now`). `None` (no
-/// expiry) when it would pass the cap: expiring such an entry would let the grant redeem again.
-pub(crate) fn ledger_ttl(life: u64) -> Option<u64> {
-    let ex = life.max(1).saturating_add(TOKEN_TTL_SLACK_SECS);
-    (ex <= MAX_TOKEN_TTL_SECS).then_some(ex)
+/// Token decisions compare canonical unsigned decimal strings, exact past 2^53.
+/// The shared clock and cleanup boundary for live redemptions and imported spent receipts.
+/// Decimal arithmetic preserves the entire u64 expiry range; EXAT is only used within the
+/// pre-existing TTL cap. The first second after expires_at is structural boundary handling.
+fn token_expiry_script(body: &str) -> Script {
+    Script::new(&format!(
+        r"
+        local function decimal(value)
+            if not value or not string.match(value, '^%d+$') then return nil end
+            local canonical = string.gsub(value, '^0+', '')
+            return canonical == '' and '0' or canonical
+        end
+        local function before(a, b)
+            if #a ~= #b then return #a < #b end
+            return a < b
+        end
+        local function add(a, b)
+            local i, j, carry, out = #a, #b, 0, ''
+            while i > 0 or j > 0 or carry > 0 do
+                local x = i > 0 and tonumber(string.sub(a, i, i)) or 0
+                local y = j > 0 and tonumber(string.sub(b, j, j)) or 0
+                local sum = x + y + carry
+                out = tostring(sum % 10) .. out
+                carry = math.floor(sum / 10)
+                i, j = i - 1, j - 1
+            end
+            return out
+        end
+        local stamp = {SHARED_TIME_COMMAND}
+        local now = decimal(stamp[1])
+        if not now then error('token server clock is not an unsigned epoch') end
+        local cleanup_limit = add(now, '{MAX_TOKEN_TTL_SECS}')
+        local function set_token(key, expires, absent_only)
+            local cleanup = add(expires, '1')
+            local bounded = not before(cleanup_limit, cleanup)
+            if absent_only then
+                if bounded then return redis.call('SET', key, expires, 'NX', 'EXAT', cleanup) end
+                return redis.call('SET', key, expires, 'NX')
+            end
+            if bounded then return redis.call('SET', key, expires, 'EXAT', cleanup) end
+            return redis.call('SET', key, expires)
+        end
+        {body}
+    "
+    ))
 }
 
-/// REDEEM: `KEYS[1]` = the ledger entry (its value the grant's `expires_at`); `ARGV = expires_at,
-/// now, ex ('' = no expiry)`. `1` = redeemed (no entry, or one with `expires_at < now`, lapsed),
-/// `0` = spent (an entry with `expires_at >= now`, or one that is not a number). The comparison is
-/// on the decimal strings (length, then text), exact past 2^53.
+/// Move a v6 receipt atomically. Its old relative TTL never shortens the absolute grant expiry.
+pub(crate) static MIGRATE_SPENT_TOKEN: std::sync::LazyLock<Script> = std::sync::LazyLock::new(
+    || {
+        token_expiry_script(&format!(
+            r"
+        local value = redis.call('GET', KEYS[1])
+        if not value then return 0 end
+        local expires = decimal(value)
+        if not expires then
+            local life = redis.call('TTL', KEYS[1])
+            if life >= 0 and life <= {MAX_TOKEN_TTL_SECS} then expires = add(now, tostring(math.max(life, 1)))
+            else expires = '{permanent}' end
+        end
+        set_token(KEYS[2], expires, true)
+        redis.call('DEL', KEYS[1])
+        return 1
+    ",
+            permanent = i64::MAX
+        ))
+    },
+);
+/// Non-consuming preflight for the reserved ticket record: its terminal deadline must match.
+static TICKET_LIVE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
+    token_expiry_script(&format!(
+        r#"
+        local expires = ARGV[2]
+        if before(expires, now) then return 0 end
+        local side = redis.call('HGET', KEYS[1], ARGV[1])
+        if not side or string.sub(side, {FLAGS}, {FLAGS}) ~= '{TERMINAL}' then return 0 end
+        local valid, record = pcall(cjson.decode, string.sub(side, {FLAGS} + 1))
+        if not valid or type(record) ~= 'table' then return 0 end
+        local ts = string.match(side, ',"ts":(%d+)}}$')
+        return ts == expires and 1 or 0
+    "#
+    ))
+});
+
 static REDEEM: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
-    Script::new(
+    token_expiry_script(
         r"
+        local expires = ARGV[1]
+        if before(expires, now) then return 0 end
         local cur = redis.call('GET', KEYS[1])
         if cur then
-            if not string.match(cur, '^%d+$') then
-                return 0
-            end
-            local spent
-            if #cur ~= #ARGV[2] then
-                spent = #cur > #ARGV[2]
-            else
-                spent = cur >= ARGV[2]
-            end
-            if spent then
-                return 0
-            end
+            local canonical = decimal(cur)
+            if not canonical or not before(canonical, now) then return 0 end
         end
-        if ARGV[3] == '' then
-            redis.call('SET', KEYS[1], ARGV[1])
-        else
-            redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3])
-        end
-        return 1",
+        set_token(KEYS[1], expires, false)
+        return 1
+    ",
     )
 });
 
 /// `redeem_plane_token`: the test and set, as ONE script the server orders against every other
 /// node's. A stored entry holds its grant's `expires_at`; it is spent while that is at or after the
-/// caller's `now`, and only an entry with `expires_at < now` is lapsed and redeems afresh. The
+/// server's TIME; an expired candidate is refused before mutation. The
 /// script's reply IS the answer, never a prior read: a `GET` followed by a `SET` would tell both
 /// halves of a race they were first, and on this backend a fleet sharing one Valkey is the ORDINARY
 /// deployment.
 ///
-/// The entry's `EX` is cleanup ([`ledger_ttl`]): this store refuses to run on a server that may
+/// Cleanup starts at the first second after absolute expiry. This store refuses a server that may
 /// evict (`noeviction`), so an unbounded keyspace would be an outage of the whole namespace.
 ///
 /// NO RECONNECT-RETRY: a dropped reply is not a lost read — the script may have run, and a blind
@@ -728,26 +882,19 @@ pub(crate) async fn redeem_token(
     kind: &str,
     token: &str,
     expires_at: u64,
-    now: u64,
+    _now: u64,
 ) -> RecordStoreResult<bool> {
-    let ex = ledger_ttl(expires_at.saturating_sub(now));
     let key = token_key(kind, token);
-    let redeemed: i64 = with_conn_no_retry!(store, |c| {
-        let mut inv = REDEEM.key(&key);
-        inv.arg(expires_at).arg(now);
-        match ex {
-            Some(ex) => inv.arg(ex),
-            None => inv.arg(""),
-        };
-        inv.invoke(c).await
-    })?;
+    let redeemed: i64 =
+        with_conn_no_retry!(store, |c| REDEEM.key(&key).arg(expires_at).invoke(c).await)?;
     Ok(redeemed == 1)
 }
 
 /// `plane_token_live`: MULTI-USE and SPENDS NOTHING — a plain read of the `(kind, token)` upserted
 /// record. LIVE means all three: present, still Active, and `now` not past `expires_at`. A missing
 /// record holds no capability, a terminal one names work that has finished, and a lapsed one is dead
-/// even if nothing finished. Asking twice answers the same twice.
+/// even if nothing finished. Reserved tickets require a matching terminal deadline under server TIME.
+/// Both paths spend nothing; final admission still calls the atomic redemption operation.
 pub(crate) async fn token_live(
     store: &ValkeyStore,
     c: &mut Conn,
@@ -756,6 +903,16 @@ pub(crate) async fn token_live(
     expires_at: u64,
     now: u64,
 ) -> RecordStoreResult<bool> {
+    if kind == TICKET_RECORD_KIND {
+        let keys = Keys::of(kind);
+        let live: i64 = with_conn!(store, |c| TICKET_LIVE
+            .key(&keys.rec)
+            .arg(field(UPSERT_SEQ, token))
+            .arg(expires_at)
+            .invoke(c)
+            .await)?;
+        return Ok(live == 1);
+    }
     if now > expires_at {
         return Ok(false);
     }
@@ -763,6 +920,29 @@ pub(crate) async fn token_live(
     let side: Option<String> = with_conn!(store, |c| c.hget(&keys.rec, field(0, token)).await)?;
     Ok(side.is_some_and(|s| is_active(&s)))
 }
+
+/// Repair cleanup left by caller-clock writers without changing their stored expiry value.
+pub(crate) static REPAIR_TOKEN_EXPIRY: std::sync::LazyLock<Script> =
+    std::sync::LazyLock::new(|| {
+        token_expiry_script(
+            r"
+        local value = redis.call('GET', KEYS[1])
+        if not value then return 0 end
+        local expires = decimal(value)
+        if not expires then
+            redis.call('PERSIST', KEYS[1])
+            return 0
+        end
+        local cleanup = add(expires, '1')
+        if before(cleanup_limit, cleanup) then
+            redis.call('PERSIST', KEYS[1])
+        else
+            redis.call('EXPIREAT', KEYS[1], cleanup)
+        end
+        return 1
+    ",
+        )
+    });
 
 #[cfg(test)]
 #[path = "tests/plane_unit.rs"]

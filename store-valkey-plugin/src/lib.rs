@@ -5,7 +5,7 @@
 //! carries (`kind: store`, alias `valkey`). Drop it in the engine's plugins folder and set
 //! `store: { module: valkey, settings: { url: "redis://..." } }`; the engine loads it in-process at
 //! boot. One Valkey instance behind a fleet of busbar nodes means shared virtual keys, credentials,
-//! budgets, usage, and audit across the cluster.
+//! usage ledgers, metering, and audit across the cluster.
 //!
 //! All the store lives in the `busbar-store-valkey` crate, including its door
 //! (`busbar_store_valkey::door`, `store_door!`). This crate re-exports the logic crate and exports

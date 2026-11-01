@@ -17,7 +17,8 @@
 //! (`TaskRow::to_plane_record` / `TaskEventRow::to_plane_record` / the demotion's), so an engine replay
 //! of a migrated event is the identical append it is meant to be, not a fork.
 //!
-//! `busbar:mcp:*` (the v6 MCP tool-call log) is deliberately NOT migrated, and NOT removed. The
+//! The v6 MCP tool-call log (`busbar:mcp:calls:*`) is deliberately NOT migrated or removed;
+//! the separate `busbar:mcp:demotions` hash is migrated as listed above. The
 //! `call` body is a framed digest stream the engine seals itself; a backend re-encoding a typed row
 //! into it would be forging the chain the engine verifies, and busbar ships no `call` migration
 //! either. The keys stay where they are, unread, so no evidence is destroyed by an upgrade.
@@ -29,7 +30,7 @@
 //! only after its records are in, and the schema marker is written last by the caller. A crash
 //! anywhere re-runs the whole upgrade on the next connect and lands in the same place.
 
-use crate::resp::{cmd, pipe, Conn};
+use crate::resp::Conn;
 use crate::{plane, RecordStoreError, RecordStoreResult, ValkeyStore};
 use busbar_contract::records::{PlaneDisposition, PlaneRecord};
 
@@ -103,8 +104,9 @@ fn decode<T: serde::de::DeserializeOwned>(
 ) -> RecordStoreResult<T> {
     serde_json::from_slice(raw).map_err(|e| {
         RecordStoreError(format!(
-            "v6 -> v7 upgrade: the {what} at {key} does not decode ({e}); the upgrade stops here and \
-             leaves every v6 key in place"
+            "v6 -> v7 upgrade: the {what} at {key} does not decode ({}); the upgrade stops here; \
+             unprocessed v6 keys remain in place",
+            crate::decode_text(&e)
         ))
     })
 }
@@ -186,31 +188,21 @@ pub(crate) async fn migrate_v6_to_v7(store: &ValkeyStore, c: &mut Conn) -> Recor
     with_conn!(store, |c| c.del::<_, ()>(MCP_DEMOTIONS_HASH).await)?;
 
     // SPENT APPROVALS: each is carried as a ledger entry holding its grant's `expires_at` (v6 wrote
-    // it as the value), with its own remaining life as the cleanup `EX`. A key already past its TTL
-    // is gone on the server and needs nothing; one with no TTL (never written by v6, which always
-    // set EX) is carried with no expiry, as a grant beyond the ledger cap is.
+    // it as the value), with cleanup after that absolute boundary. A key already past its old TTL
+    // is gone on the server and cannot be reconstructed. All surviving receipts use server TIME;
+    // huge expiries retain the existing no-TTL policy.
     for key in store.scan(c, &format!("{ASK_STATE_PREFIX}*")).await? {
-        let nonce = &key[ASK_STATE_PREFIX.len()..];
-        let (value, ttl): (Option<String>, i64) =
-            with_conn!(store, |c| pipe().get(&key).ttl(&key).query(c).await)?;
-        if let Some(value) = value {
-            let life = u64::try_from(ttl).ok().filter(|t| *t > 0);
-            let expires_at = value.parse::<u64>().unwrap_or_else(|_| match life {
-                Some(life) => crate::now().saturating_add(life),
-                None => i64::MAX as u64,
-            });
-            let ex = life.and_then(plane::ledger_ttl);
-            let target = plane::token_key(KIND_ASK, nonce);
-            with_conn!(store, |c| {
-                let mut set = cmd("SET");
-                set.arg(&target).arg(expires_at).arg("NX");
-                if let Some(ex) = ex {
-                    set.arg("EX").arg(ex);
-                }
-                set.query::<Option<String>>(c).await
-            })?;
-        }
-        with_conn!(store, |c| c.del::<_, ()>(&key).await)?;
+        let nonce = key.strip_prefix(ASK_STATE_PREFIX).ok_or_else(|| {
+            RecordStoreError(
+                "v6 -> v7 upgrade: an ask-state key does not match its namespace".into(),
+            )
+        })?;
+        let target = plane::token_key(KIND_ASK, nonce);
+        with_conn!(store, |c| plane::MIGRATE_SPENT_TOKEN
+            .key(&key)
+            .key(&target)
+            .invoke::<i64>(c)
+            .await)?;
     }
     Ok(())
 }
