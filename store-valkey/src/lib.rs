@@ -2040,7 +2040,7 @@ impl ValkeyStore {
                     // A number is not secret: echo it, so `0` or `2.5` does not read as a type error.
                     let got = match x {
                         serde_json::Value::Number(n) => n.to_string(),
-                        other => json_type(other).to_string(),
+                        other => json_type(&other).to_string(),
                     };
                     return Err(format!(
                         "{BAD}: `connect_timeout_ms` must be a positive integer (milliseconds), \
