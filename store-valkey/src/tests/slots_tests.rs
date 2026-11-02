@@ -1174,47 +1174,82 @@ fn the_v9_upgrade_keeps_digest_bodied_op_records() {
 #[test]
 fn a_purge_larger_than_one_batch_counts_and_removes_exactly_the_terminal_rows() {
     let Some(s) = live_store() else { return };
-    let kind = fresh("purge-batches");
-    let cutoff = (1u64 << 53) + 1;
-    let rec = |i: u64, ts: u64, disposition| PlaneRecord {
-        kind: kind.clone(),
-        id: format!("r{i}"),
-        parent: None,
-        seq: 0,
-        ts,
-        disposition,
-        body: b"b".to_vec(),
-    };
-    for i in 0..1200 {
-        s.upsert_plane_record(rec(i, cutoff, PlaneDisposition::Active).view())
+    let wide = (1u64 << 53) + 1;
+    // Keep the audit's old-active/equality case and the full-width timestamp case independent.
+    for (case, terminal_before, age_before, active_at, terminal_at) in [
+        ("ordinary", 10, 10, 1, 2),
+        ("wide", wide, wide + 1, wide, wide - 1),
+    ] {
+        let kind = fresh(&format!("purge-batches-{case}"));
+        let rec = |i: u64, ts: u64, disposition| PlaneRecord {
+            kind: kind.clone(),
+            id: format!("r{i}"),
+            parent: None,
+            seq: 0,
+            ts,
+            disposition,
+            body: b"b".to_vec(),
+        };
+        for i in 0..1200 {
+            s.upsert_plane_record(rec(i, active_at, PlaneDisposition::Active).view())
+                .unwrap();
+        }
+        for i in 1200..2400 {
+            s.upsert_plane_record(rec(i, terminal_at, PlaneDisposition::Terminal).view())
+                .unwrap();
+        }
+        // Both dispositions at the actual age cutoff survive the exclusive boundary.
+        for (i, disposition) in [
+            (2400, PlaneDisposition::Terminal),
+            (2401, PlaneDisposition::Active),
+        ] {
+            s.upsert_plane_record(rec(i, age_before, disposition).view())
+                .unwrap();
+        }
+        let n = s
+            .purge_plane_records(
+                &kind,
+                terminal_before,
+                busbar_contract::records::Retention::TerminalOnly,
+            )
             .unwrap();
-    }
-    for i in 1200..2400 {
-        s.upsert_plane_record(rec(i, cutoff - 1, PlaneDisposition::Terminal).view())
+        assert_eq!(
+            n, 1200,
+            "{case}: terminal-only removes exactly the old terminal rows"
+        );
+        for id in ["r0", "r1199", "r2400", "r2401"] {
+            assert_eq!(
+                RecordStore::get_plane_record(&s, &kind, id).unwrap(),
+                Some(b"b".to_vec()),
+                "{case}: active and cutoff controls survive terminal-only: {id}"
+            );
+        }
+        let n = s
+            .purge_plane_records(&kind, age_before, busbar_contract::records::Retention::Age)
             .unwrap();
+        assert_eq!(
+            n, 1200,
+            "{case}: age removes exactly the previously protected active rows"
+        );
+        for id in ["r0", "r1199"] {
+            assert_eq!(
+                RecordStore::get_plane_record(&s, &kind, id).unwrap(),
+                None,
+                "{case}: old active row actually removed: {id}"
+            );
+        }
+        for id in ["r2400", "r2401"] {
+            assert_eq!(
+                RecordStore::get_plane_record(&s, &kind, id).unwrap(),
+                Some(b"b".to_vec()),
+                "{case}: exact cutoff survives age: {id}"
+            );
+        }
+        let n = s
+            .purge_plane_records(&kind, age_before, busbar_contract::records::Retention::Age)
+            .unwrap();
+        assert_eq!(n, 0, "{case}: rows at ts == before must survive the purge");
     }
-    // Rows stamped EXACTLY at `before` (10) are not strictly older: the purge bound is exclusive,
-    // so neither retention mode may touch them.
-    s.upsert_plane_record(rec(2400, 10, PlaneDisposition::Terminal).view())
-        .unwrap();
-    s.upsert_plane_record(rec(2401, 10, PlaneDisposition::Active).view())
-        .unwrap();
-    let n = s
-        .purge_plane_records(
-            &kind,
-            cutoff,
-            busbar_contract::records::Retention::TerminalOnly,
-        )
-        .unwrap();
-    assert_eq!(n, 1200);
-    let n = s
-        .purge_plane_records(&kind, cutoff + 1, busbar_contract::records::Retention::Age)
-        .unwrap();
-    assert_eq!(n, 1200);
-    let n = s
-        .purge_plane_records(&kind, cutoff + 1, busbar_contract::records::Retention::Age)
-        .unwrap();
-    assert_eq!(n, 0, "rows at ts == before must survive the purge");
 }
 
 #[test]

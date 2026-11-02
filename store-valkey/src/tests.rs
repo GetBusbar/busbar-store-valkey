@@ -1240,7 +1240,7 @@ fn metering_round_trips_all_fields_including_renamed_and_new_ones() {
     assert_eq!(r.tokens_output, 5);
     assert_eq!(r.tokens_cache_read, 2);
     assert_eq!(r.requests, 1);
-    assert_eq!(r.priced_from_ms, 0);
+    assert_eq!(r.priced_from_ms, 1_780_000_000_123);
 }
 
 #[test]

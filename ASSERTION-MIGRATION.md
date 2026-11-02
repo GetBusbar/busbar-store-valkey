@@ -79,3 +79,16 @@ A source inventory found every donor-added function/test name present in the com
 
 
 The bounded actual-host replacement was source-reviewed after baseline `011454069f432f13a612c63900164901de639172`: all eleven named consumers retain their outcomes and exact timeout/cardinality/error assertions; only their connection implementation and certificate evidence source change. Formatting/diff checks pass; no local builds or tests were launched. Native qualification must use this final source and the parent-owned service base database 0, keeping private database 14 guarded against FLUSHDB of a shared database.
+
+## Post-composition native failure causes and source corrections
+
+The parent-owned baseline `0114540` native receipt found four source composition failures (separately from the shared-database-14 environment refusal):
+
+- The earlier audit ask_nonce guard omitted the later baseline guard's ask-state-key/namespace diagnostic context. The production error now retains both contexts; both malformed-key regressions and their no-unwind/no-target controls remain unchanged.
+- The audit's appended whole-metering field assertion assumed priced_from_ms=0, contradicting the baseline fixture's explicit 1_780_000_000_123 timestamp and its existing matching assertion. The appended timestamp assertion now checks that same written timestamp; no metering field assertion is dropped.
+- Audit revocation errors preserved pointer/occupant identities but lost the baseline credential row key. Production dangling/stale-pointer errors now include both identities and the actual row key. The nonmutation/revision/secret-canary assertions are unchanged.
+- Audit boundary rows stamped 10 were accidentally combined with the baseline cutoff above 2^53, making them genuinely old. The purge test now independently executes the original ordinary cutoff-10 old-active/terminal/equality scenario and the full-width cutoff scenario, each with the original exact 1200/1200/0 counts. Explicit row readbacks additionally prove active retention, later active removal and both dispositions surviving their actual exclusive age cutoff. No observed count was copied into an expected count.
+
+The four ignored logic tests remain unmodified: `connect_refuses_to_start_under_an_eviction_policy` and `a_start_refused_for_eviction_policy_does_not_migrate` change the server-wide maxmemory policy and require a serialized dedicated run; the latter was already ignored in the audit donor, and the former in both parents. `a_pre_v6_namespace_is_refused_not_wiped_and_keeps_refund_shaped_data` and `a_namespace_with_keys_but_no_marker_refuses_to_connect_and_keeps_every_key` were already ignored in both parents as destructive namespace fixtures; they now use private locked database custody, so that historical rationale needs a separate execution/classification decision. Neither ignore was introduced by this composition or source correction. The donor's two ignored 1.5.5 replay tests retain the diet parent's already-unignored guarded execution. No ignore status is changed here.
+
+These corrections pass formatting/diff checks only. No local build/test was launched; the parent must qualify the final exact source with the owned service base URL selecting database 0.

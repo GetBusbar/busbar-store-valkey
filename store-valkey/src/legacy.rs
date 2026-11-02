@@ -68,8 +68,8 @@ pub(crate) const KIND_ASK: &str = "ask";
 pub(crate) fn ask_nonce(key: &str) -> RecordStoreResult<&str> {
     key.strip_prefix(ASK_STATE_PREFIX).ok_or_else(|| {
         RecordStoreError(format!(
-            "v6 -> v7 upgrade: SCAN returned key outside busbar:askstate:* ({key:?}); the upgrade \
-             stops here and leaves every v6 key in place"
+            "v6 -> v7 upgrade: SCAN returned key outside busbar:askstate:* ({key:?}); an ask-state key \
+             does not match its namespace; the upgrade stops here and leaves every v6 key in place"
         ))
     })
 }

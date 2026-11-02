@@ -1798,14 +1798,14 @@ impl ValkeyStore {
                 let raw: Option<String> = c.get(&row_key).await?;
                 let Some(raw) = raw else {
                     return Err(RedisError::refused(format!(
-                        "revoke_credential: busbar:cred:id:{id} -> {ptr} names no credential row (dangling pointer); nothing was revoked"
+                        "revoke_credential: busbar:cred:id:{id} -> {ptr} names no credential row '{row_key}' (dangling pointer); nothing was revoked"
                     )));
                 };
                 let mut cred = cred_from_json("revoke_credential", &row_key, &raw)
                     .map_err(|e| RedisError::refused(e.0))?;
                 if cred.meta.id != id || slot_pointer(&cred.meta) != ptr {
                     return Err(RedisError::refused(format!(
-                        "revoke_credential: stale pointer busbar:cred:id:{id} -> {ptr} holds credential '{}'; nothing was revoked",
+                        "revoke_credential: stale pointer busbar:cred:id:{id} -> {ptr} holds credential '{}' at row '{row_key}'; nothing was revoked",
                         cred.meta.id
                     )));
                 }
