@@ -54,3 +54,5 @@ A production Connector does not expose the concrete TestTls `last_verify_off`/`l
 ## Qualification
 
 `cargo fmt --all` and `git diff --check` pass. No build or runtime test has been run: resource-lane approval is required, and no approval has yet been received. Cargo.lock intentionally remains unchanged under the lane instructions; dependency resolution/locked-build impact must be reconciled by the authorized root integration lane. DB-backed green results, fresh actual dlopen execution, and final-SDK compatibility remain unqualified until that lane runs them.
+
+Source follow-up: the authored TCP pin b896c5e6 exports its macro door through public `linked::MACRO_DOOR`; the bridge uses that path rather than its private `door` module. Verified with `git show b896c5e6:transport-tcp/src/lib.rs`; no build run.
