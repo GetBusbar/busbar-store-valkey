@@ -2456,7 +2456,7 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
     let Some(store) = live_store() else { return };
     let p = uid("vk_mcp_replay");
 
-    let rec = sample_call(&p, 1, 2_000_000_100, "", "h1");
+    let rec = sample_call(&p, 1, 2_000_000_100, "", "h1-stored-row");
     store.append_mcp_call(&rec).unwrap();
     store
         .append_mcp_call(&rec)
@@ -2471,18 +2471,19 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
     let err = store
         .append_mcp_call(&forked)
         .expect_err("a different record at an occupied (principal, seq) is a fork and must error");
+    let shown = format!("{err}");
     assert!(
-        !format!("{err}").contains("h2-second-writer"),
-        "the error must not echo stored content back"
+        !shown.contains("h1-stored-row") && !shown.contains("h2-second-writer"),
+        "the error must echo neither the stored nor the incoming hash: {shown}"
     );
     assert_eq!(
         store.list_mcp_calls(&p).unwrap()[0].hash,
-        "h1",
+        "h1-stored-row",
         "the refused fork must not have overwritten the record already on record"
     );
 
     // A differing payload under an identical sidecar is a fork too, not a silent accept.
-    let mut tampered = sample_call(&p, 1, 2_000_000_100, "", "h1");
+    let mut tampered = sample_call(&p, 1, 2_000_000_100, "", "h1-stored-row");
     tampered.tool = "srv_other_tool".to_string();
     store
         .append_mcp_call(&tampered)
