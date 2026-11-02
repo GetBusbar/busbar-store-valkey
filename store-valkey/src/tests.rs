@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 use super::*;
+use busbar_contract::abi::sdk::store::column::clamp;
 use busbar_contract::records::{MeteringDelta, PlaneDisposition, RecordStore, SecretForm};
 #[allow(unused_imports)]
 use redis::Commands;
