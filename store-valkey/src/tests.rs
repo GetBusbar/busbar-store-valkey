@@ -5842,3 +5842,20 @@ fn a_v9_upgrade_scrubs_revoked_credentials_and_publishes_the_repairs_once() {
     assert_eq!(raw.get::<_, i64>(SCHEMA_KEY).unwrap(), 9);
     assert_eq!(raw.get::<_, String>(&row_key).unwrap(), malformed);
 }
+
+/// A server (or proxy) that returns a SCAN key outside `busbar:askstate:*` -- shorter than the
+/// prefix, or not at a char boundary -- is refused with an explained error by the v6 -> v7 upgrade,
+/// never a slice panic (which the door's `catch_unwind` would turn into an opaque Fault).
+#[test]
+fn v6_upgrade_refuses_a_scan_key_outside_the_askstate_prefix() {
+    use crate::legacy::ask_nonce;
+    for bad in ["x", "", "busbar:askstat", "busbar:askstatéé", "é"] {
+        let err = ask_nonce(bad).expect_err("a key outside the prefix is refused");
+        assert!(
+            err.to_string()
+                .contains("v6 -> v7 upgrade: SCAN returned key outside busbar:askstate:*"),
+            "{err}"
+        );
+    }
+    assert_eq!(ask_nonce("busbar:askstate:n1").unwrap(), "n1");
+}
