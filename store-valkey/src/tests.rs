@@ -1718,13 +1718,13 @@ fn a_namespace_newer_than_this_build_is_refused() {
 #[test]
 fn a_non_canonical_schema_marker_is_upgraded_not_looped() {
     let Some(_) = live_store() else { return };
-    let mut up = fresh_db_client(14);
+    let mut up = fresh_db_client(10);
     redis::cmd("SET")
         .arg("busbar:schema")
         .arg("06")
         .query::<()>(&mut up)
         .unwrap();
-    let url = url_for_db(14);
+    let url = url_for_db(10);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(
@@ -1751,7 +1751,7 @@ fn a_non_canonical_schema_marker_is_upgraded_not_looped() {
 #[test]
 fn credential_upgrade_refusals_name_the_pointer() {
     let Some(_) = live_store() else { return };
-    let mut up = fresh_db_client(9);
+    let mut up = fresh_db_client(3);
     let mut refusal = |member: &str, row: Option<(&str, &str)>| {
         redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
         redis::cmd("SET")
@@ -1772,7 +1772,7 @@ fn credential_upgrade_refusals_name_the_pointer() {
                 .query::<()>(&mut up)
                 .unwrap();
         }
-        match ValkeyStore::connect(&url_for_db(9)) {
+        match ValkeyStore::connect(&url_for_db(3)) {
             Ok(_) => panic!("{member}: connect() must refuse"),
             Err(e) => e.to_string(),
         }

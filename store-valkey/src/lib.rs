@@ -872,7 +872,7 @@ impl ValkeyStore {
             // The swap refused the very marker it was told to expect: judging it again would
             // re-run every upgrade step forever.
             return Err(RecordStoreError(format!(
-                "the `{SCHEMA_KEY}` marker could not be rewritten: it still reads {} after an upgrade;                  refusing to start (re-run the upgrade would not change it). NOTHING further was changed.",
+                "the `{SCHEMA_KEY}` marker could not be rewritten: it still reads {} after an upgrade; refusing to start (re-running the upgrade would not change it). NOTHING further was changed.",
                 read.map(|v| v.to_string()).unwrap_or_default()
             )));
         }
