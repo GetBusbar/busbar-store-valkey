@@ -1342,6 +1342,16 @@ mod tests {
             let mut frame = Frame::default();
             assert_eq!(parse_from(&mut frame, &reply[..cut]).unwrap(), None);
             assert_eq!(parse_from(&mut frame, reply).unwrap(), whole);
+            // The measuring walk itself: a cut reply is unfinished, and the resumed walk ends
+            // exactly at the reply's last byte (parse_from re-walks from byte 0, so it cannot
+            // show a resume that finishes early or late).
+            let mut measuring = Frame::default();
+            assert_eq!(measuring.measure(&reply[..cut]).unwrap(), None, "cut {cut}");
+            assert_eq!(
+                measuring.measure(reply).unwrap(),
+                Some(reply.len()),
+                "cut {cut}"
+            );
         }
     }
 }
