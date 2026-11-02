@@ -166,6 +166,31 @@ impl Conns for Fragmented {
     }
 }
 impl DeclaredConns for Fragmented {
+    fn open_request(
+        &self,
+        caller: InstanceId,
+        need: NeedId,
+        desc: &OpenDesc<'_>,
+        require_secure: bool,
+        dial_timeout_ms: u64,
+    ) -> Result<ConnId, ConnError> {
+        // This raw-stream script opens immediately; carry the requested dial bound without
+        // treating it as a framed whole-request timeout or bypassing the security check.
+        self.open_with_security(
+            caller,
+            need,
+            &OpenDesc {
+                timeout_ms: if dial_timeout_ms == 0 {
+                    desc.timeout_ms
+                } else {
+                    dial_timeout_ms
+                },
+                ..desc.clone()
+            },
+            require_secure,
+        )
+    }
+
     fn declare(
         &self,
         _: InstanceId,
