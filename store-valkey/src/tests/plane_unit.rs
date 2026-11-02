@@ -26,7 +26,7 @@ fn a_position_field_round_trips_any_identity() {
         let f = field(42, ident);
         assert_eq!(parse_field(&f), Some((42, ident)), "{f}");
     }
-    let child = rec("task_event", "t1", Some("t1"), 3, PlaneDisposition::Active);
+    let child = rec("task_event", "e1", Some("t1"), 3, PlaneDisposition::Active);
     assert_eq!(identity(&child.view()), "t1");
     let top = rec("task", "t9", None, 0, PlaneDisposition::Active);
     assert_eq!(identity(&top.view()), "t9");
