@@ -1034,12 +1034,15 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
     let restart = client
         .post(format!("{admin}/restart"))
         .bearer_auth(&admin_token)
+        // This fixture is the supervisor: it observes the real exit and starts boot #2.
+        .json(&serde_json::json!({ "confirm": true }))
         .send()
         .expect("POST /api/v1/admin/restart");
+    let restart_status = restart.status();
+    let restart_body = restart.text().unwrap_or_default();
     assert!(
-        restart.status().is_success(),
-        "restart must be accepted: {}",
-        restart.status()
+        restart_status.is_success(),
+        "restart must be accepted: {restart_status}: {restart_body}"
     );
 
     // busbar's restart deliberately does not self-respawn — drains and exits, expecting a
