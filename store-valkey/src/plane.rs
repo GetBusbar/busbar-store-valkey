@@ -463,7 +463,7 @@ pub(crate) async fn get(
     id: &str,
 ) -> RecordStoreResult<Option<Vec<u8>>> {
     let keys = Keys::of(kind);
-    with_conn!(store, |c| c.hget(&keys.body, field(0, id)).await)
+    with_conn!(store, |c| c.hget(&keys.body, field(UPSERT_SEQ, id)).await)
 }
 
 /// One chain listing's read: the positions, then each one's sidecar and body (absent if gone).
@@ -760,7 +760,8 @@ pub(crate) async fn token_live(
         return Ok(false);
     }
     let keys = Keys::of(kind);
-    let side: Option<String> = with_conn!(store, |c| c.hget(&keys.rec, field(0, token)).await)?;
+    let side: Option<String> =
+        with_conn!(store, |c| c.hget(&keys.rec, field(UPSERT_SEQ, token)).await)?;
     Ok(side.is_some_and(|s| is_active(&s)))
 }
 
