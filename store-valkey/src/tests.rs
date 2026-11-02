@@ -4126,7 +4126,7 @@ fn self_signed_tls_server() -> Arc<rustls::ServerConfig> {
     Arc::new(config)
 }
 
-/// `#insecure` (ARCHITECT ruling 2026-10-03 on Q-L16-4): a server whose certificate is
+/// `#insecure` disables certificate verification for a TLS connection.
 
 #[test]
 fn rediss_insecure_skips_certificate_verification() {

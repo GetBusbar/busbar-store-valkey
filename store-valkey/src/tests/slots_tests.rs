@@ -397,7 +397,7 @@ fn records_upsert_read_back_and_scan_a_prefix_in_key_order() {
     );
 }
 
-/// AN EMPTY PUT REMOVES THE ROW (slot 40's rule, ARCHITECT 2026-10-21): the host writes every
+/// An empty put removes the stored row.
 
 #[test]
 fn an_empty_put_removes_the_row() {
