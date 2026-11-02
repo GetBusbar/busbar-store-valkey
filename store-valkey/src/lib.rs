@@ -7,7 +7,9 @@
 //! runtime of its own. `redis://` / `rediss://` URLs (and the `valkey://` spellings) are read as
 //! the upstream `redis` driver reads them.
 //!
-//! ## Keyspace (schema v9, every key under `busbar:`)
+//! ## Keyspace (schema v10, every key under `busbar:`)
+//!
+//! The v10 step scrubs secret material from revoked credential rows on upgrade.
 //!
 //! - **keys**: `key:<id>` (JSON [`VirtualKey`], tombstoned on delete, never removed), `keys` (SET of
 //!   ids), `keys:byrev` (ZSET by revision, for `list_keys_since`).
@@ -1082,6 +1084,14 @@ fn member(kind: &str, slot: u8) -> String {
     format!("{kind}:{slot}")
 }
 
+/// The refusal for a credential-index member that is not `<kind>:<slot>`.
+fn corrupt_index_member() -> RedisError {
+    RedisError::from((
+        ErrorKind::Client,
+        "delete_key: corrupt credential-index member",
+    ))
+}
+
 /// The inverse of [`member`].
 fn parse_member(m: &str) -> Option<(&str, u8)> {
     let (kind, slot) = m.split_once(':')?;
@@ -1357,11 +1367,16 @@ impl ValkeyStore {
         // membership change rebuilds the watch set from fresh state (the outer loop).
         with_conn!(self, |c| loop {
             let members: Vec<String> = c.smembers(&ids_key).await?;
+            // An index member that does not parse names a slot we cannot find: refuse, rather than
+            // delete the index and strand that slot's row and pointers behind a success.
             let row_keys: Vec<String> = members
                 .iter()
-                .filter_map(|m| parse_member(m))
-                .map(|(kind, slot)| cred_row_key(id, kind, slot))
-                .collect();
+                .map(|m| {
+                    parse_member(m)
+                        .map(|(kind, slot)| cred_row_key(id, kind, slot))
+                        .ok_or_else(corrupt_index_member)
+                })
+                .collect::<Result<_, _>>()?;
             let mut watch_keys: Vec<&str> = vec![key_row.as_str(), ids_key.as_str(), REVISION_KEY];
             watch_keys.extend(row_keys.iter().map(String::as_str));
 
@@ -1402,9 +1417,7 @@ impl ValkeyStore {
                 // Destroy every credential row and its pointers (a consumer evicts off the key's
                 // own tombstone delta).
                 for m in &members {
-                    let Some((kind, slot)) = parse_member(m) else {
-                        continue;
-                    };
+                    let (kind, slot) = parse_member(m).ok_or_else(corrupt_index_member)?;
                     let row_key = cred_row_key(id, kind, slot);
                     // A row that does not decode aborts the cascade: skipping it would leave its
                     // pointers dangling behind a reported success.

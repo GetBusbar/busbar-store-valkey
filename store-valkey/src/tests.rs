@@ -5915,6 +5915,28 @@ fn revoke_with_a_dangling_id_pointer_errors() {
     assert!(err.to_string().contains(&c0.meta.id), "{err}");
 }
 
+/// A corrupt member in the credential index (`sigv4:x`) must abort `delete_key`: skipping it and
+/// then deleting the index would strand that slot's row and pointers behind a reported success.
+#[test]
+fn delete_key_refuses_a_corrupt_credential_index_member() {
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_corrupt_member");
+    let c0 = cred(&key_id, &uid("AKIA_CORRUPT"), 0);
+    store.put_key_with_credential(&vk(&key_id), &c0).unwrap();
+    store
+        .with_conn(|c| c.sadd::<_, _, ()>(format!("busbar:cred:ids:{key_id}"), "sigv4:x"))
+        .unwrap();
+    let err = store
+        .delete_key(&key_id)
+        .expect_err("a corrupt index member must abort the cascade");
+    assert!(
+        err.to_string().contains("corrupt credential-index member"),
+        "{err}"
+    );
+    let live = store.get_key(&key_id).unwrap().expect("key row");
+    assert!(live.deleted_at.is_none(), "the key must stay live");
+}
+
 /// A usage hash field `get_usage` cannot parse is an error naming the bucket row and the field, not
 /// a silent skip: a smaller ledger would under-report spend, and the next `put_usage` (DEL +
 /// rewrite) would erase the unreadable counts for good.
