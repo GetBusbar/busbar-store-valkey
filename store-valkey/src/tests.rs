@@ -5869,9 +5869,7 @@ fn revoke_through_a_stale_id_pointer_refuses_and_leaves_the_slot_occupant_alone(
     let key_id = uid("vk_stale_ptr");
     let mut b = cred(&key_id, &uid("AKIA_B"), 0);
     b.meta.id = uid("cred_b");
-    store
-        .put_key_with_credential(&vk(&key_id), &b)
-        .unwrap();
+    store.put_key_with_credential(&vk(&key_id), &b).unwrap();
     let stale = uid("cred_a_stale");
     let ptr = format!("{key_id}:{}:{}", b.meta.kind, b.meta.slot);
     store
@@ -5892,4 +5890,27 @@ fn revoke_through_a_stale_id_pointer_refuses_and_leaves_the_slot_occupant_alone(
         .unwrap();
     assert!(live.meta.revoked_at.is_none(), "B must stay live");
     assert_eq!(live.secret, b.secret, "B's secret must be intact");
+}
+
+/// An id pointer whose credential row is gone (partial restore, manual delete) is an unknown id:
+/// `revoke_credential` errors rather than reporting a revocation that wrote nothing.
+#[test]
+fn revoke_with_a_dangling_id_pointer_errors() {
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_dangling_ptr");
+    let mut c0 = cred(&key_id, &uid("AKIA_DANGLE"), 0);
+    c0.meta.id = uid("cred_dangle");
+    store.put_key_with_credential(&vk(&key_id), &c0).unwrap();
+    store
+        .with_conn(|c| {
+            c.del::<_, ()>(format!(
+                "busbar:cred:{key_id}:{}:{}",
+                c0.meta.kind, c0.meta.slot
+            ))
+        })
+        .unwrap();
+    let err = store
+        .revoke_credential(&c0.meta.id, "gone")
+        .expect_err("a dangling pointer is not a successful revocation");
+    assert!(err.to_string().contains(&c0.meta.id), "{err}");
 }

@@ -1670,7 +1670,12 @@ impl ValkeyStore {
                 }
                 let raw: Option<String> = c.get(&row_key).await?;
                 let Some(raw) = raw else {
-                    return Ok(Some(()));
+                    // The pointer names a row that is gone (partial restore, manual delete):
+                    // nothing was revoked, so success would be a lie.
+                    return Err(RedisError::refused(format!(
+                        "revoke_credential: busbar:cred:id:{id} -> {ptr} names no credential row \
+                         (dangling pointer); nothing was revoked"
+                    )));
                 };
                 let mut cred: CredentialSecret = serde_json::from_str(&raw)
                     .map_err(|_| RedisError::from((ErrorKind::Client, "cred decode")))?;
