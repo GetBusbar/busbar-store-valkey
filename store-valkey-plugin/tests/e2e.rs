@@ -613,7 +613,8 @@ fn load_and_exercise_valkey_plugin_bad_config_fails_over_abi() {
 //   3. POST the base64 tarball to `POST /api/v1/admin/plugins` — the real runtime-install path
 //      (`crates/busbar/src/admin/v1/json/handlers.rs::install_plugin`) — and confirm 201.
 //   4. `PUT /api/v1/admin/config/settings` to set `store.module` to the freshly-installed plugin,
-//      persisted; `POST /api/v1/admin/restart` to apply it (store-module changes are documented
+//      persisted; write that Store and its archive pin into the operator base config, then
+//      `POST /api/v1/admin/restart` to apply it (store-module changes are documented
 //      restart-to-apply, never a hot swap) — then actually restart the process, since busbar's own
 //      restart deliberately does not self-respawn (a supervisor's job, which this test plays).
 //   5. Confirm the restarted process picked up the plugin as its active store module.
@@ -900,7 +901,7 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
     // Shape confirmed against core's `IdentityProviderCfg` / `resolve_auth` in
     // `crates/busbar/src/config/mod.rs`, and byte-for-byte against `busbar --migrate-config`'s own
     // output for the previous inline form.
-    let config_text = |bootstrap_pin: Option<&str>| {
+    let config_text = |bootstrap_pin: Option<&str>, store_url: Option<&str>| {
         let fetch = bootstrap_pin
             .map(|sha256| {
                 format!(
@@ -908,6 +909,15 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
                 )
             })
             .unwrap_or_default();
+        let store = store_url.map_or_else(
+            || "store:\n  module: memory\n".to_string(),
+            |url| {
+                format!(
+                    "store:\n  module: busbar-store-valkey\n  settings:\n    url: {}\n",
+                    serde_json::to_string(url).expect("the Store URL encodes as a YAML string")
+                )
+            },
+        );
         format!(
             "listen: \"127.0.0.1:{port}\"\n\
              admin_listen: \"127.0.0.1:{admin_port}\"\n\
@@ -917,11 +927,11 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
              plugins:\n  enabled: true\n  dir: {}\n{fetch}  trust:\n    allow_unsigned: true\n\
              providers:\n  mock:\n    api_key: {{ env: MOCK_KEY }}\n\
              models:\n  test-model:\n    provider: mock\n\
-             store:\n  module: memory\n",
+             {store}",
             plugins_dir.display()
         )
     };
-    std::fs::write(&config, config_text(None)).unwrap();
+    std::fs::write(&config, config_text(None, None)).unwrap();
 
     let client = reqwest::blocking::Client::new();
 
@@ -993,7 +1003,7 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
         "install retains the supplied archive bytes"
     );
     let archive_sha256 = busbar_plugin_loader::sign::sha256_hex(&installed_bytes);
-    std::fs::write(&config, config_text(Some(&archive_sha256))).unwrap();
+    std::fs::write(&config, config_text(Some(&archive_sha256), None)).unwrap();
 
     // Activate it as the store module, persisted, then restart to apply (store-module changes
     // are documented restart-to-apply, never a hot swap — confirmed by reading
@@ -1013,6 +1023,11 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
         settings_status.is_success(),
         "PUT /api/v1/admin/config/settings must succeed: {settings_status}: {settings_body}"
     );
+
+    // Boot #1's Store owns its config overlay in memory. The operator must also name the
+    // intended durable Store in the base file so a fresh process can open it before reading
+    // Store-owned config. Keep the same URL and archive authorization used by this test.
+    std::fs::write(&config, config_text(Some(&archive_sha256), Some(&url))).unwrap();
 
     let restart = client
         .post(format!("{admin}/restart"))
@@ -1043,9 +1058,9 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // Boot #2: same config, now with the persisted overlay naming the valkey plugin as the store
-    // module — the real dlopen + RecordStore::connect/migrate path executes here, before the listener
-    // ever answers a request.
+    // Boot #2: the operator's base config names the installed valkey plugin as the Store, with
+    // its immutable archive pin. The real dlopen + RecordStore::connect/migrate path executes
+    // here, before the listener ever answers a request.
     let guard2 = ChildGuard(spawn("2"));
     assert!(
         poll_admin_up(&admin, &admin_token, &client),
