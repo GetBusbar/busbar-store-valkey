@@ -935,7 +935,9 @@ impl ValkeyStore {
         let members: Vec<String> = with_conn!(self, |c| c.zrange(CREDS_BYREV, 0, -1).await)?;
         for ptr in members {
             let (key_id, kind, slot) = parse_slot_pointer(&ptr).ok_or_else(|| {
-                RecordStoreError("credential upgrade: malformed revision-index pointer".into())
+                RecordStoreError(format!(
+                    "credential upgrade: malformed revision-index pointer `{ptr}` in {CREDS_BYREV}"
+                ))
             })?;
             let row_key = cred_row_key(&key_id, &kind, slot);
             let watched = [row_key.as_str(), REVISION_KEY];
@@ -944,10 +946,15 @@ impl ValkeyStore {
                 let Some(raw) = raw else {
                     return Ok(Some(()));
                 };
-                let mut cred: CredentialSecret = serde_json::from_str(&raw)
-                    .map_err(|_| RedisError::refused("credential upgrade: malformed credential"))?;
+                let mut cred: CredentialSecret = serde_json::from_str(&raw).map_err(|_| {
+                    RedisError::refused(format!(
+                        "credential upgrade: malformed credential at `{row_key}` (pointer `{ptr}`)"
+                    ))
+                })?;
                 if slot_pointer(&cred.meta) != ptr {
-                    return Err(RedisError::refused("credential upgrade: mismatched slot"));
+                    return Err(RedisError::refused(format!(
+                        "credential upgrade: mismatched slot at `{row_key}` (pointer `{ptr}`)"
+                    )));
                 }
                 if cred.meta.revoked_at.is_none()
                     || (cred.secret.is_empty() && cred.meta.secret_form == SecretForm::None)

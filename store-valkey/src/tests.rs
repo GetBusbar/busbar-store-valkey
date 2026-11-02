@@ -1724,6 +1724,51 @@ fn a_non_canonical_schema_marker_is_upgraded_not_looped() {
     assert_eq!(marker, SCHEMA_VERSION.to_string());
 }
 
+/// A v10 upgrade refusal names the revision-index pointer it stopped at, so the operator can find
+/// what to repair.
+#[test]
+fn credential_upgrade_refusals_name_the_pointer() {
+    let Some(_) = live_store() else { return };
+    let mut up = fresh_db_client(9);
+    let mut refusal = |member: &str, row: Option<(&str, &str)>| {
+        redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
+        redis::cmd("SET")
+            .arg("busbar:schema")
+            .arg(9)
+            .query::<()>(&mut up)
+            .unwrap();
+        redis::cmd("ZADD")
+            .arg(CREDS_BYREV)
+            .arg(1)
+            .arg(member)
+            .query::<()>(&mut up)
+            .unwrap();
+        if let Some((k, v)) = row {
+            redis::cmd("SET")
+                .arg(k)
+                .arg(v)
+                .query::<()>(&mut up)
+                .unwrap();
+        }
+        match ValkeyStore::connect(&url_for_db(9)) {
+            Ok(_) => panic!("{member}: connect() must refuse"),
+            Err(e) => e.to_string(),
+        }
+    };
+    let err = refusal("corrupt-member-xyz", None);
+    assert!(
+        err.contains("corrupt-member-xyz"),
+        "malformed pointer: {err}"
+    );
+    let row_key = cred_row_key("vk_named", "bearer", 0);
+    let err = refusal("vk_named:bearer:0", Some((row_key.as_str(), "{not json")));
+    assert!(
+        err.contains("vk_named:bearer:0"),
+        "malformed credential: {err}"
+    );
+    redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
+}
+
 /// A namespace marked OLDER than v6 is REFUSED, never wiped: `migrate()` has no in-place path for
 /// it, and the old wipe also destroyed a live v6/v7 namespace whose marker had merely been lost.
 /// Seeds a refund-shaped usage row (`billable_requests == 0`, `requests > 0`), forces a v5 marker
