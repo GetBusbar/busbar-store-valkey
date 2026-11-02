@@ -3968,12 +3968,14 @@ fn trusting_nothing(d: &Dispatcher) -> TcpConns {
 #[derive(Default)]
 struct TestTls {
     roots: Option<Vec<u8>>,
+    last_handshake_error: std::sync::Mutex<Option<String>>,
 }
 
 impl TestTls {
     fn trusting(ca_der: &[u8]) -> Self {
         Self {
             roots: Some(ca_der.to_vec()),
+            ..Default::default()
         }
     }
 
@@ -4007,13 +4009,16 @@ impl busbar_test_kit::tcp_conns::SecureDial for TestTls {
         verify_off: bool,
         mut tcp: std::net::TcpStream,
     ) -> std::io::Result<Box<dyn busbar_test_kit::tcp_conns::SecuredSock>> {
+        *self.last_handshake_error.lock().unwrap() = None;
         let invalid = |e: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, e);
         let name = rustls_pki_types::ServerName::try_from(server.to_owned())
             .map_err(|e| invalid(e.to_string()))?;
         let mut tls = rustls::ClientConnection::new(self.config(verify_off), name)
             .map_err(|e| invalid(e.to_string()))?;
         while tls.is_handshaking() {
-            tls.complete_io(&mut tcp)?;
+            tls.complete_io(&mut tcp).inspect_err(|error| {
+                *self.last_handshake_error.lock().unwrap() = Some(error.to_string());
+            })?;
         }
         Ok(Box::new(TestTlsStream(rustls::StreamOwned::new(tls, tcp))))
     }
@@ -4293,11 +4298,19 @@ fn a_rediss_url_is_secured_through_the_hosts_connector() {
     assert_eq!(proxy.accepted(), 1, "one secured connection, kept");
     let _ = store.purge_key_for_test(&id);
 
-    let (untrusted, _) = open_on(&settings_for(&url), trusting_nothing);
+    // The host table deliberately returns an opaque Refused; observe the exact certificate
+    // failure at the real TLS callback, using a fresh witness for this negative attempt.
+    let untrusted_tls = Arc::new(TestTls::default());
+    let (untrusted, _) = open_on(&settings_for(&url), |d| {
+        TcpConns::with_tls(d.conn_waker(), untrusted_tls.clone())
+    });
     let err = untrusted.expect_err("the TLS certificate must be trusted");
+    let tls_error = untrusted_tls.last_handshake_error.lock().unwrap().clone();
     assert!(
-        err.contains("UnknownIssuer"),
-        "the refusal must be certificate verification: {err}"
+        tls_error
+            .as_deref()
+            .is_some_and(|error| error.contains("UnknownIssuer")),
+        "the refusal must be certificate verification: {tls_error:?}; host refusal: {err}"
     );
     assert!(
         err.starts_with(
