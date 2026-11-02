@@ -705,15 +705,11 @@ fn delete_key_cleans_up_reverse_lookup_pointers() {
 #[test]
 fn delete_key_keeps_the_usage_ledger() {
     let Some(store) = live_store() else { return };
-    // This suite runs against a SHARED, PERSISTENT Valkey that is not flushed between runs, and
-    // this test uses a FIXED id. It used to be self-healing only because `put_key` resurrected
-    // whatever tombstone a prior run had left on that id; now that `put_key` refuses to clear a
-    // tombstone, the fixture has to be removed explicitly.
-    let _ = store.purge_key_for_test("vk_usage");
-    store.put_key(&vk("vk_usage")).unwrap();
+    let id = uid("vk_usage");
+    store.put_key(&vk(&id)).unwrap();
     store
         .add_usage(
-            "vk_usage",
+            &id,
             1000,
             &UsageDelta {
                 requests: 1,
@@ -722,10 +718,10 @@ fn delete_key_keeps_the_usage_ledger() {
             },
         )
         .unwrap();
-    let before = store.get_usage("vk_usage", 1000).unwrap();
+    let before = store.get_usage(&id, 1000).unwrap();
     assert_eq!(before.requests, 1);
-    store.delete_key("vk_usage").unwrap();
-    let after = store.get_usage("vk_usage", 1000).unwrap();
+    store.delete_key(&id).unwrap();
+    let after = store.get_usage(&id, 1000).unwrap();
     assert_eq!(
         after.requests, 1,
         "delete_key destroys credentials only: the usage ledger is billing evidence and stays"
@@ -1311,7 +1307,7 @@ fn metering_round_trips_all_fields_including_renamed_and_new_ones() {
 }
 
 #[test]
-fn metering_attribution_is_first_write_wins() {
+fn metering_keeps_each_historical_attribution_with_its_own_counts() {
     let Some(store) = live_store() else { return };
     let bucket = unique_bucket(20260801);
     let base = MeteringDelta {
@@ -1336,13 +1332,24 @@ fn metering_attribution_is_first_write_wins() {
     second.pricing_version = "v2".to_string();
     store.add_metering(&second).unwrap();
     let rows = store.list_metering(bucket).unwrap();
-    assert_eq!(
-        rows[0].key_group_at_use, "first-group",
-        "attribution snapshots at first use"
-    );
-    assert_eq!(rows[0].pricing_version, "v1");
-    // But the counters still accumulate normally.
-    assert_eq!(rows[0].requests, 2);
+    assert_eq!(rows.len(), 2, "each attribution owns its counts");
+    for expected in [&base, &second] {
+        let row = rows
+            .iter()
+            .find(|row| {
+                row.key_id == expected.key_id
+                    && row.model == expected.model
+                    && row.provider == expected.provider
+                    && row.priced_from_ms == expected.priced_from_ms
+                    && row.key_group_at_use == expected.key_group_at_use
+                    && row.pricing_version == expected.pricing_version
+            })
+            .expect("the exact historical attribution survives");
+        assert_eq!(row.requests, expected.requests);
+        assert_eq!(row.billable_requests, expected.billable_requests);
+        assert_eq!(row.tokens_input, expected.tokens_input);
+        assert_eq!(row.tokens_output, expected.tokens_output);
+    }
 }
 
 #[test]
@@ -2880,7 +2887,7 @@ fn a_task_id_containing_the_key_separator_cannot_alias_another_tasks_chain() {
     reset_tasks(&store, &[victim, attacker, c1, c2]);
 }
 
-/// A `u64` a signed column cannot hold is refused before any write, naming the method and field.
+/// Signed-range sequence and price instants refuse before writing; timestamps retain all u64 bits.
 #[test]
 fn a_u64_a_signed_column_cannot_hold_is_refused() {
     let Some(store) = live_store() else { return };
@@ -2895,27 +2902,40 @@ fn a_u64_a_signed_column_cannot_hold_is_refused() {
         disposition: PlaneDisposition::Active,
         body: b"b".to_vec(),
     };
-    for (field, r) in [("seq", rec(big, 1)), ("ts", rec(1, big))] {
-        let e = store.append_plane_record(r.view()).unwrap_err().to_string();
-        assert!(
-            e.contains(&format!(
-                "append_plane_record: {field} {big} exceeds the storable range"
-            )),
-            "{e}"
-        );
-        let e = store.upsert_plane_record(r.view()).unwrap_err().to_string();
-        assert!(
-            e.contains(&format!(
-                "upsert_plane_record: {field} {big} exceeds the storable range"
-            )),
-            "{e}"
-        );
-    }
+    let r = rec(big, 1);
+    let e = store.append_plane_record(r.view()).unwrap_err().to_string();
+    assert!(
+        e.contains(&format!(
+            "append_plane_record: seq {big} exceeds the storable range"
+        )),
+        "{e}"
+    );
+    let e = store.upsert_plane_record(r.view()).unwrap_err().to_string();
+    assert!(
+        e.contains(&format!(
+            "upsert_plane_record: seq {big} exceeds the storable range"
+        )),
+        "{e}"
+    );
     assert!(store.get_plane_record(&kind, "r1").unwrap().is_none());
     assert!(store
         .list_plane_records(&kind, &PlaneSelector::All)
         .unwrap()
         .is_empty());
+
+    let dated = rec(1, u64::MAX);
+    store.append_plane_record(dated.view()).unwrap();
+    store.upsert_plane_record(dated.view()).unwrap();
+    assert_eq!(
+        store.get_plane_record(&kind, "r1").unwrap(),
+        Some(b"b".to_vec())
+    );
+    assert_eq!(
+        store.purge_plane_records_before(&kind, u64::MAX).unwrap(),
+        0
+    );
+    store.delete_plane_record(&kind, "r1").unwrap();
+    store.delete_plane_record(&kind, "p1").unwrap();
 
     let mut m = MeteringDelta {
         key_id: uid("vk_unstorable"),
@@ -2944,9 +2964,7 @@ fn a_u64_a_signed_column_cannot_hold_is_refused() {
     assert!(store.list_metering(m.bucket).unwrap().is_empty());
 }
 
-/// Every `u64` field of both rows round-trips at the full range the sidecar can hold (`i64::MAX`;
-/// beyond it the write is refused, see `a_u64_a_signed_column_cannot_hold_is_refused`), `u64::MAX`
-/// in the opaque body included, and ordering reads the exact `seq`.
+/// Sequence ordering stays exact through i64::MAX, and u64::MAX survives in opaque body fields.
 #[test]
 fn the_task_store_round_trips_the_full_u64_range() {
     let Some(store) = live_store() else { return };
@@ -5978,7 +5996,7 @@ fn a_v9_upgrade_scrubs_revoked_credentials_and_publishes_the_repairs_once() {
     }
     let marker: i64 = raw.get(SCHEMA_KEY).unwrap();
     assert_eq!(
-        marker, 10,
+        marker, SCHEMA_VERSION,
         "the completed repair advances the schema marker"
     );
     let revision: u64 = raw.get(REVISION_KEY).unwrap();
@@ -6800,34 +6818,97 @@ fn legacy_approval_peer(
 }
 
 #[test]
-fn legacy_approval_reads_one_expiry_snapshot_and_never_makes_a_finite_entry_permanent() {
-    for ttl in [-2, 0, 1, -1] {
-        let (url, peer) = legacy_approval_peer(None, ttl);
-        let opened = ValkeyStore::connect(&url);
-        let error = opened.as_ref().err().cloned();
-        drop(opened);
-        let written = peer.join().unwrap();
-        assert!(error.is_none(), "{error:?}");
-        if ttl == -2 {
-            assert!(
-                written.is_none(),
-                "an expired source cannot become a new spent entry"
-            );
-        } else {
-            let written = written.expect("a live source is migrated");
-            assert_eq!(written[1], plane::token_key("ask", "spent"));
-            assert_eq!(written[2], "2000000900");
-            assert_eq!(written[3], "NX");
-            if ttl == -1 {
-                assert_eq!(
-                    written.len(),
-                    4,
-                    "an existing permanent entry stays permanent"
-                );
-            } else {
-                assert_eq!(&written[4..], &["EX".to_owned(), "3601".to_owned()]);
-            }
-        }
+fn legacy_approval_migration_keeps_absolute_expiry_and_never_makes_a_finite_entry_permanent() {
+    let Some(_) = live_store() else { return };
+    let (_database, mut raw) = fresh_db_client(TOKEN_CLOCK_DATABASE);
+    let url = url_for_db(TOKEN_CLOCK_DATABASE);
+    let store = ValkeyStore::connect(&url).unwrap();
+    let before = token_test_now(&store);
+    let expires = before + 900;
+    let source = |token: &str| format!("{}{}", legacy::ASK_STATE_PREFIX, token);
+    let target = |token: &str| plane::token_key(legacy::KIND_ASK, token);
+
+    raw.set_ex::<_, _, ()>(source("short-cleanup"), expires, 60)
+        .unwrap();
+    raw.set::<_, _, ()>(source("no-cleanup"), expires).unwrap();
+    raw.set_ex::<_, _, ()>(source("wide-expiry"), u64::MAX, 60)
+        .unwrap();
+    raw.set_ex::<_, _, ()>(source("finite-fallback"), "not-an-expiry", 600)
+        .unwrap();
+    raw.set::<_, _, ()>(source("permanent-fallback"), "not-an-expiry")
+        .unwrap();
+    raw.set::<_, _, ()>(source("existing"), expires).unwrap();
+    raw.set::<_, _, ()>(target("existing"), u64::MAX).unwrap();
+    raw.set::<_, _, ()>(source("missing"), expires).unwrap();
+    redis::cmd("EXPIREAT")
+        .arg(source("missing"))
+        .arg(1)
+        .query::<()>(&mut raw)
+        .unwrap();
+    raw.set::<_, _, ()>(source("expired"), before - 1).unwrap();
+    raw.set::<_, _, ()>(SCHEMA_KEY, 6).unwrap();
+    drop(store);
+
+    let upgraded = ValkeyStore::connect(&url).expect("the real migration scripts run on Valkey");
+    let after = token_test_now(&upgraded);
+    for token in ["short-cleanup", "no-cleanup"] {
+        assert_eq!(raw.get::<_, u64>(target(token)).unwrap(), expires);
+        let cleanup: u64 = redis::cmd("EXPIRETIME")
+            .arg(target(token))
+            .query(&mut raw)
+            .unwrap();
+        assert_eq!(
+            cleanup,
+            expires + 1,
+            "the old TTL cannot shorten or unbound {token}"
+        );
+        assert!(!upgraded.redeem_ask_state(token, expires, u64::MAX).unwrap());
+    }
+    let fallback: u64 = raw.get(target("finite-fallback")).unwrap();
+    assert!(fallback > before && fallback <= after + 600);
+    let cleanup: u64 = redis::cmd("EXPIRETIME")
+        .arg(target("finite-fallback"))
+        .query(&mut raw)
+        .unwrap();
+    assert_eq!(
+        cleanup,
+        fallback + 1,
+        "a malformed finite source stays bounded"
+    );
+    for (token, expected) in [
+        ("wide-expiry", u64::MAX),
+        ("permanent-fallback", i64::MAX as u64),
+        ("existing", u64::MAX),
+    ] {
+        assert_eq!(raw.get::<_, u64>(target(token)).unwrap(), expected);
+        assert_eq!(raw.ttl::<_, i64>(target(token)).unwrap(), -1);
+        assert!(!upgraded.redeem_ask_state(token, u64::MAX, 0).unwrap());
+    }
+    for token in [
+        "short-cleanup",
+        "no-cleanup",
+        "wide-expiry",
+        "finite-fallback",
+        "permanent-fallback",
+        "existing",
+        "missing",
+        "expired",
+    ] {
+        assert!(
+            !raw.exists::<_, bool>(source(token)).unwrap(),
+            "source {token} retired"
+        );
+    }
+    for token in ["missing", "expired"] {
+        assert!(!raw.exists::<_, bool>(target(token)).unwrap());
+    }
+    assert!(!upgraded.redeem_ask_state("expired", before - 1, 0).unwrap());
+    assert!(upgraded.redeem_ask_state("missing", expires, 0).unwrap());
+    assert_eq!(raw.get::<_, i64>(SCHEMA_KEY).unwrap(), SCHEMA_VERSION);
+    drop(upgraded);
+    let reopened = ValkeyStore::connect(&url).unwrap();
+    for token in ["short-cleanup", "no-cleanup", "missing"] {
+        assert!(!reopened.redeem_ask_state(token, expires, 0).unwrap());
     }
 }
 
