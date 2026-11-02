@@ -515,6 +515,29 @@ fn list_keys_since_only_returns_keys_past_the_watermark() {
     );
 }
 
+/// Re-putting a live key restamps its revision, so a hydrator holding a cursor sees the change
+/// (an admin's `enabled = false` must reach the cache).
+#[test]
+fn re_putting_a_live_key_restamps_its_revision_and_re_enters_the_delta() {
+    let Some(store) = live_store() else { return };
+    let a = uid("vk_restamp");
+    store.put_key(&vk(&a)).unwrap();
+    let rev1 = store.get_key(&a).unwrap().unwrap().revision;
+    let mut off = vk(&a);
+    off.enabled = false;
+    store.put_key(&off).unwrap();
+    let rev2 = store.get_key(&a).unwrap().unwrap().revision;
+    assert!(rev2 > rev1, "re-put kept revision {rev1}, got {rev2}");
+    let delta = store.list_keys_since(rev1).unwrap();
+    let row = delta
+        .iter()
+        .find(|k| k.id == a)
+        .expect("the re-put key is in the delta past its old revision");
+    assert!(!row.enabled, "the delta carries the disabled row");
+    let score: f64 = store.with_conn(|conn| conn.zscore(KEYS_BYREV, &a)).unwrap();
+    assert_eq!(score, rev2 as f64, "the index score is the new revision");
+}
+
 /// A row at revision 0 (never stamped) is returned by every delta, and `since = 0` returns every
 /// row: the delta is `revision > since OR revision = 0`, for keys and credentials alike.
 #[test]
@@ -631,32 +654,32 @@ fn delete_key_is_idempotent_once_tombstoned() {
 #[test]
 fn delete_key_destroys_credential_secret_material() {
     let Some(store) = live_store() else { return };
-    // A FIXED id against the shared, persistent Valkey: a prior run's `delete_key` below left its
-    // tombstone, and the atomic mint (like `put_key`) now refuses to clear one, so remove it first
-    // (the same fixture cleanup `delete_key_removes_usage_windows` does).
-    let _ = store.purge_key_for_test("vk_cred");
-    let key = vk("vk_cred");
-    let c = cred("vk_cred", "AKIA_LIVE", 0);
+    // Per-invocation ids: `delete_key` leaves a tombstone and the credential's pointers are
+    // uniqueness-constrained, so a fixed id would poison every run after an aborted one.
+    let kid = uid("vk_cred");
+    let pubid = uid("AKIA_LIVE");
+    let key = vk(&kid);
+    let c = cred(&kid, &pubid, 0);
     store.put_key_with_credential(&key, &c).unwrap();
 
     // Prove the secret is really there before delete, by raw GET (bypassing the trait).
     let raw_before: Option<String> = store
-        .with_conn(|conn| conn.get(cred_row_key("vk_cred", "sigv4", 0)))
+        .with_conn(|conn| conn.get(cred_row_key(&kid, "sigv4", 0)))
         .unwrap();
     assert!(
         raw_before
             .as_deref()
             .unwrap_or("")
-            .contains("AKIA_LIVE-secret"),
+            .contains(&format!("{pubid}-secret")),
         "sanity: the secret must actually be stored before delete"
     );
 
-    store.delete_key("vk_cred").unwrap();
+    store.delete_key(&kid).unwrap();
 
     // The row must be GONE entirely (not tombstoned-with-secret-cleared) — a hard delete of the
     // credential row is fine here since the CONSUMER evicts via the key's own deleted_at delta.
     let raw_after: Option<String> = store
-        .with_conn(|conn| conn.get(cred_row_key("vk_cred", "sigv4", 0)))
+        .with_conn(|conn| conn.get(cred_row_key(&kid, "sigv4", 0)))
         .unwrap();
     assert!(
         raw_after.is_none(),
@@ -666,10 +689,10 @@ fn delete_key_destroys_credential_secret_material() {
     // The public_id reverse-lookup pointer must also be gone (no dangling "revoked but still
     // resolvable" credential).
     assert!(store
-        .lookup_credential_secret("sigv4", "AKIA_LIVE")
+        .lookup_credential_secret("sigv4", &pubid)
         .unwrap()
         .is_none());
-    assert!(store.list_credentials("vk_cred").unwrap().is_empty());
+    assert!(store.list_credentials(&kid).unwrap().is_empty());
 }
 
 /// HARDEST INVARIANT #2: the credential-id and public_id reverse-lookup pointers are cleaned up
@@ -678,18 +701,17 @@ fn delete_key_destroys_credential_secret_material() {
 #[test]
 fn delete_key_cleans_up_reverse_lookup_pointers() {
     let Some(store) = live_store() else { return };
-    // A FIXED id against the shared, persistent Valkey: a prior run's `delete_key` below left its
-    // tombstone, and the atomic mint (like `put_key`) now refuses to clear one, so remove it first
-    // (the same fixture cleanup `delete_key_removes_usage_windows` does).
-    let _ = store.purge_key_for_test("vk_ptr");
-    let key = vk("vk_ptr");
-    let c = cred("vk_ptr", "AKIA_PTR", 0);
+    // Per-invocation ids (see `delete_key_destroys_credential_secret_material`).
+    let kid = uid("vk_ptr");
+    let pubid = uid("AKIA_PTR");
+    let key = vk(&kid);
+    let c = cred(&kid, &pubid, 0);
     let cred_id = c.meta.id.clone();
     store.put_key_with_credential(&key, &c).unwrap();
-    store.delete_key("vk_ptr").unwrap();
+    store.delete_key(&kid).unwrap();
 
     let by_pub: Option<String> = store
-        .with_conn(|conn| conn.get(cred_pub_key("sigv4", "AKIA_PTR")))
+        .with_conn(|conn| conn.get(cred_pub_key("sigv4", &pubid)))
         .unwrap();
     assert!(
         by_pub.is_none(),
@@ -5937,7 +5959,7 @@ fn a_v9_upgrade_scrubs_revoked_credentials_and_publishes_the_repairs_once() {
     }
     let marker: i64 = raw.get(SCHEMA_KEY).unwrap();
     assert_eq!(
-        marker, 10,
+        marker, SCHEMA_VERSION,
         "the completed repair advances the schema marker"
     );
     let revision: u64 = raw.get(REVISION_KEY).unwrap();
@@ -5946,7 +5968,7 @@ fn a_v9_upgrade_scrubs_revoked_credentials_and_publishes_the_repairs_once() {
     raw.set::<_, _, ()>(SCHEMA_KEY, 9).unwrap();
     let direct = ValkeyStore::connect(&url).unwrap();
     let marker: i64 = raw.get(SCHEMA_KEY).unwrap();
-    assert_eq!(marker, 10);
+    assert_eq!(marker, SCHEMA_VERSION);
     let after_revision: u64 = raw.get(REVISION_KEY).unwrap();
     assert_eq!(
         after_revision, revision,
