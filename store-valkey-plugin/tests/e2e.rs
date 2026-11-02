@@ -807,6 +807,7 @@ fn valkey_url_in_db(base: &str, db: u32) -> String {
 
 #[test]
 fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
+    const INSTALLED_ARCHIVE: &str = "busbar-store-valkey-plugin-0.0.0-e2e.tar.gz";
     let Some(base_url) = valkey_url() else { return };
     let url = admin_test_valkey_url(&base_url);
     let _database = database::Database::take(&url);
@@ -899,22 +900,28 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
     // Shape confirmed against core's `IdentityProviderCfg` / `resolve_auth` in
     // `crates/busbar/src/config/mod.rs`, and byte-for-byte against `busbar --migrate-config`'s own
     // output for the previous inline form.
-    std::fs::write(
-        &config,
+    let config_text = |bootstrap_pin: Option<&str>| {
+        let fetch = bootstrap_pin
+            .map(|sha256| {
+                format!(
+                    "  fetch:\n    - url: \"https://plugins.invalid/{INSTALLED_ARCHIVE}\"\n      sha256: \"{sha256}\"\n"
+                )
+            })
+            .unwrap_or_default();
         format!(
             "listen: \"127.0.0.1:{port}\"\n\
              admin_listen: \"127.0.0.1:{admin_port}\"\n\
              identity-providers:\n  admin-tokens:\n    module: admin-tokens\n    token: {{ env: E2E_ADMIN_TOKEN }}\n\
              auth:\n  chain: [keys]\n  signing_key: {{ env: BUSBAR_SIGNING_KEY }}\n  admin_auth: [admin-tokens]\n\
              credentials:\n  at_rest:\n    key: {{ env: BUSBAR_SIGNING_KEY }}\n\
-             plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
+             plugins:\n  enabled: true\n  dir: {}\n{fetch}  trust:\n    allow_unsigned: true\n\
              providers:\n  mock:\n    api_key: {{ env: MOCK_KEY }}\n\
              models:\n  test-model:\n    provider: mock\n\
              store:\n  module: memory\n",
             plugins_dir.display()
-        ),
-    )
-    .unwrap();
+        )
+    };
+    std::fs::write(&config, config_text(None)).unwrap();
 
     let client = reqwest::blocking::Client::new();
 
@@ -958,7 +965,7 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
         .post(format!("{admin}/plugins"))
         .bearer_auth(&admin_token)
         .json(&serde_json::json!({
-            "file": "busbar-store-valkey-plugin-0.0.0-e2e.tar.gz",
+            "file": INSTALLED_ARCHIVE,
             "tarball_b64": tarball_b64,
         }))
         .send()
@@ -975,6 +982,18 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
         Some("busbar-store-valkey"),
         "install response must name the installed plugin: {install_body}"
     );
+
+    // Authorize the installed bytes in the operator's base config before they become the
+    // Store's native bootstrap dependency. Boot #1 has no fetch entry: the admin POST above
+    // remains the install path. Boot #2 uses this exact cached archive without a download.
+    let installed_bytes = std::fs::read(plugins_dir.join(INSTALLED_ARCHIVE))
+        .expect("the successful admin install retained its archive");
+    assert_eq!(
+        installed_bytes, tarball_bytes,
+        "install retains the supplied archive bytes"
+    );
+    let archive_sha256 = busbar_plugin_loader::sign::sha256_hex(&installed_bytes);
+    std::fs::write(&config, config_text(Some(&archive_sha256))).unwrap();
 
     // Activate it as the store module, persisted, then restart to apply (store-module changes
     // are documented restart-to-apply, never a hot swap — confirmed by reading
