@@ -6,7 +6,7 @@
 //! and the plane-record append) and the kernel's records. The store keeps ledger counts and
 //! records, not money: busbar derives money from the counts and its rate card.
 //!
-//! ## Layout (schema v9, `crate::SCHEMA_VERSION`)
+//! ## Layout (schema v10, `crate::SCHEMA_VERSION`)
 //!
 //! - `busbar:op:<hex op_id>`            HASH `b` = the op's body ([`Dedupe`]); expires
 //!   [`OP_ID_RETENTION_SECS`] after it is written (S4).
