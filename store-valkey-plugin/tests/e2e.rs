@@ -669,7 +669,10 @@ fn busbar_root() -> PathBuf {
 /// test's first-party key ([`HARNESS_FIRST_PARTY_KEY_ENV`]); no release build reads it.
 fn build_real_binaries() -> (PathBuf, PathBuf) {
     let root = busbar_root();
-    let target = root.join("target");
+    let target = match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(dir) => root.join(dir),
+        None => root.join("target"),
+    };
     for args in [
         &[
             "build",
@@ -696,8 +699,7 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
             .args(args)
             .arg("--target-dir")
             .arg(&target)
-            // Both binaries are read back from `<checkout>/target/release` below.
-            .env_remove("CARGO_TARGET_DIR")
+            // Both binaries are read back from this same explicit target directory below.
             .current_dir(&root)
             .status()
             .expect("run cargo build for busbar + busbar-plugin-pack");
