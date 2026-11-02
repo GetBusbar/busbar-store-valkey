@@ -857,12 +857,22 @@ impl ValkeyStore {
             .arg(SCHEMA_VERSION)
             .invoke(c)
             .await)?;
-        now.map(|v| {
-            v.parse().map_err(|_| {
-                RecordStoreError(format!("the `{SCHEMA_KEY}` marker is not a number: {v}"))
+        let now = now
+            .map(|v| {
+                v.parse().map_err(|_| {
+                    RecordStoreError(format!("the `{SCHEMA_KEY}` marker is not a number: {v}"))
+                })
             })
-        })
-        .transpose()
+            .transpose()?;
+        if now.is_some() && now == read {
+            // The swap refused the very marker it was told to expect: judging it again would
+            // re-run every upgrade step forever.
+            return Err(RecordStoreError(format!(
+                "the `{SCHEMA_KEY}` marker could not be rewritten: it still reads {} after an upgrade;                  refusing to start (re-run the upgrade would not change it). NOTHING further was changed.",
+                read.map(|v| v.to_string()).unwrap_or_default()
+            )));
+        }
+        Ok(now)
     }
 
     /// THE v9 STEP: delete what the deleted slots kept. The key families go
@@ -1229,7 +1239,11 @@ static SET_SCHEMA_MARKER: std::sync::LazyLock<Script> = std::sync::LazyLock::new
     Script::new(
         r"
         local cur = redis.call('GET', KEYS[1])
-        if (not cur and ARGV[1] == '') or cur == ARGV[1] then
+        -- Compared by value too: a restored marker may be spelled `06` or `+6`, which the
+        -- caller read as 6 and expects to match.
+        local n = cur and tonumber(cur)
+        if (not cur and ARGV[1] == '') or cur == ARGV[1]
+            or (n and n == tonumber(ARGV[1])) then
             redis.call('SET', KEYS[1], ARGV[2])
             return false
         end

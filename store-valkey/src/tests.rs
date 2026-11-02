@@ -1642,6 +1642,40 @@ fn a_namespace_newer_than_this_build_is_refused() {
     redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
 }
 
+/// A marker an operator restored in a non-canonical spelling (`06`) must still be upgraded and
+/// re-marked: the compare-and-set judges it by value, so `connect()` completes instead of looping
+/// through the upgrade steps forever.
+#[test]
+fn a_non_canonical_schema_marker_is_upgraded_not_looped() {
+    let Some(_) = live_store() else { return };
+    let mut up = fresh_db_client(14);
+    redis::cmd("SET")
+        .arg("busbar:schema")
+        .arg("06")
+        .query::<()>(&mut up)
+        .unwrap();
+    let url = url_for_db(14);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(
+            ValkeyStore::connect(&url)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+        );
+    });
+    let done = rx.recv_timeout(std::time::Duration::from_secs(20));
+    let marker: String = redis::cmd("GET")
+        .arg("busbar:schema")
+        .query(&mut up)
+        .unwrap();
+    redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
+    assert!(
+        matches!(done, Ok(Ok(()))),
+        "connect() must complete over a `06` marker: {done:?}"
+    );
+    assert_eq!(marker, SCHEMA_VERSION.to_string());
+}
+
 /// A namespace marked OLDER than v6 is REFUSED, never wiped: `migrate()` has no in-place path for
 /// it, and the old wipe also destroyed a live v6/v7 namespace whose marker had merely been lost.
 /// Seeds a refund-shaped usage row (`billable_requests == 0`, `requests > 0`), forces a v5 marker
