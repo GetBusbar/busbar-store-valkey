@@ -886,9 +886,6 @@ impl Pipeline {
     pipe_cmd!(
         /// `HSET key field value`.
         hset(k: K, f: F, v: V) => "HSET");
-    pipe_cmd!(
-        /// `TTL`.
-        ttl(k: K) => "TTL");
 
     /// `ZADD key score member`.
     pub fn zadd<K: ToArgs, M: ToArgs, S: ToArgs>(&mut self, k: K, m: M, s: S) -> &mut Self {
