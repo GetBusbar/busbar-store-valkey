@@ -5942,3 +5942,80 @@ fn get_usage_refuses_an_unreadable_field_instead_of_under_reporting() {
         "names the row and the field: {msg}"
     );
 }
+
+/// `list_keys_since` reads the revision index and the rows consistently: a write landing between
+/// the two must not let the rows run ahead of the index snapshot, or a consumer that advances its
+/// cursor to the newest row revision skips the change the snapshot missed. Here the snapshot is
+/// [A]; before the rows are read B is tombstoned and A rewritten. B's tombstone must still be
+/// delivered.
+#[test]
+fn list_keys_since_does_not_skip_a_change_landing_between_index_and_rows() {
+    let Some(direct) = live_store() else { return };
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let (a, b, m) = (uid("vk_delta_a"), uid("vk_delta_b"), uid("vk_delta_m"));
+    direct.put_key(&vk(&b)).unwrap();
+    direct.put_key(&vk(&m)).unwrap();
+    let since = direct.get_key(&m).unwrap().unwrap().revision;
+    direct.put_key(&vk(&a)).unwrap();
+
+    let a_row = format!("busbar:key:{a}");
+    let gate = interleave::gate(&url, true, move |c| {
+        interleave::contains(c, b"GET") && interleave::contains(c, a_row.as_bytes())
+    });
+    let slow = ValkeyStore::connect(&gate.url).unwrap();
+    let reader = std::thread::spawn(move || slow.list_keys_since(since));
+    gate.held
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the reader has taken its index snapshot and is about to read the rows");
+    direct.delete_key(&b).unwrap();
+    direct.put_key(&vk(&a)).unwrap();
+    gate.release.send(()).unwrap();
+    let got = reader.join().unwrap().unwrap();
+
+    let newest_a = got.iter().find(|k| k.id == a).expect("A is delivered");
+    let tombstone = got.iter().find(|k| k.id == b);
+    assert!(
+        tombstone.is_some_and(|k| k.deleted_at.is_some()),
+        "B's tombstone (older than A@{}) must be delivered with it: {:?}",
+        newest_a.revision,
+        got.iter().map(|k| (&k.id, k.revision)).collect::<Vec<_>>()
+    );
+}
+
+/// The credential delta reads the same way: a revocation landing between the index snapshot and
+/// the row reads is not skipped.
+#[test]
+fn list_credentials_since_does_not_skip_a_revocation_landing_between_index_and_rows() {
+    let Some(direct) = live_store() else { return };
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let (ka, kb, km) = (uid("vk_cdelta_a"), uid("vk_cdelta_b"), uid("vk_cdelta_m"));
+    let cb = cred(&kb, &uid("AKIA_CD_B"), 0);
+    let ca = cred(&ka, &uid("AKIA_CD_A"), 0);
+    direct.put_key_with_credential(&vk(&kb), &cb).unwrap();
+    direct.put_key(&vk(&km)).unwrap();
+    let since = direct.get_key(&km).unwrap().unwrap().revision;
+    direct.put_key_with_credential(&vk(&ka), &ca).unwrap();
+
+    let a_row = format!("busbar:cred:{ka}:{}:{}", ca.meta.kind, ca.meta.slot);
+    let gate = interleave::gate(&url, true, move |c| {
+        interleave::contains(c, b"GET") && interleave::contains(c, a_row.as_bytes())
+    });
+    let slow = ValkeyStore::connect(&gate.url).unwrap();
+    let reader = std::thread::spawn(move || slow.list_credentials_since(since));
+    gate.held
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the reader has taken its index snapshot and is about to read the rows");
+    direct.revoke_credential(&cb.meta.id, "leak").unwrap();
+    direct.revoke_credential(&ca.meta.id, "leak").unwrap();
+    gate.release.send(()).unwrap();
+    let got = reader.join().unwrap().unwrap();
+
+    assert!(
+        got.iter()
+            .any(|c| c.meta.id == cb.meta.id && c.meta.revoked_at.is_some()),
+        "B's revocation must be delivered with A's: {:?}",
+        got.iter()
+            .map(|c| (&c.meta.id, c.meta.revision))
+            .collect::<Vec<_>>()
+    );
+}

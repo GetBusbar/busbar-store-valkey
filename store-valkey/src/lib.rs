@@ -1223,33 +1223,62 @@ impl ValkeyStore {
         c: &mut Conn,
         since: u64,
     ) -> RecordStoreResult<Vec<VirtualKey>> {
-        let ids = self.delta_members(c, KEYS_BYREV, since).await?;
-        self.get_keys(c, &ids).await
+        let rows = self
+            .delta_rows(c, KEYS_BYREV, since, |id| Some(format!("{KEY_PREFIX}{id}")))
+            .await?;
+        rows.iter().map(|(_, r)| key_from_json(r)).collect()
     }
 
-    /// The members of the revision index `zset` past `since`, and those at revision 0 (never
-    /// stamped), which every delta carries; in revision order.
-    async fn delta_members(
+    /// The rows of the revision index `zset` past `since`, and those at revision 0 (never
+    /// stamped), which every delta carries; in revision order, as `(row key, raw row)` (a member
+    /// `row_of` cannot name, and a missing row, are skipped).
+    ///
+    /// The index and the rows are read under a `WATCH` of the revision counter (every key and
+    /// credential write bumps it) and committed with an `EXEC` that carries nothing: a write that
+    /// lands between the two reads aborts it and the read reruns, so the rows never run ahead of
+    /// the index snapshot (a cursor taken from the row revisions would skip the change between).
+    async fn delta_rows(
         &self,
         c: &mut Conn,
         zset: &str,
         since: u64,
-    ) -> RecordStoreResult<Vec<String>> {
-        let (unstamped, stamped): (Vec<String>, Vec<String>) = with_conn!(self, |c| {
-            pipe()
-                .atomic()
-                .cmd("ZRANGEBYSCORE")
-                .arg(zset)
-                .arg(0)
-                .arg(0)
-                .cmd("ZRANGEBYSCORE")
-                .arg(zset)
-                .arg(format!("({since}"))
-                .arg("+inf")
-                .query(c)
-                .await
-        })?;
-        Ok([unstamped, stamped].concat())
+        row_of: impl Fn(&str) -> Option<String>,
+    ) -> RecordStoreResult<Vec<(String, String)>> {
+        with_conn!(self, |c| {
+            transaction!(c, &[REVISION_KEY], |c, tx| {
+                let (unstamped, stamped): (Vec<String>, Vec<String>) = pipe()
+                    .cmd("ZRANGEBYSCORE")
+                    .arg(zset)
+                    .arg(0)
+                    .arg(0)
+                    .cmd("ZRANGEBYSCORE")
+                    .arg(zset)
+                    .arg(format!("({since}"))
+                    .arg("+inf")
+                    .query(c)
+                    .await?;
+                let row_keys: Vec<String> = [unstamped, stamped]
+                    .concat()
+                    .iter()
+                    .filter_map(|m| row_of(m))
+                    .collect();
+                let mut reads = pipe();
+                for k in &row_keys {
+                    reads.get(k);
+                }
+                let raws: Vec<Option<String>> = reads.query(c).await?;
+                // The commit: an `EXEC` that moves nothing, aborted if the counter moved.
+                tx.cmd("GET").arg(REVISION_KEY).ignore();
+                let committed: Option<()> = tx.query(c).await?;
+                Ok(committed.map(|()| {
+                    row_keys
+                        .into_iter()
+                        .zip(raws)
+                        .filter_map(|(row, raw)| Some((row, raw?)))
+                        .collect::<Vec<_>>()
+                }))
+            })
+        })
     }
 
     /// The key rows of `ids` (a missing row is skipped, a corrupt one refused).
@@ -1722,20 +1751,14 @@ impl ValkeyStore {
         c: &mut Conn,
         since: u64,
     ) -> RecordStoreResult<Vec<CredentialSecret>> {
-        let members = self.delta_members(c, CREDS_BYREV, since).await?;
-        let row_keys: Vec<String> = members
-            .iter()
-            .filter_map(|m| {
+        let rows = self
+            .delta_rows(c, CREDS_BYREV, since, |m| {
                 let (key_id, kind, slot) = parse_slot_pointer(m)?;
                 Some(cred_row_key(&key_id, &kind, slot))
             })
-            .collect();
-        let raws = self.get_all(c, &row_keys).await?;
-        row_keys
-            .iter()
-            .zip(raws)
-            .filter_map(|(row, raw)| Some((row, raw?)))
-            .map(|(row, raw)| cred_from_json("list_credentials_since", row, &raw))
+            .await?;
+        rows.iter()
+            .map(|(row, raw)| cred_from_json("list_credentials_since", row, raw))
             .collect()
     }
 
