@@ -275,8 +275,8 @@ fn a_usage_and_a_metering_batch_apply_once() {
 
 /// A store over a DATABASE of its own (`VALKEY_URL` re-pointed at `db`, emptied first and on drop):
 /// a test that seeds whole key families and asserts they are gone must not do it in the shared
-/// database 0. Each test below owns one database number (the suite's other live tests use 0 and 11 to
-/// 15), so the tests run in parallel without sharing a namespace.
+/// database 0. Each test below owns one database number (database 0 is the shared one; 4 to 15 are each
+/// private to one test across the suite), so the tests run in parallel without sharing a namespace.
 struct Iso {
     url: String,
     store: Option<ValkeyStore>,

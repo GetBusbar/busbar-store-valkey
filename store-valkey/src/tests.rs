@@ -1914,6 +1914,10 @@ fn a_corrupt_credential_row_fails_the_delta_naming_its_key() {
 /// The database the corrupt-row test owns.
 const CORRUPT_ROW_DB: u32 = 7;
 
+/// The database the always-aborting-transaction test owns (its proxy bumps `busbar:revision` in it
+/// ahead of every `EXEC`, which would abort any other test's transaction sharing the database).
+const ALWAYS_ABORT_DB: u32 = 4;
+
 /// A refused transaction must not silently swallow the NEXT write on the same connection.
 ///
 /// `redis::transaction` issues WATCH, runs the closure, and UNWATCHes only on the success path — a
@@ -5428,8 +5432,8 @@ fn a_transaction_that_always_aborts_ends_with_an_error() {
         return;
     }
     // A database of its own: the bumps would abort every other test's transaction in db 0.
-    let mut up = fresh_db_client(7);
-    let url = url_for_db(7);
+    let mut up = fresh_db_client(ALWAYS_ABORT_DB);
+    let url = url_for_db(ALWAYS_ABORT_DB);
     let bump_url = url.clone();
     let proxied = interleave::tamper(
         &url,
