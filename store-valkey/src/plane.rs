@@ -501,8 +501,8 @@ pub(crate) async fn list(
                     return Ok((fs, Vec::new(), Vec::new()));
                 }
                 let (sides, bodies): (Vec<Option<String>>, Vec<Option<Vec<u8>>>) =
-                        // Explicit HMGET: redis-rs's `hget` sends a one-element list as a
-                        // scalar HGET, whose reply would not decode as a list.
+                        // Explicit HMGET: `resp::Conn::hget` sends HGET, which takes exactly one
+                        // field; reading a list of fields needs HMGET.
                         pipe()
                             .atomic()
                             .cmd("HMGET")
