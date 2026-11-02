@@ -776,13 +776,47 @@ fn a_store_library_asked_for_as_a_secret_is_refused() {
 /// RED ARM: a manifest whose Statement is one byte off the library's own is refused.
 #[test]
 fn a_statement_one_byte_off_is_refused() {
+    use busbar_contract::abi::mechanism::rendering::read;
+    use busbar_plugin_loader::dispatch::LoadError;
+
     let lib = cdylib();
     let mut other = packed_rendering(&lib);
-    other.push(0);
+    let name = read(&other).expect("the library's Statement parses").name;
+    let name_at = other
+        .windows(name.len())
+        .position(|bytes| bytes == name.as_bytes())
+        .expect("the rendered Statement contains its name");
+    other[name_at] = if other[name_at] == b'a' { b'b' } else { b'a' };
+    assert_ne!(
+        read(&other)
+            .expect("the one-byte mutation preserves a valid Statement")
+            .name,
+        name
+    );
     let d = dispatcher();
     let e = match load_dropped::<Store>(&lib, &other, bind(&d)) {
         Ok(_) => panic!("a library loaded under a Statement that is not its own"),
-        Err(e) => e.to_string(),
+        Err(e) => e,
     };
-    assert!(e.contains("repack the plugin"), "{e}");
+    assert!(matches!(&e, LoadError::StatementMismatch), "{e}");
+    assert!(e.to_string().contains("repack the plugin"), "{e}");
+}
+
+#[test]
+fn a_statement_with_trailing_bytes_is_refused_as_malformed() {
+    use busbar_plugin_loader::dispatch::LoadError;
+
+    let lib = cdylib();
+    let mut malformed = packed_rendering(&lib);
+    let end = malformed.len();
+    malformed.push(0);
+    let d = dispatcher();
+    let error = match load_dropped::<Store>(&lib, &malformed, bind(&d)) {
+        Ok(_) => panic!("a library loaded under a Statement with trailing bytes"),
+        Err(error) => error,
+    };
+    match error {
+        LoadError::Rendering(why) => assert_eq!(why, format!("byte {end} is not end")),
+        other => panic!("expected a malformed Statement refusal, got {other}"),
+    }
 }
