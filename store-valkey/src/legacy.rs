@@ -63,6 +63,17 @@ pub(crate) const KIND_TASK_EVENT: &str = "task_event";
 pub(crate) const KIND_DEMOTION: &str = "demotion";
 pub(crate) const KIND_ASK: &str = "ask";
 
+/// The nonce of a v6 spent-approval key. A server or proxy that returns a SCAN key outside the
+/// MATCH pattern is refused with the key named, never byte-sliced (which could panic).
+pub(crate) fn ask_nonce(key: &str) -> RecordStoreResult<&str> {
+    key.strip_prefix(ASK_STATE_PREFIX).ok_or_else(|| {
+        RecordStoreError(format!(
+            "v6 -> v7 upgrade: SCAN returned key outside busbar:askstate:* ({key:?}); the upgrade \
+             stops here and leaves every v6 key in place"
+        ))
+    })
+}
+
 /// A v6 row that will not decode stops the upgrade: silently dropping it would lose a task, a
 fn decode<T: serde::de::DeserializeOwned>(
     what: &str,
@@ -151,11 +162,7 @@ pub(crate) async fn migrate_v6_to_v7(store: &ValkeyStore, c: &mut Conn) -> Recor
     with_conn!(store, |c| c.del::<_, ()>(MCP_DEMOTIONS_HASH).await)?;
 
     for key in store.scan(c, &format!("{ASK_STATE_PREFIX}*")).await? {
-        let nonce = key.strip_prefix(ASK_STATE_PREFIX).ok_or_else(|| {
-            RecordStoreError(
-                "v6 -> v7 upgrade: an ask-state key does not match its namespace".into(),
-            )
-        })?;
+        let nonce = ask_nonce(&key)?;
         let target = plane::token_key(KIND_ASK, nonce);
         with_conn!(store, |c| plane::MIGRATE_SPENT_TOKEN
             .key(&key)

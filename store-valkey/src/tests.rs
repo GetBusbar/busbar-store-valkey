@@ -224,6 +224,30 @@ fn assert_auth(target: &Target, user: Option<&str>, password: &str) {
     assert!(got_password == &expected, "sealed password differs");
 }
 
+/// An unencoded password starting with `?` moves the userinfo `@` into the query: the refusal must
+/// not echo the query's first key (a password fragment) or a `protocol=` value.
+#[test]
+fn a_password_split_at_question_mark_is_not_echoed_in_the_refusal() {
+    for url in [
+        "redis://default:?S3cretPart=x@valkey.internal:6379",
+        "redis://default:?protocol=S3cretPart@valkey.internal:6379",
+    ] {
+        let err = parse_url(url).expect_err("refused").to_string();
+        assert!(!err.contains("S3cretPart"), "{url}: secret echoed: {err}");
+    }
+}
+
+/// `unhex` takes hex digits only: `from_str_radix` alone would let a sign through (`+a`).
+#[test]
+fn unhex_refuses_a_signed_pair() {
+    assert_eq!(unhex("0a"), Some(vec![10]));
+    assert_eq!(unhex("+a"), None);
+    assert_eq!(parse_usage_field("u:+a:model"), None);
+    assert!(parse_usage_field("u:0a:model").is_some());
+}
+
+/// The password-scrub never lets the URL secret out in an error string, and the URL password
+/// extractor handles every URL shape.
 #[test]
 fn password_capture_and_redaction_preserve_raw_and_decoded_forms() {
     for (url, decoded, raw) in [
@@ -482,6 +506,29 @@ fn list_keys_since_only_returns_keys_past_the_watermark() {
     );
 }
 
+/// Re-putting a live key restamps its revision, so a hydrator holding a cursor sees the change
+/// (an admin's `enabled = false` must reach the cache).
+#[test]
+fn re_putting_a_live_key_restamps_its_revision_and_re_enters_the_delta() {
+    let Some(store) = live_store() else { return };
+    let a = uid("vk_restamp");
+    store.put_key(&vk(&a)).unwrap();
+    let rev1 = store.get_key(&a).unwrap().unwrap().revision;
+    let mut off = vk(&a);
+    off.enabled = false;
+    store.put_key(&off).unwrap();
+    let rev2 = store.get_key(&a).unwrap().unwrap().revision;
+    assert!(rev2 > rev1, "re-put kept revision {rev1}, got {rev2}");
+    let delta = store.list_keys_since(rev1).unwrap();
+    let row = delta
+        .iter()
+        .find(|k| k.id == a)
+        .expect("the re-put key is in the delta past its old revision");
+    assert!(!row.enabled, "the delta carries the disabled row");
+    let score: f64 = store.with_conn(|conn| conn.zscore(KEYS_BYREV, &a)).unwrap();
+    assert_eq!(score, rev2 as f64, "the index score is the new revision");
+}
+
 /// A row at revision 0 (never stamped) is returned by every delta, and `since = 0` returns every
 #[test]
 fn a_revision_zero_row_is_in_every_delta() {
@@ -581,27 +628,29 @@ fn delete_key_is_idempotent_once_tombstoned() {
 #[test]
 fn delete_key_destroys_credential_secret_material() {
     let Some(store) = live_store() else { return };
-
-    let _ = store.purge_key_for_test("vk_cred");
-    let key = vk("vk_cred");
-    let c = cred("vk_cred", "AKIA_LIVE", 0);
+    // Per-invocation ids: `delete_key` leaves a tombstone and the credential's pointers are
+    // uniqueness-constrained, so a fixed id would poison every run after an aborted one.
+    let kid = uid("vk_cred");
+    let pubid = uid("AKIA_LIVE");
+    let key = vk(&kid);
+    let c = cred(&kid, &pubid, 0);
     store.put_key_with_credential(&key, &c).unwrap();
 
     let raw_before: Option<String> = store
-        .with_conn(|conn| conn.get(cred_row_key("vk_cred", "sigv4", 0)))
+        .with_conn(|conn| conn.get(cred_row_key(&kid, "sigv4", 0)))
         .unwrap();
     assert!(
         raw_before
             .as_deref()
             .unwrap_or("")
-            .contains("AKIA_LIVE-secret"),
+            .contains(&format!("{pubid}-secret")),
         "sanity: the secret must actually be stored before delete"
     );
 
-    store.delete_key("vk_cred").unwrap();
+    store.delete_key(&kid).unwrap();
 
     let raw_after: Option<String> = store
-        .with_conn(|conn| conn.get(cred_row_key("vk_cred", "sigv4", 0)))
+        .with_conn(|conn| conn.get(cred_row_key(&kid, "sigv4", 0)))
         .unwrap();
     assert!(
         raw_after.is_none(),
@@ -609,26 +658,27 @@ fn delete_key_destroys_credential_secret_material() {
     );
 
     assert!(store
-        .lookup_credential_secret("sigv4", "AKIA_LIVE")
+        .lookup_credential_secret("sigv4", &pubid)
         .unwrap()
         .is_none());
-    assert!(store.list_credentials("vk_cred").unwrap().is_empty());
+    assert!(store.list_credentials(&kid).unwrap().is_empty());
 }
 
 /// HARDEST INVARIANT #2: the credential-id and public_id reverse-lookup pointers are cleaned up
 #[test]
 fn delete_key_cleans_up_reverse_lookup_pointers() {
     let Some(store) = live_store() else { return };
-
-    let _ = store.purge_key_for_test("vk_ptr");
-    let key = vk("vk_ptr");
-    let c = cred("vk_ptr", "AKIA_PTR", 0);
+    // Per-invocation ids (see `delete_key_destroys_credential_secret_material`).
+    let kid = uid("vk_ptr");
+    let pubid = uid("AKIA_PTR");
+    let key = vk(&kid);
+    let c = cred(&kid, &pubid, 0);
     let cred_id = c.meta.id.clone();
     store.put_key_with_credential(&key, &c).unwrap();
-    store.delete_key("vk_ptr").unwrap();
+    store.delete_key(&kid).unwrap();
 
     let by_pub: Option<String> = store
-        .with_conn(|conn| conn.get(cred_pub_key("sigv4", "AKIA_PTR")))
+        .with_conn(|conn| conn.get(cred_pub_key("sigv4", &pubid)))
         .unwrap();
     assert!(
         by_pub.is_none(),
@@ -646,6 +696,9 @@ fn delete_key_cleans_up_reverse_lookup_pointers() {
 #[test]
 fn delete_key_keeps_the_usage_ledger() {
     let Some(store) = live_store() else { return };
+    // The usage ledger deliberately survives `delete_key` and `purge_key_for_test`, so a fixed id
+    // and window would accumulate across runs on the shared, persistent Valkey: a fresh id owns a
+    // fresh ledger.
     let id = uid("vk_usage");
     store.put_key(&vk(&id)).unwrap();
     store
@@ -999,6 +1052,14 @@ fn list_credentials_never_carries_the_secret() {
             "metadata output must not carry the stored secret"
         );
     }
+
+    // CredentialMeta has no secret field at all — this is a compile-time guarantee, not a
+    // runtime check, but assert the shape we actually get back is the meta type.
+    let _: &CredentialMeta = &metas[0];
+    assert!(
+        !format!("{metas:?}").contains(&c.secret),
+        "the secret must not surface in list_credentials"
+    );
 }
 
 #[test]
@@ -1172,6 +1233,14 @@ fn metering_round_trips_all_fields_including_renamed_and_new_ones() {
     assert_eq!(r.billable_requests, 1);
     assert_eq!(r.key_group_at_use, "growth");
     assert_eq!(r.pricing_version, "2026-07");
+    assert_eq!(r.key_id, key_id);
+    assert_eq!(r.model, "claude");
+    assert_eq!(r.provider, "anthropic");
+    assert_eq!(r.tokens_input, 10);
+    assert_eq!(r.tokens_output, 5);
+    assert_eq!(r.tokens_cache_read, 2);
+    assert_eq!(r.requests, 1);
+    assert_eq!(r.priced_from_ms, 0);
 }
 
 #[test]
@@ -1308,6 +1377,65 @@ fn connect_refuses_to_start_under_an_eviction_policy() {
         "{error}"
     );
 }
+
+/// A start refused for its eviction policy changes NOTHING: the noeviction check runs before the
+/// in-place schema upgrade, so the v7 namespace keeps its dead-slot keys and its marker.
+/// `#[ignore]`d for the reason above (it flips the server's global policy); run alone.
+#[test]
+#[ignore]
+fn a_start_refused_for_eviction_policy_does_not_migrate() {
+    let Some(_baseline) = live_store() else {
+        return;
+    };
+    let (_database, mut up) = fresh_db_client(15);
+    redis::cmd("SET")
+        .arg("busbar:schema")
+        .arg(7)
+        .query::<()>(&mut up)
+        .unwrap();
+    redis::cmd("SET")
+        .arg("busbar:cap:dead")
+        .arg("x")
+        .query::<()>(&mut up)
+        .unwrap();
+    let set_policy = |c: &mut redis::Connection, p: &str| {
+        redis::cmd("CONFIG")
+            .arg("SET")
+            .arg("maxmemory-policy")
+            .arg(p)
+            .query::<()>(c)
+            .unwrap();
+    };
+    set_policy(&mut up, "allkeys-lru");
+    let result = ValkeyStore::connect(&url_for_db(15));
+    set_policy(&mut up, "noeviction");
+    let marker: String = redis::cmd("GET")
+        .arg("busbar:schema")
+        .query(&mut up)
+        .unwrap();
+    let dead: bool = redis::cmd("EXISTS")
+        .arg("busbar:cap:dead")
+        .query(&mut up)
+        .unwrap();
+    redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
+    assert!(result.is_err(), "the eviction policy refuses the start");
+    assert_eq!(
+        marker, "7",
+        "a refused start must not re-mark the namespace"
+    );
+    assert!(dead, "a refused start must not run the upgrade's deletions");
+}
+
+// ── migrate() / with_conn retry: guards on two predicates in `store-valkey/src/lib.rs` ─────────
+//
+// The logic these pin is correct; what was missing was anything that would fail if it broke. Both
+// predicates are silent in normal operation and catastrophic when wrong:
+//   - `migrate()`'s `version >= SCHEMA_VERSION` early return. If that comparison were inverted, a
+//     SECOND `connect()` against an already-migrated namespace would wipe the entire shared
+//     `busbar:*` keyspace on every reconnect.
+//   - `run()`'s `retry && is_connection_error(&e)` match guard. Each half must hold on its own: a
+//     non-connection error under `retry: true` must NOT be retried, and a genuine connection-level
+//     error must be retried and transparently recovered.
 
 /// Pins the `version >= SCHEMA_VERSION` early return against inversion: a second
 #[test]
@@ -1471,6 +1599,85 @@ fn a_namespace_newer_than_this_build_is_refused() {
         .query(&mut up)
         .unwrap();
     assert_eq!(marker, newer, "the marker must not be rewritten");
+    redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
+}
+
+/// A marker an operator restored in a non-canonical spelling (`06`) must still be upgraded and
+/// re-marked: the compare-and-set judges it by value, so `connect()` completes instead of looping
+/// through the upgrade steps forever.
+#[test]
+fn a_non_canonical_schema_marker_is_upgraded_not_looped() {
+    let Some(_) = live_store() else { return };
+    let (_database, mut up) = fresh_db_client(10);
+    redis::cmd("SET")
+        .arg("busbar:schema")
+        .arg("06")
+        .query::<()>(&mut up)
+        .unwrap();
+    let url = url_for_db(10);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(
+            ValkeyStore::connect(&url)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+        );
+    });
+    let done = rx.recv_timeout(std::time::Duration::from_secs(20));
+    let marker: String = redis::cmd("GET")
+        .arg("busbar:schema")
+        .query(&mut up)
+        .unwrap();
+    redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
+    assert!(
+        matches!(done, Ok(Ok(()))),
+        "connect() must complete over a `06` marker: {done:?}"
+    );
+    assert_eq!(marker, SCHEMA_VERSION.to_string());
+}
+
+/// A v10 upgrade refusal names the revision-index pointer it stopped at, so the operator can find
+/// what to repair.
+#[test]
+fn credential_upgrade_refusals_name_the_pointer() {
+    let Some(_) = live_store() else { return };
+    let (_database, mut up) = fresh_db_client(3);
+    let mut refusal = |member: &str, row: Option<(&str, &str)>| {
+        redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
+        redis::cmd("SET")
+            .arg("busbar:schema")
+            .arg(9)
+            .query::<()>(&mut up)
+            .unwrap();
+        redis::cmd("ZADD")
+            .arg(CREDS_BYREV)
+            .arg(1)
+            .arg(member)
+            .query::<()>(&mut up)
+            .unwrap();
+        if let Some((k, v)) = row {
+            redis::cmd("SET")
+                .arg(k)
+                .arg(v)
+                .query::<()>(&mut up)
+                .unwrap();
+        }
+        match ValkeyStore::connect(&url_for_db(3)) {
+            Ok(_) => panic!("{member}: connect() must refuse"),
+            Err(e) => e.to_string(),
+        }
+    };
+    let err = refusal("corrupt-member-xyz", None);
+    assert!(
+        err.contains("corrupt-member-xyz"),
+        "malformed pointer: {err}"
+    );
+    let row_key = cred_row_key("vk_named", "bearer", 0);
+    let err = refusal("vk_named:bearer:0", Some((row_key.as_str(), "{not json")));
+    assert!(
+        err.contains("vk_named:bearer:0"),
+        "malformed credential: {err}"
+    );
     redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
 }
 
@@ -1764,6 +1971,10 @@ fn a_corrupt_credential_row_fails_the_delta_naming_its_key() {
 
 /// The database the corrupt-row test owns.
 const CORRUPT_ROW_DB: u32 = 7;
+
+/// The database the always-aborting-transaction test owns (its proxy bumps `busbar:revision` in it
+/// ahead of every `EXEC`, which would abort any other test's transaction sharing the database).
+const ALWAYS_ABORT_DB: u32 = 4;
 
 /// A refused transaction must not silently swallow the NEXT write on the same connection.
 #[test]
@@ -2094,7 +2305,7 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
     let Some(store) = live_store() else { return };
     let p = uid("vk_mcp_replay");
 
-    let rec = sample_call(&p, 1, 2_000_000_100, "", "h1");
+    let rec = sample_call(&p, 1, 2_000_000_100, "", "h1-stored-row");
     store.append_mcp_call(&rec).unwrap();
     store
         .append_mcp_call(&rec)
@@ -2109,17 +2320,19 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
     let err = store
         .append_mcp_call(&forked)
         .expect_err("a different record at an occupied (principal, seq) is a fork and must error");
+    let shown = format!("{err}");
     assert!(
-        !format!("{err}").contains("h2-second-writer"),
-        "the error must not echo stored content back"
+        !shown.contains("h1-stored-row") && !shown.contains("h2-second-writer"),
+        "the error must echo neither the stored nor the incoming hash: {shown}"
     );
     assert_eq!(
         store.list_mcp_calls(&p).unwrap()[0].hash,
-        "h1",
+        "h1-stored-row",
         "the refused fork must not have overwritten the record already on record"
     );
 
-    let mut tampered = sample_call(&p, 1, 2_000_000_100, "", "h1");
+    // A differing payload under an identical sidecar is a fork too, not a silent accept.
+    let mut tampered = sample_call(&p, 1, 2_000_000_100, "", "h1-stored-row");
     tampered.tool = "srv_other_tool".to_string();
     store
         .append_mcp_call(&tampered)
@@ -2210,8 +2423,14 @@ fn reset_tasks(store: &ValkeyStore, task_ids: &[&str]) {
 }
 
 /// Own the whole low band: a previous run's (or the conformance suite's) leftovers would otherwise be
-fn clear_purge_band(store: &ValkeyStore) {
-    let byts = format!("busbar:plane:{}:byts", hex(b"task"));
+/// counted by the exact-count assertions the purge tests make. Caller holds [`purge_guard`].
+///
+/// Reads the retention index itself, never the bodies: retention sweeps by the SIDECAR `ts`, and a
+/// body's own `updated_at` need not agree with it (the conformance suite's task bodies all say
+/// 1_700_000_100 while their sidecars sit in this band) — clearing by the body would leave exactly
+/// the rows the sweep then counts.
+fn clear_purge_band(store: &ValkeyStore, kind: &str) {
+    let byts = format!("busbar:plane:{}:byts", hex(kind.as_bytes()));
     let fields: Vec<String> = store
         .with_conn(|c| c.zrangebyscore(&byts, "-inf", format!("({TASK_PURGE_BAND_TOP}")))
         .expect("read the purge band");
@@ -2219,7 +2438,13 @@ fn clear_purge_band(store: &ValkeyStore) {
         .iter()
         .filter_map(|f| f.split_once(':').map(|(_, id)| id))
         .collect();
-    reset_tasks(store, &ids);
+    if kind == "task" {
+        reset_tasks(store, &ids);
+    } else {
+        for id in ids {
+            store.delete_plane_record(kind, id).expect("clear the band");
+        }
+    }
 }
 
 /// THE TEST THAT MATTERS: an in-flight task, read back off the server on a NEW connection after the
@@ -2406,7 +2631,7 @@ fn a_replayed_task_event_is_idempotent_and_a_different_one_is_a_fork() {
 fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
     let _guard = purge_guard();
     let Some(store) = live_store() else { return };
-    clear_purge_band(&store);
+    clear_purge_band(&store, "task");
 
     let old = 1_000_000_100;
     for state in ["completed", "failed", "canceled", "rejected"] {
@@ -2471,7 +2696,7 @@ fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
         0,
         "re-running the same purge removes nothing"
     );
-    clear_purge_band(&store);
+    clear_purge_band(&store, "task");
 }
 
 /// Deleting a task takes its provenance chain with it, and no other task's.
@@ -2509,7 +2734,7 @@ fn deleting_a_task_takes_its_provenance_chain_with_it_and_no_other() {
 fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
     let _guard = purge_guard();
     let Some(store) = live_store() else { return };
-    clear_purge_band(&store);
+    clear_purge_band(&store, "task");
 
     let (gone, stays) = ("t_vk_cascade_gone", "t_vk_cascade_stays");
     reset_tasks(&store, &[gone, stays]);
@@ -2551,7 +2776,7 @@ fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
         "another task's chain must be untouched by that purge"
     );
     reset_tasks(&store, &[gone, stays]);
-    clear_purge_band(&store);
+    clear_purge_band(&store, "task");
 }
 
 /// Two task ids differing ONLY IN CASE are two tasks, and the same for two chains.
@@ -3124,6 +3349,7 @@ fn usage_carries_open_units_and_floors_each_counter_at_zero() {
         .unwrap();
     let got = store.get_usage(&bucket, 1000).unwrap();
     assert_eq!(got.requests, 1, "2, then floored at 0, then +1");
+    assert_eq!(got.billable_requests, 1, "2, then floored at 0, then +1");
     assert_eq!(got.models.len(), 1);
     let m = &got.models[0];
     assert_eq!(m.model, "m:1");
@@ -3916,7 +4142,7 @@ fn connect_timeout_ms_is_the_dial_timeout() {
     assert_eq!(
         store.expect_err("a zero timeout refuses the load"),
         "plugin 'busbar-store-valkey' open failed: invalid valkey plugin config: \
-         `connect_timeout_ms` must be a positive integer (milliseconds), got a number"
+         `connect_timeout_ms` must be a positive integer (milliseconds), got 0"
     );
 }
 
@@ -4697,11 +4923,10 @@ fn read_everything_1_5_5(store: &ValkeyStore) -> Vec<String> {
         format!("{:?}", store.list_keys().unwrap()),
         format!("{:?}", store.list_audit().unwrap()),
     ];
+    let mut metering_buckets = std::collections::BTreeSet::new();
     for key in fixture_keys().keys() {
         if let Some(rest) = key.strip_prefix("busbar:metering:") {
-            if let Ok(bucket) = rest.parse::<u64>() {
-                out.push(format!("{:?}", store.list_metering(bucket).unwrap()));
-            }
+            metering_buckets.insert(rest.split(':').next().unwrap().parse::<u64>().unwrap());
         } else if let Some(rest) = key.strip_prefix("busbar:usage:") {
             let (bucket, start) = rest.rsplit_once(':').unwrap();
             out.push(format!(
@@ -4709,6 +4934,9 @@ fn read_everything_1_5_5(store: &ValkeyStore) -> Vec<String> {
                 store.get_usage(bucket, start.parse().unwrap()).unwrap()
             ));
         }
+    }
+    for bucket in metering_buckets {
+        out.push(format!("{:?}", store.list_metering(bucket).unwrap()));
     }
     out
 }
@@ -4930,7 +5158,10 @@ fn put_key_with_credential_never_remints_a_revoked_credential() {
     );
     let row = store.lookup_credential_secret("sigv4", &p1).unwrap();
     assert!(
-        row.is_none_or(|r| r.meta.revoked_at.is_some()),
+        row.expect("a revoked credential still resolves")
+            .meta
+            .revoked_at
+            .is_some(),
         "the credential must stay revoked"
     );
 }
@@ -5022,7 +5253,10 @@ fn put_credential_never_remints_a_revoked_credential() {
     );
     let row = store.lookup_credential_secret("sigv4", &p1).unwrap();
     assert!(
-        row.is_none_or(|r| r.meta.revoked_at.is_some()),
+        row.expect("a revoked credential still resolves")
+            .meta
+            .revoked_at
+            .is_some(),
         "the credential must stay revoked"
     );
 }
@@ -5045,9 +5279,9 @@ fn settings_refuse_an_unknown_top_level_key() {
 fn settings_refuse_a_connect_timeout_that_is_not_a_positive_integer() {
     for (bad, got) in [
         ("\"5000\"", "a string"),
-        ("1.5", "a number"),
-        ("-3", "a number"),
-        ("0", "a number"),
+        ("1.5", "1.5"),
+        ("-3", "-3"),
+        ("0", "0"),
         ("true", "a boolean"),
         ("[]", "an array"),
         ("{}", "an object"),
@@ -5496,8 +5730,8 @@ fn a_transaction_that_always_aborts_ends_with_an_error() {
         return;
     }
 
-    let (database, _up) = fresh_db_client(7);
-    let url = url_for_db(7);
+    let (database, _up) = fresh_db_client(ALWAYS_ABORT_DB);
+    let url = url_for_db(ALWAYS_ABORT_DB);
     let timeout = std::time::Duration::from_secs(10);
     let bump = redis::Client::open(url.as_str())
         .unwrap()
@@ -7186,3 +7420,274 @@ fn ticket_preflight_uses_the_shared_clock_and_matching_terminal_deadline_without
 
 /// Existing isolated database lease used by the shared-clock fixtures.
 pub(crate) const TOKEN_CLOCK_DATABASE: u32 = 6;
+
+/// A server (or proxy) that returns a SCAN key outside `busbar:askstate:*` -- shorter than the
+/// prefix, or not at a char boundary -- is refused with an explained error by the v6 -> v7 upgrade,
+/// never a slice panic (which the door's `catch_unwind` would turn into an opaque Fault).
+#[test]
+fn v6_upgrade_refuses_a_scan_key_outside_the_askstate_prefix() {
+    use crate::legacy::ask_nonce;
+    for bad in ["x", "", "busbar:askstat", "busbar:askstatéé", "é"] {
+        let err = ask_nonce(bad).expect_err("a key outside the prefix is refused");
+        assert!(
+            err.to_string()
+                .contains("v6 -> v7 upgrade: SCAN returned key outside busbar:askstate:*"),
+            "{err}"
+        );
+    }
+    assert_eq!(ask_nonce("busbar:askstate:n1").unwrap(), "n1");
+}
+
+/// A stale `busbar:cred:id:<A>` pointer (an older build, or a partial restore) naming a slot that
+/// now holds live credential B must not let `revoke_credential(A)` revoke and secret-wipe B: it
+/// errors, naming the stale pointer, and B is untouched.
+#[test]
+fn revoke_through_a_stale_id_pointer_refuses_and_leaves_the_slot_occupant_alone() {
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_stale_ptr");
+    let mut b = cred(&key_id, &uid("AKIA_B"), 0);
+    b.meta.id = uid("cred_b");
+    store.put_key_with_credential(&vk(&key_id), &b).unwrap();
+    let stale = uid("cred_a_stale");
+    let ptr = format!("{key_id}:{}:{}", b.meta.kind, b.meta.slot);
+    store
+        .with_conn(|c| c.set::<_, _, ()>(format!("busbar:cred:id:{stale}"), &ptr))
+        .unwrap();
+
+    let err = store
+        .revoke_credential(&stale, "stale")
+        .expect_err("a stale pointer onto another credential's slot is refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&stale) && msg.contains(&b.meta.id),
+        "names the pointer and the occupant: {msg}"
+    );
+    let live = store
+        .lookup_credential_secret(&b.meta.kind, &b.meta.public_id)
+        .unwrap()
+        .unwrap();
+    assert!(live.meta.revoked_at.is_none(), "B must stay live");
+    assert_eq!(live.secret, b.secret, "B's secret must be intact");
+}
+
+/// An id pointer whose credential row is gone (partial restore, manual delete) is an unknown id:
+/// `revoke_credential` errors rather than reporting a revocation that wrote nothing.
+#[test]
+fn revoke_with_a_dangling_id_pointer_errors() {
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_dangling_ptr");
+    let mut c0 = cred(&key_id, &uid("AKIA_DANGLE"), 0);
+    c0.meta.id = uid("cred_dangle");
+    store.put_key_with_credential(&vk(&key_id), &c0).unwrap();
+    store
+        .with_conn(|c| {
+            c.del::<_, ()>(format!(
+                "busbar:cred:{key_id}:{}:{}",
+                c0.meta.kind, c0.meta.slot
+            ))
+        })
+        .unwrap();
+    let err = store
+        .revoke_credential(&c0.meta.id, "gone")
+        .expect_err("a dangling pointer is not a successful revocation");
+    assert!(err.to_string().contains(&c0.meta.id), "{err}");
+}
+
+/// A corrupt member in the credential index (`sigv4:x`) must abort `delete_key`: skipping it and
+/// then deleting the index would strand that slot's row and pointers behind a reported success.
+#[test]
+fn delete_key_refuses_a_corrupt_credential_index_member() {
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_corrupt_member");
+    let c0 = cred(&key_id, &uid("AKIA_CORRUPT"), 0);
+    store.put_key_with_credential(&vk(&key_id), &c0).unwrap();
+    store
+        .with_conn(|c| c.sadd::<_, _, ()>(format!("busbar:cred:ids:{key_id}"), "sigv4:x"))
+        .unwrap();
+    let err = store
+        .delete_key(&key_id)
+        .expect_err("a corrupt index member must abort the cascade");
+    assert!(
+        err.to_string().contains("corrupt credential-index member"),
+        "{err}"
+    );
+    let live = store.get_key(&key_id).unwrap().expect("key row");
+    assert!(live.deleted_at.is_none(), "the key must stay live");
+}
+
+/// A usage hash field `get_usage` cannot parse is an error naming the bucket row and the field, not
+/// a silent skip: a smaller ledger would under-report spend, and the next `put_usage` (DEL +
+/// rewrite) would erase the unreadable counts for good.
+#[test]
+fn get_usage_refuses_an_unreadable_field_instead_of_under_reporting() {
+    let Some(store) = live_store() else { return };
+    let bucket = uid("vk_usage_badfield");
+    store
+        .put_usage(&bucket, 1000, &UsageLedger::default())
+        .unwrap();
+    store
+        .with_conn(|c| {
+            c.hset_multiple::<_, _, _, ()>(
+                format!("busbar:usage:{bucket}:1000"),
+                &[("requests", "2"), ("u:zz-not-hex:gpt", "5")],
+            )
+        })
+        .unwrap();
+    let err = store
+        .get_usage(&bucket, 1000)
+        .expect_err("an unparseable usage field is refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("u:zz-not-hex:gpt") && msg.contains(&bucket),
+        "names the row and the field: {msg}"
+    );
+}
+
+/// `list_keys_since` reads the revision index and the rows consistently: a write landing between
+/// the two must not let the rows run ahead of the index snapshot, or a consumer that advances its
+/// cursor to the newest row revision skips the change the snapshot missed. Here the snapshot is
+/// [A]; before the rows are read B is tombstoned and A rewritten. B's tombstone must still be
+/// delivered.
+#[test]
+fn list_keys_since_does_not_skip_a_change_landing_between_index_and_rows() {
+    let Some(direct) = live_store() else { return };
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let (a, b, m) = (uid("vk_delta_a"), uid("vk_delta_b"), uid("vk_delta_m"));
+    direct.put_key(&vk(&b)).unwrap();
+    direct.put_key(&vk(&m)).unwrap();
+    let since = direct.get_key(&m).unwrap().unwrap().revision;
+    direct.put_key(&vk(&a)).unwrap();
+
+    let a_row = format!("busbar:key:{a}");
+    let gate = interleave::gate(&url, true, move |c| {
+        interleave::contains(c, b"GET") && interleave::contains(c, a_row.as_bytes())
+    });
+    let slow = ValkeyStore::connect(&gate.url).unwrap();
+    let reader = std::thread::spawn(move || slow.list_keys_since(since));
+    gate.held
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the reader has taken its index snapshot and is about to read the rows");
+    direct.delete_key(&b).unwrap();
+    direct.put_key(&vk(&a)).unwrap();
+    gate.release.send(()).unwrap();
+    let got = reader.join().unwrap().unwrap();
+
+    let newest_a = got.iter().find(|k| k.id == a).expect("A is delivered");
+    let tombstone = got.iter().find(|k| k.id == b);
+    assert!(
+        tombstone.is_some_and(|k| k.deleted_at.is_some()),
+        "B's tombstone (older than A@{}) must be delivered with it: {:?}",
+        newest_a.revision,
+        got.iter().map(|k| (&k.id, k.revision)).collect::<Vec<_>>()
+    );
+}
+
+/// The credential delta reads the same way: a revocation landing between the index snapshot and
+/// the row reads is not skipped.
+#[test]
+fn list_credentials_since_does_not_skip_a_revocation_landing_between_index_and_rows() {
+    let Some(direct) = live_store() else { return };
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let (ka, kb, km) = (uid("vk_cdelta_a"), uid("vk_cdelta_b"), uid("vk_cdelta_m"));
+    let cb = cred(&kb, &uid("AKIA_CD_B"), 0);
+    let ca = cred(&ka, &uid("AKIA_CD_A"), 0);
+    direct.put_key_with_credential(&vk(&kb), &cb).unwrap();
+    direct.put_key(&vk(&km)).unwrap();
+    let since = direct.get_key(&km).unwrap().unwrap().revision;
+    direct.put_key_with_credential(&vk(&ka), &ca).unwrap();
+
+    let a_row = format!("busbar:cred:{ka}:{}:{}", ca.meta.kind, ca.meta.slot);
+    let gate = interleave::gate(&url, true, move |c| {
+        interleave::contains(c, b"GET") && interleave::contains(c, a_row.as_bytes())
+    });
+    let slow = ValkeyStore::connect(&gate.url).unwrap();
+    let reader = std::thread::spawn(move || slow.list_credentials_since(since));
+    gate.held
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the reader has taken its index snapshot and is about to read the rows");
+    direct.revoke_credential(&cb.meta.id, "leak").unwrap();
+    direct.revoke_credential(&ca.meta.id, "leak").unwrap();
+    gate.release.send(()).unwrap();
+    let got = reader.join().unwrap().unwrap();
+
+    assert!(
+        got.iter()
+            .any(|c| c.meta.id == cb.meta.id && c.meta.revoked_at.is_some()),
+        "B's revocation must be delivered with A's: {:?}",
+        got.iter()
+            .map(|c| (&c.meta.id, c.meta.revision))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// `connect()` run through a gate that holds it just before it writes the schema marker, while a
+/// NEWER build marks the namespace; the open must then refuse the newer namespace and leave its
+/// marker as the newer build wrote it, never downgrade it.
+fn marker_overtaken_by_a_newer_build(db: u32, seed: impl FnOnce(&mut redis::Connection)) {
+    let (_database, mut up) = fresh_db_client(db);
+    seed(&mut up);
+    let gate = interleave::gate(&url_for_db(db), true, |c| {
+        interleave::contains(c, b"busbar:schema")
+            && (interleave::contains(c, b"SET") || interleave::contains(c, b"EVAL"))
+    });
+    let url = gate.url.clone();
+    let opener = std::thread::spawn(move || ValkeyStore::connect(&url).map(|_| ()));
+    gate.held
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("connect() is about to write the schema marker");
+    let newer = SCHEMA_VERSION + 1;
+    redis::cmd("SET")
+        .arg("busbar:schema")
+        .arg(newer)
+        .query::<()>(&mut up)
+        .unwrap();
+    gate.release.send(()).unwrap();
+    let res = opener.join().unwrap();
+    let marker: i64 = redis::cmd("GET")
+        .arg("busbar:schema")
+        .query(&mut up)
+        .unwrap();
+    redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
+    assert_eq!(
+        marker, newer,
+        "the newer build's marker must not be downgraded"
+    );
+    let err = res.expect_err("the open must refuse the namespace a newer build marked");
+    assert!(
+        err.to_string()
+            .contains(&format!("schema v{newer} is newer than this build")),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_fresh_namespace_marked_by_a_newer_build_meanwhile_is_not_downgraded() {
+    let Some(_) = live_store() else { return };
+    marker_overtaken_by_a_newer_build(14, |_| {});
+}
+
+#[test]
+fn an_upgrade_marked_by_a_newer_build_meanwhile_is_not_downgraded() {
+    let Some(_) = live_store() else { return };
+    marker_overtaken_by_a_newer_build(15, |up| {
+        redis::cmd("SET")
+            .arg("busbar:schema")
+            .arg(FIRST_MIGRATED_SCHEMA)
+            .query::<()>(up)
+            .unwrap();
+    });
+}
+
+/// A transaction that gives up under contention is a backend failure: it reaches the host with the
+/// `valkey <ctx>:` prefix, not as a bare store refusal.
+#[test]
+fn an_exhausted_transaction_is_reported_as_a_backend_failure() {
+    let store = crate::ValkeyStore::from_settings(br#"{"url":"redis://127.0.0.1:6379/0"}"#)
+        .expect("settings parse");
+    let e = crate::resp::RedisError::transaction_exhausted(crate::resp::MAX_TRANSACTION_ATTEMPTS);
+    assert!(!e.is_refusal(), "not a store refusal");
+    let text = store.err(e, "command").0;
+    assert!(text.starts_with("valkey command: "), "{text}");
+    assert!(text.contains("aborted"), "{text}");
+    assert!(text.contains("64"), "{text}");
+}

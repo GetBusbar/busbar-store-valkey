@@ -164,6 +164,13 @@ thread_local! {
     static COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// Elements the measuring walk looked at, to prove a reply that arrives in many fills is measured
+// in time linear in its size.
+#[cfg(test)]
+thread_local! {
+    static VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Value {
     /// The reply's kind, for error text: never its content.
     pub(crate) fn shape(&self) -> &'static str {
@@ -178,30 +185,138 @@ impl Value {
     }
 }
 
-/// Parse one reply from the front of `buf`: the reply and how many bytes it took, or `None` when
-pub fn parse(buf: &[u8]) -> RedisResult<Option<(Value, usize)>> {
-    match walk(buf, 0, 0, false)? {
-        None => Ok(None),
-        Some(_) => walk(buf, 0, 0, true),
+/// A CRLF-terminated line at `from`: its text and the offset after the terminator.
+fn line(buf: &[u8], from: usize) -> Option<(&[u8], usize)> {
+    let rest = buf.get(from..)?;
+    let at = rest.windows(2).position(|w| w == b"\r\n")?;
+    Some((&rest[..at], from + at + 2))
+}
+
+fn bad(what: &str) -> RedisError {
+    RedisError::from((ErrorKind::Parse, "invalid RESP reply", what.to_string()))
+}
+
+fn int(t: &[u8]) -> RedisResult<i64> {
+    std::str::from_utf8(t)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| bad("a length or integer is not a number"))
+}
+
+/// A bulk or array length: `None` for the null (`-1`, RESP2's only one), an error for any other
+/// negative.
+fn length(t: &[u8]) -> RedisResult<Option<i64>> {
+    match int(t)? {
+        -1 => Ok(None),
+        n if n < 0 => Err(bad("a negative length other than -1")),
+        n => Ok(Some(n)),
     }
 }
 
-/// One reply at `at`: built when `make`, else only measured (its value is `Nil`).
-fn walk(buf: &[u8], at: usize, depth: usize, make: bool) -> RedisResult<Option<(Value, usize)>> {
-    fn line(buf: &[u8], from: usize) -> Option<(&[u8], usize)> {
-        let rest = buf.get(from..)?;
-        let at = rest.windows(2).position(|w| w == b"\r\n")?;
-        Some((&rest[..at], from + at + 2))
+/// Where a measuring walk of one reply has got to, so a reply that arrives over many fills is
+/// measured once, each element looked at once, not again from byte 0 at every fill. Valid only
+/// while the buffer it measures only grows; start afresh ([`Frame::default`]) after a reply is
+/// drained.
+#[derive(Debug, Default)]
+pub struct Frame {
+    /// Offset of the next element to measure.
+    at: usize,
+    /// Elements still to come in each array being walked, outermost first.
+    open: Vec<u64>,
+    started: bool,
+}
+
+impl Frame {
+    /// Measure on from where the last call stopped: the length of the whole reply at the front of
+    /// `buf`, or `None` while `buf` does not hold it yet. Allocates and copies nothing.
+    ///
+    /// # Errors
+    /// Bytes that are not RESP2, an array nested deeper than 32, or a length that overflows.
+    fn measure(&mut self, buf: &[u8]) -> RedisResult<Option<usize>> {
+        if !self.started {
+            self.started = true;
+            self.open.push(1);
+        }
+        while let Some(&left) = self.open.last() {
+            if left == 0 {
+                self.open.pop();
+                continue;
+            }
+            let Some(&tag) = buf.get(self.at) else {
+                return Ok(None);
+            };
+            let Some((text, next)) = line(buf, self.at + 1) else {
+                return Ok(None);
+            };
+            #[cfg(test)]
+            VISITED.with(|c| c.set(c.get() + 1));
+            let after = match tag {
+                b'+' | b'-' => next,
+                b':' => {
+                    int(text)?;
+                    next
+                }
+                b'$' => match length(text)? {
+                    None => next,
+                    Some(n) => {
+                        let n = usize::try_from(n).map_err(|_| bad("a bulk length overflows"))?;
+                        let after = next
+                            .checked_add(n)
+                            .and_then(|end| end.checked_add(2))
+                            .ok_or_else(|| bad("a bulk length overflows"))?;
+                        if buf.len() < after {
+                            return Ok(None);
+                        }
+                        if &buf[after - 2..after] != b"\r\n" {
+                            return Err(bad("a bulk string is not terminated"));
+                        }
+                        after
+                    }
+                },
+                b'*' => {
+                    let n = length(text)?;
+                    // The root is not an array: the depth is the arrays open above this one.
+                    if self.open.len() > MAX_REPLY_DEPTH {
+                        return Err(bad("arrays are nested too deeply"));
+                    }
+                    if let Some(n) = n.filter(|&n| n > 0) {
+                        // This array is one of its parent's elements: counted before its items.
+                        if let Some(top) = self.open.last_mut() {
+                            *top -= 1;
+                        }
+                        self.open.push(n.unsigned_abs());
+                        self.at = next;
+                        continue;
+                    }
+                    next
+                }
+                _ => return Err(bad("an unknown reply type")),
+            };
+            if let Some(top) = self.open.last_mut() {
+                *top -= 1;
+            }
+            self.at = after;
+        }
+        Ok(Some(self.at))
     }
-    fn bad(what: &str) -> RedisError {
-        RedisError::from((ErrorKind::Parse, "invalid RESP reply", what.to_string()))
+}
+
+/// Parse one reply from the front of `buf`: the reply and how many bytes it took, or `None` when
+#[cfg(test)]
+pub fn parse(buf: &[u8]) -> RedisResult<Option<(Value, usize)>> {
+    parse_from(&mut Frame::default(), buf)
+}
+
+/// [`parse`], resuming `frame`'s measuring walk of `buf`.
+fn parse_from(frame: &mut Frame, buf: &[u8]) -> RedisResult<Option<(Value, usize)>> {
+    match frame.measure(buf)? {
+        None => Ok(None),
+        Some(_) => walk(buf, 0, 0),
     }
-    fn int(t: &[u8]) -> RedisResult<i64> {
-        std::str::from_utf8(t)
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .ok_or_else(|| bad("a length or integer is not a number"))
-    }
+}
+
+/// One whole reply at `at` (already measured complete), built.
+fn walk(buf: &[u8], at: usize, depth: usize) -> RedisResult<Option<(Value, usize)>> {
     let Some(&tag) = buf.get(at) else {
         return Ok(None);
     };
@@ -210,28 +325,13 @@ fn walk(buf: &[u8], at: usize, depth: usize, make: bool) -> RedisResult<Option<(
     };
     let text_of = |text: &[u8]| String::from_utf8_lossy(text).into_owned();
     match tag {
-        b'+' => Ok(Some((
-            if make {
-                Value::Status(text_of(text))
-            } else {
-                Value::Nil
-            },
-            next,
-        ))),
-        b'-' => Ok(Some((
-            if make {
-                Value::Error(text_of(text))
-            } else {
-                Value::Nil
-            },
-            next,
-        ))),
+        b'+' => Ok(Some((Value::Status(text_of(text)), next))),
+        b'-' => Ok(Some((Value::Error(text_of(text)), next))),
         b':' => Ok(Some((Value::Int(int(text)?), next))),
         b'$' => {
-            let n = int(text)?;
-            if n < 0 {
+            let Some(n) = length(text)? else {
                 return Ok(Some((Value::Nil, next)));
-            }
+            };
             let n = usize::try_from(n).map_err(|_| bad("a bulk length overflows"))?;
             let end = next
                 .checked_add(n)
@@ -245,45 +345,29 @@ fn walk(buf: &[u8], at: usize, depth: usize, make: bool) -> RedisResult<Option<(
             if &buf[end..after] != b"\r\n" {
                 return Err(bad("a bulk string is not terminated"));
             }
-            if !make {
-                return Ok(Some((Value::Nil, after)));
-            }
             #[cfg(test)]
             COPIED.with(|c| c.set(c.get() + n));
             Ok(Some((Value::Data(buf[next..end].to_vec()), after)))
         }
         b'*' => {
-            let n = int(text)?;
-            if n < 0 {
+            let Some(n) = length(text)? else {
                 return Ok(Some((Value::Nil, next)));
-            }
+            };
             if depth >= MAX_REPLY_DEPTH {
                 return Err(bad("arrays are nested too deeply"));
             }
-            let mut items = Vec::new();
-            if make {
-                items.reserve(usize::try_from(n).unwrap_or(0).min(4096));
-            }
+            let mut items = Vec::with_capacity(usize::try_from(n).unwrap_or(0).min(4096));
             let mut at = next;
             for _ in 0..n {
-                match walk(buf, at, depth + 1, make)? {
+                match walk(buf, at, depth + 1)? {
                     Some((v, after)) => {
-                        if make {
-                            items.push(v);
-                        }
+                        items.push(v);
                         at = after;
                     }
                     None => return Ok(None),
                 }
             }
-            Ok(Some((
-                if make {
-                    Value::Array(items)
-                } else {
-                    Value::Nil
-                },
-                at,
-            )))
+            Ok(Some((Value::Array(items), at)))
         }
         _ => Err(bad("an unknown reply type")),
     }
@@ -523,6 +607,8 @@ pub struct Conn {
     wire: Wire,
     /// A `WATCH` is in force (no `EXEC` or `UNWATCH` has cleared it since).
     watching: bool,
+    /// The measuring walk of the reply being read, resumed at each fill.
+    frame: Frame,
 }
 
 impl Conn {
@@ -532,6 +618,7 @@ impl Conn {
         Self {
             wire,
             watching: false,
+            frame: Frame::default(),
         }
     }
 
@@ -559,9 +646,11 @@ impl Conn {
     }
 
     async fn read(&mut self) -> RedisResult<Value> {
+        self.frame = Frame::default();
         loop {
+            let frame = &mut self.frame;
             let got = self.wire.input(|i| -> RedisResult<Option<Value>> {
-                Ok(parse(i)?.map(|(v, n)| {
+                Ok(parse_from(frame, i)?.map(|(v, n)| {
                     i.drain(..n);
                     v
                 }))
@@ -642,15 +731,6 @@ impl Conn {
     /// `GET`.
     pub async fn get<K: ToArgs, RV: FromValue>(&mut self, key: K) -> RedisResult<RV> {
         cmd("GET").arg(key).query(self).await
-    }
-
-    /// `SET`.
-    pub async fn set<K: ToArgs, V: ToArgs, RV: FromValue>(
-        &mut self,
-        key: K,
-        value: V,
-    ) -> RedisResult<RV> {
-        cmd("SET").arg(key).arg(value).query(self).await
     }
 
     /// `DEL` (one key or several).
@@ -993,6 +1073,18 @@ pub fn rr<T, F: Future<Output = RedisResult<T>>>(f: F) -> F {
 /// The most attempts a `transaction!` makes, including the first, before it gives up.
 pub const MAX_TRANSACTION_ATTEMPTS: usize = 64;
 
+impl RedisError {
+    /// A `transaction!` that gave up after `aborts` aborted attempts.
+    #[must_use]
+    pub fn transaction_exhausted(aborts: usize) -> Self {
+        Self::from((
+            ErrorKind::Client,
+            "transaction aborted by concurrent writers; giving up",
+            format!("aborted {aborts} times"),
+        ))
+    }
+}
+
 /// The optimistic transaction, as the upstream driver's `transaction`: `WATCH` the keys, run the
 /// body (it reads, and queues its writes on the atomic pipeline it is handed, then answers that
 /// pipeline's `query`: `None` when a watched key changed and `EXEC` aborted), and run it all again
@@ -1029,10 +1121,7 @@ macro_rules! transaction {
                             if $c.watching() {
                                 let _ = $crate::resp::cmd("UNWATCH").exec(&mut *$c).await;
                             }
-                            break Err($crate::resp::RedisError::refused(format!(
-                                "the transaction was aborted {__aborts} times by concurrent \
-                                 writers; giving up"
-                            )));
+                            break Err($crate::resp::RedisError::transaction_exhausted(__aborts));
                         }
                         continue;
                     }
@@ -1189,5 +1278,56 @@ mod tests {
         }
         assert_eq!(got.expect("whole").1, reply.len());
         assert_eq!(COPIED.with(std::cell::Cell::get), 40_000);
+    }
+
+    #[test]
+    fn a_large_array_arriving_in_many_fills_is_measured_in_linear_time() {
+        let n = 100_000;
+        let mut reply = format!("*{n}\r\n").into_bytes();
+        for _ in 0..n {
+            reply.extend_from_slice(b":1\r\n");
+        }
+        VISITED.with(|c| c.set(0));
+        let mut have = 0;
+        let mut done = None;
+        let mut frame = Frame::default();
+        while done.is_none() {
+            have = (have + 16 * 1024).min(reply.len());
+            done = parse_from(&mut frame, &reply[..have]).unwrap();
+        }
+        assert_eq!(done.expect("whole").1, reply.len());
+        let visited = VISITED.with(std::cell::Cell::get);
+        assert!(visited <= 2 * n, "{visited} elements visited for {n}");
+    }
+
+    #[test]
+    fn a_negative_length_other_than_minus_one_is_a_parse_error() {
+        assert!(parse(b"$-5\r\n").is_err());
+        assert!(parse(b"*-7\r\n").is_err());
+        assert!(parse(b"*1\r\n$-5\r\n").is_err());
+        assert_eq!(parse(b"$-1\r\n").unwrap(), Some((Value::Nil, 5)));
+        assert_eq!(parse(b"*-1\r\n").unwrap(), Some((Value::Nil, 5)));
+    }
+
+    #[test]
+    fn a_resumed_walk_agrees_with_a_whole_one_at_every_split() {
+        let reply = b"*3\r\n*2\r\n$3\r\nabc\r\n:7\r\n*0\r\n*2\r\n+OK\r\n$-1\r\n";
+        let whole = parse(reply).unwrap();
+        assert!(whole.is_some());
+        for cut in 0..reply.len() {
+            let mut frame = Frame::default();
+            assert_eq!(parse_from(&mut frame, &reply[..cut]).unwrap(), None);
+            assert_eq!(parse_from(&mut frame, reply).unwrap(), whole);
+            // The measuring walk itself: a cut reply is unfinished, and the resumed walk ends
+            // exactly at the reply's last byte (parse_from re-walks from byte 0, so it cannot
+            // show a resume that finishes early or late).
+            let mut measuring = Frame::default();
+            assert_eq!(measuring.measure(&reply[..cut]).unwrap(), None, "cut {cut}");
+            assert_eq!(
+                measuring.measure(reply).unwrap(),
+                Some(reply.len()),
+                "cut {cut}"
+            );
+        }
     }
 }

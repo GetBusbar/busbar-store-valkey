@@ -882,7 +882,11 @@ impl StoreSlots for ValkeyStore {
         retention: busbar_contract::records::Retention,
     ) -> Step<RecordStoreResult<u64>> {
         let kind = kind.to_string();
-        let terminal_only = retention == busbar_contract::records::Retention::TerminalOnly;
+        use busbar_contract::records::Retention;
+        let terminal_only = match retention {
+            Retention::Age => false,
+            Retention::TerminalOnly => true,
+        };
         op!(cx, self, Err, |me, c| plane::purge(
             &me,
             c,

@@ -118,29 +118,6 @@ const TEST_SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef
 
 /// The newest mtime across every workspace crate's `src/` — "how fresh must a cdylib be to be the
 fn newest_source_mtime() -> std::time::SystemTime {
-    fn walk(dir: &std::path::Path, newest: &mut std::time::SystemTime) {
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for e in rd.flatten() {
-            let p = e.path();
-
-            if p.file_name()
-                .is_some_and(|name| name == "tests" || name == "tests.rs")
-            {
-                continue;
-            }
-            if p.is_dir() {
-                walk(&p, newest);
-            } else if p.extension().is_some_and(|x| x == "rs") {
-                if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
-                    if m > *newest {
-                        *newest = m;
-                    }
-                }
-            }
-        }
-    }
     let ws_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("the plugin crate always sits under the workspace root");
@@ -148,10 +125,61 @@ fn newest_source_mtime() -> std::time::SystemTime {
     for e in std::fs::read_dir(ws_root).into_iter().flatten().flatten() {
         let src = e.path().join("src");
         if src.is_dir() {
-            walk(&src, &mut newest);
+            walk_newest_source(&src, &mut newest);
         }
     }
     newest
+}
+
+/// The walk behind [`newest_source_mtime`]: the newest `.rs` mtime under `dir`, skipping the
+/// `cfg(test)`-only sources (`tests.rs` and any `tests/` directory), which the non-test lib's
+/// dep-info omits, so editing them never relinks the cdylib.
+fn walk_newest_source(dir: &std::path::Path, newest: &mut std::time::SystemTime) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if p.file_name().is_some_and(|n| n == "tests") {
+                continue;
+            }
+            walk_newest_source(&p, newest);
+        } else if p.extension().is_some_and(|x| x == "rs")
+            && p.file_name().is_none_or(|n| n != "tests.rs")
+        {
+            if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
+                if m > *newest {
+                    *newest = m;
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn newest_source_mtime_ignores_the_cfg_test_only_sources() {
+    let dir = std::env::temp_dir().join(format!("bb-newest-src-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("tests")).unwrap();
+    let t0 = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+    let t1 = t0 + std::time::Duration::from_secs(500);
+    let touch = |p: std::path::PathBuf, t| {
+        std::fs::write(&p, "").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    };
+    touch(dir.join("lib.rs"), t0);
+    touch(dir.join("tests.rs"), t1);
+    touch(dir.join("tests").join("slots_tests.rs"), t1);
+    let mut newest = std::time::SystemTime::UNIX_EPOCH;
+    walk_newest_source(&dir, &mut newest);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(newest, t0, "test-only sources must not count");
 }
 
 /// Locate the cdylib THIS `cargo test` invocation just built — never a leftover artifact.

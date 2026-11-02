@@ -7,7 +7,12 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+
+/// Read-held by every live [`Gate`], write-held by a test that empties the server's script cache
+/// (`SCRIPT FLUSH` is server-wide): a gated test warms the cache and then holds a script call, and a
+/// flush landing in the gap makes that call answer `NOSCRIPT` and run twice.
+pub(super) static SCRIPT_CACHE: RwLock<()> = RwLock::new(());
 
 #[derive(Default)]
 struct Connections {
@@ -49,6 +54,7 @@ impl Drop for Proxy {
 }
 
 pub(super) struct Gate {
+    _script_cache: RwLockReadGuard<'static, ()>,
     pub url: String,
     pub held: Receiver<()>,
     pub release: Sender<()>,
@@ -195,6 +201,7 @@ pub(super) fn gate(
     before: bool,
     trigger: impl Fn(&[u8]) -> bool + Send + Sync + 'static,
 ) -> Gate {
+    let script_cache = SCRIPT_CACHE.read().unwrap_or_else(|e| e.into_inner());
     let (held_tx, held) = channel();
     let (release, release_rx) = channel();
     let release_rx = Mutex::new(release_rx);
@@ -210,6 +217,7 @@ pub(super) fn gate(
     let (b, a) = if before { (hold, nop) } else { (nop, hold) };
     let proxy = proxy(valkey_url, b, a);
     Gate {
+        _script_cache: script_cache,
         url: proxy.url.clone(),
         held,
         release,

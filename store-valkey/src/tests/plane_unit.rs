@@ -25,7 +25,7 @@ fn a_position_field_round_trips_any_identity() {
         let f = field(42, ident);
         assert_eq!(parse_field(&f), Some((42, ident)), "{f}");
     }
-    let child = rec("task_event", "t1", Some("t1"), 3, PlaneDisposition::Active);
+    let child = rec("task_event", "e1", Some("t1"), 3, PlaneDisposition::Active);
     assert_eq!(identity(&child.view()), "t1");
     let top = rec("task", "t9", None, 0, PlaneDisposition::Active);
     assert_eq!(identity(&top.view()), "t9");
@@ -50,6 +50,10 @@ fn the_sidecar_flags_and_determinism() {
     assert!(s.starts_with("1a{"), "{s}");
     let done = rec("task", "t", None, 0, PlaneDisposition::Terminal);
     assert!(sidecar(&done.view()).unwrap().starts_with("0t{"));
+    let fresh = rec("task", "a", None, 0, PlaneDisposition::Active);
+    assert!(sidecar(&fresh.view()).unwrap().starts_with("0a{"));
+    let sealed = rec("call", "s", Some("p"), 1, PlaneDisposition::Terminal);
+    assert!(sidecar(&sealed.view()).unwrap().starts_with("1t{"));
     assert_eq!(sidecar(&child.view()).unwrap(), s);
     let mut moved = child.clone();
     moved.ts += 1;

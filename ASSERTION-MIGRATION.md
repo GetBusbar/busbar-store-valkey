@@ -58,3 +58,21 @@ A production Connector does not expose the concrete TestTls `last_verify_off`/`l
 Source follow-up: the authored TCP pin b896c5e6 exports its macro door through public `linked::MACRO_DOOR`; the bridge uses that path rather than its private `door` module. Verified with `git show b896c5e6:transport-tcp/src/lib.rs`; no build run.
 
 Native authored-pin follow-up: the coordinated lane built the actual library successfully, then reported nine conformance-test compile errors. This source correction imports the Valkey helper names (removing stale SQLite names), preserves the loader-generated raw door in the mismatched row, and explicitly selects synchronous RecordStore calls in the TLS roundtrip. No local compile or runtime execution was performed for this follow-up.
+
+## Private Monday-audit composition
+
+This normal merge composes diet source `2aaf45364242cbd0a7421734e9f83cb3c9eb8373` with exact read-only donor `aa869cf2ead3e4665d0054ec473169532f5b018d` (34 commits from common ancestor `55280f44201dfbb57237ab9f9a89bce04fccde2c`). It changes no SDK/peer/publication/policy pin or lock. No branch was pushed or published and no foreign worktree/ref changed.
+
+Conflicts were resolved as follows:
+
+- `lib.rs`: keep schema 12, metering-attribution/token-expiry migrations, full-width canonical ledger decoding/corrections and inclusive-score delta snapshots; add audit noeviction-before-migration and compare-and-set schema marking by value. Both key and credential deltas retain the baseline WATCH of index plus revision and decoded-u64 filtering, which also preserves the audit snapshot guarantee. Unreadable usage-field refusal is applied to the shared canonical decoder and the public read adds the bucket row context. Credential revocation keeps the stricter baseline row/pointer validation while adding audit pointer/occupant diagnostics. Audit numeric-timeout explanation and malformed-query credential masking remain.
+- `legacy.rs`: use audit checked `ask_nonce` validation together with baseline atomic spent-token migration/TTL preservation; do not restore the older client-side TTL migration.
+- `resp.rs`: keep SDK-sealed authentication and discarded malformed-stream handling; add audit incremental linear measuring, negative-length rejection and backend transaction-exhaustion error. The direct parse helper is test-only as in the audit donor.
+- `slots.rs`/`plane.rs`: retain baseline slots/corrections and add exhaustive Retention match plus named UPSERT_SEQ reads; omit stale donor schema-10 descriptive header.
+- `tests.rs`: retain both appended regression blocks, all stronger baseline assertions and audit assertions. Audit fixture calls now retain the existing Database custody guard. The always-aborting test uses donor database 4 with baseline bounded worker/proxy retirement. The baseline handshake test already explicitly checks database 0 and the selected target, so both assertions remain. Credential metadata checks retain serialized and Debug secret absence plus audit concrete metadata-type check. Audit per-run credential identifiers and hash-probe distinctions remain.
+- `tests/interleave.rs`: retain baseline socket/worker retirement and add audit script-cache read custody; proxy URLs keep the actual baseline Proxy owner.
+- `tests/slots_tests.rs`: keep private Database custody and apply audit SCRIPT FLUSH exclusion, cold-EVALSHA fallback counts and replay assertion; pass the actual proxy URL to the linked-door connection helper.
+- `tests/store_conformance.rs`: retain audit corrected provenance description.
+- `tests/e2e.rs`: retain kit-free real connector and canonical actual-artifact selection/freshness assertion, replace the nested mtime walker with the audit factored walker and its test-only-source regression.
+
+A source inventory found every donor-added function/test name present in the composed sources. Kit/macro Rust-source census is zero. Formatting and diff checks pass. No cargo build/test/clippy or database run was launched in this composition lane. Earlier pre-audit native results do not qualify this merge; the parent native lane must build and exercise this exact composed tree.

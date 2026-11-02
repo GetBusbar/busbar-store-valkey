@@ -2,6 +2,15 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The [`busbar_contract::records::RecordStore`] contract conformance suite, OWNED by this backend.
+//!
+//! PROVENANCE: the `conf` module's body below is BYTE-IDENTICAL to the one in busbar's
+//! `crates/store-memory/tests/store_conformance.rs` as taken from busbar core at rev
+//! 8b7b6473f47f8d37ae60839c74cfe6a9b64a1dc9 — core's reference backend ran the same checks. Core no
+//! longer carries that file at the rev this repo pins (`.busbar-ref`), so it cannot be diffed there. It was
+//! `busbar-plugin-testkit` until the owner ruled that crate deleted (2026-09-22); #2/#31 forbid a
+//! shared test util between plugins, so each backend owns its copy. Only this header and the module's
+//! `pub(super)` (so `src/tests.rs` can call it) are new. The
+//! backend's wiring (namespacing and cleanup against the shared live Valkey) is in `src/tests.rs`.
 
 #[allow(dead_code)]
 pub(super) mod conf {

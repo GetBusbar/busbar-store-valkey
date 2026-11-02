@@ -457,7 +457,7 @@ pub(crate) async fn get(
     id: &str,
 ) -> RecordStoreResult<Option<Vec<u8>>> {
     let keys = Keys::of(kind);
-    with_conn!(store, |c| c.hget(&keys.body, field(0, id)).await)
+    with_conn!(store, |c| c.hget(&keys.body, field(UPSERT_SEQ, id)).await)
 }
 
 /// One chain listing's read: the positions, then each one's sidecar and body (absent if gone).
@@ -494,8 +494,8 @@ pub(crate) async fn list(
                     return Ok((fs, Vec::new(), Vec::new()));
                 }
                 let (sides, bodies): (Vec<Option<String>>, Vec<Option<Vec<u8>>>) =
-                        // Explicit HMGET: redis-rs's `hget` sends a one-element list as a
-                        // scalar HGET, whose reply would not decode as a list.
+                        // Explicit HMGET: `resp::Conn::hget` sends HGET, which takes exactly one
+                        // field; reading a list of fields needs HMGET.
                         pipe()
                             .atomic()
                             .cmd("HMGET")
@@ -796,7 +796,8 @@ pub(crate) async fn token_live(
         return Ok(false);
     }
     let keys = Keys::of(kind);
-    let side: Option<String> = with_conn!(store, |c| c.hget(&keys.rec, field(0, token)).await)?;
+    let side: Option<String> =
+        with_conn!(store, |c| c.hget(&keys.rec, field(UPSERT_SEQ, token)).await)?;
     Ok(side.is_some_and(|s| is_active(&s)))
 }
 

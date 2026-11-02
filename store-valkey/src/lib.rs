@@ -193,7 +193,14 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
     }
     (0..s.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .map(|i| {
+            let pair = s.get(i..i + 2)?;
+            // `from_str_radix` alone would accept a sign (`+a`).
+            if !pair.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            u8::from_str_radix(pair, 16).ok()
+        })
         .collect()
 }
 
@@ -290,7 +297,7 @@ fn url_refused(why: &'static str) -> RedisError {
 fn check_query(url: &url::Url, known: &[&str], has_secret: bool) -> RedisResult<()> {
     match url.query_pairs().find(|(k, _)| !known.contains(&k.as_ref())) {
         None => Ok(()),
-        Some((k, _)) if has_secret || k.contains('@') => Err(url_refused(
+        Some((k, _)) if has_secret || k.contains('@') || query_has_at(url) => Err(url_refused(
             "an unknown URL parameter is not supported (its name is withheld: the URL carries a password)",
         )),
         Some((k, _)) => Err(RedisError::from((
@@ -301,11 +308,20 @@ fn check_query(url: &url::Url, known: &[&str], has_secret: bool) -> RedisResult<
     }
 }
 
+/// The raw query holds an `@`: the sign that a password written unencoded split the userinfo at
+/// `?`, so every name and value in the query may be password text.
+fn query_has_at(url: &url::Url) -> bool {
+    url.query().is_some_and(|q| q.contains('@'))
+}
+
 /// The upstream driver's `protocol=` query check (`2`/`resp2`/`3`/`resp3`). The store speaks
 fn check_protocol(url: &url::Url) -> RedisResult<()> {
     match url.query_pairs().find(|(k, _)| k == "protocol") {
         None => Ok(()),
         Some((_, p)) if matches!(p.as_ref(), "2" | "resp2" | "3" | "resp3") => Ok(()),
+        Some((_, _)) if query_has_at(url) => Err(url_refused(
+            "Invalid protocol version (its value is withheld: the URL may carry a password)",
+        )),
         Some((_, p)) => Err(RedisError::from((
             ErrorKind::InvalidClientConfig,
             "Invalid protocol version",
@@ -559,11 +575,16 @@ impl ValkeyStore {
         &self.inner.pool
     }
 
-    /// `open`'s connect step: the first connection, the schema migration and the noeviction check
+    /// `open`'s connect step: the first connection, the noeviction check and the schema migration
+    /// (its failures are the load's refusal).
     async fn connect_step(&self, wire: Wire) -> RecordStoreResult<()> {
         let mut c = self.conn(wire, None).await?;
-        self.migrate(&mut c).await?;
-        let r = self.assert_noeviction(&mut c).await;
+        // The policy is judged FIRST: a start refused for it must not have rewritten and re-marked
+        // the namespace on a server that can evict what the upgrade just wrote.
+        let r = match self.assert_noeviction(&mut c).await {
+            Ok(()) => self.migrate(&mut c).await,
+            Err(e) => Err(e),
+        };
         c.settle();
         r
     }
@@ -629,16 +650,25 @@ impl ValkeyStore {
                     self.migrate_metering_attribution(c).await?;
                 }
                 self.repair_token_expiries(c).await?;
-                return with_conn!(self, |c| c
-                    .set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION)
-                    .await);
+                match self.mark_schema(c, marker).await? {
+                    None => return Ok(()),
+                    // A peer marked it meanwhile: judge the new marker, never overwrite it.
+                    Some(now) => {
+                        marker = Some(now);
+                        continue;
+                    }
+                }
             }
             let others: Vec<String> =
                 with_conn!(self, |c| c.scan_some("busbar:*", SCHEMA_KEY, 3).await)?;
             if others.is_empty() {
-                return with_conn!(self, |c| c
-                    .set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION)
-                    .await);
+                match self.mark_schema(c, marker).await? {
+                    None => return Ok(()),
+                    Some(now) => {
+                        marker = Some(now);
+                        continue;
+                    }
+                }
             }
             if !rechecked {
                 rechecked = true;
@@ -683,6 +713,34 @@ impl ValkeyStore {
         }
     }
 
+    /// Write the current schema marker if it still is `read` (what this run saw); `None` when
+    /// written, else the marker a peer put there meanwhile (left untouched).
+    async fn mark_schema(&self, c: &mut Conn, read: Option<i64>) -> RecordStoreResult<Option<i64>> {
+        let expected = read.map(|v| v.to_string()).unwrap_or_default();
+        let now: Option<String> = with_conn!(self, |c| SET_SCHEMA_MARKER
+            .key(SCHEMA_KEY)
+            .arg(&expected)
+            .arg(SCHEMA_VERSION)
+            .invoke(c)
+            .await)?;
+        let now = now
+            .map(|v| {
+                v.parse().map_err(|_| {
+                    RecordStoreError(format!("the `{SCHEMA_KEY}` marker is not a number: {v}"))
+                })
+            })
+            .transpose()?;
+        if now.is_some() && now == read {
+            // The swap refused the very marker it was told to expect: judging it again would
+            // re-run every upgrade step forever.
+            return Err(RecordStoreError(format!(
+                "the `{SCHEMA_KEY}` marker could not be rewritten: it still reads {} after an upgrade; refusing to start (re-running the upgrade would not change it). NOTHING further was changed.",
+                read.map(|v| v.to_string()).unwrap_or_default()
+            )));
+        }
+        Ok(now)
+    }
+
     /// THE v9 STEP: delete what the deleted slots kept. The key families go
     async fn drop_dead_slot_keys(&self, c: &mut Conn) -> RecordStoreResult<()> {
         for pattern in [
@@ -718,11 +776,20 @@ impl ValkeyStore {
         self.unlink_all(c, &dead).await
     }
 
+    /// THE v10 STEP: scrub the secret out of every revoked credential row. Walks the
+    /// revision index (`CREDS_BYREV`) and, for each revoked row that still carries secret bytes,
+    /// clears the secret, sets its form to `None` and stamps a fresh revision, so the delta feed
+    /// carries the change. Idempotent (a scrubbed row is skipped, a missing row is skipped), one
+    /// `WATCH`ed transaction per row, so a crash before the marker is written re-runs it and two
+    /// nodes upgrading at once land in the same place. Runs on every upgrade (version below
+    /// `SCHEMA_VERSION`), after the v7 and v9 steps.
     async fn scrub_revoked_credentials(&self, c: &mut Conn) -> RecordStoreResult<()> {
         let members: Vec<String> = with_conn!(self, |c| c.zrange(CREDS_BYREV, 0, -1).await)?;
         for ptr in members {
             let (key_id, kind, slot) = parse_slot_pointer(&ptr).ok_or_else(|| {
-                RecordStoreError("credential upgrade: malformed revision-index pointer".into())
+                RecordStoreError(format!(
+                    "credential upgrade: malformed revision-index pointer `{ptr}` in {CREDS_BYREV}"
+                ))
             })?;
             let row_key = cred_row_key(&key_id, &kind, slot);
             let watched = [row_key.as_str(), REVISION_KEY];
@@ -731,10 +798,15 @@ impl ValkeyStore {
                 let Some(raw) = raw else {
                     return Ok(Some(()));
                 };
-                let mut cred: CredentialSecret = serde_json::from_str(&raw)
-                    .map_err(|_| RedisError::refused("credential upgrade: malformed credential"))?;
+                let mut cred: CredentialSecret = serde_json::from_str(&raw).map_err(|_| {
+                    RedisError::refused(format!(
+                        "credential upgrade: malformed credential at `{row_key}` (pointer `{ptr}`)"
+                    ))
+                })?;
                 if slot_pointer(&cred.meta) != ptr {
-                    return Err(RedisError::refused("credential upgrade: mismatched slot"));
+                    return Err(RedisError::refused(format!(
+                        "credential upgrade: mismatched slot at `{row_key}` (pointer `{ptr}`)"
+                    )));
                 }
                 if cred.meta.revoked_at.is_none()
                     || (cred.secret.is_empty() && cred.meta.secret_form == SecretForm::None)
@@ -922,6 +994,14 @@ fn member(kind: &str, slot: u8) -> String {
     format!("{kind}:{slot}")
 }
 
+/// The refusal for a credential-index member that is not `<kind>:<slot>`.
+fn corrupt_index_member() -> RedisError {
+    RedisError::from((
+        ErrorKind::Client,
+        "delete_key: corrupt credential-index member",
+    ))
+}
+
 /// The inverse of [`member`].
 fn parse_member(m: &str) -> Option<(&str, u8)> {
     let (kind, slot) = m.split_once(':')?;
@@ -1044,7 +1124,9 @@ fn usage_from_fields(fields: Vec<(String, String)>) -> RecordStoreResult<UsageLe
             continue;
         }
         let Some((model, unit)) = parse_usage_field(&name) else {
-            continue;
+            return Err(RecordStoreError(format!(
+                "unreadable usage field {name}; refusing to report a partial ledger"
+            )));
         };
         let entry = match ledger.models.iter_mut().find(|m| m.model == model) {
             Some(m) => m,
@@ -1112,6 +1194,26 @@ fn metering_from_fields(fields: Vec<(String, String)>) -> RecordStoreResult<Mete
     }
     Ok(m)
 }
+
+/// Mark the schema: `KEYS[1]` = the marker, `ARGV[1]` = the version this run read (empty for none),
+/// `ARGV[2]` = the version to write. Written only if the marker still is what this run read; else
+/// nothing is written and the marker now there is returned, so a newer build's mark is never
+/// overwritten.
+static SET_SCHEMA_MARKER: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
+    Script::new(
+        r"
+        local cur = redis.call('GET', KEYS[1])
+        -- Compared by value too: a restored marker may be spelled `06` or `+6`, which the
+        -- caller read as 6 and expects to match.
+        local n = cur and tonumber(cur)
+        if (not cur and ARGV[1] == '') or cur == ARGV[1]
+            or (n and n == tonumber(ARGV[1])) then
+            redis.call('SET', KEYS[1], ARGV[2])
+            return false
+        end
+        return cur",
+    )
+});
 
 /// The base op set's bodies, each over the op's one connection `c` (the store door, `slots`, runs
 impl ValkeyStore {
@@ -1265,11 +1367,16 @@ impl ValkeyStore {
 
         with_conn!(self, |c| loop {
             let members: Vec<String> = c.smembers(&ids_key).await?;
+            // An index member that does not parse names a slot we cannot find: refuse, rather than
+            // delete the index and strand that slot's row and pointers behind a success.
             let row_keys: Vec<String> = members
                 .iter()
-                .filter_map(|m| parse_member(m))
-                .map(|(kind, slot)| cred_row_key(id, kind, slot))
-                .collect();
+                .map(|m| {
+                    parse_member(m)
+                        .map(|(kind, slot)| cred_row_key(id, kind, slot))
+                        .ok_or_else(corrupt_index_member)
+                })
+                .collect::<Result<_, _>>()?;
             let mut watch_keys: Vec<&str> = vec![key_row.as_str(), ids_key.as_str(), REVISION_KEY];
             watch_keys.extend(row_keys.iter().map(String::as_str));
 
@@ -1310,9 +1417,7 @@ impl ValkeyStore {
                 // Destroy every credential row and its pointers (a consumer evicts off the key's
                 // own tombstone delta).
                 for m in &members {
-                    let Some((kind, slot)) = parse_member(m) else {
-                        continue;
-                    };
+                    let (kind, slot) = parse_member(m).ok_or_else(corrupt_index_member)?;
                     let row_key = cred_row_key(id, kind, slot);
                     // A row that does not decode aborts the cascade: skipping it would leave its
                     // pointers dangling behind a reported success.
@@ -1351,7 +1456,7 @@ impl ValkeyStore {
     ) -> RecordStoreResult<UsageLedger> {
         let k = usage_key(bucket_id, window_start);
         let fields: Vec<(String, String)> = with_conn!(self, |c| c.hgetall(&k).await)?;
-        usage_from_fields(fields)
+        usage_from_fields(fields).map_err(|e| RecordStoreError(format!("usage row {k}: {e}")))
     }
 
     pub(crate) async fn purge_usage_before(
@@ -1693,14 +1798,15 @@ impl ValkeyStore {
                 let raw: Option<String> = c.get(&row_key).await?;
                 let Some(raw) = raw else {
                     return Err(RedisError::refused(format!(
-                        "revoke_credential: credential row '{row_key}' is missing"
+                        "revoke_credential: busbar:cred:id:{id} -> {ptr} names no credential row (dangling pointer); nothing was revoked"
                     )));
                 };
                 let mut cred = cred_from_json("revoke_credential", &row_key, &raw)
                     .map_err(|e| RedisError::refused(e.0))?;
                 if cred.meta.id != id || slot_pointer(&cred.meta) != ptr {
                     return Err(RedisError::refused(format!(
-                        "revoke_credential: credential row '{row_key}' does not match its id pointer"
+                        "revoke_credential: stale pointer busbar:cred:id:{id} -> {ptr} holds credential '{}'; nothing was revoked",
+                        cred.meta.id
                     )));
                 }
                 if cred.meta.revoked_at.is_some() {
@@ -1931,10 +2037,15 @@ impl ValkeyStore {
             Some(x) => match x.as_u64().filter(|ms| *ms > 0) {
                 Some(ms) => Duration::from_millis(ms),
                 None => {
+                    // A number is not secret: echo it, so `0` or `2.5` does not read as a type error.
+                    let got = match x {
+                        serde_json::Value::Number(n) => n.to_string(),
+                        other => json_type(other).to_string(),
+                    };
                     return Err(format!(
-                    "{BAD}: `connect_timeout_ms` must be a positive integer (milliseconds), got {}",
-                    json_type(&x)
-                ))
+                        "{BAD}: `connect_timeout_ms` must be a positive integer (milliseconds), \
+                         got {got}"
+                    ));
                 }
             },
         };

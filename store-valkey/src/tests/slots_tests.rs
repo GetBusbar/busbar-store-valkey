@@ -829,6 +829,45 @@ fn an_older_builds_recorded_body_replays_and_a_different_op_conflicts() {
     );
 }
 
+/// `SCRIPT FLUSH` empties the script cache of the whole server, so it must not land under a gated
+/// test that warmed the cache first and holds a script call across the gap.
+fn flush_scripts() {
+    let _alone = super::interleave::SCRIPT_CACHE
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut raw = redis::Client::open(std::env::var("VALKEY_URL").expect("live_store read it"))
+        .and_then(|c| c.get_connection())
+        .expect("an independent client");
+    redis::cmd("SCRIPT")
+        .arg("FLUSH")
+        .query::<()>(&mut raw)
+        .expect("SCRIPT FLUSH");
+}
+
+/// A live gate keeps the script cache: the flush waits until the gated test is done.
+#[test]
+fn a_script_flush_waits_for_a_live_gate() {
+    let Some(_) = live_store() else { return };
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let gate = super::interleave::gate(&url, false, |_| false);
+    let (done, flushed) = std::sync::mpsc::channel();
+    let flusher = std::thread::spawn(move || {
+        flush_scripts();
+        done.send(()).unwrap();
+    });
+    assert!(
+        flushed
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .is_err(),
+        "SCRIPT FLUSH ran while a gated test was live"
+    );
+    drop(gate);
+    flushed
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the flush runs once the gate is gone");
+    flusher.join().unwrap();
+}
+
 /// An `op_id` write still runs, once, when the server's script cache lost its script.
 #[test]
 fn an_op_id_write_runs_after_the_script_cache_is_flushed() {
@@ -844,17 +883,41 @@ fn an_op_id_write_runs_after_the_script_cache_is_flushed() {
         },
     )];
     s.add_usage_batch(op(94), &cells).expect("applies");
-    let mut raw = redis::Client::open(std::env::var("VALKEY_URL").expect("live_store read it"))
-        .and_then(|c| c.get_connection())
-        .expect("an independent client");
-    redis::cmd("SCRIPT")
-        .arg("FLUSH")
-        .query::<()>(&mut raw)
-        .expect("SCRIPT FLUSH");
+    // The flush lands on the proxy's thread right before the first `EVALSHA` chunk is forwarded,
+    // so the cache is cold for exactly that call (a parallel test cannot re-warm it in between),
+    // and the `EVAL` fallback is counted on the wire.
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let flushed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let evals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (f, e) = (flushed.clone(), evals.clone());
+    let proxied = super::interleave::tamper(
+        &url,
+        move |c| {
+            let has = |t: &[u8]| super::interleave::contains(c, t);
+            if has(b"$4\r\nEVAL\r\n") {
+                e.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            has(b"EVALSHA") && !f.swap(true, std::sync::atomic::Ordering::SeqCst)
+        },
+        flush_scripts,
+    );
+    let via =
+        <super::LoadedStore as Connect>::connect(&proxied.url).expect("connect through the proxy");
     let id = op(95);
-    s.add_usage_batch(id, &cells)
+    via.add_usage_batch(id, &cells)
         .expect("applies after the flush");
-    s.add_usage_batch(id, &cells).expect("replays");
+    assert!(flushed.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        evals.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the cold cache must send exactly one EVAL fallback"
+    );
+    via.add_usage_batch(id, &cells).expect("replays");
+    assert_eq!(
+        evals.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the replay is a plain EVALSHA"
+    );
     assert_eq!(s.get_usage(&bucket, 0).unwrap().requests, 2);
 }
 
@@ -1130,6 +1193,12 @@ fn a_purge_larger_than_one_batch_counts_and_removes_exactly_the_terminal_rows() 
         s.upsert_plane_record(rec(i, cutoff - 1, PlaneDisposition::Terminal).view())
             .unwrap();
     }
+    // Rows stamped EXACTLY at `before` (10) are not strictly older: the purge bound is exclusive,
+    // so neither retention mode may touch them.
+    s.upsert_plane_record(rec(2400, 10, PlaneDisposition::Terminal).view())
+        .unwrap();
+    s.upsert_plane_record(rec(2401, 10, PlaneDisposition::Active).view())
+        .unwrap();
     let n = s
         .purge_plane_records(
             &kind,
@@ -1145,7 +1214,7 @@ fn a_purge_larger_than_one_batch_counts_and_removes_exactly_the_terminal_rows() 
     let n = s
         .purge_plane_records(&kind, cutoff + 1, busbar_contract::records::Retention::Age)
         .unwrap();
-    assert_eq!(n, 0);
+    assert_eq!(n, 0, "rows at ts == before must survive the purge");
 }
 
 #[test]
