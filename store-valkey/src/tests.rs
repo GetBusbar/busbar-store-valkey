@@ -1191,56 +1191,58 @@ fn delete_key_fails_loud_on_a_corrupt_credential_row_instead_of_orphaning_pointe
 #[test]
 fn metering_round_trips_all_fields_including_renamed_and_new_ones() {
     let Some(store) = live_store() else { return };
-    let key_id = uid("vk_m");
-    let bucket = unique_bucket(20260731);
-    store
-        .add_metering(&MeteringDelta {
-            key_id: key_id.clone(),
-            bucket,
-            model: "claude".to_string(),
-            provider: "anthropic".to_string(),
-            tokens_input: 10,
-            tokens_output: 5,
-            tokens_cache_read: 2,
-            tokens_cache_write: 3,
-            requests: 1,
-            billable_requests: 1,
-            key_group_at_use: "growth".to_string(),
-            pricing_version: "2026-07".to_string(),
-            priced_from_ms: 1_780_000_000_123,
-            usage_units: std::collections::BTreeMap::from([("audio_seconds".into(), 7)]),
-        })
-        .unwrap();
-    let rows = store.list_metering(bucket).unwrap();
-    assert_eq!(rows.len(), 1);
-    let r = &rows[0];
-    assert_eq!(r.key_id, key_id);
-    assert_eq!(r.model, "claude");
-    assert_eq!(r.provider, "anthropic");
-    assert_eq!(r.tokens_input, 10);
-    assert_eq!(r.tokens_output, 5);
-    assert_eq!(r.tokens_cache_read, 2);
-    assert_eq!(r.requests, 1);
-    assert_eq!(r.priced_from_ms, 1_780_000_000_123);
-    assert_eq!(
-        r.usage_units,
-        std::collections::BTreeMap::from([("audio_seconds".into(), 7)])
-    );
-    assert_eq!(
-        r.tokens_cache_write, 3,
-        "renamed from tokens_cache_creation"
-    );
-    assert_eq!(r.billable_requests, 1);
-    assert_eq!(r.key_group_at_use, "growth");
-    assert_eq!(r.pricing_version, "2026-07");
-    assert_eq!(r.key_id, key_id);
-    assert_eq!(r.model, "claude");
-    assert_eq!(r.provider, "anthropic");
-    assert_eq!(r.tokens_input, 10);
-    assert_eq!(r.tokens_output, 5);
-    assert_eq!(r.tokens_cache_read, 2);
-    assert_eq!(r.requests, 1);
-    assert_eq!(r.priced_from_ms, 1_780_000_000_123);
+    for priced_from_ms in [0, 1_780_000_000_123] {
+        let key_id = uid("vk_m");
+        let bucket = unique_bucket(20260731);
+        store
+            .add_metering(&MeteringDelta {
+                key_id: key_id.clone(),
+                bucket,
+                model: "claude".to_string(),
+                provider: "anthropic".to_string(),
+                tokens_input: 10,
+                tokens_output: 5,
+                tokens_cache_read: 2,
+                tokens_cache_write: 3,
+                requests: 1,
+                billable_requests: 1,
+                key_group_at_use: "growth".to_string(),
+                pricing_version: "2026-07".to_string(),
+                priced_from_ms,
+                usage_units: std::collections::BTreeMap::from([("audio_seconds".into(), 7)]),
+            })
+            .unwrap();
+        let rows = store.list_metering(bucket).unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.key_id, key_id);
+        assert_eq!(r.model, "claude");
+        assert_eq!(r.provider, "anthropic");
+        assert_eq!(r.tokens_input, 10);
+        assert_eq!(r.tokens_output, 5);
+        assert_eq!(r.tokens_cache_read, 2);
+        assert_eq!(r.requests, 1);
+        assert_eq!(r.priced_from_ms, priced_from_ms);
+        assert_eq!(
+            r.usage_units,
+            std::collections::BTreeMap::from([("audio_seconds".into(), 7)])
+        );
+        assert_eq!(
+            r.tokens_cache_write, 3,
+            "renamed from tokens_cache_creation"
+        );
+        assert_eq!(r.billable_requests, 1);
+        assert_eq!(r.key_group_at_use, "growth");
+        assert_eq!(r.pricing_version, "2026-07");
+        assert_eq!(r.key_id, key_id);
+        assert_eq!(r.model, "claude");
+        assert_eq!(r.provider, "anthropic");
+        assert_eq!(r.tokens_input, 10);
+        assert_eq!(r.tokens_output, 5);
+        assert_eq!(r.tokens_cache_read, 2);
+        assert_eq!(r.requests, 1);
+        assert_eq!(r.priced_from_ms, priced_from_ms);
+    }
 }
 
 #[test]
