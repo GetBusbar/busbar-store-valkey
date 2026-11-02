@@ -1671,7 +1671,7 @@ fn v10_metering_migration_preserves_raw_rows_and_replays() {
         ])
         .query(&mut r)
         .unwrap();
-    let _: () = r.sadd(&set, [&old, &unknown]).unwrap();
+    let _: () = r.sadd(&set, &[&old, &unknown]).unwrap();
     let _: () = r.set("busbar:schema", 10).unwrap();
     iso.restart();
     iso.restart();

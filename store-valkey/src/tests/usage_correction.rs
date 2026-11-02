@@ -8,7 +8,7 @@ use busbar_contract::abi::sdk::store::{correction, dedupe::Dedupe};
 use busbar_contract::records::{
     MeteringDelta, MeteringRow, ModelTokens, ModelTokensDelta, UsageLedger, UNIT_INPUT,
 };
-use busbar_contract::store_calls::StoreCalls;
+use busbar_contract::store_calls;
 use correction::{Decision, Request, UsageAddress, UsageChange};
 use redis::Commands;
 use std::sync::atomic::Ordering;
@@ -33,7 +33,7 @@ fn setup() -> Option<(database::Database, redis::Connection, ValkeyStore, String
     let (database, raw) = fresh_db_client(PRIVATE_DATABASE);
     let url = url_for_db(PRIVATE_DATABASE);
     let store = ValkeyStore::connect(&url).unwrap();
-    assert!(StoreCalls::supports_usage_correction(&store));
+    assert!(store_calls::StoreCalls::supports_usage_correction(&store));
     Some((database, raw, store, url))
 }
 
@@ -96,7 +96,9 @@ fn candidate(store: &ValkeyStore) -> Request {
 }
 
 fn apply(store: &ValkeyStore, request: &Request) -> OpResult<Decision> {
-    call(StoreCalls::apply_usage_correction(store, request))
+    call(store_calls::StoreCalls::apply_usage_correction(
+        store, request,
+    ))
 }
 fn op_receipt(id: OpId) -> String {
     format!("busbar:op:{}", crate::hex(&id.0))
@@ -634,7 +636,8 @@ fn pending_cancellation_and_instance_destruction_before_exec_leave_no_effect_or_
     let slow_request = request.clone();
     let worker = gate.spawn(move || {
         block(async {
-            let mut operation = StoreCalls::apply_usage_correction(&slow, &slow_request);
+            let mut operation =
+                store_calls::StoreCalls::apply_usage_correction(&slow, &slow_request);
             std::future::poll_fn(|cx| {
                 *wake_worker.lock().unwrap() = Some(cx.waker().clone());
                 if cancel_worker.load(Ordering::SeqCst) {

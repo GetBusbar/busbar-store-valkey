@@ -59,7 +59,7 @@ fn receipt(request: &Request) -> String {
 fn read(store: &ValkeyStore, schema: &str, key: &[u8]) -> Option<Vec<u8>> {
     Slots::record_get(store, schema, key)
         .unwrap()
-        .map(|value| value.as_ref().to_vec())
+        .map(|value| value.as_slice().to_vec())
 }
 
 #[test]
@@ -473,7 +473,7 @@ fn ordinary_scan_sees_only_complete_prestate_or_complete_committed_batch() {
         Slots::record_scan(&reader, &schema, b"", 10)
             .unwrap()
             .into_iter()
-            .map(|(_, value)| value.as_ref().to_vec())
+            .map(|(_, value)| value.as_slice().to_vec())
             .collect::<Vec<_>>()
     };
     assert_eq!(values(), [b"old".to_vec(), b"old".to_vec()]);
