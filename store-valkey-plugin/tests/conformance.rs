@@ -816,7 +816,7 @@ fn a_statement_with_trailing_bytes_is_refused_as_malformed() {
         Err(error) => error,
     };
     match error {
-        LoadError::Rendering(why) => assert_eq!(why, format!("byte {end} is not end")),
+        LoadError::Rendering(why) => assert_eq!(why, format!("byte {end} is not the end")),
         other => panic!("expected a malformed Statement refusal, got {other}"),
     }
 }
