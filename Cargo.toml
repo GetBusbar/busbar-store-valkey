@@ -42,7 +42,7 @@ busbar-test-kit = { git = "https://github.com/GetBusbar/busbar", rev = "3d276cb2
 # rendered because the declares file states network needs): busbar's connector and its TLS
 # test kit at the pin, and the transport framers those needs name, at the revs busbar links.
 busbar-core-connector = { git = "https://github.com/GetBusbar/busbar", rev = "3d276cb2ae056f40ccbfaddcdddc4b249613fdf7", features = ["test-support"] }
-busbar-transport-tcp = { git = "https://github.com/GetBusbar/busbar-transport-tcp", rev = "de7af6404e1e281841c39a01d48fd2b405e2f1bc" }
+busbar-transport-tcp = { git = "https://github.com/GetBusbar/busbar-transport-tcp", rev = "33fffc07693523b5ce091076cf91ebb8599f602f" }
 # busbar's root [workspace.dependencies], third-party rows, at 3d276cb2ae056f40ccbfaddcdddc4b249613fdf7
 arc-swap = "1"
 async-trait = "0.1"
