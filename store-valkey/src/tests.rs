@@ -6282,3 +6282,17 @@ fn an_upgrade_marked_by_a_newer_build_meanwhile_is_not_downgraded() {
             .unwrap();
     });
 }
+
+/// A transaction that gives up under contention is a backend failure: it reaches the host with the
+/// `valkey <ctx>:` prefix, not as a bare store refusal.
+#[test]
+fn an_exhausted_transaction_is_reported_as_a_backend_failure() {
+    let store = crate::ValkeyStore::from_settings(br#"{"url":"redis://127.0.0.1:6379/0"}"#)
+        .expect("settings parse");
+    let e = crate::resp::RedisError::transaction_exhausted(crate::resp::MAX_TRANSACTION_ATTEMPTS);
+    assert!(!e.is_refusal(), "not a store refusal");
+    let text = store.err(e, "command").0;
+    assert!(text.starts_with("valkey command: "), "{text}");
+    assert!(text.contains("aborted"), "{text}");
+    assert!(text.contains("64"), "{text}");
+}

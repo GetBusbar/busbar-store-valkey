@@ -1096,6 +1096,18 @@ pub fn rr<T, F: Future<Output = RedisResult<T>>>(f: F) -> F {
 /// The most times a `transaction!` reruns its body after an abort before it gives up.
 pub const MAX_TRANSACTION_ATTEMPTS: usize = 64;
 
+impl RedisError {
+    /// A `transaction!` that gave up after `aborts` aborted attempts.
+    #[must_use]
+    pub fn transaction_exhausted(aborts: usize) -> Self {
+        Self::from((
+            ErrorKind::Client,
+            "transaction aborted by concurrent writers; giving up",
+            format!("aborted {aborts} times"),
+        ))
+    }
+}
+
 /// The optimistic transaction, as the upstream driver's `transaction`: `WATCH` the keys, run the
 /// body (it reads, and queues its writes on the atomic pipeline it is handed, then answers that
 /// pipeline's `query`: `None` when a watched key changed and `EXEC` aborted), and run it all again
@@ -1132,10 +1144,7 @@ macro_rules! transaction {
                             if $c.watching() {
                                 let _ = $crate::resp::cmd("UNWATCH").exec(&mut *$c).await;
                             }
-                            break Err($crate::resp::RedisError::refused(format!(
-                                "the transaction was aborted {__aborts} times by concurrent \
-                                 writers; giving up"
-                            )));
+                            break Err($crate::resp::RedisError::transaction_exhausted(__aborts));
                         }
                         continue;
                     }
