@@ -57,7 +57,6 @@ fn call<T, E: FromFailure>(
 }
 
 /// The store v3 slots these tests drive, through the store's async calls (`StoreCalls`, named by
-
 trait Slots {
     fn add_usage_batch(&self, op: OpId, cells: &[(&str, u64, UsageDelta)]) -> OpResult<()>;
     fn add_metering_batch(
@@ -185,7 +184,6 @@ fn open_refuses_settings_it_cannot_run_in_its_own_words() {
 }
 
 /// S1/S2/S3/S4: a replay applies nothing and answers the original, a different body is a conflict
-
 #[test]
 fn an_op_id_write_applies_once_durably_and_a_different_body_conflicts() {
     let Some(s) = live_store() else { return };
@@ -267,7 +265,6 @@ fn a_usage_and_a_metering_batch_apply_once() {
 }
 
 /// A store over a DATABASE of its own (`VALKEY_URL` re-pointed at `db`, emptied first and on drop):
-
 struct Iso {
     url: String,
     store: Option<ValkeyStore>,
@@ -315,7 +312,6 @@ impl Drop for Iso {
 use redis::Commands as _;
 
 /// S2 for the batch slots: the same `op_id` with a DIFFERENT body answers `Conflict` and
-
 #[test]
 fn the_same_op_id_with_a_different_body_conflicts_on_every_batch_slot() {
     let Some(s) = live_store() else { return };
@@ -398,7 +394,6 @@ fn records_upsert_read_back_and_scan_a_prefix_in_key_order() {
 }
 
 /// An empty put removes the stored row.
-
 #[test]
 fn an_empty_put_removes_the_row() {
     let Some(s) = live_store() else { return };
@@ -745,7 +740,6 @@ fn a_plane_replacement_validates_old_and_new_links_before_unlinking() {
 }
 
 /// A body an older build recorded (`<slot>:<values {:?}>`) still dedupes after the upgrade: the
-
 #[test]
 fn an_older_builds_recorded_body_replays_and_a_different_op_conflicts() {
     let Some(s) = live_store() else { return };
@@ -865,7 +859,6 @@ fn an_op_id_write_runs_after_the_script_cache_is_flushed() {
 }
 
 /// The v8 -> v9 step: every key the deleted slots kept (the money keys, the journal, the sessions)
-
 #[test]
 fn the_v9_upgrade_drops_the_money_and_dead_slot_keys() {
     let Some(mut iso) = Iso::new(8) else { return };
@@ -1014,7 +1007,6 @@ fn a_metering_counter_at_i64_max_pins_instead_of_failing() {
 }
 
 /// A cell the batch cannot add to refuses the WHOLE batch: no other cell applies and the op is not
-
 #[test]
 fn a_batch_with_an_unusable_cell_applies_nothing_and_records_nothing() {
     let Some(s) = live_store() else { return };
@@ -1091,7 +1083,6 @@ fn a_metering_batch_with_a_wrong_typed_row_applies_nothing() {
 }
 
 /// The v9 step keeps an op record whose body is a kept slot's digest (32 bytes, or 64 lowercase hex):
-
 #[test]
 fn the_v9_upgrade_keeps_digest_bodied_op_records() {
     let Some(mut iso) = Iso::new(9) else { return };
@@ -1117,7 +1108,6 @@ fn the_v9_upgrade_keeps_digest_bodied_op_records() {
 }
 
 /// A terminal-only purge over more records than one script call handles: every terminal row goes,
-
 #[test]
 fn a_purge_larger_than_one_batch_counts_and_removes_exactly_the_terminal_rows() {
     let Some(s) = live_store() else { return };
@@ -1299,7 +1289,6 @@ fn plane_retention_uses_exact_timestamps_and_cleans_every_index() {
 }
 
 /// The v6 -> v7 copy never deletes a v6 task-event chain whose position holds a DIFFERENT record
-
 #[test]
 fn the_v6_copy_keeps_an_event_chain_whose_position_forked() {
     use crate::legacy::TASK_EVENTS_PREFIX;
@@ -1339,7 +1328,6 @@ fn the_v6_copy_keeps_an_event_chain_whose_position_forked() {
 }
 
 /// A page is read at ONE instant: a strike landing while the scan is in flight cannot shorten it.
-
 #[test]
 fn a_record_scan_page_is_not_shortened_by_a_concurrent_strike() {
     let Some(direct) = live_store() else { return };
@@ -1367,7 +1355,6 @@ fn a_record_scan_page_is_not_shortened_by_a_concurrent_strike() {
 }
 
 /// The contract upserts by `(kind, id)` and reads at seq 0: a second upsert of an id with another
-
 #[test]
 fn an_upsert_replaces_by_id_whatever_its_seq() {
     let Some(s) = live_store() else { return };
@@ -1394,7 +1381,6 @@ fn an_upsert_replaces_by_id_whatever_its_seq() {
 }
 
 /// A reply that does not fit is refused by naming where and what was expected, never by echoing the
-
 #[test]
 fn a_malformed_stored_value_is_not_echoed_into_the_error() {
     let Some(s) = live_store() else { return };
@@ -1418,7 +1404,6 @@ fn a_malformed_stored_value_is_not_echoed_into_the_error() {
 }
 
 /// A fork-refused append records nothing under its op id: the same op id retried with a record that
-
 #[test]
 fn a_fork_refused_append_records_nothing_under_its_op_id() {
     let Some(s) = live_store() else { return };

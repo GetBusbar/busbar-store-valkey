@@ -24,7 +24,6 @@ use busbar_plugin_loader::store_v3::LoadedStore;
 use busbar_test_kit::tcp_conns::TcpConns;
 
 /// THE STORE UNDER TEST is the store as the host opens it: its door through the loader
-
 pub(crate) type ValkeyStore = LoadedStore;
 
 /// One dispatcher and one connection table for every store the tests open (the host has one each).
@@ -45,7 +44,6 @@ fn host() -> &'static (
 }
 
 /// The node's `op_id` allocator for the bridge's writes: a node half no earlier run used (the
-
 fn mint() -> OpId {
     static NODE: OnceLock<u64> = OnceLock::new();
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -92,7 +90,6 @@ impl Connect for LoadedStore {
 }
 
 /// The verify path's read, which is no longer a store op: a credential's secret by `(kind,
-
 trait Lookup {
     fn lookup_credential_secret(
         &self,
@@ -115,7 +112,6 @@ impl Lookup for LoadedStore {
 }
 
 /// The tests' INDEPENDENT view of the live Valkey (the upstream client, never the store's own
-
 pub(crate) trait Raw {
     fn with_conn<T>(
         &self,
@@ -151,7 +147,6 @@ pub(crate) trait Raw {
     }
 
     /// Put an audit row at its `seq`, as a 1.5.5 build wrote it: no store op appends one any more
-
     fn seed_audit_for_test(&self, r: &AuditRecord) -> RecordStoreResult<()> {
         let json = serde_json::to_string(r).expect("an audit row encodes");
         let score = clamp(r.seq);
@@ -274,7 +269,6 @@ fn valkeys_scheme_selects_tls_and_takes_insecure() {
 }
 
 /// The URL reads as the upstream driver read it: user, percent-decoded password, port, database,
-
 #[test]
 fn urls_parse_as_the_upstream_driver_read_them() {
     let t = parse_url("redis://alice:p%40ss@db.internal:7000/3").unwrap();
@@ -318,7 +312,6 @@ fn urls_parse_as_the_upstream_driver_read_them() {
 }
 
 /// The unix-socket URLs 1.5.5's driver read (VALKEY-UNIX): the path is the connector's
-
 #[test]
 fn unix_socket_urls_parse_as_the_upstream_driver_read_them() {
     for url in [
@@ -353,7 +346,6 @@ fn row_escaping_quotes_the_separator_and_itself() {
 }
 
 /// End-to-end against a REAL Valkey, gated on `VALKEY_URL` (a docker service in CI). Skips
-
 pub(crate) fn live_store() -> Option<ValkeyStore> {
     let url = match std::env::var("VALKEY_URL") {
         Ok(url) => url,
@@ -416,7 +408,6 @@ fn cred(key_id: &str, public_id: &str, slot: u8) -> CredentialSecret {
 }
 
 /// Per-invocation-unique identifier for tests whose fixture touches a uniqueness constraint
-
 fn unique_suffix() -> u64 {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static RUN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -432,7 +423,6 @@ fn unique_suffix() -> u64 {
 }
 
 /// Ids one run may mint; a suffix is `run_salt * RUN_SPAN + n`, below `1e9`, so `unique_bucket`'s
-
 const RUN_SPAN: u64 = 1_000;
 
 /// A run's salt, below `1_000_000`: the pid and the start time folded together.
@@ -455,7 +445,6 @@ fn uid(base: &str) -> String {
 }
 
 /// Like `uid`, but for the `bucket: u64` metering fields -- a distinct numeric bucket per call,
-
 fn unique_bucket(base: u64) -> u64 {
     base * 1_000_000_000 + unique_suffix()
 }
@@ -488,7 +477,6 @@ fn list_keys_since_only_returns_keys_past_the_watermark() {
 }
 
 /// A row at revision 0 (never stamped) is returned by every delta, and `since = 0` returns every
-
 #[test]
 fn a_revision_zero_row_is_in_every_delta() {
     let Some(store) = live_store() else { return };
@@ -584,7 +572,6 @@ fn delete_key_is_idempotent_once_tombstoned() {
 }
 
 /// HARDEST INVARIANT #1: delete_key destroys the credential's SECRET material, not just the
-
 #[test]
 fn delete_key_destroys_credential_secret_material() {
     let Some(store) = live_store() else { return };
@@ -623,7 +610,6 @@ fn delete_key_destroys_credential_secret_material() {
 }
 
 /// HARDEST INVARIANT #2: the credential-id and public_id reverse-lookup pointers are cleaned up
-
 #[test]
 fn delete_key_cleans_up_reverse_lookup_pointers() {
     let Some(store) = live_store() else { return };
@@ -678,7 +664,6 @@ fn delete_key_keeps_the_usage_ledger() {
 }
 
 /// `delete_key` touches no usage window of any key, however the id is spelled (it once swept
-
 #[test]
 fn delete_key_leaves_every_usage_window_alone() {
     let Some(store) = live_store() else { return };
@@ -860,7 +845,6 @@ fn a_revoked_credential_id_is_never_re_minted() {
 }
 
 /// `put_key_with_credential` refuses up front and writes nothing: a key that carries a tombstone,
-
 #[test]
 fn put_key_with_credential_refuses_up_front_and_writes_nothing() {
     let Some(store) = live_store() else { return };
@@ -928,7 +912,6 @@ fn put_credential_owner_refusals_read_as_the_family_writes_them() {
 }
 
 /// A credential id is unique across slots: re-putting an existing id into another slot is refused
-
 #[test]
 fn a_credential_id_cannot_be_put_into_a_second_slot() {
     let Some(store) = live_store() else { return };
@@ -1033,7 +1016,6 @@ fn list_credentials_since_carries_the_secret_for_hydration() {
 }
 
 /// `put_key_with_credential` writes the key and its credential together (the atomic-failure side
-
 #[test]
 fn put_key_with_credential_writes_the_key_and_its_credential() {
     let Some(store) = live_store() else { return };
@@ -1050,7 +1032,6 @@ fn put_key_with_credential_writes_the_key_and_its_credential() {
 }
 
 /// `with_conn` (used by `put_credential`) is documented "Safe only for READ / idempotent ops," but
-
 #[test]
 fn put_credential_replayed_with_the_same_credential_id_is_a_retry_safe_no_op() {
     let Some(store) = live_store() else { return };
@@ -1096,7 +1077,6 @@ fn put_key_with_credential_replayed_with_the_same_credential_id_is_a_retry_safe_
 }
 
 /// A credential row that does not decode fails the whole `delete_key`, leaving the key live and
-
 #[test]
 fn delete_key_fails_loud_on_a_corrupt_credential_row_instead_of_orphaning_pointers() {
     let Some(store) = live_store() else { return };
@@ -1287,7 +1267,6 @@ fn metering_row_identity_does_not_collide_across_a_delimiter_character() {
 }
 
 /// HARDEST INVARIANT #4: `connect()` refuses to start when `maxmemory-policy` is not
-
 #[test]
 #[ignore]
 fn connect_refuses_to_start_under_an_eviction_policy() {
@@ -1325,7 +1304,6 @@ fn connect_refuses_to_start_under_an_eviction_policy() {
 }
 
 /// Pins the `version >= SCHEMA_VERSION` early return against inversion: a second
-
 #[test]
 fn reconnecting_to_an_already_migrated_namespace_does_not_wipe_existing_data() {
     let Some(store1) = live_store() else { return };
@@ -1344,7 +1322,6 @@ fn reconnecting_to_an_already_migrated_namespace_does_not_wipe_existing_data() {
 }
 
 /// A deterministic NON-connection error (`WRONGTYPE`: a usage window that is not a hash) surfaces
-
 #[test]
 fn a_server_error_surfaces_through_the_op_in_the_stores_words() {
     let Some(store) = live_store() else { return };
@@ -1389,17 +1366,14 @@ fn a_repeat_denylist_add_keeps_the_first_reason() {
 }
 
 /// Serialises the tests that write the shared audit zset: `busbar:audit` is one global set keyed by
-
 pub(crate) static AUDIT_SEQ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Take `AUDIT_SEQ_LOCK`, ignoring poisoning, so one failing audit test does not convert the others
-
 pub(crate) fn audit_seq_guard() -> std::sync::MutexGuard<'static, ()> {
     AUDIT_SEQ_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// `VALKEY_URL` re-pointed at database `db`, so a refusal test owns a whole namespace and never
-
 pub(crate) fn url_for_db(db: u32) -> String {
     let url = std::env::var("VALKEY_URL").unwrap();
     let base = url.split('?').next().unwrap();
@@ -1428,7 +1402,6 @@ fn db_of_url(url: &str) -> u32 {
 }
 
 /// Refuse to flush `db` when it is the database `VALKEY_URL` itself selects (the shared one every
-
 fn assert_private_db(db: u32) {
     let shared = db_of_url(&std::env::var("VALKEY_URL").unwrap());
     assert_ne!(
@@ -1467,7 +1440,6 @@ pub(crate) fn fresh_db_client(db: u32) -> (database::Database, redis::Connection
 }
 
 /// A namespace marked NEWER than this build is REFUSED at open, and left as found: an older build
-
 #[test]
 fn a_namespace_newer_than_this_build_is_refused() {
     let Some(_) = live_store() else { return };
@@ -1497,7 +1469,6 @@ fn a_namespace_newer_than_this_build_is_refused() {
 }
 
 /// A namespace marked OLDER than v6 is REFUSED, never wiped: `migrate()` has no in-place path for
-
 #[test]
 #[ignore]
 fn a_pre_v6_namespace_is_refused_not_wiped_and_keeps_refund_shaped_data() {
@@ -1541,7 +1512,6 @@ fn a_pre_v6_namespace_is_refused_not_wiped_and_keeps_refund_shaped_data() {
 }
 
 /// A namespace holding `busbar:*` keys but NO schema marker (operator DEL, partial restore) is
-
 #[test]
 #[ignore]
 fn a_namespace_with_keys_but_no_marker_refuses_to_connect_and_keeps_every_key() {
@@ -1601,7 +1571,6 @@ fn a_namespace_with_keys_but_no_marker_refuses_to_connect_and_keeps_every_key() 
 }
 
 /// The `RecordStore` contract conformance suite, this crate's own copy (`src/tests/store_conformance.rs`
-
 #[path = "tests/store_conformance.rs"]
 mod store_conformance;
 
@@ -1622,7 +1591,6 @@ mod conformance {
     }
 
     /// Remove every row this suite is about to write, so a rerun (or a crashed prior run that left
-
     fn reset(store: &ValkeyStore, ns: &str, seq: u64) {
         for id in conf::key_ids(ns) {
             let _ = store.purge_key_for_test(&id);
@@ -1741,7 +1709,6 @@ mod conformance {
     }
 
     /// The kind-wide purge has no namespace of its own, so two runs sharing one live Valkey each
-
     #[test]
     fn plane_purges_survive_two_interleaved_runs() {
         let _serialised = super::purge_guard();
@@ -1764,7 +1731,6 @@ mod conformance {
 }
 
 /// An undecodable credential row FAILS the hydration delta, naming the row's key and never echoing
-
 #[test]
 fn a_corrupt_credential_row_fails_the_delta_naming_its_key() {
     let Some(_) = live_store() else { return };
@@ -1794,7 +1760,6 @@ fn a_corrupt_credential_row_fails_the_delta_naming_its_key() {
 const CORRUPT_ROW_DB: u32 = 7;
 
 /// A refused transaction must not silently swallow the NEXT write on the same connection.
-
 #[test]
 fn a_refused_transaction_does_not_swallow_the_next_write() {
     let Some(store) = live_store() else { return };
@@ -1972,7 +1937,6 @@ trait Vocab: RecordStore {
 impl Vocab for ValkeyStore {}
 
 /// Serialises EVERY test that purges a plane kind. `purge_plane_records_before(kind, before)` has no
-
 static PURGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn purge_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -1997,7 +1961,6 @@ fn sample_call(principal: &str, seq: u64, ts: u64, prev_hash: &str, hash: &str) 
 }
 
 /// THE TEST THAT MATTERS. A round-trip on one live handle cannot distinguish a backend that wrote
-
 #[test]
 fn an_mcp_call_chain_survives_dropping_the_store_and_reconnecting() {
     let Some(store) = live_store() else { return };
@@ -2040,7 +2003,6 @@ fn an_mcp_call_chain_survives_dropping_the_store_and_reconnecting() {
 }
 
 /// The boot enumeration: a restart has to resume a chain for a principal this process has not yet
-
 #[test]
 fn mcp_call_principals_are_enumerable_after_a_reconnect() {
     let Some(store) = live_store() else { return };
@@ -2078,7 +2040,6 @@ fn mcp_call_principals_are_enumerable_after_a_reconnect() {
 }
 
 /// Retention must ACTUALLY DELETE and report a real count — a purge that returns a number it did
-
 #[test]
 fn purge_mcp_calls_before_deletes_and_returns_a_real_count() {
     let Some(_) = live_store() else { return };
@@ -2122,7 +2083,6 @@ fn purge_mcp_calls_before_deletes_and_returns_a_real_count() {
 }
 
 /// A record arriving on a `(principal, seq)` that already has one is settled the way the contract
-
 #[test]
 fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
     let Some(store) = live_store() else { return };
@@ -2178,7 +2138,6 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
 }
 
 /// A busbar key id is caller-visible and may itself contain a colon, so retention must still find
-
 #[test]
 fn retention_still_finds_a_principal_whose_id_contains_the_separator_characters() {
     let Some(_) = live_store() else { return };
@@ -2200,7 +2159,6 @@ fn retention_still_finds_a_principal_whose_id_contains_the_separator_characters(
 }
 
 /// Timestamps are BANDED. The task purge is GLOBAL by `(disposition, ts)`, so every task this file
-
 const TASK_PURGE_BAND_TOP: u64 = 1_000_100_000;
 const TASK_LIVE_TS: u64 = 2_000_000_000;
 
@@ -2246,7 +2204,6 @@ fn reset_tasks(store: &ValkeyStore, task_ids: &[&str]) {
 }
 
 /// Own the whole low band: a previous run's (or the conformance suite's) leftovers would otherwise be
-
 fn clear_purge_band(store: &ValkeyStore) {
     let byts = format!("busbar:plane:{}:byts", hex(b"task"));
     let fields: Vec<String> = store
@@ -2260,7 +2217,6 @@ fn clear_purge_band(store: &ValkeyStore) {
 }
 
 /// THE TEST THAT MATTERS: an in-flight task, read back off the server on a NEW connection after the
-
 #[test]
 fn an_in_flight_task_survives_dropping_the_store_and_reconnecting() {
     let Some(store) = live_store() else { return };
@@ -2309,7 +2265,6 @@ fn an_in_flight_task_survives_dropping_the_store_and_reconnecting() {
 }
 
 /// The listing is deliberately UNFILTERED: the boot rehydrate wants the active rows, retention the
-
 #[test]
 fn list_tasks_returns_every_row_including_terminal_ones_after_a_reconnect() {
     let Some(store) = live_store() else { return };
@@ -2348,7 +2303,6 @@ fn list_tasks_returns_every_row_including_terminal_ones_after_a_reconnect() {
 }
 
 /// The per-task provenance chain, read back after a reconnect. Never calls `put_task`: an event and
-
 #[test]
 fn a_task_event_chain_survives_a_reconnect_and_still_links() {
     let Some(store) = live_store() else { return };
@@ -2417,7 +2371,6 @@ fn a_task_event_chain_survives_a_reconnect_and_still_links() {
 }
 
 /// A replayed `(task_id, seq)`: the IDENTICAL event is the at-least-once retry and is success with
-
 #[test]
 fn a_replayed_task_event_is_idempotent_and_a_different_one_is_a_fork() {
     let Some(store) = live_store() else { return };
@@ -2443,7 +2396,6 @@ fn a_replayed_task_event_is_idempotent_and_a_different_one_is_a_fork() {
 }
 
 /// Retention drops TERMINAL rows only, strictly older than the cutoff, and returns a count it
-
 #[test]
 fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
     let _guard = purge_guard();
@@ -2622,7 +2574,6 @@ fn task_ids_differing_only_in_case_are_distinct_tasks() {
 }
 
 /// A task id is a protocol-supplied opaque string, COLONS INCLUDED. The adversarial spellings: an id
-
 #[test]
 fn a_task_id_containing_the_key_separator_cannot_alias_another_tasks_chain() {
     let Some(store) = live_store() else { return };
@@ -2811,7 +2762,6 @@ fn reset_trust_state(store: &ValkeyStore, servers: &[&str], nonces: &[&str]) {
 }
 
 /// A DEMOTION OUTLIVES THE PROCESS THAT RECORDED IT, upserted to the latest reason, and a cleared
-
 #[test]
 fn a_demotion_survives_dropping_the_store_and_reconnecting() {
     let url = std::env::var("VALKEY_URL").unwrap_or_else(|_| {
@@ -2890,7 +2840,6 @@ fn server_ids_containing_separators_are_not_confusable() {
 }
 
 /// THE SPENT-APPROVAL LEDGER ACROSS A RESTART, with the control that keeps it from being a blanket
-
 #[test]
 fn a_reconnected_store_refuses_a_second_redemption_of_the_same_approval() {
     let url = std::env::var("VALKEY_URL")
@@ -2943,7 +2892,6 @@ fn a_second_node_cannot_redeem_an_approval_the_first_already_spent() {
 }
 
 /// CONCURRENT REDEMPTION IS THE ATTACK: eight independent connections race through a barrier;
-
 #[test]
 fn exactly_one_of_many_racing_nodes_wins_the_redemption() {
     let url = std::env::var("VALKEY_URL")
@@ -3011,7 +2959,6 @@ fn a_redeemed_entry_carries_a_ttl_bounded_by_the_approvals_own_life() {
 }
 
 /// A grant that outlives the ledger's TTL cap is recorded with NO expiry: capping it would let the
-
 #[test]
 fn a_grant_beyond_the_ttl_cap_is_recorded_without_expiry() {
     let store = require_live_store();
@@ -3033,7 +2980,6 @@ fn a_grant_beyond_the_ttl_cap_is_recorded_without_expiry() {
 }
 
 /// A live spent entry survives arbitrary caller clocks; only shared-clock expiry permits reuse.
-
 #[test]
 fn a_spent_entry_is_judged_against_the_shared_clock() {
     const LIVE_LIFE: u64 = 900;
@@ -3094,7 +3040,6 @@ fn the_demotion_record_round_trips_the_full_storable_range() {
 }
 
 /// `plane_token_live` — MULTI-USE, SPENDS NOTHING, and FAIL-CLOSED: live while the record is present,
-
 #[test]
 fn plane_token_live_is_present_active_and_unexpired() {
     let store = require_live_store();
@@ -3137,7 +3082,6 @@ fn plane_token_live_is_present_active_and_unexpired() {
 }
 
 /// Open (non-reserved) usage units round-trip beside the reserved four, per model, whatever
-
 #[test]
 fn usage_carries_open_units_and_floors_each_counter_at_zero() {
     use busbar_contract::records::{ModelTokensDelta, UNIT_INPUT, UNIT_OUTPUT};
@@ -3188,7 +3132,6 @@ fn usage_carries_open_units_and_floors_each_counter_at_zero() {
 }
 
 /// A v6 build's unfloored HINCRBY could leave a counter NEGATIVE. It always read as 0; the next add
-
 #[test]
 fn a_legacy_negative_counter_is_added_to_as_the_zero_it_always_read_as() {
     let Some(store) = live_store() else { return };
@@ -3213,7 +3156,6 @@ fn a_legacy_negative_counter_is_added_to_as_the_zero_it_always_read_as() {
 }
 
 /// `priced_from_ms` joins the metering cell's identity (a rate-card edit SPLITS the day's cell), an
-
 #[test]
 fn metering_splits_a_cell_at_a_price_change_and_carries_open_classes() {
     let Some(store) = live_store() else { return };
@@ -3254,7 +3196,6 @@ fn metering_splits_a_cell_at_a_price_change_and_carries_open_classes() {
 }
 
 /// The 1.6.0 key fields round-trip, and a NON-POOL scope grant comes back as the kind it was granted
-
 #[test]
 fn a_key_round_trips_its_attribution_and_every_scope_kind() {
     use busbar_contract::records::ScopeRef;
@@ -3301,7 +3242,6 @@ fn a_key_round_trips_its_idp_provider() {
 }
 
 /// A v6 namespace's typed task / task-event / demotion / spent-approval keys, written the way v6
-
 #[test]
 fn v6_namespace_upgrades_in_place_to_v7() {
     use crate::legacy::{
@@ -3651,7 +3591,6 @@ fn tls_pump(conn: rustls::ServerConnection, front: std::net::TcpStream, back: st
 }
 
 /// The store's door opened on `settings` on a dispatcher of its own, over the connection table
-
 fn open_on(
     settings: &str,
     table: impl FnOnce(&Dispatcher) -> TcpConns,
@@ -3691,7 +3630,6 @@ fn plain(d: &Dispatcher) -> TcpConns {
 }
 
 /// A table whose TLS trusts no root: a verifying handshake refuses every certificate, and only an
-
 fn trusting_nothing(d: &Dispatcher) -> TcpConns {
     TcpConns::with_tls(d.conn_waker(), Arc::new(TestTls::default()))
 }
@@ -3839,7 +3777,6 @@ fn settings_for(url: &str) -> String {
 }
 
 /// STORE-KEEP: the store keeps ONE connection across ops (1.5.5's one mutex-guarded connection):
-
 #[test]
 fn the_store_keeps_one_connection_across_ops() {
     if live_store().is_none() {
@@ -3865,7 +3802,6 @@ fn the_store_keeps_one_connection_across_ops() {
 }
 
 /// VALKEY-RETRY, 1.5.5's own pin: a genuine connection-level error (the server dropping the
-
 #[test]
 fn with_conn_transparently_reconnects_after_the_connection_is_dropped() {
     if live_store().is_none() {
@@ -3898,7 +3834,6 @@ fn with_conn_transparently_reconnects_after_the_connection_is_dropped() {
 }
 
 /// VALKEY-RETRY's other half: a write 1.5.5 never replayed (`with_conn_no_retry`: the plane
-
 #[test]
 fn a_no_retry_write_on_a_dropped_connection_fails_and_the_next_op_dials_fresh() {
     if live_store().is_none() {
@@ -3928,7 +3863,6 @@ fn a_no_retry_write_on_a_dropped_connection_fails_and_the_next_op_dials_fresh() 
 }
 
 /// VALKEY-UNIX: every unix-socket URL form 1.5.5's driver read reaches the server over a
-
 #[test]
 fn a_unix_socket_url_reaches_the_server() {
     if live_store().is_none() {
@@ -3955,7 +3889,6 @@ fn a_unix_socket_url_reaches_the_server() {
 }
 
 /// VALKEY-TIMEOUT: `connect_timeout_ms` (default 10 s, 1.5.5's) is every dial's timeout, as the
-
 #[test]
 fn connect_timeout_ms_is_the_dial_timeout() {
     if live_store().is_none() {
@@ -3983,7 +3916,6 @@ fn connect_timeout_ms_is_the_dial_timeout() {
 }
 
 /// A CA and a server certificate it signed for `127.0.0.1` (the proxy's address; an IP SAN): the
-
 fn tls_server() -> (Arc<rustls::ServerConfig>, Vec<u8>) {
     let ca_key = rcgen::KeyPair::generate().unwrap();
     let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -4010,7 +3942,6 @@ fn tls_server() -> (Arc<rustls::ServerConfig>, Vec<u8>) {
 }
 
 /// TLS: a `rediss://` URL is secured from its first byte through the host's connector (the test
-
 #[test]
 fn a_rediss_url_is_secured_through_the_hosts_connector() {
     if live_store().is_none() {
@@ -4052,7 +3983,6 @@ fn a_rediss_url_is_secured_through_the_hosts_connector() {
 }
 
 /// Host services offering the clock alone (the dispatcher's own timebase), refusing the rest: the
-
 struct ClockOnly;
 
 impl busbar_test_kit::services_double::ServicesDouble for ClockOnly {
@@ -4065,7 +3995,6 @@ impl busbar_test_kit::services_double::ServicesDouble for ClockOnly {
 }
 
 /// VALKEY-TIMEOUT over the whole span 1.5.5's `get_connection_with_timeout` bounded: a server that
-
 #[test]
 fn connect_timeout_ms_bounds_the_handshake_after_the_dial() {
     let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -4127,7 +4056,6 @@ fn self_signed_tls_server() -> Arc<rustls::ServerConfig> {
 }
 
 /// `#insecure` disables certificate verification for a TLS connection.
-
 #[test]
 fn rediss_insecure_skips_certificate_verification() {
     if live_store().is_none() {
@@ -4219,7 +4147,6 @@ fn recorded_1_5_5_breakdown(rows: &[&MeteringRow]) -> serde_json::Value {
 }
 
 /// Compare the loaded store's reads with all three frozen 1.5.5 HTTP response bodies. Only the
-
 fn assert_recorded_1_5_5_readback(store: &ValkeyStore) {
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
@@ -4711,7 +4638,6 @@ fn debug_output_redacts_the_url_password() {
 }
 
 /// `put_key_with_credential` into a slot holding a DIFFERENT LIVE credential is refused, and the
-
 #[test]
 fn put_key_with_credential_refuses_an_occupied_live_slot() {
     let Some(store) = live_store() else { return };
@@ -4801,7 +4727,6 @@ fn put_key_with_credential_never_remints_a_revoked_credential() {
 }
 
 /// A RESP parse error leaves the bad bytes buffered on the kept connection, so the connection must
-
 #[test]
 fn a_malformed_reply_discards_the_kept_connection() {
     use std::io::{Read, Write};
@@ -4958,7 +4883,6 @@ fn settings_refuse_a_url_that_is_not_a_non_empty_string() {
 }
 
 /// A missing (or null) `url` and a settings document that is no object are refused in the one
-
 #[test]
 fn every_settings_refusal_starts_with_the_one_prefix() {
     for json in ["{}", r#"{"url":null}"#] {
@@ -5037,7 +4961,6 @@ fn unknown_id_refusals_name_the_id_in_the_canonical_form() {
 }
 
 /// An id that spells the delete's internal retry text is just an unknown id: it answers the refusal
-
 #[test]
 fn an_unknown_id_spelling_the_retry_sentinel_is_refused_not_retried() {
     if live_store().is_none() {
@@ -5060,7 +4983,6 @@ fn an_unknown_id_spelling_the_retry_sentinel_is_refused_not_retried() {
 }
 
 /// Two writers interleaved at the revision read: the one that allocates first but commits last must
-
 #[test]
 fn a_writer_overtaken_between_its_revision_read_and_commit_restamps_above_the_winner() {
     if live_store().is_none() {
@@ -5093,7 +5015,6 @@ fn a_writer_overtaken_between_its_revision_read_and_commit_restamps_above_the_wi
 }
 
 /// A handshake the server REFUSES (AUTH) must not leave its connection kept: the next op would skip
-
 #[test]
 fn a_refused_handshake_does_not_leave_a_connection_kept() {
     if live_store().is_none() {
@@ -5158,7 +5079,6 @@ fn a_refused_handshake_does_not_leave_a_connection_kept() {
 }
 
 /// `list_metering` reads one snapshot: a write landing after it has read the bucket's row set is
-
 #[test]
 fn list_metering_is_one_snapshot() {
     let Some(direct) = live_store() else { return };
@@ -5212,7 +5132,6 @@ fn list_metering_is_one_snapshot() {
 }
 
 /// A write that decides nothing to write does not `EXEC`: a replayed credential put, a repeat
-
 #[test]
 fn no_op_paths_do_not_exec() {
     let Some(direct) = live_store() else { return };
@@ -5287,7 +5206,6 @@ fn a_held_op_does_not_block_a_second_op_on_the_same_store() {
 }
 
 /// `delete_key` leaves the key's own usage windows and every other bucket's whose id starts with
-
 #[test]
 fn delete_key_leaves_its_own_and_other_buckets_usage_windows() {
     let Some(store) = live_store() else { return };
@@ -5312,7 +5230,6 @@ fn delete_key_leaves_its_own_and_other_buckets_usage_windows() {
 }
 
 /// `delete_key` takes the key's credential pointers out of the credential revision index too: a
-
 #[test]
 fn delete_key_removes_its_credentials_from_the_revision_index() {
     let Some(store) = live_store() else { return };
@@ -5333,7 +5250,6 @@ fn delete_key_removes_its_credentials_from_the_revision_index() {
 }
 
 /// Two revokes of one credential racing: the one that commits first stands. The slower one read the
-
 #[test]
 fn a_revoke_overtaken_before_commit_does_not_overwrite_the_first_reason() {
     if live_store().is_none() {
@@ -5365,7 +5281,6 @@ fn a_revoke_overtaken_before_commit_does_not_overwrite_the_first_reason() {
 }
 
 /// A transaction whose watched key moves on EVERY attempt gives up with an error after a bounded
-
 #[test]
 fn a_transaction_that_always_aborts_ends_with_an_error() {
     if live_store().is_none() {
@@ -5408,7 +5323,6 @@ fn a_transaction_that_always_aborts_ends_with_an_error() {
 }
 
 /// Putting a credential again is a replay only when it is the SAME credential: one with the stored
-
 #[test]
 fn re_putting_a_credential_id_with_different_content_is_refused() {
     let Some(store) = live_store() else { return };
@@ -5450,7 +5364,6 @@ fn put_refusals_carry_the_reason_without_the_kind_suffix() {
 }
 
 /// A unix-socket URL's `?pass=` is the scrub secret too: an error string that echoes the URL (or
-
 #[test]
 fn unix_url_query_password_is_scrubbed_from_errors() {
     for url in [
@@ -5483,7 +5396,6 @@ fn unix_url_query_password_is_scrubbed_from_errors() {
 }
 
 /// A URL parameter the store does not read is REFUSED, never silently ignored; its name is withheld
-
 #[test]
 fn an_unknown_url_parameter_is_refused_not_ignored() {
     for url in [
@@ -5510,7 +5422,6 @@ fn an_unknown_url_parameter_is_refused_not_ignored() {
 }
 
 /// UPSERT IS BY `(kind, id)` (the contract's `RecordStore::upsert_plane_record` /
-
 #[test]
 fn a_parented_upserted_record_reads_back_by_its_own_id() {
     let Some(store) = live_store() else { return };
@@ -5589,7 +5500,6 @@ fn a_parented_upserted_record_reads_back_by_its_own_id() {
 }
 
 /// Redemption stores decimal strings, not signed columns. Permanent node claims and clocks
-
 #[test]
 fn token_redemption_keeps_the_full_u64_range_exact() {
     let Some(store) = live_store() else { return };
@@ -6284,7 +6194,6 @@ fn a_failed_legacy_upgrade_reports_safe_context_and_truthful_partial_progress() 
 }
 
 /// A bounded, joined RESP peer: exercise malformed transaction replies and a lost script reply
-
 fn malformed_reply_peer(exec: Option<&'static [u8]>) -> (String, std::thread::JoinHandle<usize>) {
     use std::io::Write;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

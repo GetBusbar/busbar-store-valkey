@@ -8,7 +8,6 @@ use busbar_contract::abi::sdk::store::dedupe::Seen;
 
 impl ValkeyStore {
     /// Only a definitive WATCH abort retries. A lost EXEC reply retains the immutable request
-
     pub(super) async fn v3_usage_correction(
         &self,
         c: &mut Conn,

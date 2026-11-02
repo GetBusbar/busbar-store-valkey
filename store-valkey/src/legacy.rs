@@ -19,7 +19,6 @@ pub(crate) const ASK_STATE_PREFIX: &str = "busbar:askstate:";
 const TERMINAL_TASK_STATES: [&str; 4] = ["completed", "failed", "canceled", "rejected"];
 
 /// The v6 row shapes, as v6 wrote them (`serde_json` of the typed rows). Read with exactly the fields
-
 pub(crate) mod rows {
     #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
     pub struct Task {
@@ -65,7 +64,6 @@ pub(crate) const KIND_DEMOTION: &str = "demotion";
 pub(crate) const KIND_ASK: &str = "ask";
 
 /// A v6 row that will not decode stops the upgrade: silently dropping it would lose a task, a
-
 fn decode<T: serde::de::DeserializeOwned>(
     what: &str,
     key: &str,
@@ -81,7 +79,6 @@ fn decode<T: serde::de::DeserializeOwned>(
 }
 
 /// Copy one v6 row into the plane keyspace as `kind` at `(id, seq)`, unless that position is taken.
-
 #[allow(clippy::too_many_arguments)]
 async fn copy<T: serde::Serialize>(
     store: &ValkeyStore,

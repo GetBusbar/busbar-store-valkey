@@ -45,7 +45,6 @@ use std::time::{Duration, Instant};
 mod database;
 
 /// A node id no earlier run or instance used, for `LoadedStore::open`: its bridge mints each op id
-
 fn node() -> u64 {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let t = std::time::SystemTime::now()
@@ -58,7 +57,6 @@ fn node() -> u64 {
 }
 
 /// The node's one `op_id` allocator (`LoadedStore::open` mints the bridge's writes from it): a node
-
 fn mint() -> busbar_contract::abi::store::OpId {
     static NODE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -70,7 +68,6 @@ fn mint() -> busbar_contract::abi::store::OpId {
 }
 
 /// Open the built cdylib the way the host opens a dropped-in store: its Statement rendered as
-
 fn load(path: &Path, cfg: &str) -> Result<Box<dyn RecordStore>, String> {
     let stated = rendering_of_library(path)
         .map_err(|e| e.to_string())?
@@ -82,7 +79,6 @@ fn load(path: &Path, cfg: &str) -> Result<Box<dyn RecordStore>, String> {
 }
 
 /// A dispatcher and a bind over the loader's test connection table (plain TCP, the host's
-
 fn host(instance: &str) -> (Arc<Dispatcher>, Bind) {
     let dispatcher = Arc::new(Dispatcher::new(DispatchConfig::default()));
     let conns: Arc<dyn busbar_contract::conn::DeclaredConns> = Arc::new(
@@ -99,7 +95,6 @@ fn host(instance: &str) -> (Arc<Dispatcher>, Bind) {
 }
 
 /// The store through its COMPILED-IN door (`busbar_store_valkey::door`, never the cdylib): the
-
 struct ValkeyStore;
 
 impl ValkeyStore {
@@ -115,11 +110,9 @@ impl ValkeyStore {
 }
 
 /// Fixed ed25519 signing secret (64 hex = 32 bytes) for this e2e test. 1.5.1 requires an
-
 const TEST_SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 /// The newest mtime across every workspace crate's `src/` — "how fresh must a cdylib be to be the
-
 fn newest_source_mtime() -> std::time::SystemTime {
     fn walk(dir: &std::path::Path, newest: &mut std::time::SystemTime) {
         let Ok(rd) = std::fs::read_dir(dir) else {
@@ -220,7 +213,6 @@ fn plugin_path() -> PathBuf {
 }
 
 /// The live `VALKEY_URL`, mirroring `busbar-store-valkey`'s own `live_store()` gating discipline
-
 fn valkey_url() -> Option<String> {
     match std::env::var("VALKEY_URL") {
         Ok(url) => Some(url),
@@ -299,7 +291,6 @@ fn row<T: serde::de::DeserializeOwned>(body: &[u8]) -> T {
 }
 
 /// The typed names, over the neutral verbs, for any `RecordStore` — the plugin-backed
-
 trait Vocab: RecordStore {
     fn put_task(&self, t: &TaskRow) -> RecordStoreResult<()> {
         let terminal = ["completed", "failed", "canceled", "rejected"].contains(&t.state.as_str());
@@ -529,7 +520,6 @@ fn load_and_exercise_valkey_plugin_persists_to_real_valkey_across_reopen() {
 }
 
 /// END-TO-END FAILURE: an `open()` config that cannot produce a usable store — malformed JSON, a
-
 #[test]
 fn load_and_exercise_valkey_plugin_bad_config_fails_over_abi() {
     let path = plugin_path();
@@ -560,7 +550,6 @@ fn load_and_exercise_valkey_plugin_bad_config_fails_over_abi() {
 }
 
 /// RAII guard for a spawned child process: kills and reaps it on drop, including when a panic
-
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
@@ -571,7 +560,6 @@ impl Drop for ChildGuard {
 }
 
 /// The busbar checkout the real binaries are built from: `BUSBAR_CHECKOUT` when set (CI checks
-
 fn busbar_root() -> PathBuf {
     let root = match std::env::var_os("BUSBAR_CHECKOUT") {
         Some(p) => PathBuf::from(p),
@@ -587,7 +575,6 @@ fn busbar_root() -> PathBuf {
 }
 
 /// Build (once, cached by cargo) the real `busbar` binary and the real `busbar-plugin-pack` tool
-
 fn build_real_binaries() -> (PathBuf, PathBuf) {
     let root = busbar_root();
     let target = match std::env::var_os("CARGO_TARGET_DIR") {
@@ -635,15 +622,12 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
 }
 
 /// A placeholder provider credential: busbar 1.6.0 refuses to boot on an unresolvable provider
-
 const SECRET_PLACEHOLDER: &str = "0000000000000000000000000000000000000000000000000000000000000001";
 
 /// THE FIRST-PARTY KEY THIS TEST SIGNS THE PLUGIN WITH (its ed25519 secret, 64 hex): the store's
-
 const HARNESS_SIGN_KEY: &str = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
 
 /// The variable a `test-harness` busbar reads its first-party key from (busbar's
-
 const HARNESS_FIRST_PARTY_KEY_ENV: &str = "BUSBAR_TEST_HARNESS_FIRST_PARTY_KEY";
 
 /// The public half of [`HARNESS_SIGN_KEY`], 64 hex: what the child trusts as first-party.
@@ -661,7 +645,6 @@ fn harness_public_key() -> String {
 }
 
 /// A free-at-the-moment localhost port (bind-then-drop; a TOCTOU race is possible in principle
-
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .expect("bind an ephemeral port")
@@ -688,13 +671,11 @@ fn poll_admin_up(admin: &str, token: &str, client: &reqwest::blocking::Client) -
 }
 
 /// Point at a DIFFERENT logical Valkey database (index 15, the conventional "spare" db a lot of
-
 fn admin_test_valkey_url(base: &str) -> String {
     valkey_url_in_db(base, 15)
 }
 
 /// The databases the live tests use: `/0` the url's own (shared), `/15` the admin end-to-end test,
-
 const SWEEP_DB: u32 = 10;
 
 /// `base` pointed at database `db`.
@@ -1026,7 +1007,6 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
 }
 
 /// THE DURABILITY PROOF FOR THE FOUR MCP CALL-LOG METHODS, OVER THE REAL PLUGIN PATH.
-
 #[test]
 fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let path = plugin_path();
@@ -1159,7 +1139,6 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 }
 
 /// THE DURABILITY PROOF FOR THE SIX A2A TASK-STORE METHODS, OVER THE REAL PLUGIN PATH.
-
 #[test]
 fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let path = plugin_path();
@@ -1360,7 +1339,6 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 }
 
 /// THE DURABILITY PROOF FOR THE FOUR TRUST-STATE METHODS, OVER THE REAL PLUGIN PATH.
-
 #[test]
 fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let path = plugin_path();

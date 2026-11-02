@@ -19,7 +19,6 @@ fn rec(kind: &str, id: &str, parent: Option<&str>, seq: u64, d: PlaneDisposition
 }
 
 /// A position field round-trips any identity, colons included, and a chain child's position is its
-
 #[test]
 fn a_position_field_round_trips_any_identity() {
     for ident in ["t1", "a:b:c", "", "99:x"] {
@@ -44,7 +43,6 @@ fn kind_keys_are_injective() {
 }
 
 /// The sidecar's two flag characters say exactly what the scripts read: parented, then disposition.
-
 #[test]
 fn the_sidecar_flags_and_determinism() {
     let child = rec("call", "c", Some("p"), 1, PlaneDisposition::Active);
@@ -63,7 +61,6 @@ fn the_sidecar_flags_and_determinism() {
 }
 
 /// The key, field and token layouts are shared with the scripts and every other node: pin the
-
 #[test]
 fn the_key_field_and_token_layouts_are_pinned() {
     assert_eq!(field(42, "a:b"), "42:a:b");
@@ -77,7 +74,6 @@ fn the_key_field_and_token_layouts_are_pinned() {
 }
 
 /// The parent the listing checks is the one the sidecar names, and only when it is flagged
-
 #[test]
 fn a_sidecar_names_its_parent() {
     let child = rec("task", "t1", Some("ctx"), 0, PlaneDisposition::Active);

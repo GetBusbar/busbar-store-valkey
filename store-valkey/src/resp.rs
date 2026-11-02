@@ -51,14 +51,12 @@ impl RedisError {
     }
 
     /// A CONNECTION-LEVEL failure (the connector's: dropped, refused, timed out; or the server
-
     #[must_use]
     pub fn is_connection_error(&self) -> bool {
         matches!(self.repr, Repr::Io(_))
     }
 
     /// The store's own refusal of an op (an unknown id, a tombstoned id): `text` reads verbatim,
-
     #[must_use]
     pub fn refused(text: impl Into<String>) -> Self {
         Self {
@@ -67,7 +65,6 @@ impl RedisError {
     }
 
     /// Whether this is a store refusal ([`RedisError::refused`]), which reaches the caller as
-
     #[must_use]
     pub fn is_refusal(&self) -> bool {
         matches!(self.repr, Repr::Refused(_))
@@ -182,7 +179,6 @@ impl Value {
 }
 
 /// Parse one reply from the front of `buf`: the reply and how many bytes it took, or `None` when
-
 pub fn parse(buf: &[u8]) -> RedisResult<Option<(Value, usize)>> {
     match walk(buf, 0, 0, false)? {
         None => Ok(None),
@@ -380,17 +376,14 @@ impl<A: ToArgs, B: ToArgs> ToArgs for (A, B) {
 /// A Rust value a reply converts to (the upstream driver's conversions, as the store used them).
 pub trait FromValue: Sized {
     /// Convert one reply.
-
     fn from_value(v: Value) -> RedisResult<Self>;
 
     /// Convert an array's items (a tuple type takes them pairwise from a flat array).
-
     fn from_values(items: Vec<Value>) -> RedisResult<Vec<Self>> {
         items.into_iter().map(Self::from_value).collect()
     }
 
     /// A bulk string as a `Vec<Self>`: `u8` takes it whole (a `Vec<u8>` is bytes); every other
-
     fn from_bytes(bytes: Vec<u8>) -> Result<Vec<Self>, Vec<u8>> {
         Err(bytes)
     }
@@ -554,7 +547,6 @@ impl Conn {
     }
 
     /// Authenticate with one SDK-owned complete RESP command. Neither the credential nor its
-
     pub async fn authenticate(&mut self, password: &Cred, user: Option<&str>) -> RedisResult<()> {
         self.wire
             .write_sealed(password.resp_auth(user))
@@ -635,7 +627,6 @@ impl Conn {
     }
 
     /// The op is done with the connection: one that still has a `WATCH` in force (a body that left
-
     pub fn settle(&self) {
         if self.watching {
             self.wire.discard();
@@ -702,7 +693,6 @@ impl Conn {
     }
 
     /// Up to `max` keys matching `pattern` other than `skip`, stopping the `SCAN` as soon as
-
     pub async fn scan_some(
         &mut self,
         pattern: &str,
@@ -778,13 +768,11 @@ impl Cmd {
     }
 
     /// Run it and convert its reply.
-
     pub async fn query<T: FromValue>(&self, c: &mut Conn) -> RedisResult<T> {
         T::from_value(c.request(self.args.clone()).await?)
     }
 
     /// Run it for its effect.
-
     pub async fn exec(&self, c: &mut Conn) -> RedisResult<()> {
         c.request(self.args.clone()).await.map(drop)
     }
@@ -865,7 +853,6 @@ impl Pipeline {
     }
 
     /// Run the pipeline and convert the replies of the commands not ignored (as one array). An
-
     pub async fn query<T: FromValue>(&self, c: &mut Conn) -> RedisResult<T> {
         if self.cmds.is_empty() {
             return T::from_value(Value::Array(Vec::new()));
@@ -970,7 +957,6 @@ impl ScriptInvocation<'_> {
     }
 
     /// Run it and convert its reply. A `NOSCRIPT` miss never ran it, so `EVAL` runs it once.
-
     pub async fn invoke<T: FromValue>(&self, c: &mut Conn) -> RedisResult<T> {
         let sha = match self.script.sha.get() {
             Some(sha) => sha,

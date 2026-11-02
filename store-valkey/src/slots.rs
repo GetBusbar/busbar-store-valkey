@@ -96,7 +96,6 @@ macro_rules! ops {
 
 impl ValkeyStore {
     /// Compare one watched pre-state, then write the rows and their applied-only receipt in a
-
     async fn v3_record_transaction(
         &self,
         c: &mut Conn,
@@ -283,7 +282,6 @@ impl ValkeyStore {
     }
 
     /// `record_put` (slot 26): an upsert on `(schema, key)`. An EMPTY value removes the row:
-
     async fn v3_record_put(
         &self,
         c: &mut Conn,
@@ -366,7 +364,6 @@ impl ValkeyStore {
 }
 
 /// A page of `record_scan`: `KEYS = key set, values`; `ARGV = min, max, limit`. One script, so a
-
 static SCAN_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(
         r"
@@ -388,7 +385,6 @@ static SCAN_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 });
 
 /// The start of an `op_id` write's script: `KEYS[1]` is the op's record; a recorded body is
-
 const LUA_SEEN: &str = r"
 local prior = redis.call('HGET', KEYS[1], 'b')
 if prior then
@@ -434,7 +430,6 @@ end
 ";
 
 /// The end of an `op_id` write's script: record the body (`ARGV[1]`) for `ARGV[2]` seconds. It
-
 const LUA_RECORD: &str = r"
 redis.call('HSET', KEYS[1], 'b', ARGV[1])
 redis.call('EXPIRE', KEYS[1], ARGV[2])
@@ -442,7 +437,6 @@ return false
 ";
 
 /// Exact decimal arithmetic for unsigned usage counters. Only individual decimal digits enter
-
 const LUA_USAGE_COUNTS: &str = r"
 local USAGE_MAX = '18446744073709551615'
 local RADIX = 10
@@ -503,7 +497,6 @@ end
 ";
 
 /// `add_usage_batch`: per cell `KEYS[k]` = its usage hash; `ARGV` from 4 = per cell `n`, then `n`
-
 static USAGE_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_SEEN}{LUA_USAGE_COUNTS}
@@ -535,7 +528,6 @@ static USAGE_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 });
 
 /// `add_metering_batch`: per delta `KEYS[k], KEYS[k + 1]` = its bucket's set and its row; `ARGV`
-
 static METERING_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_SEEN}
@@ -587,7 +579,6 @@ fn op_call(script: &'static Script, op: OpId, d: &Dedupe<'_>) -> ScriptInvocatio
 
 impl ValkeyStore {
     /// Run an `op_id` write's script once (a lost reply may have applied): the body it found, or
-
     fn deduped(
         &self,
         cx: &mut Op<'_>,

@@ -17,7 +17,6 @@ use busbar_contract::records::{
 const TICKET_RECORD_KIND: &str = "ticket";
 
 /// The kind a purge of which CASCADES: a purged `task` takes its `task_event` chain with it, and only
-
 pub(crate) const CASCADING_KIND: &str = "task";
 /// The child kind a [`CASCADING_KIND`] purge takes with it.
 const CASCADED_KIND: &str = "task_event";
@@ -66,13 +65,11 @@ fn parse_field(f: &str) -> Option<(u64, &str)> {
 }
 
 /// An APPENDED record's identity: a chain position is `(parent, seq)`; a top-level record is its
-
 fn identity<'a>(record: &PlaneRecordRef<'a>) -> &'a str {
     record.parent.unwrap_or(record.id)
 }
 
 /// The typed sidecar — everything about a record except its body, as ONE deterministic string.
-
 fn sidecar(record: &PlaneRecordRef<'_>) -> RecordStoreResult<String> {
     #[derive(serde::Serialize)]
     struct Sidecar<'a> {
@@ -132,7 +129,6 @@ fn parent_of(side: &str) -> RecordStoreResult<Option<String>> {
 }
 
 /// Shared Lua: a record's PARENT LINK. A record that names a parent is counted under that parent in
-
 const LUA_LINK: &str = r"
 local function tohex(s)
     return (string.gsub(s, '.', function(c) return string.format('%02x', string.byte(c)) end))
@@ -159,7 +155,6 @@ end
 ";
 
 /// Shared Lua: `write(rec, body, byts, idx, pcount, F, sidecar, body, ts, seq, parent, prefix)` —
-
 const LUA_WRITE: &str = r"
 local function require_type(key, want)
     local t = redis.call('TYPE', key)
@@ -238,7 +233,6 @@ end
 ";
 
 /// UPSERT: `KEYS = rec, body, byts, idx, pcount`; `ARGV = F, sidecar, body, ts, seq, parent,
-
 static UPSERT: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_LINK}{LUA_WRITE}
@@ -249,7 +243,6 @@ static UPSERT: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 });
 
 /// APPEND: as [`UPSERT`], but an occupied position is never overwritten — `0` = written or an
-
 static APPEND: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_LINK}{LUA_WRITE}
@@ -267,7 +260,6 @@ static APPEND: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 });
 
 /// APPEND UNDER AN `op_id` (`slots`): [`APPEND`], deduped on the op's record. `KEYS` as
-
 static APPEND_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_LINK}{LUA_WRITE}
@@ -293,7 +285,6 @@ static APPEND_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 });
 
 /// Shared Lua: `drop_identity(rec, body, byts, pcount, idx, ident, prefix)` — remove every record
-
 const LUA_DROP_IDENTITY: &str = r"
 local function drop_identity(rec, body, byts, pcount, idx, ident, prefix)
     local fs = redis.call('ZRANGE', idx, 0, -1)
@@ -317,7 +308,6 @@ end
 ";
 
 /// DELETE one identity: `KEYS = rec, body, byts, pcount, idx`, then (cascade only) the same five of
-
 static DELETE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_LINK}{LUA_DROP_IDENTITY}
@@ -330,7 +320,6 @@ static DELETE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 });
 
 /// PURGE, one batch: `KEYS = rec, body, byts, pcount` of the kind, then (cascade only) `rec, body,
-
 static PURGE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_LINK}{LUA_DROP_IDENTITY}
@@ -374,7 +363,6 @@ static PURGE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 });
 
 /// A write script's call for `record`: `KEYS = rec, body, byts, idx, pcount`; `ARGV = F, sidecar,
-
 fn write_call<'s>(
     script: &'s Script,
     record: &PlaneRecordRef<'_>,
@@ -412,7 +400,6 @@ async fn put(
 const UPSERT_SEQ: u64 = 0;
 
 /// `upsert_plane_record`: UPSERT BY `(kind, id)`, parent or not — a second write for one id
-
 pub(crate) async fn upsert(
     store: &ValkeyStore,
     c: &mut Conn,
@@ -426,7 +413,6 @@ pub(crate) async fn upsert(
 }
 
 /// `append_plane_record` under an `op_id` ([`APPEND_OP`]): `op_key` is the op's record, `body` its
-
 pub(crate) async fn append_op(
     store: &ValkeyStore,
     c: &mut Conn,
@@ -453,7 +439,6 @@ pub(crate) async fn append_op(
 }
 
 /// Append `record` only if its position is EMPTY; an occupied one (identical or not) is left as it
-
 pub(crate) async fn append_if_absent(
     store: &ValkeyStore,
     c: &mut Conn,
@@ -465,7 +450,6 @@ pub(crate) async fn append_if_absent(
 }
 
 /// `get_plane_record`: an upserted record lives at `(id, 0)`. No caller-scoping filter, deliberately:
-
 pub(crate) async fn get(
     store: &ValkeyStore,
     c: &mut Conn,
@@ -480,7 +464,6 @@ pub(crate) async fn get(
 type ChainRead = (Vec<String>, Vec<Option<String>>, Vec<Option<Vec<u8>>>);
 
 /// `list_plane_records`. UNFILTERED beyond the selector, terminal rows included: the boot rehydrate
-
 pub(crate) async fn list(
     store: &ValkeyStore,
     c: &mut Conn,
@@ -552,7 +535,6 @@ pub(crate) async fn list(
 }
 
 /// `list_plane_record_parents`: the boot enumeration — every parent holding at least one record of
-
 pub(crate) async fn parents(
     store: &ValkeyStore,
     c: &mut Conn,
@@ -570,7 +552,6 @@ pub(crate) async fn parents(
 }
 
 /// `purge_plane_records_before`, the age-only entry: `task` has always dropped only its TERMINAL
-
 pub(crate) async fn purge_before(
     store: &ValkeyStore,
     c: &mut Conn,
@@ -584,7 +565,6 @@ pub(crate) async fn purge_before(
 const PURGE_BATCH: usize = 1000;
 
 /// `purge_plane_records`: STRICTLY older than the cutoff, and the count actually performed. WHICH
-
 pub(crate) async fn purge(
     store: &ValkeyStore,
     c: &mut Conn,
@@ -637,7 +617,6 @@ pub(crate) async fn purge(
 }
 
 /// `delete_plane_record`: every `seq` under the identity goes, so a delete can never leave part of a
-
 pub(crate) async fn delete(
     store: &ValkeyStore,
     c: &mut Conn,
@@ -678,13 +657,11 @@ pub(crate) fn token_key(kind: &str, token: &str) -> String {
 }
 
 /// The longest life a redeemed-token entry is given an expiry for: the server refuses an `EX` that
-
 const MAX_TOKEN_TTL_SECS: u64 = 315_360_000;
 
 const SHARED_TIME_COMMAND: &str = "redis.call('TIME')";
 
 /// Token decisions compare canonical unsigned decimal strings, exact past 2^53.
-
 fn token_expiry_script(body: &str) -> Script {
     Script::new(&format!(
         r"
@@ -782,7 +759,6 @@ static REDEEM: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 });
 
 /// `redeem_plane_token`: the test and set, as ONE script the server orders against every other
-
 pub(crate) async fn redeem_token(
     store: &ValkeyStore,
     c: &mut Conn,
@@ -798,7 +774,6 @@ pub(crate) async fn redeem_token(
 }
 
 /// `plane_token_live`: MULTI-USE and SPENDS NOTHING — a plain read of the `(kind, token)` upserted
-
 pub(crate) async fn token_live(
     store: &ValkeyStore,
     c: &mut Conn,

@@ -48,7 +48,6 @@ fn host(
 }
 
 /// The fold's database on the live server, on a connection of the `redis` client's own: straight to
-
 fn fold_url(settings: &[u8]) -> String {
     let v: serde_json::Value =
         serde_json::from_slice(settings).expect("conformance.json's settings are JSON");
@@ -100,7 +99,6 @@ fn release_fold_keyspace(namespace: &str) {
 }
 
 /// The suite's namespace hook, before the fold's open: the fold takes the suite's database (waiting
-
 fn take_fold_keyspace(namespace: &str, settings: &[u8]) {
     let (held, freed) = fold_gate();
     let mut slot = held
@@ -116,7 +114,6 @@ fn take_fold_keyspace(namespace: &str, settings: &[u8]) {
 }
 
 /// The suite's namespace hook, after the fold (its failure included): everything the store wrote in
-
 fn drop_fold_keyspace(namespace: &str, _: &[u8]) {
     release_fold_keyspace(namespace);
 }
@@ -155,7 +152,6 @@ fn valkey_url() -> Option<String> {
 }
 
 /// This crate's built cdylib, from `deps/` only: the copy the build graph of this very test binary
-
 fn cdylib() -> PathBuf {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let deps = exe.parent().expect("target/<profile>/deps");
@@ -170,7 +166,6 @@ fn cdylib() -> PathBuf {
 }
 
 /// The node's one `op_id` allocator (`LoadedStore::open` mints the bridge's writes from it): a node
-
 fn mint() -> busbar_contract::abi::store::OpId {
     static NODE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -182,7 +177,6 @@ fn mint() -> busbar_contract::abi::store::OpId {
 }
 
 /// The bind the host makes: the store's declared need served by the loader's test connection table
-
 fn bind(d: &Dispatcher) -> Bind {
     Bind {
         instance: Arc::from("store-valkey-conformance"),
@@ -250,7 +244,6 @@ fn op(counter: u64) -> OpId {
 }
 
 /// Open the store through one door (`LoadedStore`, the way the host opens it), on a node id no
-
 fn open(load: &impl Fn() -> Loaded, settings: &str) -> Result<LoadedStore, String> {
     let (plugin, dispatcher) = load();
     LoadedStore::open(plugin, dispatcher, settings.as_bytes(), mint)
@@ -265,7 +258,6 @@ fn r<T: std::fmt::Debug, E: std::fmt::Display>(res: Result<T, E>) -> String {
 }
 
 /// The live scenario, in namespace `ns`, through `store`. Every observable the scenario produces is
-
 fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
     let store: &dyn RecordStore = loaded;
     let mut t = Vec::new();
@@ -533,7 +525,6 @@ fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
 }
 
 /// What one door does, as one comparable transcript. `load` loads the door afresh: a refused
-
 fn transcript(
     load: impl Fn() -> Loaded,
     live: Option<(&str, &str)>,
@@ -579,7 +570,6 @@ fn ns(arm: &str) -> String {
 }
 
 /// The Valkey store behaves as ONE store through either door, and the dropped-in library states the
-
 #[test]
 fn the_linked_and_the_dropped_in_valkey_store_are_one_store() {
     let url = valkey_url();
@@ -664,7 +654,6 @@ fn the_linked_and_the_dropped_in_valkey_store_are_one_store() {
 }
 
 /// RED ARM (live): a PERTURBED dropped-in store — its namespace already holds a different record at
-
 #[test]
 fn a_perturbed_dropped_in_store_does_not_pass_for_the_linked_one() {
     let Some(u) = valkey_url() else { return };

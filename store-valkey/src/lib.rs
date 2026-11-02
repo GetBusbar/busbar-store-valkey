@@ -65,7 +65,6 @@ macro_rules! with_conn_no_retry {
 }
 
 /// Default connect timeout: bounds each new connection's dial and handshake, so a
-
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 const KEY_PREFIX: &str = "busbar:key:";
@@ -83,10 +82,8 @@ mod plane;
 const DENYLIST_PREFIX: &str = "busbar:denylist:";
 const DENYLIST_INDEX: &str = "busbar:denylist";
 /// The store-global revision counter, read and rewritten (`next_revision`) inside the `WATCH`ed
-
 const REVISION_KEY: &str = "busbar:revision";
 /// The schema marker. v6 is the oldest namespace migrated in place (older is REFUSED, never wiped);
-
 const SCHEMA_KEY: &str = "busbar:schema";
 const ATTRIBUTED_METERING_SCHEMA: i64 = 11;
 const SCHEMA_VERSION: i64 = 12;
@@ -102,7 +99,6 @@ const FIRST_MIGRATED_SCHEMA: i64 = 6;
 const KEPT_CONNECTIONS: usize = 8;
 
 /// Whether an op record's body belongs to a kept slot: a digest (32 bytes, or 64 lowercase hex), or
-
 fn kept_op_body(body: &[u8]) -> bool {
     let hex64 = body.len() == 64 && body.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     let name = body.split(|b| *b == b':').next().unwrap_or_default();
@@ -143,7 +139,6 @@ fn cred_id_key(cred_id: &str) -> String {
 }
 
 /// `s` with a `\\` before every character of `special` (which holds `\\` itself, so the escape
-
 fn escape(s: &str, special: &[char]) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -159,7 +154,6 @@ fn escape(s: &str, special: &[char]) -> String {
 const ROW_SEP: &[char] = &['\\', '|'];
 
 /// Hash field for one (model, unit) counter in a usage window. The four RESERVED units keep the v6
-
 fn usage_field(model: &str, unit: &str) -> String {
     if RESERVED_UNITS.contains(&unit) {
         format!("m:{model}:{unit}")
@@ -169,7 +163,6 @@ fn usage_field(model: &str, unit: &str) -> String {
 }
 
 /// Parse a usage-window hash field back into `(model, unit)` — the inverse of [`usage_field`].
-
 fn parse_usage_field(field: &str) -> Option<(String, String)> {
     if let Some(rest) = field.strip_prefix("m:") {
         let (model, tier) = rest.rsplit_once(':')?;
@@ -184,7 +177,6 @@ fn parse_usage_field(field: &str) -> Option<(String, String)> {
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
 /// Lower-case hex of `bytes` — the collision-free spelling of a caller-supplied component inside a
-
 pub(crate) fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -210,7 +202,6 @@ fn metering_set(bucket: u64) -> String {
 }
 
 /// The hash key of one metering cell: `(bucket, key_id, model, provider, priced_from_ms)`.
-
 fn metering_row(
     bucket: u64,
     key_id: &str,
@@ -231,7 +222,6 @@ fn metering_row(
 }
 
 /// The metering-cell hash field an open (non-token) ledgered class accumulates under. Everything after
-
 const METERING_UNIT_PREFIX: &str = "u:";
 
 /// Percent-decode public URL components (the upstream driver's username reading).
@@ -297,7 +287,6 @@ fn url_refused(why: &'static str) -> RedisError {
 }
 
 /// Every query parameter a URL form reads is named in `known`; any other one is REFUSED (the
-
 fn check_query(url: &url::Url, known: &[&str], has_secret: bool) -> RedisResult<()> {
     match url.query_pairs().find(|(k, _)| !known.contains(&k.as_ref())) {
         None => Ok(()),
@@ -313,7 +302,6 @@ fn check_query(url: &url::Url, known: &[&str], has_secret: bool) -> RedisResult<
 }
 
 /// The upstream driver's `protocol=` query check (`2`/`resp2`/`3`/`resp3`). The store speaks
-
 fn check_protocol(url: &url::Url) -> RedisResult<()> {
     match url.query_pairs().find(|(k, _)| k == "protocol") {
         None => Ok(()),
@@ -327,7 +315,6 @@ fn check_protocol(url: &url::Url) -> RedisResult<()> {
 }
 
 /// Parse a Valkey URL exactly as the upstream driver reads it (`redis` 1.7.1's
-
 fn parse_target(input: &ValkeyUrl) -> RedisResult<Target> {
     if let Some(why) = input
         .parsing_error()
@@ -413,7 +400,6 @@ fn parse_target(input: &ValkeyUrl) -> RedisResult<Target> {
 }
 
 /// A unix-socket URL, as the upstream driver read it: its path, and `db` / `user` / `pass` from
-
 fn parse_unix(url: &url::Url, input: &ValkeyUrl) -> RedisResult<Target> {
     let path = url
         .to_file_path()
@@ -480,7 +466,6 @@ impl std::fmt::Debug for Inner {
 }
 
 /// The store's one outbound need: a `tcp` stream to the server the settings' URL names (the store
-
 pub const NEEDS: &[busbar_contract::abi::host::conn::connector::Need] = {
     use busbar_contract::abi::host::conn::connector::{
         Need, DIRECTION_OUTBOUND, EGRESS_OPERATOR_INFRASTRUCTURE, KEEP_NAMED,
@@ -500,7 +485,6 @@ const NEED_TCP: u32 = 0;
 
 impl ValkeyStore {
     /// The op's connection over `wire`: the kept one when it is idle (its handshake done), else a
-
     async fn conn(&self, wire: Wire, ctx: Option<&str>) -> RecordStoreResult<Conn> {
         let failed = |e: String| {
             let text = match ctx {
@@ -533,7 +517,6 @@ impl ValkeyStore {
     }
 
     /// A NEW connection's handshake: TLS for `rediss://` (before its first byte; unverified for
-
     async fn handshake(&self, c: &mut Conn) -> RedisResult<()> {
         let t = &self.inner.target;
         if t.tls {
@@ -554,7 +537,6 @@ impl ValkeyStore {
     }
 
     /// Reconnect after a dropped connection: close it, dial a fresh one, handshake (the
-
     async fn reconnect(&self, c: &mut Conn) -> RedisResult<()> {
         let ms = u32::try_from(self.inner.connect_timeout.as_millis()).unwrap_or(u32::MAX);
         c.wire().bound(ms);
@@ -578,7 +560,6 @@ impl ValkeyStore {
     }
 
     /// `open`'s connect step: the first connection, the schema migration and the noeviction check
-
     async fn connect_step(&self, wire: Wire) -> RecordStoreResult<()> {
         let mut c = self.conn(wire, None).await?;
         self.migrate(&mut c).await?;
@@ -588,7 +569,6 @@ impl ValkeyStore {
     }
 
     /// STARTUP ASSERTION, non-negotiable: `maxmemory-policy` must be `noeviction`. Under any eviction
-
     async fn assert_noeviction(&self, c: &mut Conn) -> RecordStoreResult<()> {
         let pairs: Vec<(String, String)> = with_conn!(self, |c| {
             cmd("CONFIG")
@@ -621,7 +601,6 @@ impl ValkeyStore {
     }
 
     /// SCHEMA MIGRATION (see `SCHEMA_VERSION` for what each version did).
-
     async fn migrate(&self, c: &mut Conn) -> RecordStoreResult<()> {
         let mut marker: Option<i64> =
             with_conn!(self, |c| c.get::<_, Option<i64>>(SCHEMA_KEY).await)?;
@@ -705,7 +684,6 @@ impl ValkeyStore {
     }
 
     /// THE v9 STEP: delete what the deleted slots kept. The key families go
-
     async fn drop_dead_slot_keys(&self, c: &mut Conn) -> RecordStoreResult<()> {
         for pattern in [
             "busbar:cap:*",
@@ -790,7 +768,6 @@ impl ValkeyStore {
     }
 
     /// `e` as the store's error: a refusal as written, anything else a backend failure under
-
     fn err(&self, e: RedisError, ctx: &str) -> RecordStoreError {
         let text = if e.is_refusal() {
             e.to_string()
@@ -801,7 +778,6 @@ impl ValkeyStore {
     }
 
     /// Reserve `n` consecutive revisions and return the first. Called inside a `transaction!` that
-
     async fn next_revision(&self, c: &mut Conn, pipe: &mut Pipeline, n: u64) -> RedisResult<u64> {
         let cur: Option<i64> = c.get(REVISION_KEY).await?;
         let cur = u64::try_from(cur.unwrap_or(0)).map_err(|_| {
@@ -825,7 +801,6 @@ impl ValkeyStore {
 }
 
 /// A revoked credential has no remaining secret reader; new writes obey the same invariant as
-
 fn validate_revoked_credential(op: &str, secret: &CredentialSecret) -> RecordStoreResult<()> {
     if secret.meta.revoked_at.is_some()
         && (!secret.secret.is_empty() || secret.meta.secret_form != SecretForm::None)
@@ -838,7 +813,6 @@ fn validate_revoked_credential(op: &str, secret: &CredentialSecret) -> RecordSto
 }
 
 /// `put_credential`'s owner precondition, read inside its WATCHed transaction: the key row named by
-
 async fn owner_is_live(c: &mut Conn, key_row: &str, key_id: &str, op: &str) -> RedisResult<()> {
     let raw: Option<String> = c.get(key_row).await?;
     let refuse = |why: String| Err(RedisError::refused(why));
@@ -860,7 +834,6 @@ async fn owner_is_live(c: &mut Conn, key_row: &str, key_id: &str, op: &str) -> R
 }
 
 /// Whether the key row at `row` is a stored tombstone. A row that does not decode is not one:
-
 async fn tombstoned(c: &mut Conn, row: &str) -> RedisResult<bool> {
     let prior: Option<String> = c.get(row).await?;
     Ok(prior
@@ -882,7 +855,6 @@ enum Slot {
 }
 
 /// The slot checks of a credential mint (`op` names the refusals): a DIFFERENT live credential in
-
 async fn read_slot(c: &mut Conn, secret: &CredentialSecret, op: &str) -> RedisResult<Slot> {
     let m = &secret.meta;
     let row_key = cred_row_key(&m.key_id, &m.kind, m.slot);
@@ -957,7 +929,6 @@ fn parse_member(m: &str) -> Option<(&str, u8)> {
 }
 
 /// Queue the writes of a credential row and its pointers on `pipe`, deleting a revoked previous
-
 fn queue_credential(
     pipe: &mut Pipeline,
     secret: &CredentialSecret,
@@ -1017,7 +988,6 @@ fn cred_from_json(op: &str, row: &str, raw: &str) -> RecordStoreResult<Credentia
 }
 
 /// Parse a `"<key_id>:<kind>:<slot>"` pointer value back into its parts. `kind` cannot itself contain
-
 fn parse_slot_pointer(s: &str) -> Option<(String, String, u8)> {
     let (rest, slot) = s.rsplit_once(':')?;
     let (key_id, kind) = rest.rsplit_once(':')?;
@@ -1025,7 +995,6 @@ fn parse_slot_pointer(s: &str) -> Option<(String, String, u8)> {
 }
 
 /// The fields one usage delta adds, as `(hash field, delta)` pairs for `add_usage_batch`: the two
-
 fn usage_fields(delta: &UsageDelta) -> Vec<(String, i64)> {
     let mut fields: Vec<(String, i64)> = vec![
         ("requests".to_string(), delta.requests),
@@ -1042,7 +1011,6 @@ fn usage_fields(delta: &UsageDelta) -> Vec<(String, i64)> {
 }
 
 /// The rows of a metering bucket: `KEYS[1]` = the bucket's row set; each row's `HGETALL`, in one
-
 static LIST_METERING: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(
         r"
@@ -1146,7 +1114,6 @@ fn metering_from_fields(fields: Vec<(String, String)>) -> RecordStoreResult<Mete
 }
 
 /// The base op set's bodies, each over the op's one connection `c` (the store door, `slots`, runs
-
 impl ValkeyStore {
     pub(crate) async fn put_key(&self, c: &mut Conn, key: &VirtualKey) -> RecordStoreResult<()> {
         let row_key = format!("{KEY_PREFIX}{}", key.id);
@@ -1217,7 +1184,6 @@ impl ValkeyStore {
     }
 
     /// Read index membership and values from one stable revision snapshot. A writer between
-
     async fn delta_rows(
         &self,
         c: &mut Conn,
@@ -1839,7 +1805,6 @@ impl ValkeyStore {
 }
 
 /// Current unix time in seconds, stamped on tombstones and revocations (advisory metadata; the store
-
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2024,7 +1989,6 @@ fn attributed_metering_row(
 }
 
 /// Rename whole hashes without decoding or rewriting their counters or unknown fields.
-
 static MIGRATE_METERING_ATTRIBUTION: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(
         r#"
