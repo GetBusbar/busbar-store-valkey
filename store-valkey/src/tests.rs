@@ -685,15 +685,14 @@ fn delete_key_cleans_up_reverse_lookup_pointers() {
 #[test]
 fn delete_key_keeps_the_usage_ledger() {
     let Some(store) = live_store() else { return };
-    // This suite runs against a SHARED, PERSISTENT Valkey that is not flushed between runs, and
-    // this test uses a FIXED id. It used to be self-healing only because `put_key` resurrected
-    // whatever tombstone a prior run had left on that id; now that `put_key` refuses to clear a
-    // tombstone, the fixture has to be removed explicitly.
-    let _ = store.purge_key_for_test("vk_usage");
-    store.put_key(&vk("vk_usage")).unwrap();
+    // The usage ledger deliberately survives `delete_key` and `purge_key_for_test`, so a fixed id
+    // and window would accumulate across runs on the shared, persistent Valkey: a fresh id owns a
+    // fresh ledger.
+    let id = uid("vk_usage");
+    store.put_key(&vk(&id)).unwrap();
     store
         .add_usage(
-            "vk_usage",
+            &id,
             1000,
             &UsageDelta {
                 requests: 1,
@@ -702,10 +701,10 @@ fn delete_key_keeps_the_usage_ledger() {
             },
         )
         .unwrap();
-    let before = store.get_usage("vk_usage", 1000).unwrap();
+    let before = store.get_usage(&id, 1000).unwrap();
     assert_eq!(before.requests, 1);
-    store.delete_key("vk_usage").unwrap();
-    let after = store.get_usage("vk_usage", 1000).unwrap();
+    store.delete_key(&id).unwrap();
+    let after = store.get_usage(&id, 1000).unwrap();
     assert_eq!(
         after.requests, 1,
         "delete_key destroys credentials only: the usage ledger is billing evidence and stays"
@@ -1273,6 +1272,14 @@ fn metering_round_trips_all_fields_including_renamed_and_new_ones() {
     assert_eq!(r.billable_requests, 1);
     assert_eq!(r.key_group_at_use, "growth");
     assert_eq!(r.pricing_version, "2026-07");
+    assert_eq!(r.key_id, key_id);
+    assert_eq!(r.model, "claude");
+    assert_eq!(r.provider, "anthropic");
+    assert_eq!(r.tokens_input, 10);
+    assert_eq!(r.tokens_output, 5);
+    assert_eq!(r.tokens_cache_read, 2);
+    assert_eq!(r.requests, 1);
+    assert_eq!(r.priced_from_ms, 0);
 }
 
 #[test]
@@ -2248,6 +2255,7 @@ fn mcp_call_principals_are_enumerable_after_a_reconnect() {
 fn purge_mcp_calls_before_deletes_and_returns_a_real_count() {
     let _serialised = purge_guard();
     let Some(store) = live_store() else { return };
+    clear_purge_band(&store, "call");
     let p = uid("vk_mcp_purge");
     store
         .append_mcp_call(&sample_call(&p, 1, 1_000_000_100, "", "h1"))
@@ -2260,9 +2268,9 @@ fn purge_mcp_calls_before_deletes_and_returns_a_real_count() {
         .unwrap();
 
     let purged = store.purge_mcp_calls_before(1_000_000_200).unwrap();
-    assert!(
-        purged >= 1,
-        "purge must report rows it actually removed; got {purged}"
+    assert_eq!(
+        purged, 1,
+        "purge must report exactly the rows it actually removed"
     );
     assert_eq!(
         store
@@ -2278,10 +2286,7 @@ fn purge_mcp_calls_before_deletes_and_returns_a_real_count() {
     assert!(store.list_mcp_call_principals().unwrap().contains(&p));
 
     let rest = store.purge_mcp_calls_before(1_000_001_000).unwrap();
-    assert!(
-        rest >= 2,
-        "the remaining two rows must actually be removed; got {rest}"
-    );
+    assert_eq!(rest, 2, "the remaining two rows are the ones removed");
     assert!(store.list_mcp_calls(&p).unwrap().is_empty());
     assert!(
         !store.list_mcp_call_principals().unwrap().contains(&p),
@@ -2433,8 +2438,8 @@ fn reset_tasks(store: &ValkeyStore, task_ids: &[&str]) {
 /// body's own `updated_at` need not agree with it (the conformance suite's task bodies all say
 /// 1_700_000_100 while their sidecars sit in this band) — clearing by the body would leave exactly
 /// the rows the sweep then counts.
-fn clear_purge_band(store: &ValkeyStore) {
-    let byts = format!("busbar:plane:{}:byts", hex(b"task"));
+fn clear_purge_band(store: &ValkeyStore, kind: &str) {
+    let byts = format!("busbar:plane:{}:byts", hex(kind.as_bytes()));
     let fields: Vec<String> = store
         .with_conn(|c| c.zrangebyscore(&byts, "-inf", format!("({TASK_PURGE_BAND_TOP}")))
         .expect("read the purge band");
@@ -2442,7 +2447,13 @@ fn clear_purge_band(store: &ValkeyStore) {
         .iter()
         .filter_map(|f| f.split_once(':').map(|(_, id)| id))
         .collect();
-    reset_tasks(store, &ids);
+    if kind == "task" {
+        reset_tasks(store, &ids);
+    } else {
+        for id in ids {
+            store.delete_plane_record(kind, id).expect("clear the band");
+        }
+    }
 }
 
 /// THE TEST THAT MATTERS: an in-flight task, read back off the server on a NEW connection after the
@@ -2637,7 +2648,7 @@ fn a_replayed_task_event_is_idempotent_and_a_different_one_is_a_fork() {
 fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
     let _guard = purge_guard();
     let Some(store) = live_store() else { return };
-    clear_purge_band(&store);
+    clear_purge_band(&store, "task");
 
     let old = 1_000_000_100;
     for state in ["completed", "failed", "canceled", "rejected"] {
@@ -2702,7 +2713,7 @@ fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
         0,
         "re-running the same purge removes nothing"
     );
-    clear_purge_band(&store);
+    clear_purge_band(&store, "task");
 }
 
 /// Deleting a task takes its provenance chain with it, and no other task's.
@@ -2740,7 +2751,7 @@ fn deleting_a_task_takes_its_provenance_chain_with_it_and_no_other() {
 fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
     let _guard = purge_guard();
     let Some(store) = live_store() else { return };
-    clear_purge_band(&store);
+    clear_purge_band(&store, "task");
 
     let (gone, stays) = ("t_vk_cascade_gone", "t_vk_cascade_stays");
     reset_tasks(&store, &[gone, stays]);
@@ -2782,7 +2793,7 @@ fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
         "another task's chain must be untouched by that purge"
     );
     reset_tasks(&store, &[gone, stays]);
-    clear_purge_band(&store);
+    clear_purge_band(&store, "task");
 }
 
 /// Two task ids differing ONLY IN CASE are two tasks, and the same for two chains.
@@ -4848,7 +4859,10 @@ fn put_key_with_credential_never_remints_a_revoked_credential() {
     );
     let row = store.lookup_credential_secret("sigv4", &p1).unwrap();
     assert!(
-        row.is_none_or(|r| r.meta.revoked_at.is_some()),
+        row.expect("a revoked credential still resolves")
+            .meta
+            .revoked_at
+            .is_some(),
         "the credential must stay revoked"
     );
 }
@@ -4945,7 +4959,10 @@ fn put_credential_never_remints_a_revoked_credential() {
     );
     let row = store.lookup_credential_secret("sigv4", &p1).unwrap();
     assert!(
-        row.is_none_or(|r| r.meta.revoked_at.is_some()),
+        row.expect("a revoked credential still resolves")
+            .meta
+            .revoked_at
+            .is_some(),
         "the credential must stay revoked"
     );
 }
@@ -5201,13 +5218,19 @@ fn a_refused_handshake_does_not_leave_a_connection_kept() {
     let id = uid("vk_hs_c");
     let landed = store.put_key(&vk(&id));
     let row = format!("busbar:key:{id}");
-    let in_db0: bool = admin.exists(&row).unwrap();
+    // Database 0 by name: the admin connection sits on `VALKEY_URL`'s database, which the suite
+    // allows to be non-zero.
+    let mut db0 = redis::Client::open(url_for_db(0).as_str())
+        .unwrap()
+        .get_connection()
+        .unwrap();
+    let in_db0: bool = db0.exists(&row).unwrap();
     let _: () = redis::cmd("ACL")
         .arg(&["DELUSER", user.as_str()][..])
         .query(&mut admin)
         .unwrap();
     if in_db0 {
-        let _: () = admin.del(&row).unwrap();
+        let _: () = db0.del(&row).unwrap();
     }
     landed.expect("the next op re-handshakes and succeeds");
     assert!(
