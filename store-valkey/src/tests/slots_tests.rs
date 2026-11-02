@@ -653,11 +653,41 @@ fn an_op_id_write_runs_after_the_script_cache_is_flushed() {
         },
     )];
     s.add_usage_batch(op(94), &cells).expect("applies");
-    flush_scripts();
+    // The flush lands on the proxy's thread right before the first `EVALSHA` chunk is forwarded,
+    // so the cache is cold for exactly that call (a parallel test cannot re-warm it in between),
+    // and the `EVAL` fallback is counted on the wire.
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let flushed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let evals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (f, e) = (flushed.clone(), evals.clone());
+    let proxied = super::interleave::tamper(
+        &url,
+        move |c| {
+            let has = |t: &[u8]| super::interleave::contains(c, t);
+            if has(b"$4\r\nEVAL\r\n") {
+                e.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            has(b"EVALSHA") && !f.swap(true, std::sync::atomic::Ordering::SeqCst)
+        },
+        flush_scripts,
+    );
+    let via =
+        <super::LoadedStore as Connect>::connect(&proxied).expect("connect through the proxy");
     let id = op(95);
-    s.add_usage_batch(id, &cells)
+    via.add_usage_batch(id, &cells)
         .expect("applies after the flush");
-    s.add_usage_batch(id, &cells).expect("replays");
+    assert!(flushed.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        evals.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the cold cache must send exactly one EVAL fallback"
+    );
+    via.add_usage_batch(id, &cells).expect("replays");
+    assert_eq!(
+        evals.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the replay is a plain EVALSHA"
+    );
     assert_eq!(s.get_usage(&bucket, 0).unwrap().requests, 2);
 }
 
