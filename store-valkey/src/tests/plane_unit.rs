@@ -106,13 +106,13 @@ fn shared_clock_equality_admits_once_and_ticket_preflight_never_spends() {
     let Some(_) = crate::tests::live_store() else {
         return;
     };
-    let (_database, _raw) = crate::tests::fresh_db_client(crate::tests::TOKEN_CLOCK_DATABASE);
-    let store = busbar_plugin_loader::store_v3::LoadedStore::connect(&crate::tests::url_for_db(
+    let (database, _raw) = crate::tests::fresh_db_client(crate::tests::TOKEN_CLOCK_DATABASE);
+    let _store = busbar_plugin_loader::store_v3::LoadedStore::connect(&crate::tests::url_for_db(
         crate::tests::TOKEN_CLOCK_DATABASE,
     ))
     .unwrap();
     let (server_now, _micros): (u64, u64) =
-        store.with_conn(|c| redis::cmd("TIME").query(c)).unwrap();
+        database.with_conn(|c| redis::cmd("TIME").query(c)).unwrap();
     const CLOCK_AHEAD: u64 = 900;
     const TOKEN_KIND: &str = "clock-boundary";
     const TOKEN: &str = "at-boundary";
@@ -155,7 +155,7 @@ fn shared_clock_equality_admits_once_and_ticket_preflight_never_spends() {
         ..record
     };
     let encoded = sidecar(&record.view()).unwrap();
-    store
+    database
         .with_conn(|c| {
             let _: () = c.hset(&keys.rec, field(UPSERT_SEQ, TOKEN), &encoded)?;
             let _: () = c.hset(&keys.body, field(UPSERT_SEQ, TOKEN), b"boundary-ticket")?;
