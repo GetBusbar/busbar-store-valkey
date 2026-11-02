@@ -939,6 +939,12 @@ fn a_purge_larger_than_one_batch_counts_and_removes_exactly_the_terminal_rows() 
         s.upsert_plane_record(rec(i, 2, PlaneDisposition::Terminal).view())
             .unwrap();
     }
+    // Rows stamped EXACTLY at `before` (10) are not strictly older: the purge bound is exclusive,
+    // so neither retention mode may touch them.
+    s.upsert_plane_record(rec(2400, 10, PlaneDisposition::Terminal).view())
+        .unwrap();
+    s.upsert_plane_record(rec(2401, 10, PlaneDisposition::Active).view())
+        .unwrap();
     let n = s
         .purge_plane_records(&kind, 10, busbar_contract::records::Retention::TerminalOnly)
         .unwrap();
@@ -950,7 +956,7 @@ fn a_purge_larger_than_one_batch_counts_and_removes_exactly_the_terminal_rows() 
     let n = s
         .purge_plane_records(&kind, 10, busbar_contract::records::Retention::Age)
         .unwrap();
-    assert_eq!(n, 0);
+    assert_eq!(n, 0, "rows at ts == before must survive the purge");
 }
 
 /// The v6 -> v7 copy never deletes a v6 task-event chain whose position holds a DIFFERENT record
