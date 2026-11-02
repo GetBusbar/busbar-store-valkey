@@ -9,10 +9,16 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+
+/// Read-held by every live [`Gate`], write-held by a test that empties the server's script cache
+/// (`SCRIPT FLUSH` is server-wide): a gated test warms the cache and then holds a script call, and a
+/// flush landing in the gap makes that call answer `NOSCRIPT` and run twice.
+pub(super) static SCRIPT_CACHE: RwLock<()> = RwLock::new(());
 
 /// A running gate: `url` is the `VALKEY_URL` pointed at the proxy.
 pub(super) struct Gate {
+    _script_cache: RwLockReadGuard<'static, ()>,
     pub url: String,
     /// Fires once, when the trigger command has been forwarded and the client is held.
     pub held: Receiver<()>,
@@ -83,6 +89,7 @@ pub(super) fn gate(
     before: bool,
     trigger: impl Fn(&[u8]) -> bool + Send + Sync + 'static,
 ) -> Gate {
+    let script_cache = SCRIPT_CACHE.read().unwrap_or_else(|e| e.into_inner());
     let (held_tx, held) = channel();
     let (release, release_rx) = channel();
     let release_rx = Mutex::new(release_rx);
@@ -98,6 +105,7 @@ pub(super) fn gate(
     let (b, a) = if before { (hold, nop) } else { (nop, hold) };
     let addr = proxy(valkey_url, b, a);
     Gate {
+        _script_cache: script_cache,
         url: repoint(valkey_url, &addr),
         held,
         release,

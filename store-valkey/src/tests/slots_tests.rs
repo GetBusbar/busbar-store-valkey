@@ -599,6 +599,45 @@ fn an_older_builds_recorded_body_replays_and_a_different_op_conflicts() {
     );
 }
 
+/// `SCRIPT FLUSH` empties the script cache of the whole server, so it must not land under a gated
+/// test that warmed the cache first and holds a script call across the gap.
+fn flush_scripts() {
+    let _alone = super::interleave::SCRIPT_CACHE
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut raw = redis::Client::open(std::env::var("VALKEY_URL").expect("live_store read it"))
+        .and_then(|c| c.get_connection())
+        .expect("an independent client");
+    redis::cmd("SCRIPT")
+        .arg("FLUSH")
+        .query::<()>(&mut raw)
+        .expect("SCRIPT FLUSH");
+}
+
+/// A live gate keeps the script cache: the flush waits until the gated test is done.
+#[test]
+fn a_script_flush_waits_for_a_live_gate() {
+    let Some(_) = live_store() else { return };
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let gate = super::interleave::gate(&url, false, |_| false);
+    let (done, flushed) = std::sync::mpsc::channel();
+    let flusher = std::thread::spawn(move || {
+        flush_scripts();
+        done.send(()).unwrap();
+    });
+    assert!(
+        flushed
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .is_err(),
+        "SCRIPT FLUSH ran while a gated test was live"
+    );
+    drop(gate);
+    flushed
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the flush runs once the gate is gone");
+    flusher.join().unwrap();
+}
+
 /// An `op_id` write still runs, once, when the server's script cache lost its script.
 #[test]
 fn an_op_id_write_runs_after_the_script_cache_is_flushed() {
@@ -614,13 +653,7 @@ fn an_op_id_write_runs_after_the_script_cache_is_flushed() {
         },
     )];
     s.add_usage_batch(op(94), &cells).expect("applies");
-    let mut raw = redis::Client::open(std::env::var("VALKEY_URL").expect("live_store read it"))
-        .and_then(|c| c.get_connection())
-        .expect("an independent client");
-    redis::cmd("SCRIPT")
-        .arg("FLUSH")
-        .query::<()>(&mut raw)
-        .expect("SCRIPT FLUSH");
+    flush_scripts();
     let id = op(95);
     s.add_usage_batch(id, &cells)
         .expect("applies after the flush");
