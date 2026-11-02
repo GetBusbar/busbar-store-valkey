@@ -1452,6 +1452,54 @@ fn connect_refuses_to_start_under_an_eviction_policy() {
     );
 }
 
+/// A start refused for its eviction policy changes NOTHING: the noeviction check runs before the
+/// in-place schema upgrade, so the v7 namespace keeps its dead-slot keys and its marker.
+/// `#[ignore]`d for the reason above (it flips the server's global policy); run alone.
+#[test]
+#[ignore]
+fn a_start_refused_for_eviction_policy_does_not_migrate() {
+    let Some(_baseline) = live_store() else {
+        return;
+    };
+    let mut up = fresh_db_client(15);
+    redis::cmd("SET")
+        .arg("busbar:schema")
+        .arg(7)
+        .query::<()>(&mut up)
+        .unwrap();
+    redis::cmd("SET")
+        .arg("busbar:cap:dead")
+        .arg("x")
+        .query::<()>(&mut up)
+        .unwrap();
+    let set_policy = |c: &mut redis::Connection, p: &str| {
+        redis::cmd("CONFIG")
+            .arg("SET")
+            .arg("maxmemory-policy")
+            .arg(p)
+            .query::<()>(c)
+            .unwrap();
+    };
+    set_policy(&mut up, "allkeys-lru");
+    let result = ValkeyStore::connect(&url_for_db(15));
+    set_policy(&mut up, "noeviction");
+    let marker: String = redis::cmd("GET")
+        .arg("busbar:schema")
+        .query(&mut up)
+        .unwrap();
+    let dead: bool = redis::cmd("EXISTS")
+        .arg("busbar:cap:dead")
+        .query(&mut up)
+        .unwrap();
+    redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
+    assert!(result.is_err(), "the eviction policy refuses the start");
+    assert_eq!(
+        marker, "7",
+        "a refused start must not re-mark the namespace"
+    );
+    assert!(dead, "a refused start must not run the upgrade's deletions");
+}
+
 // ── migrate() / with_conn retry: guards on two predicates in `store-valkey/src/lib.rs` ─────────
 //
 // The logic these pin is correct; what was missing was anything that would fail if it broke. Both

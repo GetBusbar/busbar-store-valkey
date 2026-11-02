@@ -696,12 +696,16 @@ impl ValkeyStore {
         &self.inner.pool
     }
 
-    /// `open`'s connect step: the first connection, the schema migration and the noeviction check
+    /// `open`'s connect step: the first connection, the noeviction check and the schema migration
     /// (its failures are the load's refusal).
     async fn connect_step(&self, wire: Wire) -> RecordStoreResult<()> {
         let mut c = self.conn(wire, None).await?;
-        self.migrate(&mut c).await?;
-        let r = self.assert_noeviction(&mut c).await;
+        // The policy is judged FIRST: a start refused for it must not have rewritten and re-marked
+        // the namespace on a server that can evict what the upgrade just wrote.
+        let r = match self.assert_noeviction(&mut c).await {
+            Ok(()) => self.migrate(&mut c).await,
+            Err(e) => Err(e),
+        };
         c.settle();
         r
     }
