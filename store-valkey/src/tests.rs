@@ -4356,7 +4356,7 @@ fn connect_timeout_ms_is_the_dial_timeout() {
     assert_eq!(
         store.expect_err("a zero timeout refuses the load"),
         "plugin 'busbar-store-valkey' open failed: invalid valkey plugin config: \
-         `connect_timeout_ms` must be a positive integer (milliseconds), got a number"
+         `connect_timeout_ms` must be a positive integer (milliseconds), got 0"
     );
 }
 
@@ -5143,9 +5143,9 @@ fn settings_refuse_an_unknown_top_level_key() {
 fn settings_refuse_a_connect_timeout_that_is_not_a_positive_integer() {
     for (bad, got) in [
         ("\"5000\"", "a string"),
-        ("1.5", "a number"),
-        ("-3", "a number"),
-        ("0", "a number"),
+        ("1.5", "1.5"),
+        ("-3", "-3"),
+        ("0", "0"),
         ("true", "a boolean"),
         ("[]", "an array"),
         ("{}", "an object"),
