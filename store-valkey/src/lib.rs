@@ -1382,7 +1382,9 @@ impl ValkeyStore {
                 continue;
             }
             let Some((model, unit)) = parse_usage_field(&name) else {
-                continue;
+                return Err(RecordStoreError(format!(
+                    "usage row {k} has unreadable field {name}; refusing to report a partial ledger"
+                )));
             };
             let entry = match ledger.models.iter_mut().find(|m| m.model == model) {
                 Some(m) => m,

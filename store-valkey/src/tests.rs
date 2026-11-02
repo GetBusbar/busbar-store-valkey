@@ -5914,3 +5914,31 @@ fn revoke_with_a_dangling_id_pointer_errors() {
         .expect_err("a dangling pointer is not a successful revocation");
     assert!(err.to_string().contains(&c0.meta.id), "{err}");
 }
+
+/// A usage hash field `get_usage` cannot parse is an error naming the bucket row and the field, not
+/// a silent skip: a smaller ledger would under-report spend, and the next `put_usage` (DEL +
+/// rewrite) would erase the unreadable counts for good.
+#[test]
+fn get_usage_refuses_an_unreadable_field_instead_of_under_reporting() {
+    let Some(store) = live_store() else { return };
+    let bucket = uid("vk_usage_badfield");
+    store
+        .put_usage(&bucket, 1000, &UsageLedger::default())
+        .unwrap();
+    store
+        .with_conn(|c| {
+            c.hset_multiple::<_, _, _, ()>(
+                format!("busbar:usage:{bucket}:1000"),
+                &[("requests", "2"), ("u:zz-not-hex:gpt", "5")],
+            )
+        })
+        .unwrap();
+    let err = store
+        .get_usage(&bucket, 1000)
+        .expect_err("an unparseable usage field is refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("u:zz-not-hex:gpt") && msg.contains(&bucket),
+        "names the row and the field: {msg}"
+    );
+}
