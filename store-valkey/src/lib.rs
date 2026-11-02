@@ -232,7 +232,14 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
     }
     (0..s.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .map(|i| {
+            let pair = s.get(i..i + 2)?;
+            // `from_str_radix` alone would accept a sign (`+a`).
+            if !pair.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            u8::from_str_radix(pair, 16).ok()
+        })
         .collect()
 }
 
@@ -402,7 +409,7 @@ fn percent_decode_utf8(s: &str) -> Option<String> {
 fn check_query(url: &url::Url, known: &[&str], has_secret: bool) -> RedisResult<()> {
     match url.query_pairs().find(|(k, _)| !known.contains(&k.as_ref())) {
         None => Ok(()),
-        Some((k, _)) if has_secret || k.contains('@') => Err(url_refused(
+        Some((k, _)) if has_secret || k.contains('@') || query_has_at(url) => Err(url_refused(
             "an unknown URL parameter is not supported (its name is withheld: the URL carries a password)",
         )),
         Some((k, _)) => Err(RedisError::from((
@@ -413,12 +420,21 @@ fn check_query(url: &url::Url, known: &[&str], has_secret: bool) -> RedisResult<
     }
 }
 
+/// The raw query holds an `@`: the sign that a password written unencoded split the userinfo at
+/// `?`, so every name and value in the query may be password text.
+fn query_has_at(url: &url::Url) -> bool {
+    url.query().is_some_and(|q| q.contains('@'))
+}
+
 /// The upstream driver's `protocol=` query check (`2`/`resp2`/`3`/`resp3`). The store speaks
 /// RESP2 whatever it says: every reply it reads converts the same either way.
 fn check_protocol(url: &url::Url) -> RedisResult<()> {
     match url.query_pairs().find(|(k, _)| k == "protocol") {
         None => Ok(()),
         Some((_, p)) if matches!(p.as_ref(), "2" | "resp2" | "3" | "resp3") => Ok(()),
+        Some((_, _)) if query_has_at(url) => Err(url_refused(
+            "Invalid protocol version (its value is withheld: the URL may carry a password)",
+        )),
         Some((_, p)) => Err(RedisError::from((
             ErrorKind::InvalidClientConfig,
             "Invalid protocol version",

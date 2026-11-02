@@ -186,6 +186,28 @@ impl Raw for LoadedStore {
     }
 }
 
+/// An unencoded password starting with `?` moves the userinfo `@` into the query: the refusal must
+/// not echo the query's first key (a password fragment) or a `protocol=` value.
+#[test]
+fn a_password_split_at_question_mark_is_not_echoed_in_the_refusal() {
+    for url in [
+        "redis://default:?S3cretPart=x@valkey.internal:6379",
+        "redis://default:?protocol=S3cretPart@valkey.internal:6379",
+    ] {
+        let err = parse_url(url).expect_err("refused").to_string();
+        assert!(!err.contains("S3cretPart"), "{url}: secret echoed: {err}");
+    }
+}
+
+/// `unhex` takes hex digits only: `from_str_radix` alone would let a sign through (`+a`).
+#[test]
+fn unhex_refuses_a_signed_pair() {
+    assert_eq!(unhex("0a"), Some(vec![10]));
+    assert_eq!(unhex("+a"), None);
+    assert_eq!(parse_usage_field("u:+a:model"), None);
+    assert!(parse_usage_field("u:0a:model").is_some());
+}
+
 /// The password-scrub never lets the URL secret out in an error string, and the URL password
 /// extractor handles every URL shape.
 #[test]
