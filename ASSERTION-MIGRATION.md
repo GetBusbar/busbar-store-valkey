@@ -35,7 +35,7 @@ The removed host macro's production destination-guard policy proof (private/defa
 
 `test-support/valkey_io.rs` binds the actual TCP door through the actual production Connector and TLS implementation; it implements no transport/store protocol. Normal logic and integration tests use it.
 
-`store-valkey/src/tests/socket_observer.rs` retains 402 lines solely for existing assertions requiring observable dial timeouts and a concrete TestTls handshaker's certificate-error evidence. It has no configurable transport facts, destination-guard seam, late-dial mode, protocol parser, fake store, generic TLS trait, exported package, or new framework. Its concrete ValkeyWireObserver supports only TCP, Unix and this module's TestTlsStream. Unix support is consumed by `a_unix_socket_url_reaches_the_server`. The consumers are:
+`store-valkey/src/tests/recorded_connector.rs` is a 184-line observation/forwarding value around the actual production Connector/TCP host. It records only effective requested dial timeouts and the actual connector's security-failure cause before connection retirement. It delegates socket I/O, message flags, tickets, waits, security upgrades, facts, landed status, closure and instance forgetting without substitution. It implements no socket, ConnSlab, TLS client, polling or framing. The previous 402-line socket implementation and 137 lines of custom TestTls/TestTlsStream/AnyCertificate helpers were deleted. The consumers remain:
 
 - `the_store_keeps_one_connection_across_ops`
 - `with_conn_transparently_reconnects_after_the_connection_is_dropped`
@@ -49,7 +49,7 @@ The removed host macro's production destination-guard policy proof (private/defa
 - `usage_cleanup_continues_empty_scan_pages_deduplicates_and_counts_delete_replies`
 - `usage_cleanup_never_reconnects_and_replays_a_delete_whose_reply_was_lost`
 
-A production Connector does not expose the concrete TestTls `last_verify_off`/`last_handshake_error` observations or the ordered dial-timeout values used by these unchanged assertions. ClockOnly directly implements the required HostServices refusals and clock; it is no generic services adapter. Credential-auth's fragmented RESP peer remains its pre-existing assertion-specific input.
+The trusted/untrusted TLS test now supplies EgressTrust extra anchors to the actual connector, then checks the actual CAUSE_SECURITY and the exact rustls UnknownIssuer error string. Its original UnknownIssuer check and host refusal-prefix checks remain. The trusted readback/one-kept-connection case and insecure verified-refusal/unverified-success/two-accepted-connections case remain. The production cause is also explicitly pinned by core `connector_tests::a_trust_refusal_names_its_cause_and_the_trusted_twin_is_reached` and `compose_close_deadline_tests::an_untrusted_midstream_upgrade_records_the_security_cause`; no behavior assertion is retired. ClockOnly directly implements the required HostServices refusals and clock; credential-auth's pre-existing fragmented RESP peer remains assertion-specific input.
 
 ## Qualification
 
@@ -76,3 +76,6 @@ Conflicts were resolved as follows:
 - `tests/e2e.rs`: retain kit-free real connector and canonical actual-artifact selection/freshness assertion, replace the nested mtime walker with the audit factored walker and its test-only-source regression.
 
 A source inventory found every donor-added function/test name present in the composed sources. Kit/macro Rust-source census is zero. Formatting and diff checks pass. No cargo build/test/clippy or database run was launched in this composition lane. Earlier pre-audit native results do not qualify this merge; the parent native lane must build and exercise this exact composed tree.
+
+
+The bounded actual-host replacement was source-reviewed after baseline `011454069f432f13a612c63900164901de639172`: all eleven named consumers retain their outcomes and exact timeout/cardinality/error assertions; only their connection implementation and certificate evidence source change. Formatting/diff checks pass; no local builds or tests were launched. Native qualification must use this final source and the parent-owned service base database 0, keeping private database 14 guarded against FLUSHDB of a shared database.

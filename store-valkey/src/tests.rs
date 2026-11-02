@@ -23,9 +23,9 @@ use busbar_plugin_loader::dispatch::{
     load_linked, Bind, DispatchConfig, Dispatcher, LinkedRow, NoSink,
 };
 use busbar_plugin_loader::store_v3::LoadedStore;
-#[path = "tests/socket_observer.rs"]
-mod socket_observer;
-use socket_observer::ValkeyWireObserver;
+#[path = "tests/recorded_connector.rs"]
+mod recorded_connector;
+use recorded_connector::RecordedConnector;
 
 /// THE STORE UNDER TEST is the store as the host opens it: its door through the loader
 pub(crate) type ValkeyStore = LoadedStore;
@@ -3825,8 +3825,8 @@ fn tls_pump(conn: rustls::ServerConnection, front: std::net::TcpStream, back: st
 /// The store's door opened on `settings` on a dispatcher of its own, over the connection table
 fn open_on(
     settings: &str,
-    table: impl FnOnce(&Dispatcher) -> ValkeyWireObserver,
-) -> (Result<LoadedStore, String>, Arc<ValkeyWireObserver>) {
+    table: impl FnOnce(&Dispatcher) -> RecordedConnector,
+) -> (Result<LoadedStore, String>, Arc<RecordedConnector>) {
     open_on_dispatcher(
         Arc::new(Dispatcher::new(DispatchConfig::default())),
         settings,
@@ -3838,8 +3838,8 @@ fn open_on(
 fn open_on_dispatcher(
     d: Arc<Dispatcher>,
     settings: &str,
-    table: impl FnOnce(&Dispatcher) -> ValkeyWireObserver,
-) -> (Result<LoadedStore, String>, Arc<ValkeyWireObserver>) {
+    table: impl FnOnce(&Dispatcher) -> RecordedConnector,
+) -> (Result<LoadedStore, String>, Arc<RecordedConnector>) {
     let t = Arc::new(table(&d));
     let conns: Arc<dyn busbar_contract::conn::DeclaredConns> = t.clone();
     let row = LinkedRow::of(crate::door).expect("the door");
@@ -3857,150 +3857,13 @@ fn open_on_dispatcher(
     (LoadedStore::open(p, d, settings.as_bytes(), mint), t)
 }
 
-fn plain(d: &Dispatcher) -> ValkeyWireObserver {
-    ValkeyWireObserver::new(d.conn_waker())
+fn plain(d: &Dispatcher) -> RecordedConnector {
+    RecordedConnector::new(d.conn_waker())
 }
 
-/// A table whose TLS trusts no root: a verifying handshake refuses every certificate, and only an
-fn trusting_nothing(d: &Dispatcher) -> ValkeyWireObserver {
-    ValkeyWireObserver::with_tls(d.conn_waker(), Arc::new(TestTls::default()))
-}
-
-/// The concrete Valkey wire observer's TLS: rustls trusting exactly the roots a test hands it, or, on
-/// `verify_off`, checking no certificate, only the handshake's signature. As the loader's own test
-/// table secured a stream before TLS left it (busbar 0db7ee2ea0 `ValkeyWireObserver::with_roots`).
-#[derive(Default)]
-struct TestTls {
-    roots: Option<Vec<u8>>,
-    last_handshake_error: std::sync::Mutex<Option<String>>,
-}
-
-impl TestTls {
-    fn trusting(ca_der: &[u8]) -> Self {
-        Self {
-            roots: Some(ca_der.to_vec()),
-            ..Default::default()
-        }
-    }
-
-    fn config(&self, verify_off: bool) -> Arc<rustls::ClientConfig> {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
-            .with_safe_default_protocol_versions()
-            .expect("the default protocol versions");
-        let config = if verify_off {
-            builder
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(AnyCertificate(provider)))
-                .with_no_client_auth()
-        } else {
-            let mut roots = rustls::RootCertStore::empty();
-            if let Some(ca) = &self.roots {
-                roots
-                    .add(rustls_pki_types::CertificateDer::from(ca.clone()))
-                    .expect("the test CA is a root certificate");
-            }
-            builder.with_root_certificates(roots).with_no_client_auth()
-        };
-        Arc::new(config)
-    }
-}
-
-impl TestTls {
-    fn secure(
-        &self,
-        server: &str,
-        verify_off: bool,
-        mut tcp: std::net::TcpStream,
-    ) -> std::io::Result<Box<TestTlsStream>> {
-        *self.last_handshake_error.lock().unwrap() = None;
-        let invalid = |e: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, e);
-        let name = rustls_pki_types::ServerName::try_from(server.to_owned())
-            .map_err(|e| invalid(e.to_string()))?;
-        let mut tls = rustls::ClientConnection::new(self.config(verify_off), name)
-            .map_err(|e| invalid(e.to_string()))?;
-        while tls.is_handshaking() {
-            tls.complete_io(&mut tcp).inspect_err(|error| {
-                *self.last_handshake_error.lock().unwrap() = Some(error.to_string());
-            })?;
-        }
-        Ok(Box::new(TestTlsStream(rustls::StreamOwned::new(tls, tcp))))
-    }
-}
-
-/// A stream [`TestTls`] secured.
-struct TestTlsStream(rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>);
-
-impl std::io::Read for TestTlsStream {
-    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
-        self.0.read(b)
-    }
-}
-
-impl std::io::Write for TestTlsStream {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        self.0.write(b)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
-    }
-}
-
-impl TestTlsStream {
-    fn tcp(&self) -> &std::net::TcpStream {
-        self.0.get_ref()
-    }
-    fn close(&mut self) {
-        self.0.conn.send_close_notify();
-        let _ = std::io::Write::flush(&mut self.0);
-        let _ = self.0.sock.shutdown(std::net::Shutdown::Both);
-    }
-}
-
-/// A verifier that checks no certificate, only the handshake's signature (`#insecure`).
-#[derive(Debug)]
-struct AnyCertificate(Arc<rustls::crypto::CryptoProvider>);
-
-impl rustls::client::danger::ServerCertVerifier for AnyCertificate {
-    fn verify_server_cert(
-        &self,
-        _: &rustls_pki_types::CertificateDer<'_>,
-        _: &[rustls_pki_types::CertificateDer<'_>],
-        _: &rustls_pki_types::ServerName<'_>,
-        _: &[u8],
-        _: rustls_pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls_pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls_pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
+/// The actual connector with platform trust, which does not trust either private test CA.
+fn trusting_nothing(d: &Dispatcher) -> RecordedConnector {
+    RecordedConnector::new(d.conn_waker())
 }
 
 fn settings_for(url: &str) -> String {
@@ -4184,7 +4047,13 @@ fn a_rediss_url_is_secured_through_the_hosts_connector() {
     let (_, db, userinfo) = live_parts();
     let url = format!("rediss://{userinfo}127.0.0.1:{port}/{db}");
     let (store, _) = open_on(&settings_for(&url), |d| {
-        ValkeyWireObserver::with_tls(d.conn_waker(), Arc::new(TestTls::trusting(&ca)))
+        RecordedConnector::with_trust(
+            d.conn_waker(),
+            busbar_contract::transport::EgressTrust {
+                extra_anchors: vec![ca.clone()],
+                ..Default::default()
+            },
+        )
     });
     let store = store.expect("opens over TLS");
     let id = uid("vk_tls");
@@ -4193,12 +4062,20 @@ fn a_rediss_url_is_secured_through_the_hosts_connector() {
     assert_eq!(proxy.accepted(), 1, "one secured connection, kept");
     let _ = store.purge_key_for_test(&id);
 
-    let untrusted_tls = Arc::new(TestTls::default());
-    let (untrusted, _) = open_on(&settings_for(&url), |d| {
-        ValkeyWireObserver::with_tls(d.conn_waker(), untrusted_tls.clone())
-    });
+    let (untrusted, table) = open_on(&settings_for(&url), trusting_nothing);
     let err = untrusted.expect_err("the TLS certificate must be trusted");
-    let tls_error = untrusted_tls.last_handshake_error.lock().unwrap().clone();
+    let tls_cause = table
+        .security_failure()
+        .expect("the actual connector retains the security failure");
+    assert_eq!(
+        tls_cause.stage,
+        busbar_contract::abi::host::conn::connector::CAUSE_SECURITY
+    );
+    assert_eq!(
+        tls_cause.text,
+        rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer).to_string()
+    );
+    let tls_error = Some(tls_cause.text);
     assert!(
         tls_error
             .as_deref()
