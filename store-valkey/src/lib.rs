@@ -538,8 +538,8 @@ fn parse_unix(url: &url::Url) -> RedisResult<Target> {
 }
 
 /// Valkey `RecordStore` backend (durable, shared across a cluster), reached through the HOST'S
-/// CONNECTOR: one kept connection (dialled, secured, `AUTH`, `SELECT` once), every op on it in turn;
-/// the store holds no socket and no TLS stack of its own.
+/// CONNECTOR: up to `KEPT_CONNECTIONS` kept connections, one per op in flight (each dialled, secured,
+/// `AUTH`, `SELECT` once); the store holds no socket and no TLS stack of its own.
 #[derive(Debug, Clone)]
 pub struct ValkeyStore {
     inner: Arc<Inner>,
@@ -894,6 +894,13 @@ impl ValkeyStore {
         self.unlink_all(c, &dead).await
     }
 
+    /// THE v10 STEP: scrub the secret out of every revoked credential row. Walks the
+    /// revision index (`CREDS_BYREV`) and, for each revoked row that still carries secret bytes,
+    /// clears the secret, sets its form to `None` and stamps a fresh revision, so the delta feed
+    /// carries the change. Idempotent (a scrubbed row is skipped, a missing row is skipped), one
+    /// `WATCH`ed transaction per row, so a crash before the marker is written re-runs it and two
+    /// nodes upgrading at once land in the same place. Runs on every upgrade (version below
+    /// `SCHEMA_VERSION`), after the v7 and v9 steps.
     async fn scrub_revoked_credentials(&self, c: &mut Conn) -> RecordStoreResult<()> {
         let members: Vec<String> = with_conn!(self, |c| c.zrange(CREDS_BYREV, 0, -1).await)?;
         for ptr in members {
