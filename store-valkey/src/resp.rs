@@ -661,15 +661,6 @@ impl Conn {
         cmd("GET").arg(key).query(self).await
     }
 
-    /// `SET`.
-    pub async fn set<K: ToArgs, V: ToArgs, RV: FromValue>(
-        &mut self,
-        key: K,
-        value: V,
-    ) -> RedisResult<RV> {
-        cmd("SET").arg(key).arg(value).query(self).await
-    }
-
     /// `DEL` (one key or several).
     pub async fn del<K: ToArgs, RV: FromValue>(&mut self, key: K) -> RedisResult<RV> {
         cmd("DEL").arg(key).query(self).await

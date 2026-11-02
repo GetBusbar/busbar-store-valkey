@@ -6019,3 +6019,61 @@ fn list_credentials_since_does_not_skip_a_revocation_landing_between_index_and_r
             .collect::<Vec<_>>()
     );
 }
+
+/// `connect()` run through a gate that holds it just before it writes the schema marker, while a
+/// NEWER build marks the namespace; the open must then refuse the newer namespace and leave its
+/// marker as the newer build wrote it, never downgrade it.
+fn marker_overtaken_by_a_newer_build(db: u32, seed: impl FnOnce(&mut redis::Connection)) {
+    let mut up = fresh_db_client(db);
+    seed(&mut up);
+    let gate = interleave::gate(&url_for_db(db), true, |c| {
+        interleave::contains(c, b"busbar:schema")
+            && (interleave::contains(c, b"SET") || interleave::contains(c, b"EVAL"))
+    });
+    let url = gate.url.clone();
+    let opener = std::thread::spawn(move || ValkeyStore::connect(&url).map(|_| ()));
+    gate.held
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("connect() is about to write the schema marker");
+    let newer = SCHEMA_VERSION + 1;
+    redis::cmd("SET")
+        .arg("busbar:schema")
+        .arg(newer)
+        .query::<()>(&mut up)
+        .unwrap();
+    gate.release.send(()).unwrap();
+    let res = opener.join().unwrap();
+    let marker: i64 = redis::cmd("GET")
+        .arg("busbar:schema")
+        .query(&mut up)
+        .unwrap();
+    redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
+    assert_eq!(
+        marker, newer,
+        "the newer build's marker must not be downgraded"
+    );
+    let err = res.expect_err("the open must refuse the namespace a newer build marked");
+    assert!(
+        err.to_string()
+            .contains(&format!("schema v{newer} is newer than this build")),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_fresh_namespace_marked_by_a_newer_build_meanwhile_is_not_downgraded() {
+    let Some(_) = live_store() else { return };
+    marker_overtaken_by_a_newer_build(14, |_| {});
+}
+
+#[test]
+fn an_upgrade_marked_by_a_newer_build_meanwhile_is_not_downgraded() {
+    let Some(_) = live_store() else { return };
+    marker_overtaken_by_a_newer_build(15, |up| {
+        redis::cmd("SET")
+            .arg("busbar:schema")
+            .arg(FIRST_MIGRATED_SCHEMA)
+            .query::<()>(up)
+            .unwrap();
+    });
+}

@@ -764,16 +764,25 @@ impl ValkeyStore {
                     self.drop_dead_slot_keys(c).await?;
                 }
                 self.scrub_revoked_credentials(c).await?;
-                return with_conn!(self, |c| c
-                    .set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION)
-                    .await);
+                match self.mark_schema(c, marker).await? {
+                    None => return Ok(()),
+                    // A peer marked it meanwhile: judge the new marker, never overwrite it.
+                    Some(now) => {
+                        marker = Some(now);
+                        continue;
+                    }
+                }
             }
             let others: Vec<String> =
                 with_conn!(self, |c| c.scan_some("busbar:*", SCHEMA_KEY, 3).await)?;
             if others.is_empty() {
-                return with_conn!(self, |c| c
-                    .set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION)
-                    .await);
+                match self.mark_schema(c, marker).await? {
+                    None => return Ok(()),
+                    Some(now) => {
+                        marker = Some(now);
+                        continue;
+                    }
+                }
             }
             if !rechecked {
                 // A peer may have marked the namespace between our read and the SCAN.
@@ -818,6 +827,24 @@ impl ValkeyStore {
                 sample.join(", ")
             )));
         }
+    }
+
+    /// Write the current schema marker if it still is `read` (what this run saw); `None` when
+    /// written, else the marker a peer put there meanwhile (left untouched).
+    async fn mark_schema(&self, c: &mut Conn, read: Option<i64>) -> RecordStoreResult<Option<i64>> {
+        let expected = read.map(|v| v.to_string()).unwrap_or_default();
+        let now: Option<String> = with_conn!(self, |c| SET_SCHEMA_MARKER
+            .key(SCHEMA_KEY)
+            .arg(&expected)
+            .arg(SCHEMA_VERSION)
+            .invoke(c)
+            .await)?;
+        now.map(|v| {
+            v.parse().map_err(|_| {
+                RecordStoreError(format!("the `{SCHEMA_KEY}` marker is not a number: {v}"))
+            })
+        })
+        .transpose()
     }
 
     /// THE v9 STEP: delete what the deleted slots kept. The key families go
@@ -1158,6 +1185,22 @@ static LIST_METERING: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| 
             out[#out + 1] = redis.call('HGETALL', row)
         end
         return out",
+    )
+});
+
+/// Mark the schema: `KEYS[1]` = the marker, `ARGV[1]` = the version this run read (empty for none),
+/// `ARGV[2]` = the version to write. Written only if the marker still is what this run read; else
+/// nothing is written and the marker now there is returned, so a newer build's mark is never
+/// overwritten.
+static SET_SCHEMA_MARKER: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
+    Script::new(
+        r"
+        local cur = redis.call('GET', KEYS[1])
+        if (not cur and ARGV[1] == '') or cur == ARGV[1] then
+            redis.call('SET', KEYS[1], ARGV[2])
+            return false
+        end
+        return cur",
     )
 });
 
