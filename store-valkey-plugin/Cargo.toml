@@ -30,7 +30,10 @@ busbar-contract = { workspace = true }
 # open) and the linked row through the same registry — dev-only, never in the shipped artifact. Same
 # pinned rev as the logic crate's busbar-contract, so one busbar source resolves.
 busbar-plugin-loader = { workspace = true }
-busbar-test-kit = { workspace = true }
+url = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+rcgen = { workspace = true }
 serde_json = { workspace = true }
 # Drives the store v3 slots (`StoreCalls`, async) to completion on a current-thread runtime.
 tokio = { workspace = true, features = ["rt"] }
@@ -45,8 +48,6 @@ reqwest = { workspace = true, features = ["blocking", "json"] }
 redis = { workspace = true, features = ["tls-rustls"] }
 # Base64-encodes the packed tarball into POST /api/v1/admin/plugins's JSON body.
 base64 = { workspace = true }
-# THE SUITE'S HOST CONNECTOR (tests/support/conformance_host.rs, rendered by the fleet template for a
-# repo whose declares state network needs): busbar's connector and its TLS test kit, and the tcp
-# framer the store's need names. Dev-only.
+# The real host connector and TCP carrier used by both-door integration tests.
 busbar-core-connector = { workspace = true }
 busbar-transport-tcp = { workspace = true }

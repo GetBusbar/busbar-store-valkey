@@ -6,7 +6,7 @@
 # One repo per plugin, every repo a twin: this workspace is exactly two crates, the logic (the rlib a
 # busbar build links) and the thin cdylib that packages it as a droppable `kind: store` plugin
 # (crate `busbar-store-valkey-plugin`). Its one busbar dependency is busbar-contract (busbar-plugin-loader and
-# busbar-test-kit are dev-only, for the both-ways conformance test), all git dependencies on
+# the loader is dev-only, for both-door tests), all git dependencies on
 # GetBusbar/busbar at the pin in `.busbar-ref`; no sibling-checkout path dependency ships in any manifest.
 #
 # THIRD-PARTY VERSIONS ARE THE FLEET'S, NOT THIS REPO'S. The table below is busbar's own root
@@ -38,7 +38,6 @@ needless_update = "allow"
 [workspace.dependencies]
 busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "a35493a5e74cc935ff7dcc15c1af869290da91cb" }
 busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "a35493a5e74cc935ff7dcc15c1af869290da91cb" }
-busbar-test-kit = { git = "https://github.com/GetBusbar/busbar", rev = "a35493a5e74cc935ff7dcc15c1af869290da91cb" }
 "busbar-core-connector" = { "features" = ["test-support"], "git" = "https://github.com/GetBusbar/busbar", "rev" = "a35493a5e74cc935ff7dcc15c1af869290da91cb" }
 "busbar-transport-tcp" = { "git" = "https://github.com/GetBusbar/busbar-transport-tcp", "rev" = "b896c5e6ef34dc6ea179f0dbcb4c7262cc117ca9" }
 # busbar's root [workspace.dependencies], third-party rows, at a35493a5e74cc935ff7dcc15c1af869290da91cb

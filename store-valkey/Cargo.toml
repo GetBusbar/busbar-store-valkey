@@ -39,7 +39,8 @@ zeroize = { workspace = true }
 # runtime for the async `StoreCalls`. The upstream RESP client verifies what landed in Valkey
 # INDEPENDENTLY of the store (tests only; never in the shipped image).
 busbar-plugin-loader = { workspace = true }
-busbar-test-kit = { workspace = true }
+busbar-core-connector = { workspace = true }
+busbar-transport-tcp = { workspace = true }
 tokio = { workspace = true, features = ["rt"] }
 redis = { workspace = true }
 # The TLS proxy the TLS test puts in front of the live server (a self-signed CA), test-only.

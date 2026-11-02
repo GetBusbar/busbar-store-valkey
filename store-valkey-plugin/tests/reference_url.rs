@@ -9,7 +9,6 @@ use busbar_plugin_loader::dispatch::kinds::store::Store;
 use busbar_plugin_loader::dispatch::{
     load_linked, Bind, ConnTable, DispatchConfig, Dispatcher, LinkedRow, NoSink, Plugin,
 };
-use busbar_test_kit::conformance::settings_as_the_kernel_resolves;
 
 const URL: &str = "redis://cache.internal:6379/0";
 
@@ -39,11 +38,10 @@ fn the_url_is_not_declared_secret() {
 #[test]
 fn a_reference_at_the_url_resolves_as_the_kernel_resolves_it() {
     let (p, _d) = linked();
-    let out =
-        settings_as_the_kernel_resolves(&p, br#"{"url":{"env":"REFCAP_URL_FOR_TEST"}}"#, |_, _| {
-            Ok(URL.to_string())
-        })
-        .expect("a reference at the url resolves");
+    let out = resolve_settings(&p, br#"{"url":{"env":"REFCAP_URL_FOR_TEST"}}"#, |_, _| {
+        Ok(URL.to_string())
+    })
+    .expect("a reference at the url resolves");
     let v: serde_json::Value = serde_json::from_slice(&out).expect("json");
     assert_eq!(v["url"], URL);
 }
@@ -52,10 +50,27 @@ fn a_reference_at_the_url_resolves_as_the_kernel_resolves_it() {
 fn a_literal_url_passes_as_written() {
     let (p, _d) = linked();
     let settings = format!(r#"{{"url":"{URL}"}}"#);
-    let out = settings_as_the_kernel_resolves(&p, settings.as_bytes(), |_, _| {
+    let out = resolve_settings(&p, settings.as_bytes(), |_, _| {
         Err("a literal url resolves nothing".to_string())
     })
     .expect("a literal url passes as written");
     let v: serde_json::Value = serde_json::from_slice(&out).expect("json");
     assert_eq!(v["url"], URL);
+}
+
+fn resolve_settings(
+    p: &Plugin<Store>,
+    settings: &[u8],
+    resolve: impl FnMut(&str, &busbar_contract::secret_ref::SecretRef) -> Result<String, String>,
+) -> Result<Vec<u8>, String> {
+    let mut tree: serde_json::Value =
+        serde_json::from_slice(settings).map_err(|e| e.to_string())?;
+    busbar_contract::secret_fields::resolve_declared_fields(
+        &mut tree,
+        p.secret_refs(),
+        p.reference_fields(),
+        p.name(),
+        resolve,
+    )?;
+    Ok(tree.to_string().into_bytes())
 }

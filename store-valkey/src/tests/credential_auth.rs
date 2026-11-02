@@ -215,7 +215,7 @@ fn open_script(table: Arc<Fragmented>) -> Result<LoadedStore, String> {
 fn open_script_url(table: Arc<Fragmented>, url: &str) -> Result<LoadedStore, String> {
     let d = Arc::new(Dispatcher::with_services(
         DispatchConfig::default(),
-        Arc::new(busbar_test_kit::services_double::Double(ClockOnly)),
+        Arc::new(ClockOnly),
     ));
     let p = load_linked::<Store>(
         &LinkedRow::of(crate::door).unwrap(),

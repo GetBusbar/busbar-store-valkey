@@ -36,6 +36,9 @@ use busbar_plugin_loader::dispatch::{
 };
 use busbar_plugin_loader::plugin_library_filename;
 use busbar_plugin_loader::store_v3::LoadedStore;
+#[path = "../../test-support/valkey_io.rs"]
+mod valkey_io;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -81,8 +84,9 @@ fn load(path: &Path, cfg: &str) -> Result<Box<dyn RecordStore>, String> {
 /// A dispatcher and a bind over the loader's test connection table (plain TCP, the host's
 fn host(instance: &str) -> (Arc<Dispatcher>, Bind) {
     let dispatcher = Arc::new(Dispatcher::new(DispatchConfig::default()));
-    let conns: Arc<dyn busbar_contract::conn::DeclaredConns> = Arc::new(
-        busbar_test_kit::tcp_conns::TcpConns::new(dispatcher.conn_waker()),
+    let conns: Arc<dyn busbar_contract::conn::DeclaredConns> = valkey_io::host(
+        dispatcher.conn_waker(),
+        busbar_contract::transport::EgressTrust::default(),
     );
     let bind = Bind {
         instance: Arc::from(instance),
@@ -183,10 +187,16 @@ fn newest_source_mtime() -> std::time::SystemTime {
 /// Panics rather than skipping: a missing cdylib under `cargo test` means the build graph changed
 /// shape, and the only honest report of that is a failure, not a silent pass.
 fn plugin_path() -> PathBuf {
-    let exe = std::env::current_exe().expect("current_exe");
-    let deps_dir = exe.parent().expect("the test binary always lives in deps/");
-    let name = plugin_library_filename("busbar_store_valkey_plugin");
-    let fresh = deps_dir.join(&name);
+    let fresh = if let Some(path) = std::env::var_os("BUSBAR_PLUGIN_CDYLIB") {
+        let path = PathBuf::from(path);
+        assert!(path.is_absolute(), "BUSBAR_PLUGIN_CDYLIB must be absolute");
+        path
+    } else {
+        let exe = std::env::current_exe().expect("current_exe");
+        exe.parent()
+            .expect("deps directory")
+            .join(plugin_library_filename("busbar_store_valkey_plugin"))
+    };
     assert!(
         fresh.exists(),
         "the store-valkey-plugin cdylib is not at {}, where cargo emits it for the same build that produced \

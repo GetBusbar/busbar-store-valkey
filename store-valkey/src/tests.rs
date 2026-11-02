@@ -1,3 +1,5 @@
+#[path = "../../test-support/valkey_io.rs"]
+mod valkey_io;
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
@@ -21,7 +23,9 @@ use busbar_plugin_loader::dispatch::{
     load_linked, Bind, DispatchConfig, Dispatcher, LinkedRow, NoSink,
 };
 use busbar_plugin_loader::store_v3::LoadedStore;
-use busbar_test_kit::tcp_conns::TcpConns;
+#[path = "tests/socket_observer.rs"]
+mod socket_observer;
+use socket_observer::ValkeyWireObserver;
 
 /// THE STORE UNDER TEST is the store as the host opens it: its door through the loader
 pub(crate) type ValkeyStore = LoadedStore;
@@ -37,8 +41,10 @@ fn host() -> &'static (
     )> = OnceLock::new();
     HOST.get_or_init(|| {
         let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
-        let conns: Arc<dyn busbar_contract::conn::DeclaredConns> =
-            Arc::new(TcpConns::new(d.conn_waker()));
+        let conns: Arc<dyn busbar_contract::conn::DeclaredConns> = valkey_io::host(
+            d.conn_waker(),
+            busbar_contract::transport::EgressTrust::default(),
+        );
         (d, conns)
     })
 }
@@ -3593,8 +3599,8 @@ fn tls_pump(conn: rustls::ServerConnection, front: std::net::TcpStream, back: st
 /// The store's door opened on `settings` on a dispatcher of its own, over the connection table
 fn open_on(
     settings: &str,
-    table: impl FnOnce(&Dispatcher) -> TcpConns,
-) -> (Result<LoadedStore, String>, Arc<TcpConns>) {
+    table: impl FnOnce(&Dispatcher) -> ValkeyWireObserver,
+) -> (Result<LoadedStore, String>, Arc<ValkeyWireObserver>) {
     open_on_dispatcher(
         Arc::new(Dispatcher::new(DispatchConfig::default())),
         settings,
@@ -3606,8 +3612,8 @@ fn open_on(
 fn open_on_dispatcher(
     d: Arc<Dispatcher>,
     settings: &str,
-    table: impl FnOnce(&Dispatcher) -> TcpConns,
-) -> (Result<LoadedStore, String>, Arc<TcpConns>) {
+    table: impl FnOnce(&Dispatcher) -> ValkeyWireObserver,
+) -> (Result<LoadedStore, String>, Arc<ValkeyWireObserver>) {
     let t = Arc::new(table(&d));
     let conns: Arc<dyn busbar_contract::conn::DeclaredConns> = t.clone();
     let row = LinkedRow::of(crate::door).expect("the door");
@@ -3625,19 +3631,18 @@ fn open_on_dispatcher(
     (LoadedStore::open(p, d, settings.as_bytes(), mint), t)
 }
 
-fn plain(d: &Dispatcher) -> TcpConns {
-    TcpConns::new(d.conn_waker())
+fn plain(d: &Dispatcher) -> ValkeyWireObserver {
+    ValkeyWireObserver::new(d.conn_waker())
 }
 
 /// A table whose TLS trusts no root: a verifying handshake refuses every certificate, and only an
-fn trusting_nothing(d: &Dispatcher) -> TcpConns {
-    TcpConns::with_tls(d.conn_waker(), Arc::new(TestTls::default()))
+fn trusting_nothing(d: &Dispatcher) -> ValkeyWireObserver {
+    ValkeyWireObserver::with_tls(d.conn_waker(), Arc::new(TestTls::default()))
 }
 
-/// THE TEST TABLE'S TLS (the loader's `SecureDial`; TLS itself is the connector's, which the
-/// loader's test table cannot name): rustls trusting exactly the roots a test hands it, or, on
+/// The concrete Valkey wire observer's TLS: rustls trusting exactly the roots a test hands it, or, on
 /// `verify_off`, checking no certificate, only the handshake's signature. As the loader's own test
-/// table secured a stream before TLS left it (busbar 0db7ee2ea0 `TcpConns::with_roots`).
+/// table secured a stream before TLS left it (busbar 0db7ee2ea0 `ValkeyWireObserver::with_roots`).
 #[derive(Default)]
 struct TestTls {
     roots: Option<Vec<u8>>,
@@ -3675,13 +3680,13 @@ impl TestTls {
     }
 }
 
-impl busbar_test_kit::tcp_conns::SecureDial for TestTls {
+impl TestTls {
     fn secure(
         &self,
         server: &str,
         verify_off: bool,
         mut tcp: std::net::TcpStream,
-    ) -> std::io::Result<Box<dyn busbar_test_kit::tcp_conns::SecuredSock>> {
+    ) -> std::io::Result<Box<TestTlsStream>> {
         *self.last_handshake_error.lock().unwrap() = None;
         let invalid = |e: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, e);
         let name = rustls_pki_types::ServerName::try_from(server.to_owned())
@@ -3715,7 +3720,7 @@ impl std::io::Write for TestTlsStream {
     }
 }
 
-impl busbar_test_kit::tcp_conns::SecuredSock for TestTlsStream {
+impl TestTlsStream {
     fn tcp(&self) -> &std::net::TcpStream {
         self.0.get_ref()
     }
@@ -3953,7 +3958,7 @@ fn a_rediss_url_is_secured_through_the_hosts_connector() {
     let (_, db, userinfo) = live_parts();
     let url = format!("rediss://{userinfo}127.0.0.1:{port}/{db}");
     let (store, _) = open_on(&settings_for(&url), |d| {
-        TcpConns::with_tls(d.conn_waker(), Arc::new(TestTls::trusting(&ca)))
+        ValkeyWireObserver::with_tls(d.conn_waker(), Arc::new(TestTls::trusting(&ca)))
     });
     let store = store.expect("opens over TLS");
     let id = uid("vk_tls");
@@ -3964,7 +3969,7 @@ fn a_rediss_url_is_secured_through_the_hosts_connector() {
 
     let untrusted_tls = Arc::new(TestTls::default());
     let (untrusted, _) = open_on(&settings_for(&url), |d| {
-        TcpConns::with_tls(d.conn_waker(), untrusted_tls.clone())
+        ValkeyWireObserver::with_tls(d.conn_waker(), untrusted_tls.clone())
     });
     let err = untrusted.expect_err("the TLS certificate must be trusted");
     let tls_error = untrusted_tls.last_handshake_error.lock().unwrap().clone();
@@ -3985,12 +3990,216 @@ fn a_rediss_url_is_secured_through_the_hosts_connector() {
 /// Host services offering the clock alone (the dispatcher's own timebase), refusing the rest: the
 struct ClockOnly;
 
-impl busbar_test_kit::services_double::ServicesDouble for ClockOnly {
-    fn now(&self) -> busbar_contract::services::Reading {
-        busbar_contract::services::Reading {
+use busbar_contract::services::{
+    Caller, DiskDest, HookAsk, Later, NestAsk, Ran, Reading, RecordsList, Snapshot, Stored,
+    TrustKeyRef, UNSERVED,
+};
+
+fn refused() -> Ran {
+    Ran::Now(Stored::refused(UNSERVED))
+}
+
+impl busbar_contract::services::HostServices for ClockOnly {
+    fn now(&self) -> Reading {
+        Reading {
             wall_ns: 0,
             mono_ns: busbar_plugin_loader::dispatch::now_ns(),
         }
+    }
+
+    fn dest_judge(&self, _dest: &str, _class: u32, _flags: u32, _later: Option<Later>) -> Ran {
+        refused()
+    }
+
+    fn records_get(&self, _caller: &Caller, _kind: &str, _key: &[u8], _later: Later) -> Ran {
+        refused()
+    }
+
+    fn records_list(&self, _caller: &Caller, _list: RecordsList, _later: Later) -> Ran {
+        refused()
+    }
+
+    fn records_claim(
+        &self,
+        _caller: &Caller,
+        _kind: &str,
+        _key: &[u8],
+        _ttl_ms: u64,
+        _later: Later,
+    ) -> Ran {
+        refused()
+    }
+
+    fn sign(&self, _caller: &Caller, _data: &[u8]) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+
+    fn trust_sight(
+        &self,
+        _caller: &Caller,
+        _counterparty: &str,
+        _hash: &str,
+        _later: Later,
+    ) -> Ran {
+        refused()
+    }
+
+    fn trust_unreached(&self, _caller: &Caller, _counterparty: &str) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+
+    fn trust_sight_item(
+        &self,
+        _caller: &Caller,
+        _counterparty: &str,
+        _item: &str,
+        _digest: &str,
+    ) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+
+    fn trust_decide(
+        &self,
+        _caller: &Caller,
+        _key: TrustKeyRef<'_>,
+        _expected: Option<&str>,
+        _approve: bool,
+    ) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+
+    fn trust_state(&self, _caller: &Caller, _counterparty: &str) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+
+    fn trust_serves(
+        &self,
+        _caller: &Caller,
+        _counterparty: &str,
+        _item: Option<&str>,
+        _digest: Option<&str>,
+    ) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+
+    fn trust_due(&self, _caller: &Caller) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+
+    fn trust_verify(
+        &self,
+        _caller: &Caller,
+        _counterparty: &str,
+        _payload: &[u8],
+        _signatures: &[u8],
+    ) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+
+    fn entitlement_check(&self, _caller: &Caller, _unit: Option<u64>, _target: &str) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+
+    fn session_emit(&self, _caller: &Caller, _session: u64, _bytes: &[u8]) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+
+    fn ticket_mint(
+        &self,
+        _caller: &Caller,
+        _unit: Option<u64>,
+        _ttl_secs: u64,
+        _record: &[u8],
+    ) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+
+    fn ticket_take(&self, _caller: &Caller, _unit: Option<u64>) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+
+    fn random_fill(&self, _len: u64) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+
+    fn records_secret(&self, _kind: &str, _id: &str, _later: Later) -> Ran {
+        refused()
+    }
+
+    fn unit_nest(&self, _caller: &Caller, _unit: Option<u64>, _ask: NestAsk, _later: Later) -> Ran {
+        refused()
+    }
+
+    fn work_open(
+        &self,
+        _caller: &Caller,
+        _unit: Option<u64>,
+        _kind: &str,
+        _record: &[u8],
+        _later: Later,
+    ) -> Ran {
+        refused()
+    }
+
+    fn work_find(
+        &self,
+        _caller: &Caller,
+        _unit: Option<u64>,
+        _reference: &[u8],
+        _later: Later,
+    ) -> Ran {
+        refused()
+    }
+
+    fn work_settle(
+        &self,
+        _caller: &Caller,
+        _unit: Option<u64>,
+        _handle: u64,
+        _record: &[u8],
+        _later: Later,
+    ) -> Ran {
+        refused()
+    }
+
+    fn work_resume(
+        &self,
+        _caller: &Caller,
+        _unit: Option<u64>,
+        _handle: u64,
+        _later: Later,
+    ) -> Ran {
+        refused()
+    }
+
+    fn disk_append(&self, _dest: &DiskDest, _bytes: Vec<u8>, _later: Later) -> Ran {
+        refused()
+    }
+
+    fn verify_lookup(&self, _caller: &Caller, _key: &[u8], _later: Later) -> Ran {
+        refused()
+    }
+
+    fn verify_store(&self, _caller: &Caller, _key: &[u8], _entry: &[u8], _ttl_ms: u64) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+
+    fn content_scan(
+        &self,
+        _caller: &Caller,
+        _unit: Option<u64>,
+        _content: &[u8],
+        _later: Later,
+    ) -> Ran {
+        refused()
+    }
+
+    fn hook_call(&self, _caller: &Caller, _unit: Option<u64>, _ask: HookAsk, _later: Later) -> Ran {
+        refused()
+    }
+
+    fn snapshot_read(&self, _caller: &Caller, _scope: u32) -> Snapshot {
+        Snapshot::Refused(UNSERVED)
     }
 }
 
@@ -4009,7 +4218,7 @@ fn connect_timeout_ms_bounds_the_handshake_after_the_dial() {
     for url in [format!("redis://:pw@{at}/0"), format!("redis://{at}/3")] {
         let d = Arc::new(Dispatcher::with_services(
             DispatchConfig::default(),
-            Arc::new(busbar_test_kit::services_double::Double(ClockOnly)),
+            Arc::new(ClockOnly),
         ));
         let t = std::time::Instant::now();
         let (store, _) = open_on_dispatcher(

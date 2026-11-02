@@ -3,120 +3,12 @@
 
 //! **ONE VALKEY STORE, BOTH DOORS, ONE TABLE** — the store's linked + dropped-in conformance on the
 
-#[path = "support/conformance_host.rs"]
-mod conformance_host;
 #[path = "../../test-support/database.rs"]
 mod database;
-
-busbar_test_kit::conformance_suite! {
-    door: busbar_store_valkey::door,
-    cdylib: "busbar_store_valkey_plugin",
-    inputs: include_str!("conformance.json"),
-    host: host,
-    tls: conformance_host::anchors(),
-    namespace: (take_fold_keyspace, drop_fold_keyspace),
-    newer_schema: stamp_newer_schema,
-}
-
-/// The live Valkey's address (`VALKEY_URL`'s authority; the service's default when unset).
-fn upstream() -> &'static str {
-    static AT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    AT.get_or_init(|| {
-        let url = std::env::var("VALKEY_URL").unwrap_or_default();
-        url.split_once("://")
-            .map(|(_, rest)| rest)
-            .and_then(|rest| rest.rsplit_once('@').map_or(Some(rest), |(_, at)| Some(at)))
-            .and_then(|at| at.split(['/', '?']).next())
-            .filter(|at| !at.is_empty())
-            .unwrap_or("127.0.0.1:6379")
-            .to_owned()
-    })
-}
-
-/// `rediss://` negotiates nothing in the clear: the TLS handshake is the connection's first byte.
-fn no_preamble(_: &mut std::net::TcpStream) -> bool {
-    true
-}
-
-/// The host the suite binds the store over, with the TLS front its settings name already listening.
-fn host(
-    wake: busbar_contract::conn::ConnWake,
-    anchors: Option<&str>,
-) -> std::sync::Arc<dyn busbar_contract::conn::DeclaredConns> {
-    conformance_host::tls_front(no_preamble, upstream());
-    conformance_host::host(wake, anchors)
-}
-
-/// The fold's database on the live server, on a connection of the `redis` client's own: straight to
-fn fold_url(settings: &[u8]) -> String {
-    let v: serde_json::Value =
-        serde_json::from_slice(settings).expect("conformance.json's settings are JSON");
-    v["url"]
-        .as_str()
-        .expect("conformance.json's settings name a url")
-        .replace(
-            &format!("rediss://{}", conformance_host::FAR_END),
-            &format!("redis://{}", upstream()),
-        )
-}
-
-fn fold_client(settings: &[u8]) -> redis::RedisResult<redis::Connection> {
-    redis::Client::open(fold_url(settings))?.get_connection()
-}
-
-fn stamp_newer_schema(_: &str, settings: &[u8]) {
-    redis::cmd("SET")
-        .arg("busbar:schema")
-        .arg(i64::MAX)
-        .query::<()>(&mut fold_client(settings).expect("the fold's private database"))
-        .expect("stamp a newer schema in the fold's private database");
-}
-
-/// The suite's database, held by one fold at a time: the namespace of the fold holding it.
-type FoldGate = (
-    std::sync::Mutex<Option<(String, database::Database)>>,
-    std::sync::Condvar,
-);
-fn fold_gate() -> &'static FoldGate {
-    static GATE: std::sync::OnceLock<FoldGate> = std::sync::OnceLock::new();
-    GATE.get_or_init(Default::default)
-}
-
-/// Hand the suite's database on (the fold that held it is over).
-fn release_fold_keyspace(namespace: &str) {
-    let (held, freed) = fold_gate();
-    let mut held = held
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let released = if held.as_ref().is_some_and(|(name, _)| name == namespace) {
-        held.take()
-    } else {
-        None
-    };
-    drop(held);
-    freed.notify_all();
-    drop(released);
-}
-
-/// The suite's namespace hook, before the fold's open: the fold takes the suite's database (waiting
-fn take_fold_keyspace(namespace: &str, settings: &[u8]) {
-    let (held, freed) = fold_gate();
-    let mut slot = held
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    while slot.is_some() {
-        slot = freed
-            .wait(slot)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-    }
-    let database = database::Database::take(&fold_url(settings));
-    *slot = Some((namespace.to_owned(), database));
-}
-
-/// The suite's namespace hook, after the fold (its failure included): everything the store wrote in
-fn drop_fold_keyspace(namespace: &str, _: &[u8]) {
-    release_fold_keyspace(namespace);
-}
+#[path = "support/store_behavior.rs"]
+mod store_behavior;
+#[path = "../../test-support/valkey_io.rs"]
+mod valkey_io;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -153,13 +45,19 @@ fn valkey_url() -> Option<String> {
 
 /// This crate's built cdylib, from `deps/` only: the copy the build graph of this very test binary
 fn cdylib() -> PathBuf {
-    let exe = std::env::current_exe().expect("the test binary has a path");
-    let deps = exe.parent().expect("target/<profile>/deps");
-    let file = busbar_plugin_loader::plugin_library_filename("busbar_store_valkey_plugin");
-    let path = deps.join(&file);
+    let path = if let Some(path) = std::env::var_os("BUSBAR_PLUGIN_CDYLIB") {
+        let path = PathBuf::from(path);
+        assert!(path.is_absolute(), "BUSBAR_PLUGIN_CDYLIB must be absolute");
+        path
+    } else {
+        let exe = std::env::current_exe().expect("the test binary has a path");
+        exe.parent().expect("target/<profile>/deps").join(
+            busbar_plugin_loader::plugin_library_filename("busbar_store_valkey_plugin"),
+        )
+    };
     assert!(
-        path.exists(),
-        "the busbar-store-valkey-plugin cdylib ({file}) is not at {}",
+        path.is_file(),
+        "fresh Valkey cdylib missing: {}; build it first",
         path.display()
     );
     path
@@ -183,9 +81,10 @@ fn bind(d: &Dispatcher) -> Bind {
         max_inflight_cap: 64,
         sink: Arc::new(NoSink),
         dispatcher: d.adopter(),
-        conns: ConnTable::Host(Arc::new(busbar_test_kit::tcp_conns::TcpConns::new(
+        conns: ConnTable::Host(valkey_io::host(
             d.conn_waker(),
-        ))),
+            busbar_contract::transport::EgressTrust::default(),
+        )),
     }
 }
 
@@ -724,6 +623,14 @@ fn a_statement_one_byte_off_is_refused() {
         name
     );
     let d = dispatcher();
+    let row = LinkedRow {
+        statement: other.clone(),
+        door: busbar_store_valkey::door,
+    };
+    assert!(matches!(
+        load_linked::<Store>(&row, bind(&d)),
+        Err(LoadError::StatementMismatch)
+    ));
     let e = match load_dropped::<Store>(&lib, &other, bind(&d)) {
         Ok(_) => panic!("a library loaded under a Statement that is not its own"),
         Err(e) => e,
@@ -749,4 +656,392 @@ fn a_statement_with_trailing_bytes_is_refused_as_malformed() {
         LoadError::Rendering(why) => assert_eq!(why, format!("byte {end} is not the end")),
         other => panic!("expected a malformed Statement refusal, got {other}"),
     }
+}
+
+/// The former store-kind script, now explicit calls against this shipped store.
+#[test]
+fn linked_and_dropped_preserve_every_store_operation() {
+    let url =
+        std::env::var("VALKEY_URL").expect("VALKEY_URL is required for the migrated live suite");
+    let mut url: url::Url = url.parse().expect("VALKEY_URL");
+    url.set_path("/14");
+    assert_eq!(
+        store_behavior::behavior(false, url.as_str()),
+        store_behavior::behavior(true, url.as_str())
+    );
+}
+
+#[test]
+fn networked_store_requires_a_connection_table_in_both_forms() {
+    use busbar_plugin_loader::dispatch::LoadError;
+    let row = LinkedRow::of(busbar_store_valkey::door).unwrap();
+    let stated = packed_rendering(&cdylib());
+    for dropped_in in [false, true] {
+        let d = dispatcher();
+        let bind = Bind {
+            conns: ConnTable::NoNeeds,
+            ..bind(&d)
+        };
+        let result = if dropped_in {
+            load_dropped::<Store>(&cdylib(), &stated, bind)
+        } else {
+            load_linked::<Store>(&row, bind)
+        };
+        let error = result.err().expect("networked store without table refuses");
+        assert!(
+            matches!(error, LoadError::NoConnectionTable { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("plugin 'busbar-store-valkey'"));
+        load_linked::<Store>(
+            &row,
+            Bind {
+                conns: ConnTable::Probe,
+                ..self::bind(&d)
+            },
+        )
+        .expect("probe is admitted");
+    }
+}
+
+#[test]
+fn schema_newer_than_this_build_is_refused_through_both_doors() {
+    let url =
+        std::env::var("VALKEY_URL").expect("VALKEY_URL is required for the migrated live suite");
+    let mut url: url::Url = url.parse().unwrap();
+    url.set_path("/14");
+    for dropped_in in [false, true] {
+        let db = database::Database::take(url.as_str());
+        redis::cmd("SET")
+            .arg("busbar:schema")
+            .arg(i64::MAX)
+            .query::<()>(&mut db.connection().unwrap())
+            .unwrap();
+        let cfg = serde_json::json!({"url": url.as_str()}).to_string();
+        let lib = cdylib();
+        let stated = packed_rendering(&lib);
+        let result = if dropped_in {
+            open(&|| dropped(&lib, &stated), &cfg)
+        } else {
+            open(&linked, &cfg)
+        };
+        let error = result.err().expect("newer schema refuses boot");
+        assert!(error.contains("schema"), "{error}");
+        assert!(error.contains(&i64::MAX.to_string()), "{error}");
+    }
+}
+
+/// Only malformed ABI metadata is changed; every product slot stays the real Valkey implementation.
+#[test]
+fn actual_valkey_door_rejects_incompatible_abi_and_layout() {
+    use busbar_contract::abi::mechanism::door::{Door, DoorParts};
+    use busbar_contract::abi::mechanism::KindCode;
+    use busbar_plugin_loader::dispatch::{load::rendering_of_raw, LoadError};
+    use std::sync::atomic::{AtomicPtr, Ordering};
+    static MALFORMED: AtomicPtr<Door> = AtomicPtr::new(std::ptr::null_mut());
+    extern "C" fn malformed() -> *const Door {
+        MALFORMED.load(Ordering::SeqCst)
+    }
+    // SAFETY: the actual shipped SDK door is static and complete.
+    let real = unsafe { Door::read_parts(busbar_store_valkey::door()) };
+    let kind = KindCode::Store;
+    let row = LinkedRow::of(busbar_store_valkey::door).unwrap();
+    let lib = cdylib();
+    for abi in [real.kind_abi + 1, real.kind_abi.wrapping_sub(1)] {
+        // SAFETY: preserve all static product pointers, changing ABI admission metadata only.
+        let door = unsafe {
+            Door::__from_parts(DoorParts {
+                kind_abi: abi,
+                ..real
+            })
+        };
+        MALFORMED.store(Box::into_raw(Box::new(door)), Ordering::SeqCst);
+        let want = LoadError::KindAbi {
+            kind,
+            door: abi,
+            host: real.kind_abi,
+        };
+        assert_eq!(rendering_of_raw(malformed).err(), Some(want.clone()));
+        assert_eq!(LinkedRow::of_raw(malformed).err(), Some(want));
+        let mut stated = row.statement.clone();
+        let offset = busbar_contract::abi::mechanism::rendering::RENDERING_MAGIC.len() + 8;
+        stated[offset..offset + 4].copy_from_slice(&abi.to_le_bytes());
+        assert_eq!(
+            load_dropped::<Store>(&lib, &stated, bind(&dispatcher())).err(),
+            Some(LoadError::ManifestKindAbi {
+                stated: abi,
+                host: real.kind_abi
+            })
+        );
+    }
+    for layout in [real.layout ^ 1, 0] {
+        // SAFETY: preserve static product pointers, changing layout admission metadata only.
+        let door = unsafe { Door::__from_parts(DoorParts { layout, ..real }) };
+        MALFORMED.store(Box::into_raw(Box::new(door)), Ordering::SeqCst);
+        let refused = rendering_of_raw(malformed).unwrap_err();
+        assert!(matches!(refused, LoadError::KindLayout { .. }), "{refused}");
+        assert!(refused
+            .to_string()
+            .contains("rebuild against this busbar-contract"));
+        assert_eq!(LinkedRow::of_raw(malformed).err(), Some(refused.clone()));
+        let malformed_row = LinkedRow {
+            statement: row.statement.clone(),
+            door: malformed,
+        };
+        assert_eq!(
+            load_linked::<Store>(&malformed_row, bind(&dispatcher())).err(),
+            Some(refused)
+        );
+    }
+}
+
+#[path = "support/tls_front.rs"]
+mod tls_front;
+
+#[test]
+fn linked_and_dropped_store_use_the_hosts_tls_trust_and_refuse_untrusted_peers() {
+    let url =
+        std::env::var("VALKEY_URL").expect("VALKEY_URL is required for the migrated live suite");
+    let mut url: url::Url = url.parse().unwrap();
+    let backend = format!("{}:{}", url.host_str().unwrap(), url.port().unwrap_or(6379));
+    let (front, ca) = tls_front::start(&backend);
+    let (host, port) = front.split_once(':').unwrap();
+    url.set_scheme("rediss").unwrap();
+    url.set_host(Some(host)).unwrap();
+    url.set_port(Some(port.parse().unwrap())).unwrap();
+    url.set_path("/14");
+    let mut backend_url = url.clone();
+    backend_url.set_scheme("redis").unwrap();
+    let backend: url::Url = format!("redis://{backend}").parse().unwrap();
+    backend_url.set_host(backend.host_str()).unwrap();
+    backend_url.set_port(backend.port()).unwrap();
+    let _db = database::Database::take(backend_url.as_str());
+    let settings = serde_json::json!({"url": url.as_str()}).to_string();
+    let lib = cdylib();
+    let stated = packed_rendering(&lib);
+    for dropped_in in [false, true] {
+        let load = |trusted| {
+            let d = dispatcher();
+            let trust = busbar_contract::transport::EgressTrust {
+                extra_anchors: if trusted {
+                    vec![ca.clone()]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            };
+            let bind = Bind {
+                conns: ConnTable::Host(valkey_io::host(d.conn_waker(), trust)),
+                ..bind(&d)
+            };
+            let p = if dropped_in {
+                load_dropped::<Store>(&lib, &stated, bind)
+            } else {
+                load_linked::<Store>(&LinkedRow::of(busbar_store_valkey::door).unwrap(), bind)
+            }
+            .unwrap();
+            (p, d)
+        };
+        let error = open(&|| load(false), &settings)
+            .err()
+            .expect("self-signed peer must refuse without anchor");
+        assert!(error.contains("failed to connect"), "{error}");
+        let store = open(&|| load(true), &settings).expect("the host trusts the test CA");
+        let id = ns("tls");
+        let key = VirtualKey {
+            id: id.clone(),
+            generation_hash: format!("binding:{id}"),
+            enabled: true,
+            ..Default::default()
+        };
+        store.put_key(&key).unwrap();
+        assert_eq!(
+            store.get_key(&id).unwrap().unwrap().generation_hash,
+            key.generation_hash
+        );
+    }
+}
+
+/// A genuine successful Valkey OPEN must be closed once when the host's READY fails.
+#[test]
+fn a_failed_ready_closes_the_actual_opened_valkey_store_once() {
+    use busbar_contract::abi::mechanism::call::{AbiStr, Op, OutHead, Outcome, RawOutcome};
+    use busbar_contract::abi::mechanism::door::{Door, DoorParts};
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+    static DOOR: AtomicPtr<Door> = AtomicPtr::new(std::ptr::null_mut());
+    static READY: AtomicUsize = AtomicUsize::new(0);
+    static CLOSED: AtomicUsize = AtomicUsize::new(0);
+    static CLOSE: std::sync::OnceLock<Op> = std::sync::OnceLock::new();
+    extern "C" fn door() -> *const Door {
+        DOOR.load(Ordering::SeqCst)
+    }
+    extern "C" fn ready(_: *mut c_void, _: *const c_void, out: *mut c_void) -> RawOutcome {
+        READY.fetch_add(1, Ordering::SeqCst);
+        let failed = RawOutcome::of(Outcome::Failed);
+        let text = "Valkey test: discovery refused";
+        // SAFETY: loader supplies a complete lifecycle output head.
+        unsafe {
+            (*out.cast::<OutHead>()).outcome = failed;
+            (*out.cast::<OutHead>()).error = AbiStr {
+                ptr: text.as_ptr(),
+                len: text.len(),
+            };
+        }
+        failed
+    }
+    extern "C" fn close(
+        instance: *mut c_void,
+        input: *const c_void,
+        out: *mut c_void,
+    ) -> RawOutcome {
+        CLOSED.fetch_add(1, Ordering::SeqCst);
+        // SAFETY: the unchanged real instance and host frames go to the original CLOSE once.
+        let result = unsafe { CLOSE.get().unwrap()(instance, input, out) };
+        assert_eq!(result.outcome(), Outcome::Ready);
+        result
+    }
+    let url =
+        std::env::var("VALKEY_URL").expect("VALKEY_URL is required for the migrated live suite");
+    let mut url: url::Url = url.parse().unwrap();
+    url.set_path("/14");
+    let _db = database::Database::take(url.as_str());
+    // SAFETY: the real door and Ops are complete immutable SDK-owned statics.
+    let real = unsafe { Door::read_parts(busbar_store_valkey::door()) };
+    let mut ops = unsafe {
+        real.ops
+            .cast::<busbar_contract::abi::store::Ops>()
+            .read_unaligned()
+    };
+    CLOSE.set(ops.head.close.unwrap()).unwrap();
+    ops.head.close = Some(close);
+    let ops = Box::leak(Box::new(ops));
+    // SAFETY: retain the actual product table with one forwarding cleanup observer and one failing READY input.
+    let restated = unsafe {
+        Door::__from_parts(DoorParts {
+            size: std::mem::size_of::<Door>() as u32,
+            ready: Some(ready),
+            ops: std::ptr::from_ref(ops).cast(),
+            ..real
+        })
+    };
+    DOOR.store(Box::into_raw(Box::new(restated)), Ordering::SeqCst);
+    let d = dispatcher();
+    let plugin = load_linked::<Store>(&LinkedRow::of_raw(door).unwrap(), bind(&d)).unwrap();
+    let held = Arc::clone(&plugin.inner);
+    let first = || held.crossings.load(Ordering::SeqCst) - held.resumes.load(Ordering::SeqCst);
+    let before = first();
+    let error = LoadedStore::open(
+        plugin,
+        d,
+        serde_json::json!({"url": url.as_str()})
+            .to_string()
+            .as_bytes(),
+        mint,
+    )
+    .err()
+    .expect("READY fails");
+    assert_eq!(
+        error,
+        "plugin 'busbar-store-valkey' ready failed: Valkey test: discovery refused"
+    );
+    assert_eq!(READY.load(Ordering::SeqCst), 1);
+    assert_eq!(CLOSED.load(Ordering::SeqCst), 1);
+    assert_eq!(first() - before, 3, "OPEN, failing READY, cleanup CLOSE");
+}
+
+#[path = "support/connection_ownership.rs"]
+mod connection_ownership;
+
+#[test]
+fn both_actual_doors_refuse_every_other_plugin_kind() {
+    use busbar_contract::abi::mechanism::KindCode;
+    use busbar_plugin_loader::dispatch::{kinds, LoadError};
+    let row = LinkedRow::of(busbar_store_valkey::door).unwrap();
+    let lib = cdylib();
+    let d = dispatcher();
+    assert_eq!(
+        load_linked::<kinds::auth::Auth>(&row, bind(&d)).err(),
+        Some(LoadError::ManifestKind {
+            stated: KindCode::Store,
+            want: KindCode::Auth
+        })
+    );
+    assert_eq!(
+        load_dropped::<kinds::auth::Auth>(&lib, &row.statement, bind(&d)).err(),
+        Some(LoadError::ManifestKind {
+            stated: KindCode::Store,
+            want: KindCode::Auth
+        })
+    );
+    assert_eq!(
+        load_linked::<kinds::export::Export>(&row, bind(&d)).err(),
+        Some(LoadError::ManifestKind {
+            stated: KindCode::Store,
+            want: KindCode::Export
+        })
+    );
+    assert_eq!(
+        load_dropped::<kinds::export::Export>(&lib, &row.statement, bind(&d)).err(),
+        Some(LoadError::ManifestKind {
+            stated: KindCode::Store,
+            want: KindCode::Export
+        })
+    );
+    assert_eq!(
+        load_linked::<kinds::hook::Hook>(&row, bind(&d)).err(),
+        Some(LoadError::ManifestKind {
+            stated: KindCode::Store,
+            want: KindCode::Hook
+        })
+    );
+    assert_eq!(
+        load_dropped::<kinds::hook::Hook>(&lib, &row.statement, bind(&d)).err(),
+        Some(LoadError::ManifestKind {
+            stated: KindCode::Store,
+            want: KindCode::Hook
+        })
+    );
+    assert_eq!(
+        load_linked::<kinds::plane::Plane>(&row, bind(&d)).err(),
+        Some(LoadError::ManifestKind {
+            stated: KindCode::Store,
+            want: KindCode::Plane
+        })
+    );
+    assert_eq!(
+        load_dropped::<kinds::plane::Plane>(&lib, &row.statement, bind(&d)).err(),
+        Some(LoadError::ManifestKind {
+            stated: KindCode::Store,
+            want: KindCode::Plane
+        })
+    );
+    assert_eq!(
+        load_linked::<kinds::secret::Secret>(&row, bind(&d)).err(),
+        Some(LoadError::ManifestKind {
+            stated: KindCode::Store,
+            want: KindCode::Secret
+        })
+    );
+    assert_eq!(
+        load_dropped::<kinds::secret::Secret>(&lib, &row.statement, bind(&d)).err(),
+        Some(LoadError::ManifestKind {
+            stated: KindCode::Store,
+            want: KindCode::Secret
+        })
+    );
+    assert_eq!(
+        load_linked::<kinds::transport::Transport>(&row, bind(&d)).err(),
+        Some(LoadError::ManifestKind {
+            stated: KindCode::Store,
+            want: KindCode::Transport
+        })
+    );
+    assert_eq!(
+        load_dropped::<kinds::transport::Transport>(&lib, &row.statement, bind(&d)).err(),
+        Some(LoadError::ManifestKind {
+            stated: KindCode::Store,
+            want: KindCode::Transport
+        })
+    );
 }
