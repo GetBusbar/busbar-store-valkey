@@ -2,45 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! **The plane-record keyspace.** The eight kind-tagged verbs over an opaque
-//! [`PlaneRecord`](busbar_contract::records::PlaneRecord), plus [`RecordStore::plane_token_live`](busbar_contract::records::RecordStore).
-//!
-//! ## Layout
-//!
-//! Every key carries the record KIND as lower-case hex (`K`), so no kind — whatever characters a
-//! plane declares it with — can make one kind's key render as another's. Inside a kind, a record's
-//! POSITION is `(identity, seq)`, where `identity` is, for an APPENDED record, its `parent` when it
-//! has one (a chain child: a `task_event`'s task, a `call`'s principal) and its own `id` otherwise,
-//! and for an UPSERTED record always its own `id` (a `task`, a `demotion`; the contract upserts by
-//! `(kind, id)`, parent or not). The position is the hash field `F = "<seq>:<identity>"`: `seq` is
-//! digits, so the first `:` always ends it and any identity round-trips.
-//!
-//! - `busbar:plane:K:rec`    HASH  `F` → the typed SIDECAR (see [`sidecar`]); never the body.
-//! - `busbar:plane:K:body`   HASH  `F` → the opaque body, verbatim bytes. The store never decodes it.
-//! - `busbar:plane:K:byts`   ZSET  `F` scored by `ts` — the retention index `purge` reads.
-//! - `busbar:plane:K:idx:I`  ZSET  `F` scored by `seq`, one per identity (`I` = hex identity) — what
-//!   a parent's chain listing and an identity's delete read, so neither scans the kind. An upserted
-//!   record that names a parent is also on its parent's index (the listing checks the sidecar's
-//!   parent; a delete takes only the positions at its own identity).
-//! - `busbar:plane:K:pcount` HASH  parent → how many records name it as their `parent` — the boot
-//!   enumeration of parents (`list_plane_record_parents`), kept exact by every write and removal.
-//! - `busbar:plane:K:tok:T`  STRING — one redeemed single-use token (`T` = hex token): its grant's
-//!   `expires_at`, with absolute cleanup after that boundary ([`redeem_token`]).
-//!
-//! ## Why every write is a script
-//!
-//! Each verb reads the position it is about to write (a replayed append must be told apart from a
-//! fork; an overwrite must take its predecessor's index entries with it) and then writes several
-//! keys. A client-side read-then-`MULTI` would need a `WATCH` on the kind's whole `rec` hash, so every
-//! concurrent writer of a kind — every principal's call log on a busy node, every node of a fleet —
-//! would abort every other one. The server runs a script atomically instead: the read and the writes
-//! are one step no other client can land between, with no retry loop. The scripts name keys they
-//! derive from their arguments, which a standalone or replicated Valkey runs as written; this store
-//! does not support Valkey Cluster (its multi-key transactions never did either).
-//!
-//! ZSET scores are IEEE doubles. They only ever FILTER (retention candidates) or pre-order a
-//! listing; every listing is re-sorted by the exact `seq` parsed out of `F`, so a `seq` past 2^53
-//! still orders correctly. Retention includes the rounded cutoff's score, then compares the exact
-//! decimal timestamp in the sidecar before deleting a candidate.
 
 use crate::resp::{pipe, Conn, Script, ScriptInvocation, Value};
 use crate::{hex, ValkeyStore};
@@ -56,9 +17,7 @@ use busbar_contract::records::{
 const TICKET_RECORD_KIND: &str = "ticket";
 
 /// The kind a purge of which CASCADES: a purged `task` takes its `task_event` chain with it, and only
-/// its own. Nothing else ever removes a task's events, so leaving them would keep chains whose task
-/// no longer exists forever — outliving the retention decision just made about them. (store-sqlite,
-/// store-postgres and store-mysql settle it the same way.)
+
 pub(crate) const CASCADING_KIND: &str = "task";
 /// The child kind a [`CASCADING_KIND`] purge takes with it.
 const CASCADED_KIND: &str = "task_event";
@@ -107,19 +66,13 @@ fn parse_field(f: &str) -> Option<(u64, &str)> {
 }
 
 /// An APPENDED record's identity: a chain position is `(parent, seq)`; a top-level record is its
-/// own `id` at `seq`. An UPSERTED record's identity is always its own `id`, parent or not (the
-/// contract upserts by `(kind, id)`); one that names a parent is also on its parent's index.
+
 fn identity<'a>(record: &PlaneRecordRef<'a>) -> &'a str {
     record.parent.unwrap_or(record.id)
 }
 
 /// The typed sidecar — everything about a record except its body, as ONE deterministic string.
-///
-/// Two leading flag characters the scripts read without decoding anything: `1`/`0` whether the
-/// record has a `parent` (what [`Keys::pcount`] counts), then `t`/`a` its disposition (what a
-/// terminal-only purge reads). Then the JSON of `{id, parent, seq, ts}` — every field that identifies
-/// or orders the record. Deterministic, so a byte comparison of two sidecars is a comparison of the
-/// records they describe (the append fork check).
+
 fn sidecar(record: &PlaneRecordRef<'_>) -> RecordStoreResult<String> {
     #[derive(serde::Serialize)]
     struct Sidecar<'a> {
@@ -179,10 +132,7 @@ fn parent_of(side: &str) -> RecordStoreResult<Option<String>> {
 }
 
 /// Shared Lua: a record's PARENT LINK. A record that names a parent is counted under that parent in
-/// `pcount` and listed on the parent's index (`prefix` .. hex parent). For an appended child that
-/// index is its own identity's; an upserted record lives at its own id, so it is on both.
-/// `unlink(pcount, idx, prefix, F, sidecar)` takes the record at `F` (whose own index is `idx`) out
-/// of both; `tohex` spells an identity as its index key does.
+
 const LUA_LINK: &str = r"
 local function tohex(s)
     return (string.gsub(s, '.', function(c) return string.format('%02x', string.byte(c)) end))
@@ -209,8 +159,7 @@ end
 ";
 
 /// Shared Lua: `write(rec, body, byts, idx, pcount, F, sidecar, body, ts, seq, parent, prefix)` —
-/// put the record at `F` on its own index `idx`, replacing whatever was there, and link it to
-/// `parent` (`''` = none), keeping `pcount` and the parent indexes exact across the replacement.
+
 const LUA_WRITE: &str = r"
 local function require_type(key, want)
     local t = redis.call('TYPE', key)
@@ -289,7 +238,7 @@ end
 ";
 
 /// UPSERT: `KEYS = rec, body, byts, idx, pcount`; `ARGV = F, sidecar, body, ts, seq, parent,
-/// idx_prefix`.
+
 static UPSERT: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_LINK}{LUA_WRITE}
@@ -300,7 +249,7 @@ static UPSERT: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 });
 
 /// APPEND: as [`UPSERT`], but an occupied position is never overwritten — `0` = written or an
-/// identical replay (no write), `1` = a DIFFERENT record already holds the position (a fork).
+
 static APPEND: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_LINK}{LUA_WRITE}
@@ -318,11 +267,7 @@ static APPEND: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 });
 
 /// APPEND UNDER AN `op_id` (`slots`): [`APPEND`], deduped on the op's record. `KEYS` as
-/// [`APPEND`], then `KEYS[6]` = the op's record (a hash: `b` = the op's body); `ARGV` as [`APPEND`],
-/// then `ARGV[8]` = the op's body, `ARGV[9]` = the record's lifetime in seconds. Returns the body
-/// recorded under the op's id (nothing written), or `0` = written or the identical record already
-/// at the position, `1` = a fork. Every successful append records the op, including an identical
-/// record under a fresh op id; a fork or error records nothing.
+
 static APPEND_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_LINK}{LUA_WRITE}
@@ -348,8 +293,7 @@ static APPEND_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 });
 
 /// Shared Lua: `drop_identity(rec, body, byts, pcount, idx, ident, prefix)` — remove every record
-/// at one identity (every `seq`) and unlink each from its parent. The identity's index may also
-/// list upserted records that only name it as their parent (they live at their own ids): they stay.
+
 const LUA_DROP_IDENTITY: &str = r"
 local function drop_identity(rec, body, byts, pcount, idx, ident, prefix)
     local fs = redis.call('ZRANGE', idx, 0, -1)
@@ -373,8 +317,7 @@ end
 ";
 
 /// DELETE one identity: `KEYS = rec, body, byts, pcount, idx`, then (cascade only) the same five of
-/// the cascaded kind; `ARGV = identity, idx_prefix, cascade_idx_prefix ('' = no cascade)`. Returns
-/// the records of the kind removed.
+
 static DELETE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_LINK}{LUA_DROP_IDENTITY}
@@ -387,11 +330,7 @@ static DELETE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 });
 
 /// PURGE, one batch: `KEYS = rec, body, byts, pcount` of the kind, then (cascade only) `rec, body,
-/// byts, pcount` of the cascaded kind; `ARGV = before, terminal_only ('1'|'0'), idx_prefix,
-/// cascade_idx_prefix ('' = no cascade), offset, limit, kind`. Looks at the `limit` candidates from
-/// `offset` (a kept candidate stays in the index, so the caller advances `offset` past them) and
-/// returns `{removed, kept, seen}`: records OF THE KIND removed, candidates kept, candidates seen.
-/// `sidecar` writes `ts` as the final decimal integer: read its digits without cjson's f64 decode.
+
 static PURGE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_LINK}{LUA_DROP_IDENTITY}
@@ -434,13 +373,8 @@ static PURGE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     ))
 });
 
-// Every plane write runs ONCE on the op's connection, never replayed: a dropped reply on a write is
-// not a lost read (the script may well have run), and a blind replay of an upsert is harmless but of
-// a purge would under-report its count and of a first append would read its own write back as an
-// identical replay. The failure surfaces instead.
-
 /// A write script's call for `record`: `KEYS = rec, body, byts, idx, pcount`; `ARGV = F, sidecar,
-/// body, ts, seq, parent ('' = none), idx_prefix`.
+
 fn write_call<'s>(
     script: &'s Script,
     record: &PlaneRecordRef<'_>,
@@ -478,7 +412,7 @@ async fn put(
 const UPSERT_SEQ: u64 = 0;
 
 /// `upsert_plane_record`: UPSERT BY `(kind, id)`, parent or not — a second write for one id
-/// replaces it, never stands a rival beside it.
+
 pub(crate) async fn upsert(
     store: &ValkeyStore,
     c: &mut Conn,
@@ -492,8 +426,7 @@ pub(crate) async fn upsert(
 }
 
 /// `append_plane_record` under an `op_id` ([`APPEND_OP`]): `op_key` is the op's record, `body` its
-/// body. The body already recorded under the op's id (nothing written), or `None`: written, or the
-/// identical record already at the position. A different record there is the fork refused.
+
 pub(crate) async fn append_op(
     store: &ValkeyStore,
     c: &mut Conn,
@@ -520,8 +453,7 @@ pub(crate) async fn append_op(
 }
 
 /// Append `record` only if its position is EMPTY; an occupied one (identical or not) is left as it
-/// is. The v6 → v7 migration's write: a record already in the plane keyspace is newer than any v6 row
-/// could be, and is never overwritten by one. `true` = a DIFFERENT record holds the position (a fork).
+
 pub(crate) async fn append_if_absent(
     store: &ValkeyStore,
     c: &mut Conn,
@@ -533,8 +465,7 @@ pub(crate) async fn append_if_absent(
 }
 
 /// `get_plane_record`: an upserted record lives at `(id, 0)`. No caller-scoping filter, deliberately:
-/// an authorization check in the backend is one an unauthorized reader bypasses by configuring a
-/// different backend, so the contract keeps it engine-side.
+
 pub(crate) async fn get(
     store: &ValkeyStore,
     c: &mut Conn,
@@ -549,9 +480,7 @@ pub(crate) async fn get(
 type ChainRead = (Vec<String>, Vec<Option<String>>, Vec<Option<Vec<u8>>>);
 
 /// `list_plane_records`. UNFILTERED beyond the selector, terminal rows included: the boot rehydrate
-/// wants the active rows, retention the terminal ones and a scoped listing one principal's, and a
-/// store that pre-filtered for any one of those would break the other two. Oldest-first by `seq`
-/// (then identity, for `All`), the order a chain verifier reads a parent's records in.
+
 pub(crate) async fn list(
     store: &ValkeyStore,
     c: &mut Conn,
@@ -575,9 +504,7 @@ pub(crate) async fn list(
         }
         PlaneSelector::Parent(parent) => {
             let idx = keys.idx(parent);
-            // The sidecars and the bodies are read in ONE atomic step, so a concurrent write can
-            // never pair one record's sidecar with another's body; a position the index named but a
-            // concurrent delete removed in between reads back absent and is skipped.
+
             let (fs, sides, bodies): ChainRead = with_conn!(store, |c| {
                 let fs: Vec<String> = c.zrange(&idx, 0, -1).await?;
                 if fs.is_empty() {
@@ -600,7 +527,7 @@ pub(crate) async fn list(
             let mut rows = Vec::new();
             for ((f, side), body) in fs.into_iter().zip(sides).zip(bodies) {
                 let (side, body) = match (side, body) {
-                    (None, None) => continue, // A concurrent deletion removed the whole row.
+                    (None, None) => continue,
                     (Some(side), Some(body)) => (side, body),
                     _ => {
                         return Err(RecordStoreError(
@@ -612,7 +539,7 @@ pub(crate) async fn list(
                 let (seq, ident) = parse_field(&f).ok_or_else(|| {
                     RecordStoreError("list_plane_records: a stored position does not parse".into())
                 })?;
-                // An upserted row can share this index through its own id without being a child.
+
                 if parent_of(&side)?.as_deref() == Some(&**parent) {
                     rows.push((seq, ident.to_string(), body));
                 }
@@ -625,7 +552,7 @@ pub(crate) async fn list(
 }
 
 /// `list_plane_record_parents`: the boot enumeration — every parent holding at least one record of
-/// the kind, exactly once, sorted.
+
 pub(crate) async fn parents(
     store: &ValkeyStore,
     c: &mut Conn,
@@ -643,7 +570,7 @@ pub(crate) async fn parents(
 }
 
 /// `purge_plane_records_before`, the age-only entry: `task` has always dropped only its TERMINAL
-/// rows here, every other kind every row older than `before`.
+
 pub(crate) async fn purge_before(
     store: &ValkeyStore,
     c: &mut Conn,
@@ -657,11 +584,7 @@ pub(crate) async fn purge_before(
 const PURGE_BATCH: usize = 1000;
 
 /// `purge_plane_records`: STRICTLY older than the cutoff, and the count actually performed. WHICH
-/// rows go is the rule the call carries (never one inferred from the kind's name), read off the
-/// typed disposition, never out of the body: `terminal_only` drops only TERMINAL rows (an
-/// interrupted task waiting on a human is exactly the row that legitimately sits still longest),
-/// otherwise every row older than `before` goes. A purged `task` takes its `task_event` chain with
-/// it either way.
+
 pub(crate) async fn purge(
     store: &ValkeyStore,
     c: &mut Conn,
@@ -714,8 +637,7 @@ pub(crate) async fn purge(
 }
 
 /// `delete_plane_record`: every `seq` under the identity goes, so a delete can never leave part of a
-/// chain behind; a deleted `task` takes its `task_event` chain with it, as a purge does. Deleting what is not there is a NO-OP, not an error: the engine clears on every
-/// observation that agrees with an approval rather than tracking whether it had demoted.
+
 pub(crate) async fn delete(
     store: &ValkeyStore,
     c: &mut Conn,
@@ -756,16 +678,13 @@ pub(crate) fn token_key(kind: &str, token: &str) -> String {
 }
 
 /// The longest life a redeemed-token entry is given an expiry for: the server refuses an `EX` that
-/// overflows its own millisecond arithmetic, so a grant living longer is recorded with no expiry.
-// Existing ten-year cleanup cap; larger grants retain no TTL.
+
 const MAX_TOKEN_TTL_SECS: u64 = 315_360_000;
 
 const SHARED_TIME_COMMAND: &str = "redis.call('TIME')";
 
 /// Token decisions compare canonical unsigned decimal strings, exact past 2^53.
-/// The shared clock and cleanup boundary for live redemptions and imported spent receipts.
-/// Decimal arithmetic preserves the entire u64 expiry range; EXAT is only used within the
-/// pre-existing TTL cap. The first second after expires_at is structural boundary handling.
+
 fn token_expiry_script(body: &str) -> Script {
     Script::new(&format!(
         r"
@@ -863,19 +782,7 @@ static REDEEM: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 });
 
 /// `redeem_plane_token`: the test and set, as ONE script the server orders against every other
-/// node's. A stored entry holds its grant's `expires_at`; it is spent while that is at or after the
-/// server's TIME; an expired candidate is refused before mutation. The
-/// script's reply IS the answer, never a prior read: a `GET` followed by a `SET` would tell both
-/// halves of a race they were first, and on this backend a fleet sharing one Valkey is the ORDINARY
-/// deployment.
-///
-/// Cleanup starts at the first second after absolute expiry. This store refuses a server that may
-/// evict (`noeviction`), so an unbounded keyspace would be an outage of the whole namespace.
-///
-/// NO RECONNECT-RETRY: a dropped reply is not a lost read — the script may have run, and a blind
-/// retry would find its own write and report `false`, refusing a grant this very call recorded. The
-/// error surfaces instead, and the engine turns it into a REFUSED redemption; both answers are
-/// closed.
+
 pub(crate) async fn redeem_token(
     store: &ValkeyStore,
     c: &mut Conn,
@@ -891,10 +798,7 @@ pub(crate) async fn redeem_token(
 }
 
 /// `plane_token_live`: MULTI-USE and SPENDS NOTHING — a plain read of the `(kind, token)` upserted
-/// record. LIVE means all three: present, still Active, and `now` not past `expires_at`. A missing
-/// record holds no capability, a terminal one names work that has finished, and a lapsed one is dead
-/// even if nothing finished. Reserved tickets require a matching terminal deadline under server TIME.
-/// Both paths spend nothing; final admission still calls the atomic redemption operation.
+
 pub(crate) async fn token_live(
     store: &ValkeyStore,
     c: &mut Conn,

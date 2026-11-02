@@ -2,33 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! **The v6 → v7 upgrade, in place.** The protocol-named durable methods were replaced by the
-//! kind-neutral plane-record verbs. A v6 namespace holds the typed rows those methods wrote; this
-//! copies each into the plane keyspace ([`crate::plane`]) as the exact body the plane decodes, then
-//! removes the typed keys.
-//!
-//! | v6 keyspace | v7 plane record |
-//! |---|---|
-//! | `busbar:task:row:<id>` + `busbar:tasks` + `busbar:tasks:byupdated` | kind `task`, id = task id, seq 0, ts = `updated_at`, TERMINAL iff the state is |
-//! | `busbar:task:events:<id>` (ZSET by seq) | kind `task_event`, parent = task id, seq, ts |
-//! | `busbar:mcp:demotions` (HASH server → row) | kind `demotion`, id = server, seq 0, ts = `recorded_at` |
-//! | `busbar:askstate:<nonce>` (`SET NX EX`) | a redeemed `ask` token, with the remaining TTL |
-//!
-//! The sidecar each record gets is exactly what the engine writes for the same row
-//! (`TaskRow::to_plane_record` / `TaskEventRow::to_plane_record` / the demotion's), so an engine replay
-//! of a migrated event is the identical append it is meant to be, not a fork.
-//!
-//! The v6 MCP tool-call log (`busbar:mcp:calls:*`) is deliberately NOT migrated or removed;
-//! the separate `busbar:mcp:demotions` hash is migrated as listed above. The
-//! `call` body is a framed digest stream the engine seals itself; a backend re-encoding a typed row
-//! into it would be forging the chain the engine verifies, and busbar ships no `call` migration
-//! either. The keys stay where they are, unread, so no evidence is destroyed by an upgrade.
-//! (store-sqlite, store-postgres and store-mysql make the same four moves and the same exception.)
-//!
-//! Idempotent, and that is what makes it crash-safe without one giant transaction: every record goes in
-//! through [`crate::plane::append_if_absent`] (a position already holding a record — a newer
-//! write, or this same copy from a run a crash interrupted — is left as it is), a typed key is removed
-//! only after its records are in, and the schema marker is written last by the caller. A crash
-//! anywhere re-runs the whole upgrade on the next connect and lands in the same place.
 
 use crate::resp::Conn;
 use crate::{plane, RecordStoreError, RecordStoreResult, ValkeyStore};
@@ -46,10 +19,7 @@ pub(crate) const ASK_STATE_PREFIX: &str = "busbar:askstate:";
 const TERMINAL_TASK_STATES: [&str; 4] = ["completed", "failed", "canceled", "rejected"];
 
 /// The v6 row shapes, as v6 wrote them (`serde_json` of the typed rows). Read with exactly the fields
-/// the plane's own rows carry, and written back out in the same field order, so the migrated
-/// body is the body the plane would have encoded. A v6 event carries no `digest_version`, and none is
-/// added: the plane reads its absence as the framing those rows were sealed under, and writing one
-/// would claim a framing the stored `hash` was never computed with.
+
 pub(crate) mod rows {
     #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
     pub struct Task {
@@ -95,8 +65,7 @@ pub(crate) const KIND_DEMOTION: &str = "demotion";
 pub(crate) const KIND_ASK: &str = "ask";
 
 /// A v6 row that will not decode stops the upgrade: silently dropping it would lose a task, a
-/// provenance link or a quarantine, and leaving the typed keys behind (the upgrade removes a key only
-/// after its records are in) means nothing is lost while an operator repairs the row.
+
 fn decode<T: serde::de::DeserializeOwned>(
     what: &str,
     key: &str,
@@ -112,7 +81,7 @@ fn decode<T: serde::de::DeserializeOwned>(
 }
 
 /// Copy one v6 row into the plane keyspace as `kind` at `(id, seq)`, unless that position is taken.
-/// `true` = the position holds a DIFFERENT record (a fork).
+
 #[allow(clippy::too_many_arguments)]
 async fn copy<T: serde::Serialize>(
     store: &ValkeyStore,
@@ -140,11 +109,9 @@ async fn copy<T: serde::Serialize>(
 
 /// Run the upgrade. See the module doc.
 pub(crate) async fn migrate_v6_to_v7(store: &ValkeyStore, c: &mut Conn) -> RecordStoreResult<()> {
-    // TASK EVENTS first, then tasks: a task's events are in before the task row that owns them, so
-    // there is no instant at which a migrated task exists with its chain still behind.
     for key in store.scan(c, &format!("{TASK_EVENTS_PREFIX}*")).await? {
         let members: Vec<Vec<u8>> = with_conn!(store, |c| c.zrange(&key, 0, -1).await)?;
-        // A chain position that forked is evidence: its v6 source is kept for an operator.
+
         let mut forked = false;
         for raw in members {
             let e: rows::TaskEvent = decode("task event", &key, &raw)?;
@@ -168,8 +135,7 @@ pub(crate) async fn migrate_v6_to_v7(store: &ValkeyStore, c: &mut Conn) -> Recor
                 PlaneDisposition::Active
             };
             let (id, at) = (t.task_id.clone(), (0, t.updated_at));
-            // An upserted row: a record already at its place is the newer one, and the stale v6
-            // row goes (`v6_namespace_upgrades_in_place_to_v7`).
+
             copy(store, c, KIND_TASK, id, None, at, disposition, &t).await?;
         }
         with_conn!(store, |c| c.del::<_, ()>(&key).await)?;
@@ -187,10 +153,6 @@ pub(crate) async fn migrate_v6_to_v7(store: &ValkeyStore, c: &mut Conn) -> Recor
     }
     with_conn!(store, |c| c.del::<_, ()>(MCP_DEMOTIONS_HASH).await)?;
 
-    // SPENT APPROVALS: each is carried as a ledger entry holding its grant's `expires_at` (v6 wrote
-    // it as the value), with cleanup after that absolute boundary. A key already past its old TTL
-    // is gone on the server and cannot be reconstructed. All surviving receipts use server TIME;
-    // huge expiries retain the existing no-TTL policy.
     for key in store.scan(c, &format!("{ASK_STATE_PREFIX}*")).await? {
         let nonce = key.strip_prefix(ASK_STATE_PREFIX).ok_or_else(|| {
             RecordStoreError(

@@ -2,58 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! **ONE VALKEY STORE, BOTH DOORS, ONE TABLE** — the store's linked + dropped-in conformance on the
-//! store kind's memory ABI (store v3), run against the busbar rev this repo pins (`.busbar-ref`).
-//!
-//! The store is held two ways at once: LINKED (the logic crate's `door`, as a busbar build that
-//! compiles it in registers it: `LinkedRow::of(door)` through the loader's `load_linked`) and
-//! DROPPED IN (this crate's built cdylib, its Statement rendered the way `busbar-plugin-pack`
-//! renders it into the signed manifest, then `dlopen`ed by the loader's `load_dropped`). Each is
-//! bound to its own dispatcher, opened the way the host opens a store (`LoadedStore`), and driven
-//! through the same transcript:
-//!
-//! - the name its Statement states;
-//! - the refusals the store's own `open` gives for settings that cannot produce a store (no `url`,
-//!   malformed JSON, a URL the driver refuses, an unreachable server) — each in the store's own
-//!   words, across the door;
-//! - against the live Valkey (`VALKEY_URL`): one scenario over every surface a governance store
-//!   answers — a key (mint, read, tombstone, the tombstone guard), a credential (mint, the live-owner
-//!   refusal, lookup, revoke), the usage ledger (additive, floored), metering (the dated split), the
-//!   plane-record verbs (upsert, chain append, replay, fork, listing,
-//!   parents, terminal-only purge with its cascade, single-use token, live token) — and the store v3
-//!   slots (the usage batch, its replay and its reused op id, records).
-//!
-//! The two transcripts must agree line for line. Each arm runs in its own namespace (fresh ids, a
-//! fresh plane kind), so the arms never read each other's rows; the namespace is replaced by a fixed
-//! token before comparing.
-//!
-//! THE RED ARMS, each its own test: the library asked for as another kind is refused before it is
-//! opened; a manifest whose Statement is one byte off the library's own is refused; and (live) a
-//! PERTURBED dropped-in arm — its namespace already holding a different record at a position the
-//! scenario appends to — must NOT produce the linked transcript.
-//!
-//! The live leg follows this repo's Valkey gate: skipped locally without `VALKEY_URL`, a HARD
-//! FAILURE under `CI` without it. A missing cdylib is always a failure, never a skip: this test IS
-//! the dropped-in door's proof.
 
-// THE PUBLISHED SUITE (busbar-plugin-loader's `conformance` feature, at the pin): the linked door and
-// the built cdylib, each through the one loader, driven by the store kind's script over the live
-// Valkey `conformance.json` names; exact crossing counts, the two folds equal, its RED arms.
-//
-// THE HOST (ARCHITECT Q-P4-9): the store's `tcp` need is served by busbar's own connector, composed
-// as the root composes it (`conformance_host`, rendered by the fleet template), and the store asks
-// for TLS (`rediss://`): the suite's TLS front answers, its certificate chaining to the suite's test
-// CA, the anchors only the HOST's TLS is handed (`tls:`); the front carries the secured connection to
-// the live Valkey. So every fold proves the store's connection is secured by the host, verified
-// against the anchors.
-//
-// EACH FOLD'S KEYSPACE (Q-P4-8): the store's keys are fixed (`busbar:*`) and its settings name no key
-// prefix, and a fold namespace is no database number, so `{fold}` has nowhere to go in the url. The
-// suite's folds therefore run in a database of their own (`/14`; this repo's other live tests use the
-// url's `/0`, the admin end-to-end test `/15`, the e2e durability proofs `/10`, store-valkey's schema-refusal tests `/11` to `/13` and
-// its v9 upgrade test `/8`), one fold at a time: the namespace hooks below take
-// that database for the fold and flush it before the fold opens, and flush it and hand it on when
-// the fold ends, on an independent connection of the `redis` client. Every fold starts on an empty
-// keyspace and leaves none; nothing in the store's behaviour changes.
 #[path = "support/conformance_host.rs"]
 mod conformance_host;
 #[path = "../../test-support/database.rs"]
@@ -99,7 +48,7 @@ fn host(
 }
 
 /// The fold's database on the live server, on a connection of the `redis` client's own: straight to
-/// the server, in the clear (the TLS front is the store's, not this client's).
+
 fn fold_url(settings: &[u8]) -> String {
     let v: serde_json::Value =
         serde_json::from_slice(settings).expect("conformance.json's settings are JSON");
@@ -147,11 +96,11 @@ fn release_fold_keyspace(namespace: &str) {
     };
     drop(held);
     freed.notify_all();
-    drop(released); // Flush before the OS lock becomes available to another fold/process.
+    drop(released);
 }
 
 /// The suite's namespace hook, before the fold's open: the fold takes the suite's database (waiting
-/// while another fold holds it) and it is flushed, so the fold opens on an empty keyspace.
+
 fn take_fold_keyspace(namespace: &str, settings: &[u8]) {
     let (held, freed) = fold_gate();
     let mut slot = held
@@ -167,7 +116,7 @@ fn take_fold_keyspace(namespace: &str, settings: &[u8]) {
 }
 
 /// The suite's namespace hook, after the fold (its failure included): everything the store wrote in
-/// the fold is flushed, and the database is handed to the next fold.
+
 fn drop_fold_keyspace(namespace: &str, _: &[u8]) {
     release_fold_keyspace(namespace);
 }
@@ -206,8 +155,7 @@ fn valkey_url() -> Option<String> {
 }
 
 /// This crate's built cdylib, from `deps/` only: the copy the build graph of this very test binary
-/// refreshed (`target/<profile>/` is uplifted by `cargo build` alone and can be stale). A missing
-/// artifact is a failure, never a skip.
+
 fn cdylib() -> PathBuf {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let deps = exe.parent().expect("target/<profile>/deps");
@@ -222,7 +170,7 @@ fn cdylib() -> PathBuf {
 }
 
 /// The node's one `op_id` allocator (`LoadedStore::open` mints the bridge's writes from it): a node
-/// half no earlier run used (the dedupe is durable) and one counter.
+
 fn mint() -> busbar_contract::abi::store::OpId {
     static NODE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -234,7 +182,7 @@ fn mint() -> busbar_contract::abi::store::OpId {
 }
 
 /// The bind the host makes: the store's declared need served by the loader's test connection table
-/// (plain TCP, the host's connector path).
+
 fn bind(d: &Dispatcher) -> Bind {
     Bind {
         instance: Arc::from("store-valkey-conformance"),
@@ -302,8 +250,7 @@ fn op(counter: u64) -> OpId {
 }
 
 /// Open the store through one door (`LoadedStore`, the way the host opens it), on a node id no
-/// other instance uses: the bridge mints op ids as `(node, counter from 0)` and the dedupe is
-/// durable.
+
 fn open(load: &impl Fn() -> Loaded, settings: &str) -> Result<LoadedStore, String> {
     let (plugin, dispatcher) = load();
     LoadedStore::open(plugin, dispatcher, settings.as_bytes(), mint)
@@ -318,9 +265,8 @@ fn r<T: std::fmt::Debug, E: std::fmt::Display>(res: Result<T, E>) -> String {
 }
 
 /// The live scenario, in namespace `ns`, through `store`. Every observable the scenario produces is
-/// one line of the returned transcript.
+
 fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
-    // The 1.5.5 op set through the store's `RecordStore` face (the v3 slots below are `StoreCalls`).
     let store: &dyn RecordStore = loaded;
     let mut t = Vec::new();
     let kind = format!("conf_{ns}");
@@ -335,7 +281,7 @@ fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
         idp_subject: Some("alice".into()),
         ..Default::default()
     };
-    // KEYS: mint, read back (revision is store-stamped, so only its presence is compared).
+
     t.push(r(store.put_key(&key)));
     let back = store.get_key(&key_id).unwrap().expect("the key reads back");
     t.push(format!(
@@ -346,7 +292,7 @@ fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
         back.idp_subject,
         back.revision > 0
     ));
-    // CREDENTIALS: the owner must be live; mint; lookup; revoke; unknown revoke refused.
+
     let cred = |id: &str, owner: &str| CredentialSecret {
         meta: CredentialMeta {
             id: format!("{ns}_{id}"),
@@ -379,7 +325,7 @@ fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
     ));
     t.push(r(store.revoke_credential(&format!("{ns}_c1"), "leaked")));
     t.push(r(store.revoke_credential(&format!("{ns}_nope"), "x")));
-    // THE TOMBSTONE: delete, the guard, idempotency, the unknown id.
+
     t.push(r(store.delete_key(&key_id)));
     t.push(r(store.delete_key(&key_id)));
     t.push(r(store.put_key(&key)));
@@ -391,7 +337,7 @@ fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
             .unwrap()
             .map(|k| (k.enabled, k.deleted_at.is_some()))
     ));
-    // USAGE: additive, floored at 0, open units beside the reserved ones.
+
     let delta = |input: i64, calls: i64| UsageDelta {
         requests: input.signum(),
         billable_requests: 0,
@@ -409,7 +355,7 @@ fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
     t.push(r(store.add_usage(&bucket, 60, &delta(10, 2))));
     t.push(r(store.add_usage(&bucket, 60, &delta(-30, 1))));
     t.push(format!("usage:{:?}", store.get_usage(&bucket, 60).unwrap()));
-    // METERING: a price change splits the cell.
+
     let bucket_n: u64 = 7_000_000_000 + u64::from(std::process::id());
     for priced_from_ms in [0, 0, 5_000] {
         t.push(r(store.add_metering(&MeteringDelta {
@@ -438,7 +384,7 @@ fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
         .collect();
     cells.sort();
     t.push(format!("metering:{cells:?}"));
-    // PLANE RECORDS, in a kind nothing else writes.
+
     let rec = |id: &str, parent: Option<&str>, seq: u64, ts: u64, terminal: bool, body: &str| {
         PlaneRecord {
             kind: kind.clone(),
@@ -552,7 +498,7 @@ fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
                 .unwrap(),
         ]
     ));
-    // THE STORE V3 SLOTS, through the door's own table.
+
     let schema = format!("{ns}_schema");
     let usage_bucket = format!("{ns}_batch");
     let cells = [(usage_bucket.as_str(), 60, delta(5, 1))];
@@ -587,8 +533,7 @@ fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
 }
 
 /// What one door does, as one comparable transcript. `load` loads the door afresh: a refused
-/// `open` consumes the instance it was offered. `plant` writes through the opened store before the
-/// scenario runs (the perturbed RED arm).
+
 fn transcript(
     load: impl Fn() -> Loaded,
     live: Option<(&str, &str)>,
@@ -634,7 +579,7 @@ fn ns(arm: &str) -> String {
 }
 
 /// The Valkey store behaves as ONE store through either door, and the dropped-in library states the
-/// linked door's Statement byte for byte.
+
 #[test]
 fn the_linked_and_the_dropped_in_valkey_store_are_one_store() {
     let url = valkey_url();
@@ -662,8 +607,6 @@ fn the_linked_and_the_dropped_in_valkey_store_are_one_store() {
     same(&linked, &dropped_in);
     assert_eq!(linked[0], format!("name = {}", busbar_store_valkey::NAME));
 
-    // The transcript is about the store, not about nothing: the refusals are the store's own words,
-    // and (live) the scenario did what a governance store is for.
     assert!(linked[1].contains("`url` is required"), "{linked:#?}");
     assert!(
         linked[2].contains("invalid valkey plugin config"),
@@ -721,9 +664,7 @@ fn the_linked_and_the_dropped_in_valkey_store_are_one_store() {
 }
 
 /// RED ARM (live): a PERTURBED dropped-in store — its namespace already holds a different record at
-/// a chain position the scenario appends to — must not reproduce the linked transcript. It needs a
-/// server: skipped locally without `VALKEY_URL`, a failure under CI ([`valkey_url`]); an arm that
-/// perturbed nothing would pass vacuously.
+
 #[test]
 fn a_perturbed_dropped_in_store_does_not_pass_for_the_linked_one() {
     let Some(u) = valkey_url() else { return };

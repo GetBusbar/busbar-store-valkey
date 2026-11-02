@@ -2,13 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! A RESP2 client over the host's connector: the subset of the Valkey protocol this store speaks,
-//! sans-IO. Every byte goes out and comes back through the op's one connection (the store SDK's
-//! [`Wire`]); this module only encodes commands, parses replies and converts them to Rust values.
-//! No socket, no TLS stack and no runtime of its own: the host's connector owns all three.
-//!
-//! The surface mirrors what the store used of the upstream driver (`cmd`, `pipe`, `Script`, the
-//! typed `get`/`hgetall`/... helpers and the optimistic [`transaction!`]), as `async` calls, so the
-//! store's bodies read as they did over the blocking client.
 
 use std::fmt;
 use std::future::Future;
@@ -58,15 +51,14 @@ impl RedisError {
     }
 
     /// A CONNECTION-LEVEL failure (the connector's: dropped, refused, timed out; or the server
-    /// closing), worth one reconnect-and-retry (the upstream driver's `is_io_error` /
-    /// `is_connection_dropped` / `is_connection_refusal` / `is_timeout`).
+
     #[must_use]
     pub fn is_connection_error(&self) -> bool {
         matches!(self.repr, Repr::Io(_))
     }
 
     /// The store's own refusal of an op (an unknown id, a tombstoned id): `text` reads verbatim,
-    /// with no ` - Client` suffix, in the siblings' `<op>: <reason>` shape.
+
     #[must_use]
     pub fn refused(text: impl Into<String>) -> Self {
         Self {
@@ -75,7 +67,7 @@ impl RedisError {
     }
 
     /// Whether this is a store refusal ([`RedisError::refused`]), which reaches the caller as
-    /// written.
+
     #[must_use]
     pub fn is_refusal(&self) -> bool {
         matches!(self.repr, Repr::Refused(_))
@@ -170,7 +162,6 @@ pub enum Value {
 /// The deepest array nesting a reply may have; deeper is refused rather than recursed into.
 const MAX_REPLY_DEPTH: usize = 32;
 
-// Bytes `walk` copied into `Value::Data`, to prove a reply is materialised once.
 #[cfg(test)]
 thread_local! {
     static COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -191,11 +182,7 @@ impl Value {
 }
 
 /// Parse one reply from the front of `buf`: the reply and how many bytes it took, or `None` when
-/// `buf` does not hold a whole reply yet. A first pass only checks that the reply is complete (it
-/// allocates and copies nothing), so a reply that arrives in many fills is built once, when whole.
-///
-/// # Errors
-/// Bytes that are not RESP2, nesting beyond [`MAX_REPLY_DEPTH`], or a length that overflows.
+
 pub fn parse(buf: &[u8]) -> RedisResult<Option<(Value, usize)>> {
     match walk(buf, 0, 0, false)? {
         None => Ok(None),
@@ -393,24 +380,17 @@ impl<A: ToArgs, B: ToArgs> ToArgs for (A, B) {
 /// A Rust value a reply converts to (the upstream driver's conversions, as the store used them).
 pub trait FromValue: Sized {
     /// Convert one reply.
-    ///
-    /// # Errors
-    /// A reply of another shape.
+
     fn from_value(v: Value) -> RedisResult<Self>;
 
     /// Convert an array's items (a tuple type takes them pairwise from a flat array).
-    ///
-    /// # Errors
-    /// An item of another shape.
+
     fn from_values(items: Vec<Value>) -> RedisResult<Vec<Self>> {
         items.into_iter().map(Self::from_value).collect()
     }
 
     /// A bulk string as a `Vec<Self>`: `u8` takes it whole (a `Vec<u8>` is bytes); every other
-    /// type hands it back.
-    ///
-    /// # Errors
-    /// The bytes back, for the caller to convert as one item.
+
     fn from_bytes(bytes: Vec<u8>) -> Result<Vec<Self>, Vec<u8>> {
         Err(bytes)
     }
@@ -574,8 +554,7 @@ impl Conn {
     }
 
     /// Authenticate with one SDK-owned complete RESP command. Neither the credential nor its
-    /// packet enters the public command encoder; the wire retains the seal across partial writes
-    /// and Pending, and discards an interrupted exchange before it can be reused.
+
     pub async fn authenticate(&mut self, password: &Cred, user: Option<&str>) -> RedisResult<()> {
         self.wire
             .write_sealed(password.resp_auth(user))
@@ -598,9 +577,6 @@ impl Conn {
             let got = match got {
                 Ok(got) => got,
                 Err(e) => {
-                    // A reply that does not parse leaves the stream out of step with the commands
-                    // sent (the rest of that reply, or a late one, would be read as a LATER op's
-                    // reply): this connection is never kept.
                     self.wire.discard();
                     return Err(e);
                 }
@@ -659,7 +635,7 @@ impl Conn {
     }
 
     /// The op is done with the connection: one that still has a `WATCH` in force (a body that left
-    /// it in doubt) is not kept for the next op.
+
     pub fn settle(&self) {
         if self.watching {
             self.wire.discard();
@@ -726,7 +702,7 @@ impl Conn {
     }
 
     /// Up to `max` keys matching `pattern` other than `skip`, stopping the `SCAN` as soon as
-    /// that many are found.
+
     pub async fn scan_some(
         &mut self,
         pattern: &str,
@@ -802,17 +778,13 @@ impl Cmd {
     }
 
     /// Run it and convert its reply.
-    ///
-    /// # Errors
-    /// The connection failed, the server answered an error, or the reply does not convert.
+
     pub async fn query<T: FromValue>(&self, c: &mut Conn) -> RedisResult<T> {
         T::from_value(c.request(self.args.clone()).await?)
     }
 
     /// Run it for its effect.
-    ///
-    /// # Errors
-    /// As [`Cmd::query`].
+
     pub async fn exec(&self, c: &mut Conn) -> RedisResult<()> {
         c.request(self.args.clone()).await.map(drop)
     }
@@ -893,11 +865,7 @@ impl Pipeline {
     }
 
     /// Run the pipeline and convert the replies of the commands not ignored (as one array). An
-    /// atomic pipeline whose `EXEC` a watched key aborted answers `Nil` (so `Option<_>` is
-    /// `None`); an error reply anywhere is `Err`.
-    ///
-    /// # Errors
-    /// The connection failed, a command answered an error, or the replies do not convert.
+
     pub async fn query<T: FromValue>(&self, c: &mut Conn) -> RedisResult<T> {
         if self.cmds.is_empty() {
             return T::from_value(Value::Array(Vec::new()));
@@ -914,7 +882,7 @@ impl Pipeline {
         let replies = if self.atomic {
             c.watching = false;
             let exec = replies.pop().unwrap_or(Value::Nil);
-            // A command the server refused to queue: `EXEC` answers EXECABORT; name the first.
+
             if let Some(Value::Error(e)) = replies.iter().find(|r| matches!(r, Value::Error(_))) {
                 return Err(RedisError::server(e.clone()));
             }
@@ -1002,9 +970,7 @@ impl ScriptInvocation<'_> {
     }
 
     /// Run it and convert its reply. A `NOSCRIPT` miss never ran it, so `EVAL` runs it once.
-    ///
-    /// # Errors
-    /// As [`Cmd::query`].
+
     pub async fn invoke<T: FromValue>(&self, c: &mut Conn) -> RedisResult<T> {
         let sha = match self.script.sha.get() {
             Some(sha) => sha,
@@ -1133,14 +1099,13 @@ mod tests {
 
     #[test]
     fn a_malformed_or_partial_bulk_is_refused_or_waited_for() {
-        // The two bytes after the payload must be CRLF.
         assert!(parse(b"$3\r\nabcX\r\n").is_err());
-        // CRLF INSIDE the declared length is payload, not a terminator.
+
         let (v, n) = parse(b"$4\r\na\r\nb\r\n").unwrap().unwrap();
         assert_eq!((v, n), (Value::Data(b"a\r\nb".to_vec()), 10));
-        // A non-numeric length is refused.
+
         assert!(parse(b"$x\r\n").is_err());
-        // A bulk short of its payload or terminator is waited for, not refused.
+
         assert_eq!(parse(b"$5\r\nab").unwrap(), None);
         assert_eq!(parse(b"$3\r\nabc").unwrap(), None);
         assert_eq!(parse(b"$3\r\nabc\r").unwrap(), None);

@@ -17,7 +17,7 @@ use std::time::Duration;
 
 fn setup() -> Option<(database::Database, redis::Connection, ValkeyStore, String)> {
     let _ = live_store()?;
-    // The existing OS database lock serializes every suite sharing this private DB.
+
     let (database, raw) = fresh_db_client(6);
     let url = url_for_db(6);
     let store = ValkeyStore::connect(&url).unwrap();
@@ -72,7 +72,7 @@ fn two_loaded_clients_racing_absence_have_exactly_one_atomic_winner() {
         candidate(&schema, b"owner", Expected::Absent, b"one"),
         candidate(&schema, b"owner", Expected::Absent, b"two"),
     ];
-    // Finish both fallible opens before any operation worker can wait for its start.
+
     let connections = [
         ValkeyStore::connect(&url).unwrap(),
         ValkeyStore::connect(&url).unwrap(),
@@ -82,8 +82,6 @@ fn two_loaded_clients_racing_absence_have_exactly_one_atomic_winner() {
             .into_iter()
             .zip(requests.clone())
             .map(|(connection, request)| {
-                // If spawning a later worker panics, dropping these senders releases every
-                // earlier receiver before scope joins it. No stranded Barrier remains.
                 let (start, started) = mpsc::channel();
                 let worker = scope.spawn(move || {
                     started.recv().expect("race worker started");
@@ -330,7 +328,7 @@ impl Proxy {
                     Err(error) => panic!("accept: {error}"),
                 }
             };
-            drop(listener); // A hidden reconnect cannot obtain another connection.
+            drop(listener);
             client
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
@@ -431,9 +429,6 @@ impl Proxy {
 }
 impl Drop for Proxy {
     fn drop(&mut self) {
-        // This Drop completes before the enclosing test's Database guard can FLUSHDB/unlock.
-        // Release both ways an operation can be waiting, then join every worker even if a
-        // worker panicked. Preserve the original panic when already unwinding.
         self.resume();
         self.stop.store(true, Ordering::SeqCst);
         if let Some(stream) = self

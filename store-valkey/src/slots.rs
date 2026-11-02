@@ -2,34 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The store v3 door over [`ValkeyStore`]: `store_door!` and the slots the store v3 table adds to
-//! the base op set ([`StoreSlots`]): the `op_id`-carrying writes (the usage and metering batches
-//! and the plane-record append) and the kernel's records. The store keeps ledger counts and
-//! records, not money: busbar derives money from the counts and its rate card.
-//!
-//! ## Layout (schema v10, `crate::SCHEMA_VERSION`)
-//!
-//! - `busbar:op:<hex op_id>`            HASH `b` = the op's body ([`Dedupe`]); expires
-//!   [`OP_ID_RETENTION_SECS`] after it is written (S4).
-//! - `busbar:records:<hex schema>:k`    ZSET of keys, every score 0, so `ZRANGEBYLEX` reads them in
-//!   byte order; `busbar:records:<hex schema>:v` HASH key -> value.
-//!
-//! ## Dedupe (`abi::store` S1-S4), durable and atomic
-//!
-//! Usage, metering and append `op_id` writes use ONE server-side script: it returns the body recorded under the op's id
-//! and applies nothing, or applies the effect and records the op's body. [`Dedupe::answer`] reads
-//! the returned body: a replay answers done, a different op's body a conflict (S1-S3).
-//! `append_plane_record`'s script is [`crate::plane`]'s. Conditional records WATCH every schema
-//! hash/index and the receipt. Usage corrections WATCH the live key, day index, metering hashes,
-//! usage hashes and receipt. Both commit one MULTI/EXEC; condition conflicts write nothing, and
-//! lost EXEC answers require exact id/body replay within the existing receipt lifetime.
-//!
-//! ## Every slot is one op through the host's connector
-//!
-//! Each slot runs its body with the store SDK's `wire::drive_kept` on one of the store's kept
-//! connections: drawn when the op starts (dialled through the host's connector on the op's ticket
-//! when none is idle), every command a write and a read that
-//! may PEND (the op answers PENDING and is resumed on the connector's wake), handed back when the op
-//! answers. The body is the blocking client's body, `async`.
 
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::store::column::{clamp, prefix_end, storable_i64};
@@ -53,8 +25,6 @@ use crate::{
 #[path = "correction.rs"]
 mod correction_backend;
 
-// `url` is reference-capable, not secret: a `{env:}`/`{file:}`/`{module:}` reference resolves in
-// place (a 1.5.5 `url: {env: VAR}` keeps booting) and a literal passes as written.
 busbar_contract::statement_extensions!(EXTENSIONS: [
     (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["url"]"#),
     (busbar_contract::abi::sdk::store::rewrap::INTENT, b"1"),
@@ -126,8 +96,7 @@ macro_rules! ops {
 
 impl ValkeyStore {
     /// Compare one watched pre-state, then write the rows and their applied-only receipt in a
-    /// single EXEC. Only a definitive WATCH abort retries here. A transport error never dials
-    /// again inside this operation: its caller must reconcile the same op id and fingerprint.
+
     async fn v3_record_transaction(
         &self,
         c: &mut Conn,
@@ -155,9 +124,6 @@ impl ValkeyStore {
             watched.extend([keys.as_str(), values.as_str()]);
         }
 
-        // Reuse the ordinary optimistic transaction's existing contention bound. WATCH names
-        // every key in ONE command: a cluster rejects CROSSSLOT before any MULTI or mutation.
-        // These existing schema keys have no shared hash tag; cluster atomicity is not promised.
         for _ in 0..crate::resp::MAX_TRANSACTION_ATTEMPTS {
             if let Err(error) = crate::resp::cmd("WATCH").arg(&watched).exec(c).await {
                 return Err(if error.to_string().starts_with("CROSSSLOT") {
@@ -169,8 +135,6 @@ impl ValkeyStore {
                 });
             }
             let attempted = crate::resp::rr(async {
-                // An exact receipt wins over today's predicates, even if another operation has
-                // subsequently changed the records. Replaying never renews the receipt's TTL.
                 let kind: String = crate::resp::cmd("TYPE").arg(&receipt).query(c).await?;
                 if kind != "none" && kind != "hash" {
                     return Ok(Some(Err(OpRefused::Refused(
@@ -183,8 +147,7 @@ impl ValkeyStore {
                     Seen::Conflict => return Ok(Some(Err(OpRefused::Conflict))),
                     Seen::New => {}
                 }
-                // MULTI/EXEC cannot roll back runtime WRONGTYPE. Validate every physical target
-                // while WATCH still covers it, including indexes for predicate-only schemas.
+
                 for (keys, values) in schemas.values() {
                     for (key, expected) in [(keys, "zset"), (values, "hash")] {
                         let kind: String = crate::resp::cmd("TYPE").arg(key).query(c).await?;
@@ -203,10 +166,6 @@ impl ValkeyStore {
                         Expected::Bytes(bytes) => actual.as_ref() == Some(bytes),
                     };
                     if !matches {
-                        // A concurrent identical request may have committed after our receipt
-                        // read and made this predicate false. Confirm the watched snapshot
-                        // before allowing the caller to replan. An empty Pipeline skips EXEC,
-                        // so PING supplies a read-only validation command, with no receipt.
                         let mut validation = pipe();
                         validation.atomic().cmd("PING").ignore();
                         return validation
@@ -249,9 +208,7 @@ impl ValkeyStore {
                                     "record range key length is not representable",
                                 )
                             })?;
-                            // Read both physical collections under the same schema-wide WATCH.
-                            // A matching insertion before EXEC aborts this entire candidate and
-                            // forces re-enumeration, so prefix phantoms cannot survive a commit.
+
                             let mut members: std::collections::BTreeSet<Vec<u8>> =
                                 crate::resp::cmd("HKEYS")
                                     .arg(values)
@@ -297,7 +254,7 @@ impl ValkeyStore {
             })
             .await;
             match attempted {
-                Ok(None) => continue, // EXEC definitively aborted: no effects and same candidate.
+                Ok(None) => continue,
                 Ok(Some(answer)) => {
                     if c.watching() {
                         crate::resp::cmd("UNWATCH").exec(c).await.map_err(|error| {
@@ -307,9 +264,6 @@ impl ValkeyStore {
                     return answer;
                 }
                 Err(error) => {
-                    // Do not issue another command on a broken stream; settle discards a
-                    // connection with an outstanding WATCH. Never translate this into a
-                    // ConditionConflict: EXEC may have committed before its answer was lost.
                     if !error.is_connection_error() && c.watching() {
                         let _ = crate::resp::cmd("UNWATCH").exec(c).await;
                     }
@@ -329,9 +283,7 @@ impl ValkeyStore {
     }
 
     /// `record_put` (slot 26): an upsert on `(schema, key)`. An EMPTY value removes the row:
-    /// it is the host's strike, so the key leaves both the ordered key set and the values,
-    /// `record_get` then answers `None` and `record_scan` never returns it.
-    /// Removing a row that is not there is `Ok`.
+
     async fn v3_record_put(
         &self,
         c: &mut Conn,
@@ -392,8 +344,7 @@ impl ValkeyStore {
             return Ok(Vec::new());
         }
         let (k, v) = records_keys(schema);
-        // A byte-ordered RANGE over the key set: `[prefix, the prefix's successor)`; a prefix with
-        // no successor (empty, or every byte 0xFF) has no upper bound.
+
         let min: Vec<u8> = if prefix.is_empty() {
             b"-".to_vec()
         } else {
@@ -415,8 +366,7 @@ impl ValkeyStore {
 }
 
 /// A page of `record_scan`: `KEYS = key set, values`; `ARGV = min, max, limit`. One script, so a
-/// strike between the key range and the values cannot shorten the page. Returns `key, value` pairs
-/// flat; an indexed key missing its value is corruption, refused rather than a false short page.
+
 static SCAN_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(
         r"
@@ -438,7 +388,7 @@ static SCAN_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 });
 
 /// The start of an `op_id` write's script: `KEYS[1]` is the op's record; a recorded body is
-/// returned and nothing applies. Then the helpers the two scripts share.
+
 const LUA_SEEN: &str = r"
 local prior = redis.call('HGET', KEYS[1], 'b')
 if prior then
@@ -484,8 +434,7 @@ end
 ";
 
 /// The end of an `op_id` write's script: record the body (`ARGV[1]`) for `ARGV[2]` seconds. It
-/// runs only after every cell is applied, so a recorded op is a fully applied one. The script
-/// answers a refusal as `{'refused', text}` before anything is written.
+
 const LUA_RECORD: &str = r"
 redis.call('HSET', KEYS[1], 'b', ARGV[1])
 redis.call('EXPIRE', KEYS[1], ARGV[2])
@@ -493,8 +442,7 @@ return false
 ";
 
 /// Exact decimal arithmetic for unsigned usage counters. Only individual decimal digits enter
-/// Lua arithmetic; whole counters never pass through Lua's floating-point number representation.
-/// This matches `UsageLedger::apply_delta`: saturating unsigned addition and zero-floored refunds.
+
 const LUA_USAGE_COUNTS: &str = r"
 local USAGE_MAX = '18446744073709551615'
 local RADIX = 10
@@ -555,8 +503,7 @@ end
 ";
 
 /// `add_usage_batch`: per cell `KEYS[k]` = its usage hash; `ARGV` from 4 = per cell `n`, then `n`
-/// `field, delta` pairs. ARGV[3] refuses fresh reserved-adjustment writes after receipt lookup.
-/// Validate every target before applying; exact decimal arithmetic preserves the full u64 range.
+
 static USAGE_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_SEEN}{LUA_USAGE_COUNTS}
@@ -588,10 +535,7 @@ static USAGE_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 });
 
 /// `add_metering_batch`: per delta `KEYS[k], KEYS[k + 1]` = its bucket's set and its row; `ARGV`
-/// from 3 = per delta the six counters, `n`, `n` `unit field, count` pairs, then `key_id`, `model`,
-/// `provider`, `priced_from_ms`, `key_group_at_use`, `pricing_version`. The row joins its set,
-/// every count is an `HINCRBY` pinned at `i64::MAX`, the attribution snapshot is in the row key
-/// (including empty values). Validate-then-apply as [`USAGE_OP`].
+
 static METERING_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_SEEN}
@@ -643,7 +587,7 @@ fn op_call(script: &'static Script, op: OpId, d: &Dedupe<'_>) -> ScriptInvocatio
 
 impl ValkeyStore {
     /// Run an `op_id` write's script once (a lost reply may have applied): the body it found, or
-    /// its refusal (decided before anything was written).
+
     fn deduped(
         &self,
         cx: &mut Op<'_>,
@@ -754,7 +698,6 @@ impl StoreSlots for ValkeyStore {
         op: OpId,
         record: PlaneRecordRef<'_>,
     ) -> Step<OpResult<()>> {
-        // Timestamp digits live in the sidecar; the ZSET score only selects candidates.
         if let Err(e) = storable_i64("append_plane_record", "seq", record.seq) {
             return Step::Ready(Err(OpRefused::Refused(e.0)));
         }
@@ -816,7 +759,7 @@ impl StoreSlots for ValkeyStore {
     ) -> Step<OpResult<()>> {
         let d = Dedupe::usage(cells);
         let mut inv = op_call(&USAGE_OP, op, &d);
-        // The Lua receipt lookup precedes this fresh-write refusal, preserving exact old replay.
+
         inv.arg(
             if cells
                 .iter()
@@ -885,7 +828,6 @@ impl StoreSlots for ValkeyStore {
         self.deduped(cx, inv).map(|found| d.answer(found))
     }
 
-    // The base op set and the plane verbs: each body is the store's own, run as one op.
     ops! {
         put_key(key: &VirtualKey => clone) -> () = ValkeyStore::put_key;
         get_key(id: &str => to_owned) -> Option<VirtualKey> = ValkeyStore::get_key;
@@ -933,7 +875,6 @@ impl StoreSlots for ValkeyStore {
         cx: &mut Op<'_>,
         record: PlaneRecordRef<'_>,
     ) -> Step<RecordStoreResult<()>> {
-        // Timestamp digits live in the sidecar; the ZSET score only selects candidates.
         if let Err(e) = storable_i64("upsert_plane_record", "seq", record.seq) {
             return Step::Ready(Err(e));
         }

@@ -8,7 +8,7 @@ use busbar_contract::abi::sdk::store::dedupe::Seen;
 
 impl ValkeyStore {
     /// Only a definitive WATCH abort retries. A lost EXEC reply retains the immutable request
-    /// for receipt reconciliation by the caller; this operation never reconnects and replays.
+
     pub(super) async fn v3_usage_correction(
         &self,
         c: &mut Conn,
@@ -45,15 +45,12 @@ impl ValkeyStore {
                     Seen::New => {}
                 }
 
-                // Validate every physical target before constructing MULTI. WATCH also covers
-                // absence: an insertion or a type change after validation aborts EXEC.
                 require_type(c, &owner, "string").await?;
                 require_type(c, &day, "set").await?;
                 for key in &usage {
                     require_type(c, key, "hash").await?;
                 }
-                // Watch the set before enumeration, then its members before reading them.
-                // A new day row changes the set; an update to an existing row changes its hash.
+
                 let rows: Vec<String> = c.smembers(&day).await?;
                 if !rows.is_empty() {
                     crate::resp::cmd("WATCH").arg(&rows).exec(c).await?;
@@ -88,8 +85,6 @@ impl ValkeyStore {
                     matches &= actual == change.expected;
                 }
                 if !matches {
-                    // Validate the watched snapshot even on conflict. Another identical request
-                    // may have committed between our receipt read and these failed predicates.
                     let mut validation = pipe();
                     validation.atomic().cmd("PING").ignore();
                     return validation
@@ -139,8 +134,6 @@ impl ValkeyStore {
                     return answer;
                 }
                 Err(error) => {
-                    // There is no rollback after an unknown EXEC outcome. Preserve its error,
-                    // discard a broken connection, and require exact id/body reconciliation.
                     if !error.is_connection_error() && c.watching() {
                         let _ = crate::resp::cmd("UNWATCH").exec(c).await;
                     }

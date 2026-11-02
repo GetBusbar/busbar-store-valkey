@@ -2,42 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The **Valkey** backend for busbar's durable governance store: the shared, multi-node store
-//! over a key-value data model. It serves the store v3 door (`busbar_contract::abi::sdk::store`)
-//! over the HOST'S CONNECTOR: it speaks RESP2 itself ([`resp`]) and holds no socket, TLS stack or
-//! runtime of its own. `redis://` / `rediss://` URLs (and the `valkey://` spellings) are read as
-//! the upstream `redis` driver reads them.
-//!
-//! ## Keyspace (schema v10, every key under `busbar:`)
-//!
-//! - **keys**: `key:<id>` (JSON [`VirtualKey`], tombstoned on delete, never removed), `keys` (SET of
-//!   ids), `keys:byrev` (ZSET by revision, for `list_keys_since`).
-//! - **credentials**: `cred:<key_id>:<kind>:<slot>` (JSON [`CredentialSecret`]; the metadata view is
-//!   the decoded row minus `.secret`), `cred:pub:<kind>:<public_id>` (UNIQUE(kind, public_id)),
-//!   `cred:id:<cred_id>`, `cred:ids:<key_id>` (SET of `<kind>:<slot>`), `creds:byrev`.
-//! - **usage** `usage:<bucket>:<window>` (HASH; reserved units `m:<model>:<unit>`, open units
-//!   `u:<hex unit>:<model>`, floored at 0 server-side); **metering** `metering:<bucket>` (SET of row
-//!   hashes); **audit** `audit` (ZSET); **denylist** `denylist` / `denylist:<sub>`.
-//! - **plane records** ([`plane`]); the v6 typed keyspaces are copied into it on connect ([`legacy`]).
-//! - **records** `records:<hex schema>:k` / `:v` (the door's ordered key-value records), **op
-//!   records** `op:<hex op_id>` (HASH, the dedupe state of the `op_id` writes), `revision` (the
-//!   store-wide counter) and `schema` (the version marker).
-//!
-//! ## Atomicity
-//!
-//! Multi-key writes use one server-side script or one `MULTI`/`EXEC` pipeline. Writes that depend
-//! on a value read just before (credential slot occupancy, `delete_key`'s credential fan-out) use
-//! an optimistic `WATCH`/`MULTI`/`EXEC` transaction (`transaction!`) that re-runs on an abort.
-//!
-//! ## Connections
-//!
-//! Up to [`KEPT_CONNECTIONS`] kept connections, one per op in flight, dialled through the host's
-//! connector for the store's one `tcp` need, secured for `rediss://` (unverified for `#insecure`), then `AUTH`
-//! and `SELECT` as the URL says; `connect_timeout_ms` bounds dial plus handshake. A connection-level
-//! failure on a `with_conn!` call reconnects and re-runs that call once; `with_conn_no_retry!` calls
-//! (non-idempotent writes) fail instead. `open` only parses; its connect step migrates the schema and
-//! checks `noeviction`. Error strings are scrubbed of the URL password. Op records
-//! (`OP_ID_RETENTION_SECS`) and redeemed-token entries carry TTLs; no other row does: retention is
-//! the engine's.
 
 #![forbid(unsafe_code)]
 
@@ -101,11 +65,9 @@ macro_rules! with_conn_no_retry {
 }
 
 /// Default connect timeout: bounds each new connection's dial and handshake, so a
-/// blackholed/firewalled host cannot wedge engine boot indefinitely. The `connect_timeout_ms`
-/// setting overrides it.
+
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-// Key-space helpers: one namespace prefix so a Valkey shared with other apps never collides.
 const KEY_PREFIX: &str = "busbar:key:";
 const KEYS_INDEX: &str = "busbar:keys";
 const KEYS_BYREV: &str = "busbar:keys:byrev";
@@ -121,15 +83,10 @@ mod plane;
 const DENYLIST_PREFIX: &str = "busbar:denylist:";
 const DENYLIST_INDEX: &str = "busbar:denylist";
 /// The store-global revision counter, read and rewritten (`next_revision`) inside the `WATCH`ed
-/// transaction that stamps key and credential rows with it.
+
 const REVISION_KEY: &str = "busbar:revision";
 /// The schema marker. v6 is the oldest namespace migrated in place (older is REFUSED, never wiped);
-/// v7 copied the v6 typed task / event / demotion / spent-approval keys into the plane
-/// keyspace ([`legacy`]); v8 never shipped; v9 deleted the keys of the dropped money, journal and
-/// session slots ([`ValkeyStore::drop_dead_slot_keys`]); v10 scrubs retained revoked credentials.
-/// v11 puts each metering row under its recorded group and price version.
-/// v12 repairs spent-token cleanup against absolute expiry using the server clock.
-/// A NEWER marker is refused.
+
 const SCHEMA_KEY: &str = "busbar:schema";
 const ATTRIBUTED_METERING_SCHEMA: i64 = 11;
 const SCHEMA_VERSION: i64 = 12;
@@ -145,7 +102,7 @@ const FIRST_MIGRATED_SCHEMA: i64 = 6;
 const KEPT_CONNECTIONS: usize = 8;
 
 /// Whether an op record's body belongs to a kept slot: a digest (32 bytes, or 64 lowercase hex), or
-/// the older textual form that starts with the slot's name. Only the dead slots' bodies are neither.
+
 fn kept_op_body(body: &[u8]) -> bool {
     let hex64 = body.len() == 64 && body.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     let name = body.split(|b| *b == b':').next().unwrap_or_default();
@@ -186,7 +143,7 @@ fn cred_id_key(cred_id: &str) -> String {
 }
 
 /// `s` with a `\\` before every character of `special` (which holds `\\` itself, so the escape
-/// round-trips): `|` for a metering row's joined identity (else two identities collide).
+
 fn escape(s: &str, special: &[char]) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -202,10 +159,7 @@ fn escape(s: &str, special: &[char]) -> String {
 const ROW_SEP: &[char] = &['\\', '|'];
 
 /// Hash field for one (model, unit) counter in a usage window. The four RESERVED units keep the v6
-/// spelling `m:<model>:<tier>` (parsed with a RIGHT split on the tier, so a model name containing `:`
-/// still round-trips, and a v6 row reads back unchanged). Every OTHER (open) unit is spelled
-/// `u:<hex unit>:<model>`: an open unit name is caller-supplied and may itself contain `:`, and hex
-/// has none, so the split is unambiguous whatever the model and unit are.
+
 fn usage_field(model: &str, unit: &str) -> String {
     if RESERVED_UNITS.contains(&unit) {
         format!("m:{model}:{unit}")
@@ -215,7 +169,7 @@ fn usage_field(model: &str, unit: &str) -> String {
 }
 
 /// Parse a usage-window hash field back into `(model, unit)` — the inverse of [`usage_field`].
-/// `None` for the two request counters and anything else that is not a unit field.
+
 fn parse_usage_field(field: &str) -> Option<(String, String)> {
     if let Some(rest) = field.strip_prefix("m:") {
         let (model, tier) = rest.rsplit_once(':')?;
@@ -230,7 +184,7 @@ fn parse_usage_field(field: &str) -> Option<(String, String)> {
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
 /// Lower-case hex of `bytes` — the collision-free spelling of a caller-supplied component inside a
-/// key or field name (hex contains no separator character).
+
 pub(crate) fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -256,15 +210,7 @@ fn metering_set(bucket: u64) -> String {
 }
 
 /// The hash key of one metering cell: `(bucket, key_id, model, provider, priced_from_ms)`.
-///
-/// `priced_from_ms` joins the identity (a rate-card edit SPLITS the day's cell at the edit, and each
-/// half prices at the card it was earned under). A cell whose price started at `0` —
-/// the opening entry, and every row written before the field existed — keeps the v6 three-component
-/// key, so a v6 cell and a v7 write of the same undated cell are one cell. A dated cell appends a
-/// fourth `|<ms>` component. Each component is escaped before joining (see
-/// [`escape`]), so the join is injective: an escaped component never contains a bare
-/// `|`, so a three-component key and a four-component key can never render the same, and two
-/// different identities never share a row.
+
 fn metering_row(
     bucket: u64,
     key_id: &str,
@@ -285,7 +231,7 @@ fn metering_row(
 }
 
 /// The metering-cell hash field an open (non-token) ledgered class accumulates under. Everything after
-/// the fixed `u:` prefix is the class name, verbatim, so no class name can collide with a fixed field.
+
 const METERING_UNIT_PREFIX: &str = "u:";
 
 /// Percent-decode public URL components (the upstream driver's username reading).
@@ -351,9 +297,7 @@ fn url_refused(why: &'static str) -> RedisError {
 }
 
 /// Every query parameter a URL form reads is named in `known`; any other one is REFUSED (the
-/// upstream driver ignored it silently, which would leave an operator believing a setting applied).
-/// The parameter's name is echoed only when the URL carries no password: a password written
-/// unencoded can split at `?` and arrive here as a "name" (one holding the `@` that ended it).
+
 fn check_query(url: &url::Url, known: &[&str], has_secret: bool) -> RedisResult<()> {
     match url.query_pairs().find(|(k, _)| !known.contains(&k.as_ref())) {
         None => Ok(()),
@@ -369,7 +313,7 @@ fn check_query(url: &url::Url, known: &[&str], has_secret: bool) -> RedisResult<
 }
 
 /// The upstream driver's `protocol=` query check (`2`/`resp2`/`3`/`resp3`). The store speaks
-/// RESP2 whatever it says: every reply it reads converts the same either way.
+
 fn check_protocol(url: &url::Url) -> RedisResult<()> {
     match url.query_pairs().find(|(k, _)| k == "protocol") {
         None => Ok(()),
@@ -383,9 +327,7 @@ fn check_protocol(url: &url::Url) -> RedisResult<()> {
 }
 
 /// Parse a Valkey URL exactly as the upstream driver reads it (`redis` 1.7.1's
-/// `IntoConnectionInfo for &str`): `redis://[user[:password]@]host[:port][/db]`, `rediss://` for TLS
-/// (`#insecure` the one fragment it took), the `valkey://` / `valkeys://` spellings, and the
-/// unix-socket URLs `unix://`, `redis+unix://`, `valkey+unix://` (`?db=`, `?user=`, `?pass=`).
+
 fn parse_target(input: &ValkeyUrl) -> RedisResult<Target> {
     if let Some(why) = input
         .parsing_error()
@@ -471,7 +413,7 @@ fn parse_target(input: &ValkeyUrl) -> RedisResult<Target> {
 }
 
 /// A unix-socket URL, as the upstream driver read it: its path, and `db` / `user` / `pass` from
-/// the query.
+
 fn parse_unix(url: &url::Url, input: &ValkeyUrl) -> RedisResult<Target> {
     let path = url
         .to_file_path()
@@ -538,8 +480,7 @@ impl std::fmt::Debug for Inner {
 }
 
 /// The store's one outbound need: a `tcp` stream to the server the settings' URL names (the store
-/// names the target at each connect), governed as operator infrastructure (private, loopback and
-/// plaintext allowed). Its timeout bounds the dial.
+
 pub const NEEDS: &[busbar_contract::abi::host::conn::connector::Need] = {
     use busbar_contract::abi::host::conn::connector::{
         Need, DIRECTION_OUTBOUND, EGRESS_OPERATOR_INFRASTRUCTURE, KEEP_NAMED,
@@ -559,10 +500,7 @@ const NEED_TCP: u32 = 0;
 
 impl ValkeyStore {
     /// The op's connection over `wire`: the kept one when it is idle (its handshake done), else a
-    /// fresh dial, secured for `rediss://`, `AUTH` and `SELECT` as the URL says — the dial AND the
-    /// handshake bounded by `connect_timeout_ms` in all. A failure reads `valkey {ctx}: …` (`ctx`
-    /// `reconnect` when an op had to dial) or, at boot (`None`), the driver's words alone: the
-    /// door's connect step adds its one prefix.
+
     async fn conn(&self, wire: Wire, ctx: Option<&str>) -> RecordStoreResult<Conn> {
         let failed = |e: String| {
             let text = match ctx {
@@ -573,7 +511,6 @@ impl ValkeyStore {
         };
         let ms = self.inner.connect_timeout.as_millis();
         if ms == 0 {
-            // The upstream driver's TCP connect refused a zero timeout, in std's words.
             return Err(failed("cannot set a 0 duration timeout".into()));
         }
         let ms = u32::try_from(ms).unwrap_or(u32::MAX);
@@ -596,7 +533,7 @@ impl ValkeyStore {
     }
 
     /// A NEW connection's handshake: TLS for `rediss://` (before its first byte; unverified for
-    /// `#insecure`), `AUTH`, `SELECT`.
+
     async fn handshake(&self, c: &mut Conn) -> RedisResult<()> {
         let t = &self.inner.target;
         if t.tls {
@@ -617,7 +554,7 @@ impl ValkeyStore {
     }
 
     /// Reconnect after a dropped connection: close it, dial a fresh one, handshake (the
-    /// dial and the handshake bounded by `connect_timeout_ms`, as every new connection is).
+
     async fn reconnect(&self, c: &mut Conn) -> RedisResult<()> {
         let ms = u32::try_from(self.inner.connect_timeout.as_millis()).unwrap_or(u32::MAX);
         c.wire().bound(ms);
@@ -641,7 +578,7 @@ impl ValkeyStore {
     }
 
     /// `open`'s connect step: the first connection, the schema migration and the noeviction check
-    /// (its failures are the load's refusal).
+
     async fn connect_step(&self, wire: Wire) -> RecordStoreResult<()> {
         let mut c = self.conn(wire, None).await?;
         self.migrate(&mut c).await?;
@@ -651,12 +588,7 @@ impl ValkeyStore {
     }
 
     /// STARTUP ASSERTION, non-negotiable: `maxmemory-policy` must be `noeviction`. Under any eviction
-    /// policy, Valkey can silently evict a denylist entry (un-revoking a compromised key) or a
-    /// metering row (destroying billing evidence) under memory pressure, with zero error anywhere in
-    /// the request path — the loss is invisible until someone goes looking for data that should be
-    /// there. Refuse to start rather than risk it. If `CONFIG GET` itself is disabled by an ACL
-    /// (a legitimate hardened deployment), we cannot verify the policy either way — fail loud with a
-    /// distinct message rather than silently assuming it's safe.
+
     async fn assert_noeviction(&self, c: &mut Conn) -> RecordStoreResult<()> {
         let pairs: Vec<(String, String)> = with_conn!(self, |c| {
             cmd("CONFIG")
@@ -689,19 +621,7 @@ impl ValkeyStore {
     }
 
     /// SCHEMA MIGRATION (see `SCHEMA_VERSION` for what each version did).
-    /// A fresh namespace (no `busbar:*` keys) is simply marked; one already
-    /// at the current version passes through untouched; one NEWER than this build is refused; a v6
-    /// namespace is upgraded IN PLACE ([`legacy::migrate_v6_to_v7`]) and a v6 or v7 one then gets
-    /// the v9 step ([`ValkeyStore::drop_dead_slot_keys`]); v10 scrubs revoked credentials.
-    /// Each step is idempotent, the marker written last
-    /// so a crash mid-upgrade re-runs it on the next connect.
-    ///
-    /// NOTHING IS EVER WIPED. A namespace with `busbar:*` keys whose marker is absent or older than
-    /// v6 is REFUSED with an explained error and left byte-for-byte as found: a missing marker is
-    /// indistinguishable from a live v6/v7 namespace whose marker was lost (operator `DEL`, partial
-    /// restore), and two nodes first-booting on an empty server must not wipe each other. Before
-    /// refusing, the marker is re-read once, so a peer that marked the namespace in the meantime is
-    /// honoured rather than refused.
+
     async fn migrate(&self, c: &mut Conn) -> RecordStoreResult<()> {
         let mut marker: Option<i64> =
             with_conn!(self, |c| c.get::<_, Option<i64>>(SCHEMA_KEY).await)?;
@@ -742,7 +662,6 @@ impl ValkeyStore {
                     .await);
             }
             if !rechecked {
-                // A peer may have marked the namespace between our read and the SCAN.
                 rechecked = true;
                 let again: Option<i64> =
                     with_conn!(self, |c| c.get::<_, Option<i64>>(SCHEMA_KEY).await)?;
@@ -755,8 +674,7 @@ impl ValkeyStore {
                 None => "the `busbar:schema` marker is missing".to_string(),
                 Some(v) => format!("the `busbar:schema` marker is {v}"),
             };
-            // Key PREFIXES only (first two `:`-segments + `*`): full names can carry a credential's
-            // public id.
+
             let mut sample: Vec<String> = others
                 .iter()
                 .map(|k| {
@@ -787,16 +705,7 @@ impl ValkeyStore {
     }
 
     /// THE v9 STEP: delete what the deleted slots kept. The key families go
-    /// by `SCAN` + `UNLINK` (never `KEYS`, never a blocking `DEL`), once, at the upgrade: the
-    /// money keys (`busbar:cap:*`, `busbar:slice:*`, `busbar:open:*`, `busbar:slices`,
-    /// `busbar:epoch`), the journal (`busbar:journal:*`, its `streams` set included) and the
-    /// sessions (`busbar:session:*`, `busbar:sessions:*`). The `busbar:op:*` dedupe hashes of the
-    /// deleted slots go too, told apart by the op's body (`b`): a kept slot's body is a 32-byte
-    /// digest (or 64 lowercase hex), or the older text that starts with the slot's name; only the
-    /// dead slots' bodies are neither. The hashes of the kept slots (`add_usage_batch`,
-    /// `add_metering_batch`, `append_plane_record`) are untouched, so a retry across the upgrade still answers its
-    /// original. Idempotent (a re-run finds nothing more), so a crash before the marker is
-    /// written re-runs it and two nodes upgrading at once land in the same place.
+
     async fn drop_dead_slot_keys(&self, c: &mut Conn) -> RecordStoreResult<()> {
         for pattern in [
             "busbar:cap:*",
@@ -881,7 +790,7 @@ impl ValkeyStore {
     }
 
     /// `e` as the store's error: a refusal as written, anything else a backend failure under
-    /// `valkey {ctx}: `.
+
     fn err(&self, e: RedisError, ctx: &str) -> RecordStoreError {
         let text = if e.is_refusal() {
             e.to_string()
@@ -892,9 +801,7 @@ impl ValkeyStore {
     }
 
     /// Reserve `n` consecutive revisions and return the first. Called inside a `transaction!` that
-    /// WATCHes [`REVISION_KEY`]: the counter is read here and written back by the same `EXEC` as
-    /// the stamped rows, so a writer overtaken since the read aborts and restamps. Stamps then
-    /// become visible in revision order, which the hydration watermarks rely on.
+
     async fn next_revision(&self, c: &mut Conn, pipe: &mut Pipeline, n: u64) -> RedisResult<u64> {
         let cur: Option<i64> = c.get(REVISION_KEY).await?;
         let cur = u64::try_from(cur.unwrap_or(0)).map_err(|_| {
@@ -918,7 +825,7 @@ impl ValkeyStore {
 }
 
 /// A revoked credential has no remaining secret reader; new writes obey the same invariant as
-/// revocation and the v10 repair, without ever persisting supplied secret material.
+
 fn validate_revoked_credential(op: &str, secret: &CredentialSecret) -> RecordStoreResult<()> {
     if secret.meta.revoked_at.is_some()
         && (!secret.secret.is_empty() || secret.meta.secret_form != SecretForm::None)
@@ -931,8 +838,7 @@ fn validate_revoked_credential(op: &str, secret: &CredentialSecret) -> RecordSto
 }
 
 /// `put_credential`'s owner precondition, read inside its WATCHed transaction: the key row named by
-/// `key_id` must exist and must not be tombstoned. An unparseable owner row is refused too — a
-/// credential cannot be attached to a key whose liveness cannot be established.
+
 async fn owner_is_live(c: &mut Conn, key_row: &str, key_id: &str, op: &str) -> RedisResult<()> {
     let raw: Option<String> = c.get(key_row).await?;
     let refuse = |why: String| Err(RedisError::refused(why));
@@ -954,7 +860,7 @@ async fn owner_is_live(c: &mut Conn, key_row: &str, key_id: &str, op: &str) -> R
 }
 
 /// Whether the key row at `row` is a stored tombstone. A row that does not decode is not one:
-/// refusing it would make a corrupt row permanently unwritable.
+
 async fn tombstoned(c: &mut Conn, row: &str) -> RedisResult<bool> {
     let prior: Option<String> = c.get(row).await?;
     Ok(prior
@@ -970,17 +876,13 @@ const OP_PUT_KEY_WITH_CREDENTIAL: &str = "put_key_with_credential";
 /// What a credential slot allows a mint of `secret`, read inside the WATCHed transaction.
 enum Slot {
     /// The slot already holds THIS credential, live: a reconnect-and-retry replaying an `EXEC` that
-    /// had committed. Nothing to write.
     Replay,
     /// Free; a revoked previous occupant's `(public_id, id)`, whose pointers the write deletes.
     Free(Option<(String, String)>),
 }
 
 /// The slot checks of a credential mint (`op` names the refusals): a DIFFERENT live credential in
-/// the slot is refused (never silently destroyed mid-overlap), a revoked one is never re-minted
-/// under its own id, a credential id lives in one slot, and `UNIQUE(kind, public_id)` is a real
-/// read of the pointer (a `SETNX` queued in an `.ignore()`d pipe would discard the "already
-/// claimed" answer).
+
 async fn read_slot(c: &mut Conn, secret: &CredentialSecret, op: &str) -> RedisResult<Slot> {
     let m = &secret.meta;
     let row_key = cred_row_key(&m.key_id, &m.kind, m.slot);
@@ -1055,8 +957,7 @@ fn parse_member(m: &str) -> Option<(&str, u8)> {
 }
 
 /// Queue the writes of a credential row and its pointers on `pipe`, deleting a revoked previous
-/// occupant's pointers in the same atomic step (a stale `cred:id:<old>` would let a later revoke of
-/// the old id wipe the new occupant).
+
 fn queue_credential(
     pipe: &mut Pipeline,
     secret: &CredentialSecret,
@@ -1116,8 +1017,7 @@ fn cred_from_json(op: &str, row: &str, raw: &str) -> RecordStoreResult<Credentia
 }
 
 /// Parse a `"<key_id>:<kind>:<slot>"` pointer value back into its parts. `kind` cannot itself contain
-/// `:` (enforced by the fixed kind allowlist upstream), so a right-split on `:` twice is unambiguous
-/// even if a future `key_id` contained a colon.
+
 fn parse_slot_pointer(s: &str) -> Option<(String, String, u8)> {
     let (rest, slot) = s.rsplit_once(':')?;
     let (key_id, kind) = rest.rsplit_once(':')?;
@@ -1125,7 +1025,7 @@ fn parse_slot_pointer(s: &str) -> Option<(String, String, u8)> {
 }
 
 /// The fields one usage delta adds, as `(hash field, delta)` pairs for `add_usage_batch`: the two
-/// request counters always, and every non-zero unit.
+
 fn usage_fields(delta: &UsageDelta) -> Vec<(String, i64)> {
     let mut fields: Vec<(String, i64)> = vec![
         ("requests".to_string(), delta.requests),
@@ -1142,7 +1042,7 @@ fn usage_fields(delta: &UsageDelta) -> Vec<(String, i64)> {
 }
 
 /// The rows of a metering bucket: `KEYS[1]` = the bucket's row set; each row's `HGETALL`, in one
-/// atomic step.
+
 static LIST_METERING: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(
         r"
@@ -1188,8 +1088,7 @@ fn usage_from_fields(fields: Vec<(String, String)>) -> RecordStoreResult<UsageLe
                 ledger.models.last_mut().expect("just pushed")
             }
         };
-        // A zero counter is not carried: the map is sparse (`ModelTokens::is_zero` reads an
-        // absent key and a zero one the same), and a v6 row wrote all four tiers, zeros included.
+
         if count != 0 {
             entry.usage_units.insert(unit, count);
         }
@@ -1216,10 +1115,6 @@ fn metering_from_fields(fields: Vec<(String, String)>) -> RecordStoreResult<Mete
         usage_units: Default::default(),
     };
     for (name, val) in fields {
-        // Every other decode path in this file (key_from_json, cred_from_json, audit
-        // records) propagates a RecordStoreError on a corrupt value rather than silently
-        // substituting a default -- a malformed numeric field here must not silently
-        // read back as 0 and under-report billing/usage data.
         if let Some(class) = name.strip_prefix(METERING_UNIT_PREFIX) {
             let n = ledger_count(&val)?;
             if n != 0 {
@@ -1251,8 +1146,7 @@ fn metering_from_fields(fields: Vec<(String, String)>) -> RecordStoreResult<Mete
 }
 
 /// The base op set's bodies, each over the op's one connection `c` (the store door, `slots`, runs
-/// each as one op through the host's connector). The `op_id` writes (`add_usage_batch`,
-/// `add_metering_batch`, `append_plane_record`) are the door's own slots, deduped durably.
+
 impl ValkeyStore {
     pub(crate) async fn put_key(&self, c: &mut Conn, key: &VirtualKey) -> RecordStoreResult<()> {
         let row_key = format!("{KEY_PREFIX}{}", key.id);
@@ -1296,7 +1190,6 @@ impl ValkeyStore {
     }
 
     pub(crate) async fn list_keys(&self, c: &mut Conn) -> RecordStoreResult<Vec<VirtualKey>> {
-        // UNFILTERED, tombstones included: a hydrator must see a tombstone to evict its credentials.
         let ids: Vec<String> = with_conn!(self, |c| c.smembers(KEYS_INDEX).await)?;
         let mut out = self.get_keys(c, &ids).await?;
         out.sort_by(|a, b| {
@@ -1324,8 +1217,7 @@ impl ValkeyStore {
     }
 
     /// Read index membership and values from one stable revision snapshot. A writer between
-    /// enumeration and GET must abort the read, otherwise a newer row can advance the caller's
-    /// cursor beyond an intervening row the index snapshot did not include.
+
     async fn delta_rows(
         &self,
         c: &mut Conn,
@@ -1404,9 +1296,7 @@ impl ValkeyStore {
     pub(crate) async fn delete_key(&self, c: &mut Conn, id: &str) -> RecordStoreResult<()> {
         let ids_key = cred_ids_key(id);
         let key_row = format!("{KEY_PREFIX}{id}");
-        // WATCH the key row, its credential-id index AND every member's credential row (a slot
-        // rewritten in place changes no index). The row set depends on the membership, so a
-        // membership change rebuilds the watch set from fresh state (the outer loop).
+
         with_conn!(self, |c| loop {
             let members: Vec<String> = c.smembers(&ids_key).await?;
             let row_keys: Vec<String> = members
@@ -1564,7 +1454,7 @@ impl ValkeyStore {
         bucket: u64,
     ) -> RecordStoreResult<Vec<MeteringRow>> {
         let set = metering_set(bucket);
-        // One script: the bucket's row set and its rows are read in one step, one snapshot.
+
         let all_fields: Vec<Vec<(String, String)>> =
             with_conn!(self, |c| LIST_METERING.key(&set).invoke(c).await)?;
         all_fields
@@ -1628,7 +1518,7 @@ impl ValkeyStore {
         let id_key = cred_id_key(&meta.id);
         let pub_key = cred_pub_key(&meta.kind, &meta.public_id);
         let pointer = slot_pointer(meta);
-        // A lost EXEC reply is ambiguous. Never reconnect and replay a successful CAS as false.
+
         with_conn_no_retry!(self, |c| {
             let watched = [
                 row_key.as_str(),
@@ -1715,8 +1605,7 @@ impl ValkeyStore {
                 secret.meta.key_id, key.id
             )));
         }
-        // The atomic mint: `put_key`'s tombstone check and `put_credential`'s slot checks, WATCHing
-        // the key row, the slot's row and the public id pointer.
+
         let m = &secret.meta;
         let key_row = format!("{KEY_PREFIX}{}", key.id);
         let row_key = cred_row_key(&m.key_id, &m.kind, m.slot);
@@ -1790,7 +1679,7 @@ impl ValkeyStore {
                 Some(cred_row_key(key_id, kind, slot))
             })
             .collect();
-        // The metadata view is the decoded row minus its secret: there is one decode path.
+
         let raws = self.get_all(c, &row_keys).await?;
         let mut metas = row_keys
             .iter()
@@ -1917,7 +1806,6 @@ impl ValkeyStore {
         limit: u64,
     ) -> RecordStoreResult<Vec<AuditRecord>> {
         if limit == 0 {
-            // The contract's empty tail; `ZRANGE 0 -1` would be the WHOLE chain.
             return Ok(Vec::new());
         }
         self.audit_from(c, isize::try_from(limit).map(|n| -n).unwrap_or(isize::MIN))
@@ -1951,18 +1839,13 @@ impl ValkeyStore {
 }
 
 /// Current unix time in seconds, stamped on tombstones and revocations (advisory metadata; the store
-/// has no injected clock and does no admission math with it).
+
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
-
-// The store's door lives HERE, in the logic crate (`slots`: `store_door!` over this store's
-// `StoreSlots`): a busbar build that links this crate registers `door` as its compiled-in row
-// (`LinkedRow::of(door)`), and the sibling `busbar-store-valkey-plugin` cdylib exports the same
-// `door` as the image's one symbol (`export_door!`). One source, both doors.
 
 /// The store's package name: the name its Statement states and its signed tarball carries.
 pub const NAME: &str = "busbar-store-valkey";
@@ -1987,8 +1870,7 @@ impl ValkeyStore {
 
     fn from_settings_lent(settings: &[u8], secrets: &[&[u8]]) -> Result<Self, String> {
         const BAD: &str = "invalid valkey plugin config";
-        // The SDK captures URL credentials while it reads the document and wipes its parse tree.
-        // In particular, a host marker is resolved here, before any retained plugin config exists.
+
         struct Settings {
             url: Option<ValkeyUrl>,
             connect_timeout_ms: Option<serde_json::Value>,
@@ -2026,8 +1908,7 @@ impl ValkeyStore {
                                 }
                             }
                         }
-                        // Keep the existing refusal order: unknown setting, URL shape, timeout,
-                        // then URL parsing. The SDK map owns each value even when it was refused.
+
                         if let Some(key) = unknown {
                             return Err(serde::de::Error::unknown_field(
                                 &key,
@@ -2120,7 +2001,6 @@ fn json_type(v: &serde_json::Value) -> &'static str {
 mod slots;
 
 /// The store door (store v3, `busbar_contract::abi::store`): every slot of the store v3 table over
-/// [`ValkeyStore`], through the contract's store SDK.
 pub use slots::door;
 
 /// Unlike the legacy three/four-component row key, this always has six escaped components.
@@ -2144,7 +2024,7 @@ fn attributed_metering_row(
 }
 
 /// Rename whole hashes without decoding or rewriting their counters or unknown fields.
-/// Every fallible shape/identity check precedes the first mutation: Lua errors do not roll back.
+
 static MIGRATE_METERING_ATTRIBUTION: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(
         r#"
@@ -2177,7 +2057,7 @@ impl ValkeyStore {
             let Some(suffix) = set.strip_prefix("busbar:metering:") else {
                 continue;
             };
-            // Only bucket indexes, not their row hashes.
+
             if suffix.contains(':') {
                 continue;
             }
@@ -2206,7 +2086,7 @@ impl ValkeyStore {
                         "invalid metering identity response".into(),
                     ));
                 }
-                // Another opener may have moved this indexed row since SMEMBERS.
+
                 if fields.iter().all(Option::is_none) {
                     let present: u64 = with_conn!(self, |c| cmd("SISMEMBER")
                         .arg(&set)
@@ -2261,7 +2141,6 @@ impl ValkeyStore {
     }
 
     async fn repair_token_expiries(&self, c: &mut Conn) -> RecordStoreResult<()> {
-        // The kind and token components are hex encoded, so this pattern names only token receipts.
         for key in self.scan(c, plane::TOKEN_PATTERN).await? {
             with_conn!(self, |c| plane::REPAIR_TOKEN_EXPIRY
                 .key(&key)

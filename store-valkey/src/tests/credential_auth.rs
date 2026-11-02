@@ -73,7 +73,7 @@ impl Conns for Fragmented {
             self.changed.notify_all();
             return Ok(0);
         }
-        // Returning no capacity forces the wire to resume its same output after Pending.
+
         if s.writes % 3 == 1 {
             return Ok(0);
         }
@@ -174,8 +174,6 @@ impl DeclaredConns for Fragmented {
         require_secure: bool,
         dial_timeout_ms: u64,
     ) -> Result<ConnId, ConnError> {
-        // This raw-stream script opens immediately; carry the requested dial bound without
-        // treating it as a framed whole-request timeout or bypassing the security check.
         self.open_with_security(
             caller,
             need,

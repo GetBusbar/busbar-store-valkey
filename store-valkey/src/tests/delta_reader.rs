@@ -11,7 +11,7 @@ fn hydration_watermarks_compare_exact_revisions_above_double_precision() {
     let url = url_for_db(5);
     let store = ValkeyStore::connect(&url).unwrap();
     const EDGE: u64 = 1 << 53;
-    // All three stored row shapes: live key, key tombstone and credential (live/revoked).
+
     for edge in [EDGE, (1 << 54) + 4, (1 << 55) + 8] {
         raw.set::<_, _, ()>(REVISION_KEY, edge - 2).unwrap();
         let mut expected_keys = Vec::new();
@@ -31,7 +31,7 @@ fn hydration_watermarks_compare_exact_revisions_above_double_precision() {
                     .unwrap();
             }
             expected_keys.push(store.get_key(&owner).unwrap().unwrap());
-            // Key deletion destroys its credential rows; only live owners have credential deltas.
+
             if n % 2 != 0 {
                 expected_creds.push(
                     store
@@ -48,7 +48,7 @@ fn hydration_watermarks_compare_exact_revisions_above_double_precision() {
         reopened
             .revoke_credential(&expected_creds[0].meta.id, "already revoked")
             .unwrap();
-        // Repeated readers do not allocate revisions; a caller can advance one exact stamp at a time.
+
         for since in edge - 2..=top + 1 {
             for reader in [&store, &reopened] {
                 let keys = reader.list_keys_since(since).unwrap();
@@ -72,7 +72,7 @@ fn hydration_watermarks_compare_exact_revisions_above_double_precision() {
             }
         }
         assert_eq!(raw.get::<_, u64>(REVISION_KEY).unwrap(), top);
-        // A legacy zero-score row stays visible even with a nonzero decoded revision.
+
         raw.zadd::<_, _, _, ()>(KEYS_BYREV, &expected_keys[0].id, 0)
             .unwrap();
         raw.zadd::<_, _, _, ()>(CREDS_BYREV, slot_pointer(&expected_creds[0].meta), 0)

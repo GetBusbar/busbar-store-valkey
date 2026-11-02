@@ -67,7 +67,6 @@ impl Gate {
 
 impl Drop for Gate {
     fn drop(&mut self) {
-        // Release the hook before Proxy shuts sockets and joins its forwarding threads.
         let _ = self.release.send(());
     }
 }
@@ -87,7 +86,6 @@ impl<T> Worker<T> {
 impl<T> Drop for Worker<T> {
     fn drop(&mut self) {
         if let Some(worker) = self.worker.take() {
-            // On unwind the writer can be held in the hook or waiting on the connector.
             let _ = self.release.send(());
             self.connections.close();
             if let Err(error) = worker.join() {
@@ -122,7 +120,7 @@ fn proxy(valkey_url: &str, before: Hook, after: Hook) -> Proxy {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    // Resolve before spawning: teardown must not join a worker stuck in DNS.
+
     let upstream: Vec<_> = std::net::ToSocketAddrs::to_socket_addrs(&upstream_addr(valkey_url))
         .expect("resolve upstream")
         .collect();
@@ -150,8 +148,6 @@ fn proxy(valkey_url: &str, before: Hook, after: Hook) -> Proxy {
                 }
                 let mut server = server.take().expect("upstream");
                 {
-                    // Registration and shutdown share this lock, so a late accept cannot
-                    // leave an untracked socket waiting after teardown began.
                     let mut sockets = running.sockets.lock().unwrap();
                     if running.stopping.load(Ordering::SeqCst) {
                         break;

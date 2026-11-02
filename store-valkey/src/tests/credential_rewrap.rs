@@ -118,7 +118,7 @@ fn loaded_rewrap_cannot_resurrect_revoked_deleted_or_reclaimed_credentials() {
 #[test]
 fn loaded_rewrap_checks_the_whole_row_and_preserves_revision_on_every_refusal() {
     let Some(_) = live_store() else { return };
-    // This test alone owns database 1: global revision and index corruption cannot share db 0.
+
     let (_database, mut raw) = fresh_db_client(1);
     let store = ValkeyStore::connect(&url_for_db(1)).unwrap();
     let owner = uid("vk_cas_snapshot");
@@ -348,7 +348,7 @@ fn lose_rewrap_reply(
     let running = stopping.clone();
     let stream = Arc::new(std::sync::Mutex::new(None));
     let retained = stream.clone();
-    // Complete DNS and connection setup before creating the owned worker.
+
     let timeout = std::time::Duration::from_secs(10);
     let mut server = redis::Client::open(url.as_str())
         .unwrap()
@@ -376,7 +376,7 @@ fn lose_rewrap_reply(
             }
             *socket = Some(client.try_clone().unwrap());
         }
-        // A second dial must fail promptly; the test also counts host dial attempts.
+
         drop(listener);
         client
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
@@ -501,8 +501,7 @@ fn loaded_rewrap_cancellation_is_noop_before_commit_and_reconciled_after_commit(
             open_on_dispatcher(Arc::clone(&dispatcher), &settings_for(&proxy_url), plain);
         let slow = slow.unwrap();
         let dials = table.dial_timeouts().len();
-        // The pinned SDK exposes rewrap through PUT_CREDENTIAL's extension, exactly as
-        // LoadedStore's synchronous bridge does. The dispatcher owns both pointed-at buffers.
+
         let lent = Arc::new((
             serde_json::to_vec(&rewrap::Request::new(&expected, "cancelled-envelope")).unwrap(),
             extensions::encode(&[(rewrap::INTENT, b"1")]),
@@ -563,8 +562,7 @@ fn loaded_rewrap_cancellation_is_noop_before_commit_and_reconciled_after_commit(
         {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        // Release the withheld reply only after observing the dispatcher's cancellation
-        // finish and release its request owner; a reply-loss alone cannot satisfy this.
+
         let cancelled = weak.strong_count() == 0 && slow.plugin().inflight() == 0;
         let _ = release.send(());
         proxy.join().unwrap();

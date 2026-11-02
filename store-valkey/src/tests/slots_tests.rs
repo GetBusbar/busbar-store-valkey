@@ -2,12 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The store v3 slots ([`StoreSlots`]) against a live Valkey: the durable `op_id` dedupe (S1-S4),
-//! the usage and metering batches, the plane-record append and the kernel's records, and the v9
-//! upgrade that drops what the deleted slots kept. The settings refusals need no server and always
-//! run.
-//!
-//! Every test names its own buckets, schemas and keys freshly (process, clock, counter), so
-//! the suite runs in parallel against the one shared Valkey and leaves nothing another test reads.
 
 use super::{live_store, Connect};
 use crate::ValkeyStore as Door;
@@ -63,8 +57,7 @@ fn call<T, E: FromFailure>(
 }
 
 /// The store v3 slots these tests drive, through the store's async calls (`StoreCalls`, named by
-/// path only: its methods share these names), answered
-/// synchronously in each slot's own result type.
+
 trait Slots {
     fn add_usage_batch(&self, op: OpId, cells: &[(&str, u64, UsageDelta)]) -> OpResult<()>;
     fn add_metering_batch(
@@ -192,7 +185,7 @@ fn open_refuses_settings_it_cannot_run_in_its_own_words() {
 }
 
 /// S1/S2/S3/S4: a replay applies nothing and answers the original, a different body is a conflict
-/// and applies nothing, and the record survives a reconnect (it is in Valkey, not the process).
+
 #[test]
 fn an_op_id_write_applies_once_durably_and_a_different_body_conflicts() {
     let Some(s) = live_store() else { return };
@@ -274,9 +267,7 @@ fn a_usage_and_a_metering_batch_apply_once() {
 }
 
 /// A store over a DATABASE of its own (`VALKEY_URL` re-pointed at `db`, emptied first and on drop):
-/// a test that seeds whole key families and asserts they are gone must not do it in the shared
-/// database 0. The guard holds an OS lock for the complete lifetime, including across test binaries
-/// and nextest processes that reuse the same private database number.
+
 struct Iso {
     url: String,
     store: Option<ValkeyStore>,
@@ -324,12 +315,11 @@ impl Drop for Iso {
 use redis::Commands as _;
 
 /// S2 for the batch slots: the same `op_id` with a DIFFERENT body answers `Conflict` and
-/// applies nothing.
+
 #[test]
 fn the_same_op_id_with_a_different_body_conflicts_on_every_batch_slot() {
     let Some(s) = live_store() else { return };
 
-    // add_usage_batch
     let a = fresh("s2-batch");
     let d = |n| UsageDelta {
         requests: n,
@@ -345,7 +335,6 @@ fn the_same_op_id_with_a_different_body_conflicts_on_every_batch_slot() {
     );
     assert_eq!(s.get_usage(&a, 0).unwrap().requests, 1);
 
-    // add_metering_batch
     let bucket = super::unique_bucket(88);
     let m = |n| busbar_contract::records::MeteringDelta {
         key_id: fresh("vk"),
@@ -409,9 +398,7 @@ fn records_upsert_read_back_and_scan_a_prefix_in_key_order() {
 }
 
 /// AN EMPTY PUT REMOVES THE ROW (slot 40's rule, ARCHITECT 2026-10-21): the host writes every
-/// strike as an empty `record_put` and reads empty as absent, so the key LEAVES both the ordered key
-/// set and the values hash: `record_get` answers `None`, `record_scan` never returns it, and both
-/// shrink. Removing a row that is not there is `Ok`.
+
 #[test]
 fn an_empty_put_removes_the_row() {
     let Some(s) = live_store() else { return };
@@ -758,7 +745,7 @@ fn a_plane_replacement_validates_old_and_new_links_before_unlinking() {
 }
 
 /// A body an older build recorded (`<slot>:<values {:?}>`) still dedupes after the upgrade: the
-/// same op replays and applies nothing, a different op under its id conflicts.
+
 #[test]
 fn an_older_builds_recorded_body_replays_and_a_different_op_conflicts() {
     let Some(s) = live_store() else { return };
@@ -878,8 +865,7 @@ fn an_op_id_write_runs_after_the_script_cache_is_flushed() {
 }
 
 /// The v8 -> v9 step: every key the deleted slots kept (the money keys, the journal, the sessions)
-/// is gone after the upgrade, and so are the dedupe hashes of the deleted slots; the dedupe hash of
-/// a kept slot survives, so its op replays across the upgrade and applies nothing.
+
 #[test]
 fn the_v9_upgrade_drops_the_money_and_dead_slot_keys() {
     let Some(mut iso) = Iso::new(8) else { return };
@@ -896,7 +882,6 @@ fn the_v9_upgrade_drops_the_money_and_dead_slot_keys() {
         .record_put("v9-schema", b"k", b"v")
         .expect("a record the upgrade must keep");
 
-    // The namespace a v8 build left: the dead slots' keys, and their op hashes.
     let dead_ops = [
         "reserve:0:[]",
         "slice_release:0:[]",
@@ -926,7 +911,7 @@ fn the_v9_upgrade_drops_the_money_and_dead_slot_keys() {
         let k = format!("busbar:op:dead{i}");
         let _: () = c.hset_multiple(&k, &[("b", *body), ("a", "")]).unwrap();
     }
-    // A v8 build recorded the kept op's body in its own form.
+
     let kept_key = format!("busbar:op:{}", crate::hex(&kept.0));
     let v8_body = format!("add_usage_batch:{:?}", &cells[..]);
     let _: () = c.hset(&kept_key, "b", v8_body).unwrap();
@@ -947,7 +932,7 @@ fn the_v9_upgrade_drops_the_money_and_dead_slot_keys() {
     }
     let marker: i64 = c.get("busbar:schema").unwrap();
     assert_eq!(marker, crate::SCHEMA_VERSION);
-    // A kept slot's op replays across the upgrade and applies nothing.
+
     iso.s()
         .add_usage_batch(kept, &cells)
         .expect("a replay across the upgrade answers Ok");
@@ -1029,7 +1014,7 @@ fn a_metering_counter_at_i64_max_pins_instead_of_failing() {
 }
 
 /// A cell the batch cannot add to refuses the WHOLE batch: no other cell applies and the op is not
-/// recorded, so a retry under the same op id with the key fixed applies.
+
 #[test]
 fn a_batch_with_an_unusable_cell_applies_nothing_and_records_nothing() {
     let Some(s) = live_store() else { return };
@@ -1042,7 +1027,7 @@ fn a_batch_with_an_unusable_cell_applies_nothing_and_records_nothing() {
         billable_requests: 0,
         models: Vec::new(),
     };
-    // The bad cell is LAST: a validate-and-apply cell by cell would apply the good one first.
+
     let cells = [(good.as_str(), 0, d.clone()), (bad.as_str(), 0, d)];
     let id = op(43);
     let e = s.add_usage_batch(id, &cells).expect_err("refused");
@@ -1106,7 +1091,7 @@ fn a_metering_batch_with_a_wrong_typed_row_applies_nothing() {
 }
 
 /// The v9 step keeps an op record whose body is a kept slot's digest (32 bytes, or 64 lowercase hex):
-/// a node upgrading concurrently with live writers must not erase their dedupe records.
+
 #[test]
 fn the_v9_upgrade_keeps_digest_bodied_op_records() {
     let Some(mut iso) = Iso::new(9) else { return };
@@ -1132,8 +1117,7 @@ fn the_v9_upgrade_keeps_digest_bodied_op_records() {
 }
 
 /// A terminal-only purge over more records than one script call handles: every terminal row goes,
-/// none of the active rows at the cutoff is touched, and the count is the whole sweep's. Both
-/// timestamps round to the same ZSET score.
+
 #[test]
 fn a_purge_larger_than_one_batch_counts_and_removes_exactly_the_terminal_rows() {
     let Some(s) = live_store() else { return };
@@ -1315,7 +1299,7 @@ fn plane_retention_uses_exact_timestamps_and_cleans_every_index() {
 }
 
 /// The v6 -> v7 copy never deletes a v6 task-event chain whose position holds a DIFFERENT record
-/// already (a fork): the v6 event is the only copy of that evidence, so it stays for an operator.
+
 #[test]
 fn the_v6_copy_keeps_an_event_chain_whose_position_forked() {
     use crate::legacy::TASK_EVENTS_PREFIX;
@@ -1355,7 +1339,7 @@ fn the_v6_copy_keeps_an_event_chain_whose_position_forked() {
 }
 
 /// A page is read at ONE instant: a strike landing while the scan is in flight cannot shorten it.
-/// The scan is held right after its key range is read; the row is struck; the scan is released.
+
 #[test]
 fn a_record_scan_page_is_not_shortened_by_a_concurrent_strike() {
     let Some(direct) = live_store() else { return };
@@ -1364,7 +1348,7 @@ fn a_record_scan_page_is_not_shortened_by_a_concurrent_strike() {
     for k in [b"a", b"b", b"c"] {
         direct.record_put(&schema, k, b"v").unwrap();
     }
-    // Warm the server's script cache, so the held scan sends no `SCRIPT LOAD`.
+
     assert_eq!(direct.record_scan(&schema, b"", 10).unwrap().len(), 3);
     let gate = super::interleave::gate(&url, false, |c| {
         let has = |t: &[u8]| super::interleave::contains(c, t);
@@ -1383,7 +1367,7 @@ fn a_record_scan_page_is_not_shortened_by_a_concurrent_strike() {
 }
 
 /// The contract upserts by `(kind, id)` and reads at seq 0: a second upsert of an id with another
-/// `seq` replaces the first, never stands beside it.
+
 #[test]
 fn an_upsert_replaces_by_id_whatever_its_seq() {
     let Some(s) = live_store() else { return };
@@ -1410,7 +1394,7 @@ fn an_upsert_replaces_by_id_whatever_its_seq() {
 }
 
 /// A reply that does not fit is refused by naming where and what was expected, never by echoing the
-/// stored value into the error.
+
 #[test]
 fn a_malformed_stored_value_is_not_echoed_into_the_error() {
     let Some(s) = live_store() else { return };
@@ -1427,14 +1411,14 @@ fn a_malformed_stored_value_is_not_echoed_into_the_error() {
         .get_usage(&bucket, 0)
         .expect_err("not an integer")
         .to_string();
-    // Debug-printed bytes are digits, so the text check alone would miss the echo.
+
     let bytes = format!("{:?}", b"secret-text".to_vec());
     assert!(!e.contains("secret-text") && !e.contains(&bytes), "{e}");
     assert!(!e.contains("response was"), "{e}");
 }
 
 /// A fork-refused append records nothing under its op id: the same op id retried with a record that
-/// does not fork applies, instead of conflicting with a body the refusal wrongly recorded.
+
 #[test]
 fn a_fork_refused_append_records_nothing_under_its_op_id() {
     let Some(s) = live_store() else { return };
@@ -1771,7 +1755,7 @@ fn v10_metering_destination_collision_refuses_without_overwriting_evidence() {
         (&*rows[0].key_group_at_use, &*rows[0].pricing_version),
         ("g", "v")
     );
-    // A stale schema marker is the state after an interrupted upgrade. Already moved rows are idempotent.
+
     let _: () = r.set("busbar:schema", 10).unwrap();
     iso.restart();
     assert_eq!(iso.s().list_metering(17).unwrap(), rows);
@@ -1793,7 +1777,7 @@ fn v10_metering_upgrade_keeps_the_existing_replay_receipt_and_same_cell() {
     let names: Vec<String> = r.smembers(&set).unwrap();
     assert_eq!(names.len(), 1);
     let old = format!("{set}:history|m|p");
-    // Put the hash in its pre-upgrade location while preserving the real committed op receipt.
+
     if names[0] != old {
         let _: () = redis::cmd("RENAME")
             .arg(&names[0])

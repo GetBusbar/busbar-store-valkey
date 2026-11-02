@@ -2,9 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE `url` IS REFERENCE-CAPABLE, NOT SECRET (busbar lead ruling item 7a): a 1.5.5 config that
-//! writes the valkey store's `url` as `{env: VAR}` keeps booting (the reference resolves in place, as the
-//! kernel resolves it), and a literal url keeps working (it passes as written, never refused as a
-//! secret literal). The linked door is loaded the way the host binds it.
 
 use std::sync::Arc;
 

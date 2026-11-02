@@ -320,7 +320,7 @@ fn wrong_types_and_invalid_requests_never_commit_any_row_or_receipt() {
         let poisoned = &targets[target];
         let saved: redis::Value = redis::cmd("DUMP").arg(poisoned).query(&mut raw).unwrap();
         raw.set::<_, _, ()>(poisoned, "wrong-type").unwrap();
-        // The owner is normally a string, so poison it with a hash instead.
+
         if target == 1 {
             raw.del::<_, ()>(poisoned).unwrap();
             raw.hset::<_, _, _, ()>(poisoned, "field", "wrong-type")
@@ -497,7 +497,7 @@ fn legacy_reserved_writes_refuse_fresh_effects_but_replay_exact_existing_receipt
             store.get_usage(bucket, DAY_START).unwrap(),
             UsageLedger::default()
         );
-        // A legacy durable receipt is independent of current row contents and remains replayable.
+
         raw.hset::<_, _, _, ()>(op_receipt(id), "b", &Dedupe::usage(&cells).body()[..])
             .unwrap();
         Slots::add_usage_batch(&store, id, &cells).unwrap();
@@ -580,7 +580,7 @@ fn high_correction_survives_accrual_refund_saturation_and_reopen() {
         correction::canonical_ledger(&mut expected).unwrap();
         assert_eq!(actual, expected);
     }
-    // Absolute non-reserved usage writes share the same full-width storage contract.
+
     store
         .put_usage(bucket, DAY_START, &ledger(u64::MAX))
         .unwrap();
@@ -651,9 +651,9 @@ fn pending_cancellation_and_instance_destruction_before_exec_leave_no_effect_or_
                 }
             })
             .await;
-            drop(operation); // Cancels the ticket and closes its in-flight watched connection.
+            drop(operation);
         });
-        drop(slow); // Instance destruction follows cancellation while the proxy is still held.
+        drop(slow);
     });
     gate.held.recv_timeout(WAIT).unwrap();
     cancelled.store(true, Ordering::SeqCst);
