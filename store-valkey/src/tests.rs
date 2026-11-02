@@ -5859,3 +5859,37 @@ fn v6_upgrade_refuses_a_scan_key_outside_the_askstate_prefix() {
     }
     assert_eq!(ask_nonce("busbar:askstate:n1").unwrap(), "n1");
 }
+
+/// A stale `busbar:cred:id:<A>` pointer (an older build, or a partial restore) naming a slot that
+/// now holds live credential B must not let `revoke_credential(A)` revoke and secret-wipe B: it
+/// errors, naming the stale pointer, and B is untouched.
+#[test]
+fn revoke_through_a_stale_id_pointer_refuses_and_leaves_the_slot_occupant_alone() {
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_stale_ptr");
+    let mut b = cred(&key_id, &uid("AKIA_B"), 0);
+    b.meta.id = uid("cred_b");
+    store
+        .put_key_with_credential(&vk(&key_id), &b)
+        .unwrap();
+    let stale = uid("cred_a_stale");
+    let ptr = format!("{key_id}:{}:{}", b.meta.kind, b.meta.slot);
+    store
+        .with_conn(|c| c.set::<_, _, ()>(format!("busbar:cred:id:{stale}"), &ptr))
+        .unwrap();
+
+    let err = store
+        .revoke_credential(&stale, "stale")
+        .expect_err("a stale pointer onto another credential's slot is refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&stale) && msg.contains(&b.meta.id),
+        "names the pointer and the occupant: {msg}"
+    );
+    let live = store
+        .lookup_credential_secret(&b.meta.kind, &b.meta.public_id)
+        .unwrap()
+        .unwrap();
+    assert!(live.meta.revoked_at.is_none(), "B must stay live");
+    assert_eq!(live.secret, b.secret, "B's secret must be intact");
+}

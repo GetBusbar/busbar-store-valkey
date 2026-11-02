@@ -1674,6 +1674,15 @@ impl ValkeyStore {
                 };
                 let mut cred: CredentialSecret = serde_json::from_str(&raw)
                     .map_err(|_| RedisError::from((ErrorKind::Client, "cred decode")))?;
+                if cred.meta.id != id {
+                    // A stale pointer onto a slot that now holds another credential: fail closed
+                    // and touch nothing, never revoke the occupant.
+                    return Err(RedisError::refused(format!(
+                        "revoke_credential: stale pointer busbar:cred:id:{id} -> {ptr} holds \
+                         credential '{}'; nothing was revoked",
+                        cred.meta.id
+                    )));
+                }
                 if cred.meta.revoked_at.is_some() {
                     // Already revoked: idempotent no-op.
                     return Ok(Some(()));
