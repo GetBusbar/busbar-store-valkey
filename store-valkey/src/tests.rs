@@ -1070,6 +1070,10 @@ fn list_credentials_never_carries_the_secret() {
     // CredentialMeta has no secret field at all — this is a compile-time guarantee, not a
     // runtime check, but assert the shape we actually get back is the meta type.
     let _: &CredentialMeta = &metas[0];
+    assert!(
+        !format!("{metas:?}").contains(&c.secret),
+        "the secret must not surface in list_credentials"
+    );
 }
 
 #[test]
@@ -3384,6 +3388,7 @@ fn usage_carries_open_units_and_floors_each_counter_at_zero() {
         .unwrap();
     let got = store.get_usage(&bucket, 1000).unwrap();
     assert_eq!(got.requests, 1, "2, then floored at 0, then +1");
+    assert_eq!(got.billable_requests, 1, "2, then floored at 0, then +1");
     assert_eq!(got.models.len(), 1);
     let m = &got.models[0];
     assert_eq!(m.model, "m:1");
@@ -4624,11 +4629,10 @@ fn read_everything_1_5_5(store: &ValkeyStore) -> Vec<String> {
         format!("{:?}", store.list_keys().unwrap()),
         format!("{:?}", store.list_audit().unwrap()),
     ];
+    let mut metering_buckets = std::collections::BTreeSet::new();
     for key in fixture_keys().keys() {
         if let Some(rest) = key.strip_prefix("busbar:metering:") {
-            if let Ok(bucket) = rest.parse::<u64>() {
-                out.push(format!("{:?}", store.list_metering(bucket).unwrap()));
-            }
+            metering_buckets.insert(rest.split(':').next().unwrap().parse::<u64>().unwrap());
         } else if let Some(rest) = key.strip_prefix("busbar:usage:") {
             let (bucket, start) = rest.rsplit_once(':').unwrap();
             out.push(format!(
@@ -4636,6 +4640,9 @@ fn read_everything_1_5_5(store: &ValkeyStore) -> Vec<String> {
                 store.get_usage(bucket, start.parse().unwrap()).unwrap()
             ));
         }
+    }
+    for bucket in metering_buckets {
+        out.push(format!("{:?}", store.list_metering(bucket).unwrap()));
     }
     out
 }
