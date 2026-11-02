@@ -625,7 +625,7 @@ fn a_statement_one_byte_off_is_refused() {
     let d = dispatcher();
     let row = LinkedRow {
         statement: other.clone(),
-        door: busbar_store_valkey::door,
+        ..LinkedRow::of(busbar_store_valkey::door).expect("actual linked door")
     };
     assert!(matches!(
         load_linked::<Store>(&row, bind(&d)),
@@ -854,9 +854,12 @@ fn linked_and_dropped_store_use_the_hosts_tls_trust_and_refuse_untrusted_peers()
             enabled: true,
             ..Default::default()
         };
-        store.put_key(&key).unwrap();
+        RecordStore::put_key(&store, &key).unwrap();
         assert_eq!(
-            store.get_key(&id).unwrap().unwrap().generation_hash,
+            RecordStore::get_key(&store, &id)
+                .unwrap()
+                .unwrap()
+                .generation_hash,
             key.generation_hash
         );
     }
