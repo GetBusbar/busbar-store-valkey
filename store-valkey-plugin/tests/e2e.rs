@@ -615,6 +615,8 @@ fn busbar_root() -> PathBuf {
 /// Build (once, cached by cargo) the real `busbar` binary and the real `busbar-plugin-pack` tool
 fn build_real_binaries() -> (PathBuf, PathBuf) {
     let root = busbar_root();
+    let toolchain =
+        std::env::var_os("RUSTUP_TOOLCHAIN").unwrap_or_else(|| std::ffi::OsString::from("1.98"));
     let target = match std::env::var_os("CARGO_TARGET_DIR") {
         Some(dir) => root.join(dir),
         None => root.join("target"),
@@ -622,6 +624,7 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
     for args in [
         &[
             "build",
+            "--locked",
             "--release",
             "--manifest-path",
             "dist/default/Cargo.toml",
@@ -632,6 +635,7 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
         ][..],
         &[
             "build",
+            "--locked",
             "--release",
             "-p",
             "busbar-plugin-loader",
@@ -642,6 +646,7 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
         ][..],
     ] {
         let status = Command::new("cargo")
+            .env("RUSTUP_TOOLCHAIN", &toolchain)
             .args(args)
             .arg("--target-dir")
             .arg(&target)
