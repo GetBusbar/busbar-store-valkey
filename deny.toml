@@ -1,5 +1,5 @@
 # RENDERED by `busbar-release plugin heal` from GetBusbar/busbar-release template/ and busbar's
-# `.github/fleet/deps.toml` at a35493a5e74cc935ff7dcc15c1af869290da91cb; a hand edit is overwritten by the next sync. CI runs
+# `.github/fleet/deps.toml` at 892773b8ed5d0cc78694bbcf5a10d89346ad61e6; a hand edit is overwritten by the next sync. CI runs
 # `cargo deny check` on it (busbar's plugin-ci.yml at the pin). The license allowlist is busbar's own;
 # reviewed git sources are the pinned core, declared transport test dependencies and explicit
 # dependency-policy exceptions listed below.
@@ -133,12 +133,8 @@ deny = [
     { crate = "num-bigint:>=0.5.0", reason = "busbar resolves num-bigint to 0.4.6; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "oauth-as:<1.0.0", reason = "busbar resolves oauth-as to 1.0.1; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "oauth-as:>=2.0.0", reason = "busbar resolves oauth-as to 1.0.1; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "opentelemetry-proto:<0.32.0", reason = "busbar resolves opentelemetry-proto to 0.32.0; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "opentelemetry-proto:>=0.33.0", reason = "busbar resolves opentelemetry-proto to 0.32.0; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "proc-macro2:<1.0.0", reason = "busbar resolves proc-macro2 to 1.0.106; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "proc-macro2:>=2.0.0", reason = "busbar resolves proc-macro2 to 1.0.106; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "prost:<0.14.0", reason = "busbar resolves prost to 0.14.3; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "prost:>=0.15.0", reason = "busbar resolves prost to 0.14.3; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "psl:<2.0.0", reason = "busbar resolves psl to 2.1.244; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "psl:>=3.0.0", reason = "busbar resolves psl to 2.1.244; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "quote:<1.0.0", reason = "busbar resolves quote to 1.0.45; a plugin may not pull a second version (OWNER 2026-10-02)" },

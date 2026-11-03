@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   consumer:
-    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@a35493a5e74cc935ff7dcc15c1af869290da91cb
+    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@892773b8ed5d0cc78694bbcf5a10d89346ad61e6
     with:
       version: ${{ inputs.version || '' }}
       asset_prefix: busbar-store-valkey

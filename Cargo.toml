@@ -5,13 +5,13 @@
 #
 # One repo per plugin, every repo a twin: this workspace is exactly two crates, the logic (the rlib a
 # busbar build links) and the thin cdylib that packages it as a droppable `kind: store` plugin
-# (crate `busbar-store-valkey-plugin`). Its one busbar dependency is busbar-contract (busbar-plugin-loader and
-# the loader is dev-only, for both-door tests), all git dependencies on
+# (crate `busbar-store-valkey-plugin`). Its runtime busbar dependency is busbar-contract; busbar-plugin-loader
+# is dev-only for ordinary linked and dropped-in tests. All Git dependencies on
 # GetBusbar/busbar at the pin in `.busbar-ref`; no sibling-checkout path dependency ships in any manifest.
 #
 # THIRD-PARTY VERSIONS ARE THE FLEET'S, NOT THIS REPO'S. The table below is busbar's own root
-# `[workspace.dependencies]` (third-party rows) at busbar a35493a5e74cc935ff7dcc15c1af869290da91cb, followed by the plugin-only rows
-# of busbar's `.github/fleet/deps.toml` at a35493a5e74cc935ff7dcc15c1af869290da91cb. A member takes a crate with
+# `[workspace.dependencies]` (third-party rows) at busbar 892773b8ed5d0cc78694bbcf5a10d89346ad61e6, followed by the plugin-only rows
+# of busbar's `.github/fleet/deps.toml` at 892773b8ed5d0cc78694bbcf5a10d89346ad61e6. A member takes a crate with
 # `{ workspace = true }` (adding features if it needs them); a crate in neither table is a new
 # `deps.toml` row in busbar first. Heal seeds resolution from busbar's lock at the pin; this
 # plugin retains its own Cargo.lock and CI checks its pinned core revision and dependency policy.
@@ -36,11 +36,11 @@ repository = "https://github.com/GetBusbar/busbar-store-valkey"
 needless_update = "allow"
 
 [workspace.dependencies]
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "a35493a5e74cc935ff7dcc15c1af869290da91cb" }
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "a35493a5e74cc935ff7dcc15c1af869290da91cb" }
-"busbar-core-connector" = { "features" = ["test-support"], "git" = "https://github.com/GetBusbar/busbar", "rev" = "a35493a5e74cc935ff7dcc15c1af869290da91cb" }
-"busbar-transport-tcp" = { "git" = "https://github.com/GetBusbar/busbar-transport-tcp", "rev" = "b896c5e6ef34dc6ea179f0dbcb4c7262cc117ca9" }
-# busbar's root [workspace.dependencies], third-party rows, at a35493a5e74cc935ff7dcc15c1af869290da91cb
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "892773b8ed5d0cc78694bbcf5a10d89346ad61e6" }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "892773b8ed5d0cc78694bbcf5a10d89346ad61e6" }
+"busbar-core-connector" = { "features" = ["test-support"], "git" = "https://github.com/GetBusbar/busbar", "rev" = "892773b8ed5d0cc78694bbcf5a10d89346ad61e6" }
+"busbar-transport-tcp" = { "git" = "https://github.com/GetBusbar/busbar-transport-tcp", "rev" = "6c804d968737f39ea435c81ef22d16cd7ffcaf59" }
+# busbar's root [workspace.dependencies], third-party rows, at 892773b8ed5d0cc78694bbcf5a10d89346ad61e6
 arc-swap = "1"
 async-trait = "0.1"
 aws-lc-sys = { version = "=0.47.0", default-features = false }
@@ -117,7 +117,7 @@ url = "2"
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std", "ring"] }
 webpki-roots = "1"
 zeroize = "1"
-# busbar .github/fleet/deps.toml [plugin-deps], at a35493a5e74cc935ff7dcc15c1af869290da91cb
+# busbar .github/fleet/deps.toml [plugin-deps], at 892773b8ed5d0cc78694bbcf5a10d89346ad61e6
 fallible-iterator = "0.2"
 httparse = { version = "1", default-features = false }
 ldap3 = { version = "0.12", default-features = false, features = ["sync"] }
@@ -136,6 +136,5 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 sonic-number = "=0.1.3"
 ulid = "1"
 
-# Unify this pinned framer's legacy core source with the suite's core pin.
 [patch."https://github.com/GetBusbar/busbar"]
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "a35493a5e74cc935ff7dcc15c1af869290da91cb" }
+"busbar-contract" = { "git" = "https://github.com/GetBusbar/busbar", "rev" = "892773b8ed5d0cc78694bbcf5a10d89346ad61e6" }
