@@ -15,11 +15,9 @@ on:
   pull_request:
     branches: [dev]
   workflow_dispatch: {}
-  # release.yml runs this file on the tagged commit before it publishes.
-  workflow_call: {}
 
 # A newer push to a pull request cancels its older run (only the newest commit can merge); a push to
-# dev, a dispatch and release.yml's call run to the end.
+# dev and a dispatch run to the end.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -38,4 +36,5 @@ jobs:
       plugin_crate: busbar-store-valkey-plugin
       plugin_kind: store
       plugin_alias: valkey
-    secrets: inherit
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

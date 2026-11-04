@@ -46,8 +46,10 @@ multiple-versions = "deny"
 wildcards = "deny"
 allow-wildcard-paths = true
 # busbar .github/fleet/deps.toml [bans].deny (one stack per concern), then ONE VERSION OF EVERYTHING
-# BUSBAR USES (OWNER 2026-10-02): every version of a shared crate outside the line busbar's own
-# Cargo.lock resolves it to, at the pin.
+# BUSBAR USES (OWNER 2026-10-02): for each shared crate (a third-party row of busbar's
+# [workspace.dependencies]; a crate busbar's Cargo.lock reaches only transitively is not one), every
+# version outside the line(s) busbar's own Cargo.lock resolves it to, at the pin. A range a
+# [bans].deny row already bans is listed once, as that row.
 deny = [
     # ONE Ed25519 = ed25519-dalek 2 (ARCHITECT ruling 2026-10-02; mirrors busbar deny.toml): no older
     # dalek and no other Ed25519 implementation may enter a plugin's closure.
@@ -101,7 +103,6 @@ deny = [
     { crate = "http-body-util:>=0.2.0", reason = "busbar resolves http-body-util to 0.1.5; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "httpdate:<1.0.0", reason = "busbar resolves httpdate to 1.0.3; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "httpdate:>=2.0.0", reason = "busbar resolves httpdate to 1.0.3; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "hyper:<1.0.0", reason = "busbar resolves hyper to 1.11.1; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "hyper:>=2.0.0", reason = "busbar resolves hyper to 1.11.1; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "hyper-util:<0.1.0", reason = "busbar resolves hyper-util to 0.1.20; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "hyper-util:>=0.2.0", reason = "busbar resolves hyper-util to 0.1.20; a plugin may not pull a second version (OWNER 2026-10-02)" },
@@ -143,9 +144,7 @@ deny = [
     { crate = "rcgen:>=0.15.0", reason = "busbar resolves rcgen to 0.14.10; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "reqwest:<0.12.0", reason = "busbar resolves reqwest to 0.12.28; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "reqwest:>=0.13.0", reason = "busbar resolves reqwest to 0.12.28; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "ring:<0.17.0", reason = "busbar resolves ring to 0.17.14; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "ring:>=0.18.0", reason = "busbar resolves ring to 0.17.14; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "rustls:<0.23.0", reason = "busbar resolves rustls to 0.23.46; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "rustls:>=0.24.0", reason = "busbar resolves rustls to 0.23.46; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "rustls-pki-types:<1.0.0", reason = "busbar resolves rustls-pki-types to 1.15.1; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "rustls-pki-types:>=2.0.0", reason = "busbar resolves rustls-pki-types to 1.15.1; a plugin may not pull a second version (OWNER 2026-10-02)" },

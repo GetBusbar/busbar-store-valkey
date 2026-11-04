@@ -21,21 +21,26 @@ at the pin); change them there, not here.
 
 ## This repo tests itself against busbar
 
-CI runs the fleet's one harness, busbar's reusable `plugin-ci.yml`, at the busbar commit in
-`.busbar-ref`: fmt, clippy -D warnings, the whole test suite, `cargo deny`, the dependency wall
-(busbar-contract plus third-party only), the socket/TLS ban (no plugin opens its own socket, dials,
-binds or does TLS), the C-dependency allow-list, `Cargo.lock` parity with busbar's lock at the pin,
-the both-ways conformance and the busbar conformance kit for this kind. The tests are this repo's:
-`store-valkey-plugin/tests/conformance.rs` loads the LINKED door and the BUILT cdylib through busbar's
-plugin loader and requires one transcript (a test named `the_linked_and_the_dropped_in_*`), and keeps
-at least one RED arm (any other test in that target) that proves the comparison can fail.
+CI calls busbar's reusable `plugin-ci.yml` at the commit in `.busbar-ref`. It runs formatting,
+strict Clippy, dependency checks and this repository's ordinary Rust tests. The tests load the
+actual linked door and the freshly built library through the public plugin loader. CI exports the
+absolute library path as `BUSBAR_PLUGIN_CDYLIB`; a missing library fails the tests.
+
+Keep product assertions in this repository. Exercise both actual loading paths and retain negative
+cases that distinguish a refused input or failed operation from success. There is no shared kind
+script or generated host adapter. Configure any real service backends and existing test-only
+features in this repository's registry entry; test-image features do not change production builds.
+
+The plugin keeps its own `Cargo.lock`. Heal seeds its resolution from busbar's lock at the pin;
+this does not make the two complete dependency graphs or every resolved version identical.
 
 ## Before you open a pull request
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+cargo build --release --locked -p busbar-store-valkey-plugin --lib
+BUSBAR_PLUGIN_CDYLIB="$PWD/target/release/libbusbar_store_valkey_plugin.so" cargo test --release --workspace --locked
 ```
 
 The README's Tests section names any live backend the full suite needs. Add or update
