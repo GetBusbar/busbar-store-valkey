@@ -687,7 +687,7 @@ fn networked_store_requires_a_connection_table_in_both_forms() {
         } else {
             load_linked::<Store>(&row, bind)
         };
-        let error = result.err().expect("networked store without table refuses");
+        let error = result.expect_err("networked store without table refuses");
         assert!(
             matches!(error, LoadError::NoConnectionTable { .. }),
             "{error}"
@@ -725,7 +725,7 @@ fn schema_newer_than_this_build_is_refused_through_both_doors() {
         } else {
             open(&linked, &cfg)
         };
-        let error = result.err().expect("newer schema refuses boot");
+        let error = result.expect_err("newer schema refuses boot");
         assert!(error.contains("schema"), "{error}");
         assert!(error.contains(&i64::MAX.to_string()), "{error}");
     }
@@ -843,8 +843,7 @@ fn linked_and_dropped_store_use_the_hosts_tls_trust_and_refuse_untrusted_peers()
             (p, d)
         };
         let error = open(&|| load(false), &settings)
-            .err()
-            .expect("self-signed peer must refuse without anchor");
+            .expect_err("self-signed peer must refuse without anchor");
         assert!(error.contains("failed to connect"), "{error}");
         let store = open(&|| load(true), &settings).expect("the host trusts the test CA");
         let id = ns("tls");
@@ -942,8 +941,7 @@ fn a_failed_ready_closes_the_actual_opened_valkey_store_once() {
             .as_bytes(),
         mint,
     )
-    .err()
-    .expect("READY fails");
+    .expect_err("READY fails");
     assert_eq!(
         error,
         "plugin 'busbar-store-valkey' ready failed: Valkey test: discovery refused"

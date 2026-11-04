@@ -205,6 +205,7 @@ fn valkey_declares_exactly_its_statement_needs_and_requested_profile() {
     declared.dedup();
     assert_eq!(stated, declared);
     if std::env::var_os("BUSBAR_EXPECT_RELEASE").is_some() {
-        assert!(!cfg!(debug_assertions), "release profile requested");
+        #[cfg(debug_assertions)]
+        panic!("release profile requested");
     }
 }

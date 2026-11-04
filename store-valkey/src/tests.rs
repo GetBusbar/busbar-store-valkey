@@ -2156,10 +2156,15 @@ trait Vocab: RecordStore {
 impl Vocab for ValkeyStore {}
 
 /// Serialises EVERY test that purges a plane kind. `purge_plane_records_before(kind, before)` has no
-static PURGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn purge_guard() -> std::sync::MutexGuard<'static, ()> {
-    PURGE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+fn purge_guard() -> std::fs::File {
+    let file = std::fs::File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(std::env::temp_dir().join("busbar-store-valkey-purge.lock"))
+        .expect("open the shared purge-test lock");
+    file.lock().expect("serialize purge tests across processes");
+    file
 }
 
 fn sample_call(principal: &str, seq: u64, ts: u64, prev_hash: &str, hash: &str) -> CallRow {
