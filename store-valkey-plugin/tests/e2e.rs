@@ -48,6 +48,8 @@ use std::time::{Duration, Instant};
 mod database;
 
 /// A node id no earlier run or instance used, for `LoadedStore::open`: its bridge mints each op id
+/// as `(node, counter from 0)`, and this store's dedupe is DURABLE, so two instances sharing a node
+/// would replay each other's op ids (the kernel draws the node from the OS CSPRNG per process).
 fn node() -> u64 {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let t = std::time::SystemTime::now()
@@ -60,6 +62,7 @@ fn node() -> u64 {
 }
 
 /// The node's one `op_id` allocator (`LoadedStore::open` mints the bridge's writes from it): a node
+/// half no earlier run used (the dedupe is durable) and one counter.
 fn mint() -> busbar_contract::abi::store::OpId {
     static NODE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -71,6 +74,9 @@ fn mint() -> busbar_contract::abi::store::OpId {
 }
 
 /// Open the built cdylib the way the host opens a dropped-in store: its Statement rendered as
+/// `busbar-plugin-pack` renders it into the signed manifest, `load_dropped` (dlopen,
+/// `busbar_plugin_door`, the Statement compared byte for byte), then `LoadedStore::open`. Dropping
+/// the handle closes the instance and unloads the library.
 fn load(path: &Path, cfg: &str) -> Result<Box<dyn RecordStore>, String> {
     let stated = rendering_of_library(path)
         .map_err(|e| e.to_string())?
@@ -82,6 +88,7 @@ fn load(path: &Path, cfg: &str) -> Result<Box<dyn RecordStore>, String> {
 }
 
 /// A dispatcher and a bind over the loader's test connection table (plain TCP, the host's
+/// connector path): every store op is one connection the "host" dials.
 fn host(instance: &str) -> (Arc<Dispatcher>, Bind) {
     let dispatcher = Arc::new(Dispatcher::new(DispatchConfig::default()));
     let conns: Arc<dyn busbar_contract::conn::DeclaredConns> = valkey_io::host(
@@ -99,6 +106,7 @@ fn host(instance: &str) -> (Arc<Dispatcher>, Bind) {
 }
 
 /// The store through its COMPILED-IN door (`busbar_store_valkey::door`, never the cdylib): the
+/// independent leg the dropped-in store's writes are read back and cleaned up through.
 struct ValkeyStore;
 
 impl ValkeyStore {
@@ -114,9 +122,15 @@ impl ValkeyStore {
 }
 
 /// Fixed ed25519 signing secret (64 hex = 32 bytes) for this e2e test. 1.5.1 requires an
+/// explicit signing key to mint virtual keys; busbar no longer auto-generates one.
 const TEST_SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 /// The newest mtime across every workspace crate's `src/` — "how fresh must a cdylib be to be the
+/// one this source tree describes".
+///
+/// Deliberately ONLY `src/**/*.rs` of each workspace member: editing a `tests/` file or a
+/// `[dev-dependencies]` line recompiles the test binary but NOT the lib, so including those would
+/// fail a perfectly current cdylib.
 fn newest_source_mtime() -> std::time::SystemTime {
     let ws_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -251,6 +265,9 @@ fn plugin_path() -> PathBuf {
 }
 
 /// The live `VALKEY_URL`, mirroring `busbar-store-valkey`'s own `live_store()` gating discipline
+/// (see `busbar-store-valkey`'s own `live_store()`): skip cleanly when unset LOCALLY, but a
+/// missing `VALKEY_URL` under `CI` is a hard failure, not a silent skip — CI provisions the
+/// `valkey:7` service container and must set this env var (see `.github/workflows/ci.yml`).
 fn valkey_url() -> Option<String> {
     match std::env::var("VALKEY_URL") {
         Ok(url) => Some(url),
@@ -329,6 +346,7 @@ fn row<T: serde::de::DeserializeOwned>(body: &[u8]) -> T {
 }
 
 /// The typed names, over the neutral verbs, for any `RecordStore` — the plugin-backed
+/// `Box<dyn RecordStore>` and the direct `ValkeyStore` alike.
 trait Vocab: RecordStore {
     fn put_task(&self, t: &TaskRow) -> RecordStoreResult<()> {
         let terminal = ["completed", "failed", "canceled", "rejected"].contains(&t.state.as_str());
@@ -492,6 +510,10 @@ fn load_and_exercise_valkey_plugin_persists_to_real_valkey_across_reopen() {
     let Some(url) = valkey_url() else {
         return;
     };
+    let mut isolated: url::Url = url.parse().unwrap();
+    isolated.set_path("/14");
+    let url = isolated.to_string();
+    let _database = database::Database::take(&url);
     let cfg = serde_json::json!({ "url": url }).to_string();
 
     let direct = ValkeyStore::connect(&url).expect("connect directly to seed/clean up");
@@ -558,6 +580,9 @@ fn load_and_exercise_valkey_plugin_persists_to_real_valkey_across_reopen() {
 }
 
 /// END-TO-END FAILURE: an `open()` config that cannot produce a usable store — malformed JSON, a
+/// config missing `url`, and a `url` Valkey itself refuses to parse — surfaces back across the C
+/// ABI as a clean `Err`, never a panic or a silently-succeeded load. Needs no live Valkey: every
+/// case here fails before (or instead of) actually connecting.
 #[test]
 fn load_and_exercise_valkey_plugin_bad_config_fails_over_abi() {
     let path = plugin_path();
@@ -588,6 +613,7 @@ fn load_and_exercise_valkey_plugin_bad_config_fails_over_abi() {
 }
 
 /// RAII guard for a spawned child process: kills and reaps it on drop, including when a panic
+/// unwinds partway through the test.
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
@@ -598,6 +624,10 @@ impl Drop for ChildGuard {
 }
 
 /// The busbar checkout the real binaries are built from: `BUSBAR_CHECKOUT` when set (CI checks
+/// GetBusbar/busbar out at the `.busbar-ref` rev and points this at it), otherwise a sibling
+/// `../busbar` beside this repo. It must be the rev `.busbar-ref` pins — the rev this plugin's
+/// contract comes from. A missing checkout is a FAILURE, never a skip: this is the only proof that
+/// a real busbar installs and boots on this store.
 fn busbar_root() -> PathBuf {
     let root = match std::env::var_os("BUSBAR_CHECKOUT") {
         Some(p) => PathBuf::from(p),
@@ -613,6 +643,9 @@ fn busbar_root() -> PathBuf {
 }
 
 /// Build (once, cached by cargo) the real `busbar` binary and the real `busbar-plugin-pack` tool
+/// from that checkout — never a fixture, never a stub. The pack tool is a feature-gated bin of
+/// `busbar-plugin-loader` in busbar 1.6.0. busbar is the `test-harness` build, the one that takes a
+/// test's first-party key ([`HARNESS_FIRST_PARTY_KEY_ENV`]); no release build reads it.
 fn build_real_binaries() -> (PathBuf, PathBuf) {
     let root = busbar_root();
     let toolchain =
@@ -665,12 +698,20 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
 }
 
 /// A placeholder provider credential: busbar 1.6.0 refuses to boot on an unresolvable provider
+/// credential (BUSBAR-9007), and the mock provider is never dialled.
 const SECRET_PLACEHOLDER: &str = "0000000000000000000000000000000000000000000000000000000000000001";
 
 /// THE FIRST-PARTY KEY THIS TEST SIGNS THE PLUGIN WITH (its ed25519 secret, 64 hex): the store's
+/// `tcp` need sits in the `operator-infrastructure` egress class, which the host grants to a
+/// FIRST-PARTY plugin only (`BUSBAR-1.6.0.md` §5), and no test holds the embedded release key's
+/// private half. So the pack tool signs with this key (`BUSBAR_SIGN_KEY`), and the child busbar, a
+/// `test-harness` build, takes its public half as its first-party key through the harness seam
+/// ([`HARNESS_FIRST_PARTY_KEY_ENV`], ARCHITECT ruling busbar #700), as busbar's own end-to-end
+/// battery admits a first-party plugin it signed.
 const HARNESS_SIGN_KEY: &str = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
 
 /// The variable a `test-harness` busbar reads its first-party key from (busbar's
+/// `root::boot::HARNESS_FIRST_PARTY_KEY_ENV`).
 const HARNESS_FIRST_PARTY_KEY_ENV: &str = "BUSBAR_TEST_HARNESS_FIRST_PARTY_KEY";
 
 /// The public half of [`HARNESS_SIGN_KEY`], 64 hex: what the child trusts as first-party.
@@ -688,6 +729,8 @@ fn harness_public_key() -> String {
 }
 
 /// A free-at-the-moment localhost port (bind-then-drop; a TOCTOU race is possible in principle
+/// but is the standard, accepted pattern for test port allocation and hasn't been a problem for
+/// the sibling repos' own equivalents).
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .expect("bind an ephemeral port")
@@ -714,11 +757,22 @@ fn poll_admin_up(admin: &str, token: &str, client: &reqwest::blocking::Client) -
 }
 
 /// Point at a DIFFERENT logical Valkey database (index 15, the conventional "spare" db a lot of
+/// Valkey tooling reserves for tests) than [`valkey_url`]'s own `/0`, which every OTHER test in this
+/// file/crate shares. A real `busbar` boot (unlike a plain `Store` call) HYDRATES every existing
+/// virtual key at startup and validates its `group` against the config's own `groups:` block —
+/// this test's config intentionally defines none, so ANY leftover key from another test sharing
+/// db 0 (e.g. the dlopen persistence test above, which mints a key with `group: "infra"`) makes
+/// boot fail outright with an unrelated "group does not exist" error. Same server, same
+/// `VALKEY_URL` host/port, just an isolated `SELECT`ed database — proven the strongest fix short of
+/// a second Valkey container (confirmed necessary: this test failed with exactly that pollution
+/// before being pointed at its own db).
 fn admin_test_valkey_url(base: &str) -> String {
     valkey_url_in_db(base, 15)
 }
 
 /// The databases the live tests use: `/0` the url's own (shared), `/15` the admin end-to-end test,
+/// `/14` conformance's folds, `/11` to `/13` store-valkey's schema-refusal tests, and this one for
+/// the two durability proofs that sweep a whole kind (`call`, terminal `task`).
 const SWEEP_DB: u32 = 10;
 
 /// `base` pointed at database `db`.
@@ -1050,6 +1104,30 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
 }
 
 /// THE DURABILITY PROOF FOR THE FOUR MCP CALL-LOG METHODS, OVER THE REAL PLUGIN PATH.
+///
+/// This repo ships `feat/durable-mcp-call-log` — `append_mcp_call`/`list_mcp_calls`/
+/// `list_mcp_call_principals`/`purge_mcp_calls_before` against a real Valkey. Every existing test of
+/// those four calls `ValkeyStore` DIRECTLY, in-process, and NONE of them can see the failure that
+/// actually matters in production, because in production this backend is ONLY ever reached as a
+/// plugin: conformance boots the in-process RAM store, so the plugin seam is the only path a real
+/// deployment takes and was, until this test, the one path with zero coverage of these methods.
+///
+/// The contract DEFAULTS every plane-record verb to accept-and-keep-nothing. A plugin
+/// seam that does not RELAY them silently substitutes those defaults: every `append_mcp_call`
+/// returns `Ok`, every `list_mcp_calls` answers empty, and a deployment loses every tool-call record
+/// while reporting success. That is not hypothetical — the ABI once carried four store methods while
+/// the trait carried ten, so exactly this happened. A unit test passing while the ABI drops every
+/// write is the precise shape this test exists to make impossible.
+///
+/// So it goes through [`load`]: a REAL `dlopen` of the built cdylib, the real memory ABI, the real
+/// `LoadedStore`. It writes AT ARITY > 1 (three chained records for one principal
+/// and one for a second), DROPS the handle — which runs `the door's `close`` and UNLOADS the library, so
+/// nothing this process still holds can answer the reads — then `dlopen`s AGAIN over the same file
+/// and reads everything back. A restart is what proves durability; a single-row same-session round
+/// trip would not distinguish a relayed method from a lucky trait default, and a multi-row one
+/// across an unload/reload cannot be faked by either.
+///
+/// A third leg reads the same rows through a fresh linked door and the same loader and store ABI.
 #[test]
 fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let path = plugin_path();
@@ -1182,6 +1260,25 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 }
 
 /// THE DURABILITY PROOF FOR THE SIX A2A TASK-STORE METHODS, OVER THE REAL PLUGIN PATH.
+///
+/// The sibling proof above does this for the MCP call log; this one exists because the task methods
+/// are a SEPARATE half of the same defaulted seam and half the fleet used to be missing them.
+/// The contract defaults the upsert to `Ok(())`, the point read to `Ok(None)` and the listing to
+/// `Ok(vec![])`: a backend that does not override them ACCEPTS EVERY WRITE AND REPORTS SUCCESS while
+/// keeping nothing. An operator would find "task state survives a restart" false on their own
+/// deployment, which is the worst place to discover it.
+///
+/// The conformance suite cannot see this: it boots the in-process RAM store, where those defaults
+/// ARE the honest answer and nothing looks wrong. The plugin seam is the ONLY path a real Valkey
+/// deployment takes, so it is the only path worth proving on. A unit test against `ValkeyStore`
+/// proves the function compiles and works in-process; it does not prove the plugin path reaches it.
+///
+/// So: a REAL `dlopen` of the built cdylib, the real memory ABI, the real `LoadedStore`. Write at arity > 1
+/// (two tasks, one of them UPSERTED a second time, plus two independent provenance chains), DROP the
+/// handle — `the door's `close`` runs and the library is unloaded, so nothing this process still holds can
+/// answer the reads — then `dlopen` again and read everything back. A third leg reads the same rows
+/// through the plain `ValkeyStore`, never touching the cdylib, so a plugin answering out of its own
+/// in-process cache still fails.
 #[test]
 fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let path = plugin_path();
@@ -1382,12 +1479,34 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 }
 
 /// THE DURABILITY PROOF FOR THE FOUR TRUST-STATE METHODS, OVER THE REAL PLUGIN PATH.
+///
+/// Same reasoning as the task-store test above, and a sharper cost. The contract defaults the
+/// demotion's upsert / listing / delete to accept-and-keep-nothing, so a seam that does not RELAY them
+/// discards a demotion while reporting success, and a restart hands a quarantined upstream the
+/// operator's approval back. The redemption defaults FAIL-CLOSED (`Ok(false)`), so an unrelayed seam
+/// refuses every confirmation; what this proves is the other half — that a relayed ledger is really
+/// shared and durable, so a single-use approval executes once, not once per node and once per
+/// restart.
+///
+/// A Valkey deployment reaches this backend ONLY over the plugin seam, and it is the backend a
+/// FLEET reaches for first — so the second-node case below is the ordinary deployment, not an
+/// exotic one. A real `dlopen`, the real memory ABI, the real `LoadedStore`; two simultaneous loads are the
+/// fleet, a drop and a reload is the restart, and a third leg reads through the plain `ValkeyStore`
+/// so a plugin answering out of its own in-process state still fails.
+///
+/// Skips locally when no Valkey is configured and fails under CI, like its siblings
+/// ([`valkey_url`]): it is the only over-the-ABI coverage of two properties whose unimplemented form
+/// is silently green.
 #[test]
 fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let path = plugin_path();
     let Some(url) = valkey_url() else {
         return;
     };
+    let mut isolated: url::Url = url.parse().unwrap();
+    isolated.set_path("/14");
+    let url = isolated.to_string();
+    let _database = database::Database::take(&url);
     let cfg = serde_json::json!({ "url": url }).to_string();
 
     let direct = ValkeyStore::connect(&url).expect("connect directly to clean up and verify");

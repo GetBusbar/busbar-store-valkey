@@ -2,6 +2,38 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! **ONE VALKEY STORE, BOTH DOORS, ONE TABLE** — the store's linked + dropped-in conformance on the
+//! store kind's memory ABI (store v3), run against the busbar rev this repo pins (`.busbar-ref`).
+//!
+//! The store is held two ways at once: LINKED (the logic crate's `door`, as a busbar build that
+//! compiles it in registers it: `LinkedRow::of(door)` through the loader's `load_linked`) and
+//! DROPPED IN (this crate's built cdylib, its Statement rendered the way `busbar-plugin-pack`
+//! renders it into the signed manifest, then `dlopen`ed by the loader's `load_dropped`). Each is
+//! bound to its own dispatcher, opened the way the host opens a store (`LoadedStore`), and driven
+//! through the same transcript:
+//!
+//! - the name its Statement states;
+//! - the refusals the store's own `open` gives for settings that cannot produce a store (no `url`,
+//!   malformed JSON, a URL the driver refuses, an unreachable server) — each in the store's own
+//!   words, across the door;
+//! - against the live Valkey (`VALKEY_URL`): one scenario over every surface a governance store
+//!   answers — a key (mint, read, tombstone, the tombstone guard), a credential (mint, the live-owner
+//!   refusal, lookup, revoke), the usage ledger (additive, floored), metering (the dated split), the
+//!   plane-record verbs (upsert, chain append, replay, fork, listing,
+//!   parents, terminal-only purge with its cascade, single-use token, live token) — and the store v3
+//!   slots (the usage batch, its replay and its reused op id, records).
+//!
+//! The two transcripts must agree line for line. Each arm runs in its own namespace (fresh ids, a
+//! fresh plane kind), so the arms never read each other's rows; the namespace is replaced by a fixed
+//! token before comparing.
+//!
+//! THE RED ARMS, each its own test: the library asked for as another kind is refused before it is
+//! opened; a manifest whose Statement is one byte off the library's own is refused; and (live) a
+//! PERTURBED dropped-in arm — its namespace already holding a different record at a position the
+//! scenario appends to — must NOT produce the linked transcript.
+//!
+//! The live leg follows this repo's Valkey gate: skipped locally without `VALKEY_URL`, a HARD
+//! FAILURE under `CI` without it. A missing cdylib is always a failure, never a skip: this test IS
+//! the dropped-in door's proof.
 
 #[path = "../../test-support/database.rs"]
 mod database;
@@ -44,6 +76,8 @@ fn valkey_url() -> Option<String> {
 }
 
 /// This crate's built cdylib, from `deps/` only: the copy the build graph of this very test binary
+/// refreshed (`target/<profile>/` is uplifted by `cargo build` alone and can be stale). A missing
+/// artifact is a failure, never a skip.
 fn cdylib() -> PathBuf {
     let path = if let Some(path) = std::env::var_os("BUSBAR_PLUGIN_CDYLIB") {
         let path = PathBuf::from(path);
@@ -64,6 +98,7 @@ fn cdylib() -> PathBuf {
 }
 
 /// The node's one `op_id` allocator (`LoadedStore::open` mints the bridge's writes from it): a node
+/// half no earlier run used (the dedupe is durable) and one counter.
 fn mint() -> busbar_contract::abi::store::OpId {
     static NODE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -75,6 +110,7 @@ fn mint() -> busbar_contract::abi::store::OpId {
 }
 
 /// The bind the host makes: the store's declared need served by the loader's test connection table
+/// (plain TCP, the host's connector path).
 fn bind(d: &Dispatcher) -> Bind {
     Bind {
         instance: Arc::from("store-valkey-conformance"),
@@ -143,6 +179,8 @@ fn op(counter: u64) -> OpId {
 }
 
 /// Open the store through one door (`LoadedStore`, the way the host opens it), on a node id no
+/// other instance uses: the bridge mints op ids as `(node, counter from 0)` and the dedupe is
+/// durable.
 fn open(load: &impl Fn() -> Loaded, settings: &str) -> Result<LoadedStore, String> {
     let (plugin, dispatcher) = load();
     LoadedStore::open(plugin, dispatcher, settings.as_bytes(), mint)
@@ -157,6 +195,7 @@ fn r<T: std::fmt::Debug, E: std::fmt::Display>(res: Result<T, E>) -> String {
 }
 
 /// The live scenario, in namespace `ns`, through `store`. Every observable the scenario produces is
+/// one line of the returned transcript.
 fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
     let store: &dyn RecordStore = loaded;
     let mut t = Vec::new();
@@ -424,6 +463,8 @@ fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
 }
 
 /// What one door does, as one comparable transcript. `load` loads the door afresh: a refused
+/// `open` consumes the instance it was offered. `plant` writes through the opened store before the
+/// scenario runs (the perturbed RED arm).
 fn transcript(
     load: impl Fn() -> Loaded,
     live: Option<(&str, &str)>,
@@ -469,6 +510,7 @@ fn ns(arm: &str) -> String {
 }
 
 /// The Valkey store behaves as ONE store through either door, and the dropped-in library states the
+/// linked door's Statement byte for byte.
 #[test]
 fn the_linked_and_the_dropped_in_valkey_store_are_one_store() {
     let url = valkey_url();
@@ -553,6 +595,9 @@ fn the_linked_and_the_dropped_in_valkey_store_are_one_store() {
 }
 
 /// RED ARM (live): a PERTURBED dropped-in store — its namespace already holds a different record at
+/// a chain position the scenario appends to — must not reproduce the linked transcript. It needs a
+/// server: skipped locally without `VALKEY_URL`, a failure under CI ([`valkey_url`]); an arm that
+/// perturbed nothing would pass vacuously.
 #[test]
 fn a_perturbed_dropped_in_store_does_not_pass_for_the_linked_one() {
     let Some(u) = valkey_url() else { return };
@@ -580,10 +625,10 @@ fn a_perturbed_dropped_in_store_does_not_pass_for_the_linked_one() {
             .expect("plant a rival record");
         },
     );
-    assert_ne!(
-        red, linked,
-        "a perturbed store must not pass for the linked one"
-    );
+    let chain = |lines: &[String]| lines.iter().find(|line| line.contains("chain:")).cloned();
+    assert!(chain(&linked).unwrap().contains("e3"));
+    assert!(chain(&red).unwrap().contains("planted"));
+    assert_ne!(chain(&red), chain(&linked));
 }
 
 /// RED ARM: the library asked for as another kind is refused before it is opened.
@@ -874,6 +919,7 @@ fn a_failed_ready_closes_the_actual_opened_valkey_store_once() {
     static DOOR: AtomicPtr<Door> = AtomicPtr::new(std::ptr::null_mut());
     static READY: AtomicUsize = AtomicUsize::new(0);
     static CLOSED: AtomicUsize = AtomicUsize::new(0);
+    static CLOSE_FAILED: AtomicUsize = AtomicUsize::new(0);
     static CLOSE: std::sync::OnceLock<Op> = std::sync::OnceLock::new();
     extern "C" fn door() -> *const Door {
         DOOR.load(Ordering::SeqCst)
@@ -899,8 +945,14 @@ fn a_failed_ready_closes_the_actual_opened_valkey_store_once() {
     ) -> RawOutcome {
         CLOSED.fetch_add(1, Ordering::SeqCst);
         // SAFETY: the unchanged real instance and host frames go to the original CLOSE once.
-        let result = unsafe { CLOSE.get().unwrap()(instance, input, out) };
-        assert_eq!(result.outcome(), Outcome::Ready);
+        let Some(close) = CLOSE.get() else {
+            CLOSE_FAILED.fetch_add(1, Ordering::SeqCst);
+            return RawOutcome::of(Outcome::Failed);
+        };
+        let result = unsafe { close(instance, input, out) };
+        if result.outcome() != Outcome::Ready {
+            CLOSE_FAILED.fetch_add(1, Ordering::SeqCst);
+        }
         result
     }
     let url =
@@ -948,6 +1000,7 @@ fn a_failed_ready_closes_the_actual_opened_valkey_store_once() {
     );
     assert_eq!(READY.load(Ordering::SeqCst), 1);
     assert_eq!(CLOSED.load(Ordering::SeqCst), 1);
+    assert_eq!(CLOSE_FAILED.load(Ordering::SeqCst), 0);
     assert_eq!(first() - before, 3, "OPEN, failing READY, cleanup CLOSE");
 }
 

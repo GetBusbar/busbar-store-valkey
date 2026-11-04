@@ -2,6 +2,34 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The store v3 door over [`ValkeyStore`]: `store_door!` and the slots the store v3 table adds to
+//! the base op set ([`StoreSlots`]): the `op_id`-carrying writes (the usage and metering batches
+//! and the plane-record append) and the kernel's records. The store keeps ledger counts and
+//! records, not money: busbar derives money from the counts and its rate card.
+//!
+//! ## Layout (schema v7, `crate::SCHEMA_VERSION`)
+//!
+//! - `busbar:op:<hex op_id>`            HASH `b` = the op's body ([`Dedupe`]); expires
+//!   [`OP_ID_RETENTION_SECS`] after it is written (S4).
+//! - `busbar:records:<hex schema>:k`    ZSET of keys, every score 0, so `ZRANGEBYLEX` reads them in
+//!   byte order; `busbar:records:<hex schema>:v` HASH key -> value.
+//!
+//! ## Dedupe (`abi::store` S1-S4), durable and atomic
+//!
+//! Usage, metering and append `op_id` writes use ONE server-side script: it returns the body recorded under the op's id
+//! and applies nothing, or applies the effect and records the op's body. [`Dedupe::answer`] reads
+//! the returned body: a replay answers done, a different op's body a conflict (S1-S3).
+//! `append_plane_record`'s script is [`crate::plane`]'s. Conditional records WATCH every schema
+//! hash/index and the receipt. Usage corrections WATCH the live key, day index, metering hashes,
+//! usage hashes and receipt. Both commit one MULTI/EXEC; condition conflicts write nothing, and
+//! lost EXEC answers require exact id/body replay within the existing receipt lifetime.
+//!
+//! ## Every slot is one op through the host's connector
+//!
+//! Each slot runs its body with the store SDK's `wire::drive_kept` on one of the store's kept
+//! connections: drawn when the op starts (dialled through the host's connector on the op's ticket
+//! when none is idle), every command a write and a read that
+//! may PEND (the op answers PENDING and is resumed on the connector's wake), handed back when the op
+//! answers. The body is the blocking client's body, `async`.
 
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::store::column::{clamp, prefix_end, storable_i64};
@@ -16,10 +44,10 @@ use busbar_contract::records::{
     PlaneSelector, RecordStoreError, RecordStoreResult, UsageDelta, UsageLedger, VirtualKey,
 };
 
-use crate::resp::{pipe, Conn, Script, ScriptInvocation, Value};
+use crate::resp::{cmd, pipe, Conn, RedisError, RedisResult, Script, ScriptInvocation, Value};
 use crate::{
-    attributed_metering_row, hex, metering_set, plane, usage_fields, usage_key, ValkeyStore,
-    METERING_UNIT_PREFIX, NAME, NEEDS,
+    attributed_metering_row, hex, metering_set, plane, usage_fields, usage_key, SecureOwned,
+    ValkeyStore, METERING_UNIT_PREFIX, NAME, NEEDS,
 };
 
 #[path = "correction.rs"]
@@ -96,6 +124,8 @@ macro_rules! ops {
 
 impl ValkeyStore {
     /// Compare one watched pre-state, then write the rows and their applied-only receipt in a
+    /// single EXEC. Only a definitive WATCH abort retries here. A transport error never dials
+    /// again inside this operation: its caller must reconcile the same op id and fingerprint.
     async fn v3_record_transaction(
         &self,
         c: &mut Conn,
@@ -125,7 +155,7 @@ impl ValkeyStore {
 
         for _ in 0..crate::resp::MAX_TRANSACTION_ATTEMPTS {
             if let Err(error) = crate::resp::cmd("WATCH").arg(&watched).exec(c).await {
-                return Err(if error.to_string().starts_with("CROSSSLOT") {
+                return Err(if error.is_crossslot() {
                     OpRefused::Refused(
                         "record transaction requires keys on one Valkey node; cross-slot keys are unsupported".into(),
                     )
@@ -133,6 +163,7 @@ impl ValkeyStore {
                     OpRefused::Failed(self.err(error, "record transaction WATCH").0)
                 });
             }
+            let mut submitted = false;
             let attempted = crate::resp::rr(async {
                 let kind: String = crate::resp::cmd("TYPE").arg(&receipt).query(c).await?;
                 if kind != "none" && kind != "hash" {
@@ -208,21 +239,7 @@ impl ValkeyStore {
                                 )
                             })?;
 
-                            let mut members: std::collections::BTreeSet<Vec<u8>> =
-                                crate::resp::cmd("HKEYS")
-                                    .arg(values)
-                                    .query::<Vec<Vec<u8>>>(c)
-                                    .await?
-                                    .into_iter()
-                                    .collect();
-                            members.extend(
-                                crate::resp::cmd("ZRANGE")
-                                    .arg(keys)
-                                    .arg(0)
-                                    .arg(-1)
-                                    .query::<Vec<Vec<u8>>>(c)
-                                    .await?,
-                            );
+                            let members = range_members(c, keys, values, prefix, length).await?;
                             for member in members.into_iter().filter(|member| {
                                 member.len() == length && member.starts_with(prefix)
                             }) {
@@ -246,6 +263,7 @@ impl ValkeyStore {
                     .arg(&receipt)
                     .arg(OP_ID_RETENTION_SECS)
                     .ignore();
+                submitted = true;
                 transaction
                     .query::<Option<()>>(c)
                     .await
@@ -266,13 +284,17 @@ impl ValkeyStore {
                     if !error.is_connection_error() && c.watching() {
                         let _ = crate::resp::cmd("UNWATCH").exec(c).await;
                     }
-                    return Err(OpRefused::Failed(
-                        self.err(
-                            error,
-                            "record transaction outcome unknown; replay exact id and body",
+                    return Err(if error.is_refusal() || !submitted {
+                        OpRefused::Refused(self.err(error, "record transaction before EXEC").0)
+                    } else {
+                        OpRefused::Failed(
+                            self.err(
+                                error,
+                                "record transaction outcome unknown; replay exact id and body",
+                            )
+                            .0,
                         )
-                        .0,
-                    ));
+                    });
                 }
             }
         }
@@ -282,6 +304,9 @@ impl ValkeyStore {
     }
 
     /// `record_put` (slot 26): an upsert on `(schema, key)`. An EMPTY value removes the row:
+    /// it is the host's strike, so the key leaves both the ordered key set and the values,
+    /// `record_get` then answers `None` and `record_scan` never returns it.
+    /// Removing a row that is not there is `Ok`.
     async fn v3_record_put(
         &self,
         c: &mut Conn,
@@ -356,14 +381,13 @@ impl ValkeyStore {
         inv.key(&v).arg(&min).arg(&max).arg(limit);
         let flat: Vec<Option<Vec<u8>>> =
             with_conn!(self, |c| inv.invoke(c).await).map_err(|e| e.0)?;
-        flat.chunks(2)
-            .filter_map(|kv| Some((kv.first()?.clone()?, kv.get(1)?.clone()?)))
-            .map(|(key, value)| Ok((key, record(value)?)))
-            .collect()
+        scan_pairs(flat)
     }
 }
 
 /// A page of `record_scan`: `KEYS = key set, values`; `ARGV = min, max, limit`. One script, so a
+/// strike between the key range and the values cannot shorten the page. Returns `key, value` pairs
+/// flat; an indexed key missing its value is corruption, refused rather than a false short page.
 static SCAN_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(
         r"
@@ -385,6 +409,7 @@ static SCAN_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 });
 
 /// The start of an `op_id` write's script: `KEYS[1]` is the op's record; a recorded body is
+/// returned and nothing applies. Then the helpers the two scripts share.
 const LUA_SEEN: &str = r"
 local prior = redis.call('HGET', KEYS[1], 'b')
 if prior then
@@ -430,6 +455,8 @@ end
 ";
 
 /// The end of an `op_id` write's script: record the body (`ARGV[1]`) for `ARGV[2]` seconds. It
+/// runs only after every cell is applied, so a recorded op is a fully applied one. The script
+/// answers a refusal as `{'refused', text}` before anything is written.
 const LUA_RECORD: &str = r"
 redis.call('HSET', KEYS[1], 'b', ARGV[1])
 redis.call('EXPIRE', KEYS[1], ARGV[2])
@@ -437,6 +464,8 @@ return false
 ";
 
 /// Exact decimal arithmetic for unsigned usage counters. Only individual decimal digits enter
+/// Lua arithmetic; whole counters never pass through Lua's floating-point number representation.
+/// This matches `UsageLedger::apply_delta`: saturating unsigned addition and zero-floored refunds.
 const LUA_USAGE_COUNTS: &str = r"
 local USAGE_MAX = '18446744073709551615'
 local RADIX = 10
@@ -497,6 +526,8 @@ end
 ";
 
 /// `add_usage_batch`: per cell `KEYS[k]` = its usage hash; `ARGV` from 4 = per cell `n`, then `n`
+/// `field, delta` pairs. ARGV[3] refuses fresh reserved-adjustment writes after receipt lookup.
+/// Validate every target before applying; exact decimal arithmetic preserves the full u64 range.
 static USAGE_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_SEEN}{LUA_USAGE_COUNTS}
@@ -528,6 +559,10 @@ static USAGE_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 });
 
 /// `add_metering_batch`: per delta `KEYS[k], KEYS[k + 1]` = its bucket's set and its row; `ARGV`
+/// from 3 = per delta the six counters, `n`, `n` `unit field, count` pairs, then `key_id`, `model`,
+/// `provider`, `priced_from_ms`, `key_group_at_use`, `pricing_version`. The row joins its set,
+/// every count is an `HINCRBY` pinned at `i64::MAX`, the attribution snapshot is in the row key
+/// (including empty values). Validate-then-apply as [`USAGE_OP`].
 static METERING_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_SEEN}
@@ -579,6 +614,7 @@ fn op_call(script: &'static Script, op: OpId, d: &Dedupe<'_>) -> ScriptInvocatio
 
 impl ValkeyStore {
     /// Run an `op_id` write's script once (a lost reply may have applied): the body it found, or
+    /// its refusal (decided before anything was written).
     fn deduped(
         &self,
         cx: &mut Op<'_>,
@@ -831,10 +867,10 @@ impl StoreSlots for ValkeyStore {
             -> () = ValkeyStore::put_usage;
         purge_usage_before(before: u64) -> u64 = ValkeyStore::purge_usage_before;
         list_metering(bucket: u64) -> Vec<MeteringRow> = ValkeyStore::list_metering;
-        put_credential(secret: &CredentialSecret => clone) -> () = ValkeyStore::put_credential;
-        rewrap_credential(expected: &CredentialSecret => clone, replacement: &str => to_owned)
+        put_credential(secret: &CredentialSecret => secure_owned) -> () = ValkeyStore::put_credential;
+        rewrap_credential(expected: &CredentialSecret => secure_owned, replacement: &str => secure_owned)
             -> bool = ValkeyStore::rewrap_credential;
-        put_key_with_credential(key: &VirtualKey => clone, secret: &CredentialSecret => clone)
+        put_key_with_credential(key: &VirtualKey => clone, secret: &CredentialSecret => secure_owned)
             -> () = ValkeyStore::put_key_with_credential;
         list_credentials(key_id: &str => to_owned) -> Vec<CredentialMeta>
             = ValkeyStore::list_credentials;
@@ -882,11 +918,7 @@ impl StoreSlots for ValkeyStore {
         retention: busbar_contract::records::Retention,
     ) -> Step<RecordStoreResult<u64>> {
         let kind = kind.to_string();
-        use busbar_contract::records::Retention;
-        let terminal_only = match retention {
-            Retention::Age => false,
-            Retention::TerminalOnly => true,
-        };
+        let terminal_only = matches!(retention, busbar_contract::records::Retention::TerminalOnly);
         op!(cx, self, Err, |me, c| plane::purge(
             &me,
             c,
@@ -906,3 +938,90 @@ fn record(v: Vec<u8>) -> Result<RecordBytes, String> {
 #[cfg(test)]
 #[path = "tests/slots_unit.rs"]
 mod unit;
+
+/// Decode the flat scan reply without copying owned key/value payloads or hiding corruption.
+fn scan_pairs(flat: Vec<Option<Vec<u8>>>) -> Result<Vec<(Vec<u8>, RecordBytes)>, String> {
+    if !flat.len().is_multiple_of(2) {
+        return Err("record_scan: odd-length reply".into());
+    }
+    let mut rows = Vec::with_capacity(flat.len() / 2);
+    let mut values = flat.into_iter();
+    while let (Some(key), Some(value)) = (values.next(), values.next()) {
+        let key = key.ok_or("record_scan: missing key")?;
+        let value = value.ok_or("record_scan: missing value")?;
+        rows.push((key, record(value)?));
+    }
+    Ok(rows)
+}
+
+#[cfg(test)]
+#[path = "tests/scan_pairs.rs"]
+mod scan_pairs_tests;
+
+type HashFields = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// Collect only matching names, including values whose ordered index is damaged.
+async fn range_members(
+    c: &mut Conn,
+    keys: &str,
+    values: &str,
+    prefix: &[u8],
+    length: usize,
+) -> RedisResult<std::collections::BTreeSet<Vec<u8>>> {
+    let min = [b"[".as_slice(), prefix].concat();
+    let max =
+        prefix_end(prefix).map_or_else(|| b"+".to_vec(), |end| [b"(".as_slice(), &end].concat());
+    let indexed: Vec<Vec<u8>> = cmd("ZRANGEBYLEX")
+        .arg(keys)
+        .arg(min)
+        .arg(max)
+        .query(c)
+        .await?;
+    let mut members: std::collections::BTreeSet<_> = indexed
+        .into_iter()
+        .filter(|key| key.len() == length)
+        .collect();
+    let mut bytes = members
+        .iter()
+        .fold(0usize, |n, key| n.saturating_add(key.len()));
+    let mut pattern = Vec::new();
+    for byte in prefix {
+        if b"*?[]\\".contains(byte) {
+            pattern.push(b'\\');
+        }
+        pattern.push(*byte);
+    }
+    pattern.push(b'*');
+    let mut cursor = String::from("0");
+    for _ in 0..crate::resp::MAX_SCAN_PAGES {
+        let (next, fields): (String, HashFields) = cmd("HSCAN")
+            .arg(values)
+            .arg(&cursor)
+            .arg("MATCH")
+            .arg(&pattern)
+            .arg("COUNT")
+            .arg(1000)
+            .query(c)
+            .await?;
+        for (key, _) in fields {
+            if key.len() == length && key.starts_with(prefix) && !members.contains(&key) {
+                bytes = bytes.saturating_add(key.len());
+                if bytes > crate::resp::MAX_REPLY_BYTES
+                    || members.len() >= crate::resp::MAX_REPLY_ELEMENTS as usize
+                {
+                    return Err(RedisError::refused(
+                        "record range exceeds the collected-key limit",
+                    ));
+                }
+                members.insert(key);
+            }
+        }
+        if next == "0" {
+            return Ok(members);
+        }
+        cursor = next;
+    }
+    Err(RedisError::refused(
+        "record range SCAN exceeded the page limit",
+    ))
+}

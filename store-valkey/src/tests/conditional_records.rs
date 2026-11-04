@@ -708,3 +708,36 @@ fn same_id_commit_between_receipt_and_predicate_read_is_applied_not_condition_co
         "only the read-only snapshot check aborts"
     );
 }
+
+#[test]
+fn range_delete_keeps_binary_globs_literal_and_removes_hash_only_records() {
+    let Some((_database, mut raw, store, _)) = setup() else {
+        return;
+    };
+    let schema = fresh("conditional-range-orphan");
+    for key in [b"p*a".as_slice(), b"p?b", b"p[c"] {
+        Slots::record_put(&store, &schema, key, b"value").unwrap();
+    }
+    let (keys, values) = physical(&schema);
+    raw.zrem::<_, _, ()>(&keys, b"p*a".as_slice()).unwrap();
+    let request = Request {
+        version: VERSION,
+        op_id: op(10),
+        predicates: vec![predicate(
+            &schema,
+            b"p*a",
+            Expected::Bytes(b"value".to_vec()),
+        )],
+        mutations: vec![Mutation::DeleteRange {
+            schema: schema.clone(),
+            prefix: b"p*".to_vec(),
+            exact_key_length: 3,
+        }],
+    };
+    assert_eq!(transact(&store, &request).unwrap(), Decision::Applied);
+    assert!(!raw
+        .hexists::<_, _, bool>(&values, b"p*a".as_slice())
+        .unwrap());
+    assert_eq!(read(&store, &schema, b"p?b"), Some(b"value".to_vec()));
+    assert_eq!(read(&store, &schema, b"p[c"), Some(b"value".to_vec()));
+}

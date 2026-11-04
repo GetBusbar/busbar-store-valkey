@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 
 pub fn start(upstream: &str) -> (String, Vec<u8>) {
-    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
     let ca = certificate.cert.der().to_vec();
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -54,9 +54,24 @@ pub fn start(upstream: &str) -> (String, Vec<u8>) {
                             Ok(n) => {
                                 // Response/request bursts are bounded by this test's small records.
                                 let result = if from_client {
-                                    backend.write_all(&buffer[..n])
+                                    backend.set_nonblocking(false).unwrap();
+                                    backend
+                                        .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                                        .unwrap();
+                                    let result = backend.write_all(&buffer[..n]);
+                                    backend.set_nonblocking(true).unwrap();
+                                    result
                                 } else {
-                                    server.write_all(&buffer[..n]).and_then(|()| server.flush())
+                                    server.sock.set_nonblocking(false).unwrap();
+                                    server
+                                        .sock
+                                        .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                                        .unwrap();
+                                    let result = server
+                                        .write_all(&buffer[..n])
+                                        .and_then(|()| server.flush());
+                                    server.sock.set_nonblocking(true).unwrap();
+                                    result
                                 };
                                 if result.is_err() {
                                     return;
@@ -71,5 +86,5 @@ pub fn start(upstream: &str) -> (String, Vec<u8>) {
             });
         }
     });
-    (format!("localhost:{port}"), ca)
+    (format!("127.0.0.1:{port}"), ca)
 }

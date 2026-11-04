@@ -3,13 +3,12 @@
 
 //! The [`busbar_contract::records::RecordStore`] contract conformance suite, OWNED by this backend.
 //!
-//! PROVENANCE: the `conf` module's body below is BYTE-IDENTICAL to the one in busbar's
+//! PROVENANCE: the `conf` module originated from the suite in busbar's
 //! `crates/store-memory/tests/store_conformance.rs` as taken from busbar core at rev
 //! 8b7b6473f47f8d37ae60839c74cfe6a9b64a1dc9 — core's reference backend ran the same checks. Core no
 //! longer carries that file at the rev this repo pins (`.busbar-ref`), so it cannot be diffed there. It was
 //! `busbar-plugin-testkit` until the owner ruled that crate deleted (2026-09-22); #2/#31 forbid a
-//! shared test util between plugins, so each backend owns its copy. Only this header and the module's
-//! `pub(super)` (so `src/tests.rs` can call it) are new. The
+//! shared test util between plugins, so each backend owns its copy. The module's `pub(super)` lets `src/tests.rs` call it. The
 //! backend's wiring (namespacing and cleanup against the shared live Valkey) is in `src/tests.rs`.
 
 #[allow(dead_code)]
@@ -24,11 +23,9 @@ pub(super) mod conf {
     //!
     //! So the suite is COPIED, not relocated, and each backend owns its copy outright. The duplication
     //! is the ruled design, not an accident of the move — the cost #2 accepts in exchange for a plugin
-    //! that can be built and tested with no sibling in the tree. Every assertion below is BYTE-IDENTICAL
-    //! to the testkit's last version; only this header is new.
+    //! that can be built and tested with no sibling in the tree. The assertions originated in
+    //! the testkit's last version and are maintained locally with this backend.
     //!
-    //! The "reaches every backend on its next dependency bump" promise in the doc above is therefore
-    //! NO LONGER TRUE of this copy, and is left standing as the record of what the shared crate was for.
     //! Contract conformance for [`busbar_contract::records::RecordStore`] — the checks every backend must pass identically.
     //!
     //! These exist because an audit found the fleet disagreeing with itself: the same input produced a
@@ -75,6 +72,22 @@ pub(super) mod conf {
     use std::hash::{Hash, Hasher};
 
     /// A per-`ns` `(old_ts, new_ts)` pair for the two `purge_plane_records_before` checks below, straddling
+    /// a FIXED, SHARED `cutoff`.
+    ///
+    /// `purge_plane_records_before(kind, before)` takes a `kind` and a cutoff — no namespace — so it is
+    /// the one verb in this battery the `ns` discipline (module doc above) cannot reach directly: two
+    /// concurrent runs sharing a live database both write rows and sweep the same kind-wide cutoff, so
+    /// each run's sweep can catch the other's OLD rows too, and `assert_eq!(purged, 1)` then fails for a
+    /// perfectly conforming backend.
+    ///
+    /// The cutoff itself must NOT vary per run: a `before` that grows with `ns` would let whichever run
+    /// draws the larger cutoff sweep every smaller-cutoff run's rows in full, including their still-live
+    /// NEWER rows — trading one collision for a worse one. So `cutoff` is the single fixed point every
+    /// run shares, and only `old_ts`/`new_ts` are salted per `ns`, each confined to its own side of that
+    /// shared line: `old_ts` always lands strictly below `cutoff`, `new_ts` always strictly above it. That
+    /// makes the invariant every run's own survivor check depends on — "the old row is gone, the new row
+    /// reads back" — hold under an arbitrary interleaving of any number of concurrent runs, since no run's
+    /// sweep (bounded by the same `cutoff`) can ever reach past `cutoff` into another run's `new_ts`.
     fn ns_purge_window(ns: &str, cutoff: u64, high_span: u64) -> (u64, u64) {
         let mut hasher = DefaultHasher::new();
         ns.hash(&mut hasher);
@@ -85,6 +98,7 @@ pub(super) mod conf {
     }
 
     /// Every `VirtualKey` id the suite writes under `ns`. A shared-database backend must delete these
+    /// (and their credential rows) before calling, and should clean them up afterwards.
     pub fn key_ids(ns: &str) -> Vec<String> {
         vec![
             format!("{ns}_resurrect"),
@@ -148,6 +162,13 @@ pub(super) mod conf {
     }
 
     /// **`put_key` must not clear a tombstone.** Writing a LIVE key over a tombstoned row resurrects a
+    /// key an operator revoked, which is the outcome `delete_key` exists to prevent, reached through the
+    /// other door. Writing a key that CARRIES a tombstone stays allowed — hydration and fixtures do that
+    /// legitimately, and neither clears anything.
+    ///
+    /// Enforced in the store rather than by the caller on purpose: core's callers do check `deleted_at`
+    /// first, but that is a read-then-write, and a `delete_key` committing in the gap goes straight
+    /// through it. Only the backend can make the test and the write atomic.
     pub fn assert_put_key_does_not_resurrect_a_tombstone(store: &dyn Store, ns: &str) {
         let id = format!("{ns}_resurrect");
         let key = live_key(&id);
@@ -187,6 +208,9 @@ pub(super) mod conf {
     }
 
     /// **`delete_key` on an unknown id is an error.** Distinct from the documented idempotent case:
+    /// "already tombstoned" means the intent is satisfied and the evidence is on disk, while "no such
+    /// id" means nothing was touched, and `Ok(())` there tells an operator a key was revoked when it was
+    /// not.
     pub fn assert_delete_key_unknown_id_is_an_error(store: &dyn Store, ns: &str) {
         assert!(
             store.delete_key(&format!("{ns}_no_such_key")).is_err(),
@@ -203,6 +227,11 @@ pub(super) mod conf {
     }
 
     /// **`revoke_credential` on an unknown id is an error, on an already-revoked id is `Ok`.** A backend
+    /// has to read the row count its UPDATE actually affected: a statement that matched nothing looks
+    /// identical to one that matched, and this is the case where those must not be confused — a silent
+    /// no-op lets an operator believe a leaked secret was killed when it was not.
+    ///
+    /// Skip on a backend with no credential support.
     pub fn assert_revoke_credential_unknown_id_is_an_error(store: &dyn Store, ns: &str) {
         assert!(
             store
@@ -227,6 +256,15 @@ pub(super) mod conf {
     }
 
     /// **`put_credential` requires a LIVE owning key.** A credential minted onto a key that names no
+    /// row, or onto a TOMBSTONED one, must be refused: `delete_key` cascades a key's credentials away
+    /// precisely so the secret material stops resolving, and accepting a write afterwards puts it back
+    /// under a key an operator just revoked.
+    ///
+    /// Enforced in the store for the same reason the tombstone rule above is: a caller that checks the
+    /// key first and writes after is a read-then-write, and a `delete_key` committing in the gap cascades
+    /// away only the rows that existed at that moment.
+    ///
+    /// Skip on a backend with no credential support.
     pub fn assert_put_credential_requires_a_live_key(store: &dyn Store, ns: &str) {
         let absent = format!("{ns}_no_such_owner");
         assert!(
@@ -258,6 +296,11 @@ pub(super) mod conf {
     }
 
     /// **`put_key_with_credential` is ATOMIC.** When the credential leg is refused — a `public_id`
+    /// already in use is the ordinary way it is — NO key row may survive. The trait's default is the
+    /// two-call sequence, which commits the key before the credential can fail, leaving a live key
+    /// with no credential that the caller was told did not get created.
+    ///
+    /// Skip on a backend with no credential support.
     pub fn assert_put_key_with_credential_is_atomic(store: &dyn Store, ns: &str) {
         let incumbent_key = format!("{ns}_mintowner");
         let incumbent_cred = format!("{ns}_mintcred");
@@ -442,6 +485,8 @@ pub(super) mod conf {
     }
 
     /// **`upsert_plane_record`/`get_plane_record` (kind `task`) round-trip.** A task written through the
+    /// neutral upsert reads back through the neutral point-read as the same row; an unknown id is `None`,
+    /// not an error; and the row appears in the kind's unfiltered listing.
     pub fn assert_plane_task_upsert_get_list(store: &dyn Store, ns: &str) {
         let record = plane_task(ns, "working");
         let task_id = record.id.clone();
@@ -482,6 +527,8 @@ pub(super) mod conf {
     }
 
     /// **`append_plane_record`/`list_plane_records(Parent)` (kind `task_event`) orders by `seq`.** Events
+    /// appended OUT of order come back oldest-first — the property the engine's chain verifier depends
+    /// on. This is exactly the cross-backend ruling that used to live only in each backend's own suite.
     pub fn assert_plane_event_chain_is_ordered_by_seq(store: &dyn Store, ns: &str) {
         let parent = format!("{ns}_pchain");
 
@@ -504,6 +551,8 @@ pub(super) mod conf {
     }
 
     /// **`list_plane_record_parents` (kind `call`) enumerates every parent with a record.** The boot
+    /// enumeration a restart resumes chains from — it must find a principal this process never saw
+    /// written.
     pub fn assert_plane_call_parents_enumerated(store: &dyn Store, ns: &str) {
         let p1 = format!("{ns}_prinA");
         let p2 = format!("{ns}_prinB");
@@ -528,6 +577,7 @@ pub(super) mod conf {
     }
 
     /// **`upsert_plane_record`/`list_plane_records(All)`/`delete_plane_record` (kind `demotion`).** A
+    /// demotion is recorded, listed, then dropped; deleting an ABSENT record is a no-op, not an error.
     pub fn assert_plane_demotion_upsert_list_delete(store: &dyn Store, ns: &str) {
         let s1 = format!("{ns}_srvA");
         let s2 = format!("{ns}_srvB");
@@ -570,6 +620,27 @@ pub(super) mod conf {
     }
 
     /// **`purge_plane_records_before` (kind `call`) HONOURS THE CUTOFF.** The retention sweep drops rows
+    /// STRICTLY OLDER than `before` and leaves everything at or after it alone, and it reports how many
+    /// it actually dropped.
+    ///
+    /// The eighth neutral verb, and the only one whose failure mode is destruction rather than a wrong
+    /// answer. Both directions are wrong and both are checked here, because a suite that only asked
+    /// "did anything go?" would accept either:
+    ///
+    /// - a backend that IGNORES `before` and truncates the kind deletes live plane state on the first
+    ///   sweep an operator ever runs, and nothing downstream can tell it apart from a quiet node;
+    /// - a backend that returns `Ok(0)` and purges nothing conforms to the trait signature perfectly
+    ///   while the plane log grows without bound.
+    ///
+    /// The assertions are on the SURVIVORS ONLY, and deliberately not on the returned count. The count
+    /// is kind-wide (see [`ns_purge_window`]): under a genuinely concurrent sibling run sharing the same
+    /// live database, whichever of the two sweeps executes SECOND can correctly see `0` — the row was
+    /// already dropped by the sibling's earlier, same-kind sweep — with neither backend being
+    /// non-conforming. So a per-call bound on the count (exact OR `>= 1`) cannot be asserted without
+    /// reintroducing the same flake this fix removes; what stays true under any interleaving is the
+    /// SURVIVOR evidence below (this run's own older row, addressed by id/parent, is gone; its own newer
+    /// row is still readable), because `new_ts` never crosses the shared `cutoff` regardless of who
+    /// dropped what when.
     pub fn assert_plane_purge_honours_the_cutoff(store: &dyn Store, ns: &str) {
         let parent = format!("{ns}_purgeprin");
 
@@ -626,6 +697,12 @@ pub(super) mod conf {
     }
 
     /// **`purge_plane_records_before` (kind `task`) drops only TERMINAL rows.** Age alone is not the
+    /// task table's retention rule: an interrupted task waiting on a human is exactly the row that sits
+    /// still longest, and dropping it loses the work. Terminality is the envelope's
+    /// [`PlaneDisposition`] sidecar — a backend never has to decode the opaque body to honour this.
+    ///
+    /// The cutoff still applies on top: a TERMINAL row newer than `before` stays. So the three rows
+    /// below separate the two axes, and a backend that honours only one of them fails.
     pub fn assert_plane_purge_task_keeps_active_rows(store: &dyn Store, ns: &str) {
         const CUTOFF: u64 = 100_000;
         let (old_ts, fresh_ts) = ns_purge_window(ns, CUTOFF, 100_000);
@@ -676,6 +753,8 @@ pub(super) mod conf {
     }
 
     /// **`redeem_plane_token` (kind `ask`) is a single-use test-and-set.** The FIRST redemption of a
+    /// nonce is `true`, every later one is `false` — the durable ledger that makes a confirm-once tool
+    /// execute once across a restart and across two nodes. A different nonce is still redeemable.
     pub fn assert_plane_token_is_single_use(store: &dyn Store, ns: &str) {
         let token = format!("{ns}_asknonce");
         let expires_at = u64::MAX;

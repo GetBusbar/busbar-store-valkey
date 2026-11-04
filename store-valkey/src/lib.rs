@@ -2,6 +2,42 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The **Valkey** backend for busbar's durable governance store: the shared, multi-node store
+//! over a key-value data model. It serves the store v3 door (`busbar_contract::abi::sdk::store`)
+//! over the HOST'S CONNECTOR: it speaks RESP2 itself ([`resp`]) and holds no socket, TLS stack or
+//! runtime of its own. `redis://` / `rediss://` URLs (and the `valkey://` spellings) are read as
+//! the upstream `redis` driver reads them.
+//!
+//! ## Keyspace (schema v7, every key under `busbar:`)
+//!
+//! - **keys**: `key:<id>` (JSON [`VirtualKey`], tombstoned on delete, never removed), `keys` (SET of
+//!   ids), `keys:byrev` (ZSET by revision, for `list_keys_since`).
+//! - **credentials**: `cred:<key_id>:<kind>:<slot>` (JSON [`CredentialSecret`]; the metadata view is
+//!   the decoded row minus `.secret`), `cred:pub:<kind>:<public_id>` (UNIQUE(kind, public_id)),
+//!   `cred:id:<cred_id>`, `cred:ids:<key_id>` (SET of `<kind>:<slot>`), `creds:byrev`.
+//! - **usage** `usage:<bucket>:<window>` (HASH; reserved units `m:<model>:<unit>`, open units
+//!   `u:<hex unit>:<model>`, floored at 0 server-side); **metering** `metering:<bucket>` (SET of row
+//!   hashes); **audit** `audit` (ZSET); **denylist** `denylist` / `denylist:<sub>`.
+//! - **plane records** ([`plane`]); the v6 typed keyspaces are copied into it on connect ([`legacy`]).
+//! - **records** `records:<hex schema>:k` / `:v` (the door's ordered key-value records), **op
+//!   records** `op:<hex op_id>` (HASH, the dedupe state of the `op_id` writes), `revision` (the
+//!   store-wide counter) and `schema` (the version marker).
+//!
+//! ## Atomicity
+//!
+//! Multi-key writes use one server-side script or one `MULTI`/`EXEC` pipeline. Writes that depend
+//! on a value read just before (credential slot occupancy, `delete_key`'s credential fan-out) use
+//! an optimistic `WATCH`/`MULTI`/`EXEC` transaction (`transaction!`) that re-runs on an abort.
+//!
+//! ## Connections
+//!
+//! Up to [`KEPT_CONNECTIONS`] kept connections, one per op in flight, dialled through the host's
+//! connector for the store's one `tcp` need, secured for `rediss://` (unverified for `#insecure`), then `AUTH`
+//! and `SELECT` as the URL says; `connect_timeout_ms` bounds dial plus handshake. A connection-level
+//! failure on a `with_conn!` call reconnects and re-runs that call once; `with_conn_no_retry!` calls
+//! (non-idempotent writes) fail instead. `open` only parses; its connect step migrates the schema and
+//! checks `noeviction`. Error strings are scrubbed of the URL password. Op records
+//! (`OP_ID_RETENTION_SECS`) and redeemed-token entries carry TTLs; no other row does: retention is
+//! the engine's.
 
 #![forbid(unsafe_code)]
 
@@ -13,6 +49,8 @@ use busbar_contract::records::{
     RecordStoreResult, SecretForm, UsageDelta, UsageLedger, VirtualKey, RESERVED_UNITS,
 };
 use resp::{cmd, pipe, Conn, ErrorKind, Pipeline, RedisError, RedisResult, Script};
+use zeroize::{Zeroize, Zeroizing};
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,7 +70,11 @@ macro_rules! with_conn {
         match $crate::resp::rr(async { $e }).await {
             Ok(v) => Ok(v),
             Err(err) if err.is_connection_error() => match $me.reconnect(&mut *$c).await {
-                Err(e2) => Err($me.err(e2, "reconnect after drop")),
+                Err(e2) => Err($crate::RecordStoreError(format!(
+                    "{}; {}",
+                    $me.err(err, "command"),
+                    $me.err(e2, "reconnect after drop")
+                ))),
                 Ok(()) => $crate::resp::rr(async { $e })
                     .await
                     .map_err(|e2| $me.err(e2, "retry after reconnect")),
@@ -65,6 +107,8 @@ macro_rules! with_conn_no_retry {
 }
 
 /// Default connect timeout: bounds each new connection's dial and handshake, so a
+/// blackholed/firewalled host cannot wedge engine boot indefinitely. The `connect_timeout_ms`
+/// setting overrides it.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 const KEY_PREFIX: &str = "busbar:key:";
@@ -82,12 +126,14 @@ mod plane;
 const DENYLIST_PREFIX: &str = "busbar:denylist:";
 const DENYLIST_INDEX: &str = "busbar:denylist";
 /// The store-global revision counter, read and rewritten (`next_revision`) inside the `WATCH`ed
+/// transaction that stamps key and credential rows with it.
 const REVISION_KEY: &str = "busbar:revision";
-/// The schema marker. v6 is the oldest namespace migrated in place (older is REFUSED, never wiped);
+/// The schema marker. v6 is the oldest namespace migrated in place; older stores are refused.
 const SCHEMA_KEY: &str = "busbar:schema";
-const ATTRIBUTED_METERING_SCHEMA: i64 = SCHEMA_VERSION;
+/// v7 upgrades the released v6 schema: copy typed plane rows, remove retired slots,
+/// scrub revoked credentials, preserve metering attribution and repair token expiries.
 const SCHEMA_VERSION: i64 = 7;
-/// The slots whose `busbar:op:*` dedupe hashes survive the v9 upgrade.
+/// The slots whose `busbar:op:*` dedupe hashes survive the v6 -> v7 upgrade.
 const KEPT_OP_SLOTS: [&str; 3] = [
     "add_usage_batch",
     "add_metering_batch",
@@ -99,6 +145,7 @@ const FIRST_MIGRATED_SCHEMA: i64 = 6;
 const KEPT_CONNECTIONS: usize = 8;
 
 /// Whether an op record's body belongs to a kept slot: a digest (32 bytes, or 64 lowercase hex), or
+/// the older textual form that starts with the slot's name. Only the dead slots' bodies are neither.
 fn kept_op_body(body: &[u8]) -> bool {
     let hex64 = body.len() == 64 && body.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     let name = body.split(|b| *b == b':').next().unwrap_or_default();
@@ -139,6 +186,7 @@ fn cred_id_key(cred_id: &str) -> String {
 }
 
 /// `s` with a `\\` before every character of `special` (which holds `\\` itself, so the escape
+/// round-trips): `|` for a metering row's joined identity (else two identities collide).
 fn escape(s: &str, special: &[char]) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -154,6 +202,10 @@ fn escape(s: &str, special: &[char]) -> String {
 const ROW_SEP: &[char] = &['\\', '|'];
 
 /// Hash field for one (model, unit) counter in a usage window. The four RESERVED units keep the v6
+/// spelling `m:<model>:<tier>` (parsed with a RIGHT split on the tier, so a model name containing `:`
+/// still round-trips, and a v6 row reads back unchanged). Every OTHER (open) unit is spelled
+/// `u:<hex unit>:<model>`: an open unit name is caller-supplied and may itself contain `:`, and hex
+/// has none, so the split is unambiguous whatever the model and unit are.
 fn usage_field(model: &str, unit: &str) -> String {
     if RESERVED_UNITS.contains(&unit) {
         format!("m:{model}:{unit}")
@@ -163,6 +215,7 @@ fn usage_field(model: &str, unit: &str) -> String {
 }
 
 /// Parse a usage-window hash field back into `(model, unit)` — the inverse of [`usage_field`].
+/// `None` for the two request counters and anything else that is not a unit field.
 fn parse_usage_field(field: &str) -> Option<(String, String)> {
     if let Some(rest) = field.strip_prefix("m:") {
         let (model, tier) = rest.rsplit_once(':')?;
@@ -177,6 +230,7 @@ fn parse_usage_field(field: &str) -> Option<(String, String)> {
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
 /// Lower-case hex of `bytes` — the collision-free spelling of a caller-supplied component inside a
+/// key or field name (hex contains no separator character).
 pub(crate) fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -209,6 +263,15 @@ fn metering_set(bucket: u64) -> String {
 }
 
 /// The hash key of one metering cell: `(bucket, key_id, model, provider, priced_from_ms)`.
+///
+/// `priced_from_ms` joins the identity (a rate-card edit SPLITS the day's cell at the edit, and each
+/// half prices at the card it was earned under). A cell whose price started at `0` —
+/// the opening entry, and every row written before the field existed — keeps the v6 three-component
+/// key, so a v6 cell and a v7 write of the same undated cell are one cell. A dated cell appends a
+/// fourth `|<ms>` component. Each component is escaped before joining (see
+/// [`escape`]), so the join is injective: an escaped component never contains a bare
+/// `|`, so a three-component key and a four-component key can never render the same, and two
+/// different identities never share a row.
 fn metering_row(
     bucket: u64,
     key_id: &str,
@@ -229,6 +292,7 @@ fn metering_row(
 }
 
 /// The metering-cell hash field an open (non-token) ledgered class accumulates under. Everything after
+/// the fixed `u:` prefix is the class name, verbatim, so no class name can collide with a fixed field.
 const METERING_UNIT_PREFIX: &str = "u:";
 
 /// Percent-decode public URL components (the upstream driver's username reading).
@@ -294,6 +358,9 @@ fn url_refused(why: &'static str) -> RedisError {
 }
 
 /// Every query parameter a URL form reads is named in `known`; any other one is REFUSED (the
+/// upstream driver ignored it silently, which would leave an operator believing a setting applied).
+/// The parameter's name is echoed only when the URL carries no password: a password written
+/// unencoded can split at `?` and arrive here as a "name" (one holding the `@` that ended it).
 fn check_query(url: &url::Url, known: &[&str], has_secret: bool) -> RedisResult<()> {
     match url.query_pairs().find(|(k, _)| !known.contains(&k.as_ref())) {
         None => Ok(()),
@@ -315,8 +382,9 @@ fn query_has_at(url: &url::Url) -> bool {
 }
 
 /// The upstream driver's `protocol=` query check (`2`/`resp2`/`3`/`resp3`). The store speaks
+/// RESP2 whatever it says: every reply it reads converts the same either way.
 fn check_protocol(url: &url::Url) -> RedisResult<()> {
-    match url.query_pairs().find(|(k, _)| k == "protocol") {
+    match url.query_pairs().filter(|(k, _)| k == "protocol").last() {
         None => Ok(()),
         Some((_, p)) if matches!(p.as_ref(), "2" | "resp2" | "3" | "resp3") => Ok(()),
         Some((_, _)) if query_has_at(url) => Err(url_refused(
@@ -331,6 +399,9 @@ fn check_protocol(url: &url::Url) -> RedisResult<()> {
 }
 
 /// Parse a Valkey URL exactly as the upstream driver reads it (`redis` 1.7.1's
+/// `IntoConnectionInfo for &str`): `redis://[user[:password]@]host[:port][/db]`, `rediss://` for TLS
+/// (`#insecure` the one fragment it took), the `valkey://` / `valkeys://` spellings, and the
+/// unix-socket URLs `unix://`, `redis+unix://`, `valkey+unix://` (`?db=`, `?user=`, `?pass=`).
 fn parse_target(input: &ValkeyUrl) -> RedisResult<Target> {
     if let Some(why) = input
         .parsing_error()
@@ -416,6 +487,7 @@ fn parse_target(input: &ValkeyUrl) -> RedisResult<Target> {
 }
 
 /// A unix-socket URL, as the upstream driver read it: its path, and `db` / `user` / `pass` from
+/// the query.
 fn parse_unix(url: &url::Url, input: &ValkeyUrl) -> RedisResult<Target> {
     let path = url
         .to_file_path()
@@ -482,6 +554,8 @@ impl std::fmt::Debug for Inner {
 }
 
 /// The store's one outbound need: a `tcp` stream to the server the settings' URL names (the store
+/// names the target at each connect), governed as operator infrastructure (private, loopback and
+/// plaintext allowed). Its timeout bounds the dial.
 pub const NEEDS: &[busbar_contract::abi::host::conn::connector::Need] = {
     use busbar_contract::abi::host::conn::connector::{
         Need, DIRECTION_OUTBOUND, EGRESS_OPERATOR_INFRASTRUCTURE, KEEP_NAMED,
@@ -501,6 +575,10 @@ const NEED_TCP: u32 = 0;
 
 impl ValkeyStore {
     /// The op's connection over `wire`: the kept one when it is idle (its handshake done), else a
+    /// fresh dial, secured for `rediss://`, `AUTH` and `SELECT` as the URL says — the dial AND the
+    /// handshake bounded by `connect_timeout_ms` in all. A failure reads `valkey {ctx}: …` (`ctx`
+    /// `reconnect` when an op had to dial) or, at boot (`None`), the driver's words alone: the
+    /// door's connect step adds its one prefix.
     async fn conn(&self, wire: Wire, ctx: Option<&str>) -> RecordStoreResult<Conn> {
         let failed = |e: String| {
             let text = match ctx {
@@ -533,6 +611,7 @@ impl ValkeyStore {
     }
 
     /// A NEW connection's handshake: TLS for `rediss://` (before its first byte; unverified for
+    /// `#insecure`), `AUTH`, `SELECT`.
     async fn handshake(&self, c: &mut Conn) -> RedisResult<()> {
         let t = &self.inner.target;
         if t.tls {
@@ -553,6 +632,7 @@ impl ValkeyStore {
     }
 
     /// Reconnect after a dropped connection: close it, dial a fresh one, handshake (the
+    /// dial and the handshake bounded by `connect_timeout_ms`, as every new connection is).
     async fn reconnect(&self, c: &mut Conn) -> RedisResult<()> {
         let ms = u32::try_from(self.inner.connect_timeout.as_millis()).unwrap_or(u32::MAX);
         c.wire().bound(ms);
@@ -590,6 +670,12 @@ impl ValkeyStore {
     }
 
     /// STARTUP ASSERTION, non-negotiable: `maxmemory-policy` must be `noeviction`. Under any eviction
+    /// policy, Valkey can silently evict a denylist entry (un-revoking a compromised key) or a
+    /// metering row (destroying billing evidence) under memory pressure, with zero error anywhere in
+    /// the request path — the loss is invisible until someone goes looking for data that should be
+    /// there. Refuse to start rather than risk it. If `CONFIG GET` itself is disabled by an ACL
+    /// (a legitimate hardened deployment), we cannot verify the policy either way — fail loud with a
+    /// distinct message rather than silently assuming it's safe.
     async fn assert_noeviction(&self, c: &mut Conn) -> RecordStoreResult<()> {
         let pairs: Vec<(String, String)> = with_conn!(self, |c| {
             cmd("CONFIG")
@@ -622,9 +708,21 @@ impl ValkeyStore {
     }
 
     /// SCHEMA MIGRATION (see `SCHEMA_VERSION` for what each version did).
+    /// A fresh namespace (no `busbar:*` keys) is simply marked; one already
+    /// at the current version passes through untouched; one NEWER than this build is refused; a v6
+    /// namespace is upgraded IN PLACE ([`legacy::migrate_v6_to_v7`]) and then gets
+    /// the retired-slot cleanup step ([`ValkeyStore::drop_dead_slot_keys`]); v7 scrubs revoked credentials.
+    /// Each step is idempotent, the marker written last
+    /// so a crash mid-upgrade re-runs it on the next connect.
+    ///
+    /// NOTHING IS EVER WIPED. A namespace with `busbar:*` keys whose marker is absent or older than
+    /// v6 is REFUSED with an explained error and left byte-for-byte as found: a missing marker is
+    /// indistinguishable from a live v6/v7 namespace whose marker was lost (operator `DEL`, partial
+    /// restore), and two nodes first-booting on an empty server must not wipe each other. Before
+    /// refusing, the marker is re-read once, so a peer that marked the namespace in the meantime is
+    /// honoured rather than refused.
     async fn migrate(&self, c: &mut Conn) -> RecordStoreResult<()> {
-        let mut marker: Option<i64> =
-            with_conn!(self, |c| c.get::<_, Option<i64>>(SCHEMA_KEY).await)?;
+        let mut marker = self.read_schema(c).await?;
         let mut rechecked = false;
         loop {
             let version = marker.unwrap_or(0);
@@ -639,16 +737,10 @@ impl ValkeyStore {
                 return Ok(());
             }
             if version >= FIRST_MIGRATED_SCHEMA {
-                if version < 7 {
-                    legacy::migrate_v6_to_v7(self, c).await?;
-                }
-                if version < SCHEMA_VERSION {
-                    self.drop_dead_slot_keys(c).await?;
-                }
+                legacy::migrate_v6_to_v7(self, c).await?;
+                self.drop_dead_slot_keys(c).await?;
                 self.scrub_revoked_credentials(c).await?;
-                if version < ATTRIBUTED_METERING_SCHEMA {
-                    self.migrate_metering_attribution(c).await?;
-                }
+                self.migrate_metering_attribution(c).await?;
                 self.repair_token_expiries(c).await?;
                 match self.mark_schema(c, marker).await? {
                     None => return Ok(()),
@@ -672,8 +764,7 @@ impl ValkeyStore {
             }
             if !rechecked {
                 rechecked = true;
-                let again: Option<i64> =
-                    with_conn!(self, |c| c.get::<_, Option<i64>>(SCHEMA_KEY).await)?;
+                let again = self.read_schema(c).await?;
                 if again.is_some_and(|v| v >= FIRST_MIGRATED_SCHEMA) {
                     marker = again;
                     continue;
@@ -703,7 +794,7 @@ impl ValkeyStore {
                  refusing to start. NOTHING was changed: no key was deleted and no marker written. \
                  If this is a current namespace whose marker was lost, restore it with \
                  `SET {SCHEMA_KEY} {FIRST_MIGRATED_SCHEMA}` and restart ({FIRST_MIGRATED_SCHEMA} is safe \
-                 either way: the v6->v7 copy is append-if-absent and the v9 step deletes keys a v6/v7 namespace already lacks or no longer reads, \
+                 either way: the v6->v7 copy is append-if-absent and the retired-slot cleanup step deletes keys a v6/v7 namespace already lacks or no longer reads, \
                  so both are safe on a namespace already past them, whereas {SCHEMA_VERSION} on a namespace last run by a v6 build would skip the copy \
                  and strand its task and ask-state data). If it was written by plugin v1.0.0 or an earlier 1.5.0 \
                  development build, it cannot be migrated: back it up if needed, delete the \
@@ -711,6 +802,18 @@ impl ValkeyStore {
                 sample.join(", ")
             )));
         }
+    }
+
+    async fn read_schema(&self, c: &mut Conn) -> RecordStoreResult<Option<i64>> {
+        let raw: Option<String> = with_conn!(self, |c| c.get(SCHEMA_KEY).await)?;
+        raw.map(|value| {
+            value.parse().map_err(|_| {
+                RecordStoreError(
+                    "the `busbar:schema` marker is not a number; NOTHING was changed".into(),
+                )
+            })
+        })
+        .transpose()
     }
 
     /// Write the current schema marker if it still is `read` (what this run saw); `None` when
@@ -741,7 +844,17 @@ impl ValkeyStore {
         Ok(now)
     }
 
-    /// THE v9 STEP: delete what the deleted slots kept. The key families go
+    /// RETIRED-SLOT CLEANUP: delete what the deleted slots kept. The key families go
+    /// by `SCAN` + `UNLINK` (never `KEYS`, never a blocking `DEL`), once, at the upgrade: the
+    /// money keys (`busbar:cap:*`, `busbar:slice:*`, `busbar:open:*`, `busbar:slices`,
+    /// `busbar:epoch`), the journal (`busbar:journal:*`, its `streams` set included) and the
+    /// sessions (`busbar:session:*`, `busbar:sessions:*`). The `busbar:op:*` dedupe hashes of the
+    /// deleted slots go too, told apart by the op's body (`b`): a kept slot's body is a 32-byte
+    /// digest (or 64 lowercase hex), or the older text that starts with the slot's name; only the
+    /// dead slots' bodies are neither. The hashes of the kept slots (`add_usage_batch`,
+    /// `add_metering_batch`, `append_plane_record`) are untouched, so a retry across the upgrade still answers its
+    /// original. Idempotent (a re-run finds nothing more), so a crash before the marker is
+    /// written re-runs it and two nodes upgrading at once land in the same place.
     async fn drop_dead_slot_keys(&self, c: &mut Conn) -> RecordStoreResult<()> {
         for pattern in [
             "busbar:cap:*",
@@ -776,13 +889,13 @@ impl ValkeyStore {
         self.unlink_all(c, &dead).await
     }
 
-    /// THE v10 STEP: scrub the secret out of every revoked credential row. Walks the
+    /// REVOKED-CREDENTIAL SCRUB: scrub the secret out of every revoked credential row. Walks the
     /// revision index (`CREDS_BYREV`) and, for each revoked row that still carries secret bytes,
     /// clears the secret, sets its form to `None` and stamps a fresh revision, so the delta feed
     /// carries the change. Idempotent (a scrubbed row is skipped, a missing row is skipped), one
     /// `WATCH`ed transaction per row, so a crash before the marker is written re-runs it and two
     /// nodes upgrading at once land in the same place. Runs on every upgrade (version below
-    /// `SCHEMA_VERSION`), after the v7 and v9 steps.
+    /// `SCHEMA_VERSION`), after copying legacy rows and removing retired slots.
     async fn scrub_revoked_credentials(&self, c: &mut Conn) -> RecordStoreResult<()> {
         let members: Vec<String> = with_conn!(self, |c| c.zrange(CREDS_BYREV, 0, -1).await)?;
         for ptr in members {
@@ -798,11 +911,12 @@ impl ValkeyStore {
                 let Some(raw) = raw else {
                     return Ok(Some(()));
                 };
-                let mut cred: CredentialSecret = serde_json::from_str(&raw).map_err(|_| {
+                let raw = Zeroizing::new(raw);
+                let mut cred = OwnedCredential(serde_json::from_str(&raw).map_err(|_| {
                     RedisError::refused(format!(
                         "credential upgrade: malformed credential at `{row_key}` (pointer `{ptr}`)"
                     ))
-                })?;
+                })?);
                 if slot_pointer(&cred.meta) != ptr {
                     return Err(RedisError::refused(format!(
                         "credential upgrade: mismatched slot at `{row_key}` (pointer `{ptr}`)"
@@ -813,12 +927,12 @@ impl ValkeyStore {
                 {
                     return Ok(Some(()));
                 }
-                cred.secret.clear();
+                cred.secret.zeroize();
                 cred.meta.secret_form = SecretForm::None;
                 cred.meta.revision = self.next_revision(c, pipe, 1).await?;
                 let json = cred_to_json(&cred)
                     .map_err(|_| RedisError::refused("credential upgrade: encode failed"))?;
-                pipe.set(&row_key, &json).ignore();
+                pipe.set(&row_key, json.as_str()).ignore();
                 pipe.zadd(CREDS_BYREV, &ptr, cred.meta.revision).ignore();
                 pipe.query(c).await
             }))?;
@@ -840,6 +954,7 @@ impl ValkeyStore {
     }
 
     /// `e` as the store's error: a refusal as written, anything else a backend failure under
+    /// `valkey {ctx}: `.
     fn err(&self, e: RedisError, ctx: &str) -> RecordStoreError {
         let text = if e.is_refusal() {
             e.to_string()
@@ -850,6 +965,9 @@ impl ValkeyStore {
     }
 
     /// Reserve `n` consecutive revisions and return the first. Called inside a `transaction!` that
+    /// WATCHes [`REVISION_KEY`]: the counter is read here and written back by the same `EXEC` as
+    /// the stamped rows, so a writer overtaken since the read aborts and restamps. Stamps then
+    /// become visible in revision order, which the hydration watermarks rely on.
     async fn next_revision(&self, c: &mut Conn, pipe: &mut Pipeline, n: u64) -> RedisResult<u64> {
         let cur: Option<i64> = c.get(REVISION_KEY).await?;
         let cur = u64::try_from(cur.unwrap_or(0)).map_err(|_| {
@@ -873,6 +991,7 @@ impl ValkeyStore {
 }
 
 /// A revoked credential has no remaining secret reader; new writes obey the same invariant as
+/// revocation and the v7 repair, without ever persisting supplied secret material.
 fn validate_revoked_credential(op: &str, secret: &CredentialSecret) -> RecordStoreResult<()> {
     if secret.meta.revoked_at.is_some()
         && (!secret.secret.is_empty() || secret.meta.secret_form != SecretForm::None)
@@ -885,6 +1004,8 @@ fn validate_revoked_credential(op: &str, secret: &CredentialSecret) -> RecordSto
 }
 
 /// `put_credential`'s owner precondition, read inside its WATCHed transaction: the key row named by
+/// `key_id` must exist and must not be tombstoned. An unparseable owner row is refused too — a
+/// credential cannot be attached to a key whose liveness cannot be established.
 async fn owner_is_live(c: &mut Conn, key_row: &str, key_id: &str, op: &str) -> RedisResult<()> {
     let raw: Option<String> = c.get(key_row).await?;
     let refuse = |why: String| Err(RedisError::refused(why));
@@ -906,6 +1027,7 @@ async fn owner_is_live(c: &mut Conn, key_row: &str, key_id: &str, op: &str) -> R
 }
 
 /// Whether the key row at `row` is a stored tombstone. A row that does not decode is not one:
+/// refusing it would make a corrupt row permanently unwritable.
 async fn tombstoned(c: &mut Conn, row: &str) -> RedisResult<bool> {
     let prior: Option<String> = c.get(row).await?;
     Ok(prior
@@ -921,26 +1043,32 @@ const OP_PUT_KEY_WITH_CREDENTIAL: &str = "put_key_with_credential";
 /// What a credential slot allows a mint of `secret`, read inside the WATCHed transaction.
 enum Slot {
     /// The slot already holds THIS credential, live: a reconnect-and-retry replaying an `EXEC` that
+    /// had committed. Nothing to write.
     Replay,
     /// Free; a revoked previous occupant's `(public_id, id)`, whose pointers the write deletes.
     Free(Option<(String, String)>),
 }
 
 /// The slot checks of a credential mint (`op` names the refusals): a DIFFERENT live credential in
+/// the slot is refused (never silently destroyed mid-overlap), a revoked one is never re-minted
+/// under its own id, a credential id lives in one slot, and `UNIQUE(kind, public_id)` is a real
+/// read of the pointer (a `SETNX` queued in an `.ignore()`d pipe would discard the "already
+/// claimed" answer).
 async fn read_slot(c: &mut Conn, secret: &CredentialSecret, op: &str) -> RedisResult<Slot> {
     let m = &secret.meta;
     let row_key = cred_row_key(&m.key_id, &m.kind, m.slot);
     let existing: Option<String> = c.get(&row_key).await?;
+    let existing = existing.map(Zeroizing::new);
     let mut prior = None;
     if let Some(raw) = &existing {
-        let cur: CredentialSecret = serde_json::from_str(raw).map_err(|_| {
+        let cur = OwnedCredential(serde_json::from_str(raw).map_err(|_| {
             RedisError::from((ErrorKind::Client, "credential row does not decode", row_key))
-        })?;
+        })?);
         if cur.meta.revoked_at.is_none() {
             if cur.meta.id == m.id {
                 let mut same = cur;
                 same.meta.revision = m.revision;
-                if same != *secret {
+                if same.0 != *secret {
                     return Err(RedisError::refused(format!(
                         "{op}: credential '{}' already exists with different content",
                         m.id
@@ -959,7 +1087,7 @@ async fn read_slot(c: &mut Conn, secret: &CredentialSecret, op: &str) -> RedisRe
                 m.id
             )));
         }
-        prior = Some((cur.meta.public_id, cur.meta.id));
+        prior = Some((cur.meta.public_id.clone(), cur.meta.id.clone()));
     }
     let ptr = slot_pointer(m);
     let id_holder: Option<String> = c.get(cred_id_key(&m.id)).await?;
@@ -1009,14 +1137,17 @@ fn parse_member(m: &str) -> Option<(&str, u8)> {
 }
 
 /// Queue the writes of a credential row and its pointers on `pipe`, deleting a revoked previous
+/// occupant's pointers in the same atomic step (a stale `cred:id:<old>` would let a later revoke of
+/// the old id wipe the new occupant).
 fn queue_credential(
     pipe: &mut Pipeline,
     secret: &CredentialSecret,
     prior: &Option<(String, String)>,
 ) -> RedisResult<()> {
     let m = &secret.meta;
-    let json =
-        cred_to_json(secret).map_err(|_| RedisError::from((ErrorKind::Client, "cred encode")))?;
+    let json = Zeroizing::new(
+        cred_to_json(secret).map_err(|_| RedisError::from((ErrorKind::Client, "cred encode")))?,
+    );
     let ptr = slot_pointer(m);
     if let Some((old_pub, old_id)) = prior {
         if *old_pub != m.public_id {
@@ -1028,7 +1159,7 @@ fn queue_credential(
     }
     pipe.set(cred_pub_key(&m.kind, &m.public_id), &ptr).ignore();
     pipe.set(cred_id_key(&m.id), &ptr).ignore();
-    pipe.set(cred_row_key(&m.key_id, &m.kind, m.slot), &json)
+    pipe.set(cred_row_key(&m.key_id, &m.kind, m.slot), json.as_str())
         .ignore();
     pipe.sadd(cred_ids_key(&m.key_id), member(&m.kind, m.slot))
         .ignore();
@@ -1068,6 +1199,8 @@ fn cred_from_json(op: &str, row: &str, raw: &str) -> RecordStoreResult<Credentia
 }
 
 /// Parse a `"<key_id>:<kind>:<slot>"` pointer value back into its parts. `kind` cannot itself contain
+/// `:` (enforced by the fixed kind allowlist upstream), so a right-split on `:` twice is unambiguous
+/// even if a future `key_id` contained a colon.
 fn parse_slot_pointer(s: &str) -> Option<(String, String, u8)> {
     let (rest, slot) = s.rsplit_once(':')?;
     let (key_id, kind) = rest.rsplit_once(':')?;
@@ -1075,6 +1208,7 @@ fn parse_slot_pointer(s: &str) -> Option<(String, String, u8)> {
 }
 
 /// The fields one usage delta adds, as `(hash field, delta)` pairs for `add_usage_batch`: the two
+/// request counters always, and every non-zero unit.
 fn usage_fields(delta: &UsageDelta) -> Vec<(String, i64)> {
     let mut fields: Vec<(String, i64)> = vec![
         ("requests".to_string(), delta.requests),
@@ -1091,6 +1225,7 @@ fn usage_fields(delta: &UsageDelta) -> Vec<(String, i64)> {
 }
 
 /// The rows of a metering bucket: `KEYS[1]` = the bucket's row set; each row's `HGETALL`, in one
+/// atomic step.
 static LIST_METERING: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(
         r"
@@ -1113,6 +1248,7 @@ fn ledger_count(value: &str) -> RecordStoreResult<u64> {
 /// The ordinary reader and correction predicate use the same canonical raw ledger.
 fn usage_from_fields(fields: Vec<(String, String)>) -> RecordStoreResult<UsageLedger> {
     let mut ledger = UsageLedger::default();
+    let mut positions = std::collections::HashMap::new();
     for (name, v) in fields {
         let count = ledger_count(&v)?;
         if name == "requests" {
@@ -1128,16 +1264,15 @@ fn usage_from_fields(fields: Vec<(String, String)>) -> RecordStoreResult<UsageLe
                 "unreadable usage field {name}; refusing to report a partial ledger"
             )));
         };
-        let entry = match ledger.models.iter_mut().find(|m| m.model == model) {
-            Some(m) => m,
-            None => {
-                ledger.models.push(ModelTokens {
-                    model,
-                    ..Default::default()
-                });
-                ledger.models.last_mut().expect("just pushed")
-            }
-        };
+        let index = *positions.entry(model.clone()).or_insert_with(|| {
+            let index = ledger.models.len();
+            ledger.models.push(ModelTokens {
+                model,
+                ..Default::default()
+            });
+            index
+        });
+        let entry = &mut ledger.models[index];
 
         if count != 0 {
             entry.usage_units.insert(unit, count);
@@ -1173,9 +1308,9 @@ fn metering_from_fields(fields: Vec<(String, String)>) -> RecordStoreResult<Mete
             continue;
         }
         match name.as_str() {
-            "key_id" => m.key_id = val.clone(),
-            "model" => m.model = val.clone(),
-            "provider" => m.provider = val.clone(),
+            "key_id" => m.key_id = val,
+            "model" => m.model = val,
+            "provider" => m.provider = val,
             "tokens_input" => m.tokens_input = ledger_count(&val)?,
             "tokens_output" => m.tokens_output = ledger_count(&val)?,
             "tokens_cache_read" => m.tokens_cache_read = ledger_count(&val)?,
@@ -1187,8 +1322,8 @@ fn metering_from_fields(fields: Vec<(String, String)>) -> RecordStoreResult<Mete
                     RecordStoreError(format!("list_metering: bad priced_from_ms value: {e}"))
                 })?
             }
-            "key_group_at_use" => m.key_group_at_use = val.clone(),
-            "pricing_version" => m.pricing_version = val.clone(),
+            "key_group_at_use" => m.key_group_at_use = val,
+            "pricing_version" => m.pricing_version = val,
             _ => {}
         }
     }
@@ -1211,11 +1346,13 @@ static SET_SCHEMA_MARKER: std::sync::LazyLock<Script> = std::sync::LazyLock::new
             redis.call('SET', KEYS[1], ARGV[2])
             return false
         end
-        return cur",
+        return cur or 'missing'",
     )
 });
 
 /// The base op set's bodies, each over the op's one connection `c` (the store door, `slots`, runs
+/// each as one op through the host's connector). The `op_id` writes (`add_usage_batch`,
+/// `add_metering_batch`, `append_plane_record`) are the door's own slots, deduped durably.
 impl ValkeyStore {
     pub(crate) async fn put_key(&self, c: &mut Conn, key: &VirtualKey) -> RecordStoreResult<()> {
         let row_key = format!("{KEY_PREFIX}{}", key.id);
@@ -1236,8 +1373,7 @@ impl ValkeyStore {
                 key.revision = rev;
                 let json = serde_json::to_string(&key)
                     .map_err(|_e| RedisError::from((ErrorKind::Client, "encode")))?;
-                pipe.atomic()
-                    .set(&row_key, &json)
+                pipe.set(&row_key, &json)
                     .ignore()
                     .sadd(KEYS_INDEX, &key.id)
                     .ignore()
@@ -1286,6 +1422,8 @@ impl ValkeyStore {
     }
 
     /// Read index membership and values from one stable revision snapshot. A writer between
+    /// enumeration and GET must abort the read, otherwise a newer row can advance the caller's
+    /// cursor beyond an intervening row the index snapshot did not include.
     async fn delta_rows(
         &self,
         c: &mut Conn,
@@ -1315,7 +1453,7 @@ impl ValkeyStore {
                     .chain(stamped.iter().map(|m| (m, false)))
                     .map(|(m, legacy)| {
                         key_of(m).map(|key| (key, legacy)).ok_or_else(|| {
-                            RedisError::refused("list_credentials_since: credential revision index member does not parse")
+                            RedisError::refused("delta_rows: revision index member does not parse")
                         })
                     })
                     .collect::<RedisResult<Vec<_>>>()?;
@@ -1411,7 +1549,6 @@ impl ValkeyStore {
                 let key_json = serde_json::to_string(&key)
                     .map_err(|_| RedisError::from((ErrorKind::Client, "key encode")))?;
 
-                pipe.atomic();
                 pipe.set(&key_row, &key_json).ignore();
                 pipe.zadd(KEYS_BYREV, id, rev).ignore();
                 // Destroy every credential row and its pointers (a consumer evicts off the key's
@@ -1422,12 +1559,13 @@ impl ValkeyStore {
                     // A row that does not decode aborts the cascade: skipping it would leave its
                     // pointers dangling behind a reported success.
                     if let Some(raw) = c.get::<_, Option<String>>(&row_key).await? {
-                        let cred: CredentialSecret = serde_json::from_str(&raw).map_err(|_| {
+                        let raw = Zeroizing::new(raw);
+                        let cred = OwnedCredential(serde_json::from_str(&raw).map_err(|_| {
                             RedisError::from((
                                 ErrorKind::Client,
                                 "delete_key: corrupt credential row",
                             ))
-                        })?;
+                        })?);
                         pipe.del(cred_pub_key(kind, &cred.meta.public_id)).ignore();
                         pipe.del(cred_id_key(&cred.meta.id)).ignore();
                     }
@@ -1468,13 +1606,12 @@ impl ValkeyStore {
             return Ok(0);
         }
         let mut cursor = String::from("0");
-        let mut seen = std::collections::HashSet::new();
         let mut removed = 0_u64;
         loop {
             let (next, keys) = with_conn!(self, |c| c.scan_page(&cursor, "busbar:usage:*").await)?;
             let expired: Vec<String> = keys
                 .into_iter()
-                .filter(|key| expired_usage_key(key, before) && seen.insert(key.clone()))
+                .filter(|key| expired_usage_key(key, before))
                 .collect();
             if !expired.is_empty() {
                 let deleted: u64 =
@@ -1562,7 +1699,7 @@ impl ValkeyStore {
                     Slot::Replay => return Ok(Some(())),
                     Slot::Free(prior) => prior,
                 };
-                let mut secret = secret.clone();
+                let mut secret = OwnedCredential(secret.clone());
                 pipe.atomic();
                 secret.meta.revision = self.next_revision(c, pipe, 1).await?;
                 queue_credential(pipe, &secret, &prior)?;
@@ -1705,7 +1842,9 @@ impl ValkeyStore {
                             let raw: Option<String> = c.get(&key_row).await?;
                             let same = raw
                                 .as_deref()
-                                .and_then(|raw| key_from_json(raw).ok())
+                                .map(key_from_json)
+                                .transpose()
+                                .map_err(|e| RedisError::refused(e.0))?
                                 .is_some_and(|mut stored| {
                                     stored.revision = key.revision;
                                     stored == *key
@@ -1720,13 +1859,12 @@ impl ValkeyStore {
                         }
                         Slot::Free(prior) => prior,
                     };
-                    let (mut key, mut secret) = (key.clone(), secret.clone());
+                    let (mut key, mut secret) = (key.clone(), OwnedCredential(secret.clone()));
                     pipe.atomic();
                     key.revision = self.next_revision(c, pipe, 2).await?;
                     secret.meta.revision = key.revision + 1;
                     let key_json = serde_json::to_string(&key)
                         .map_err(|_| RedisError::from((ErrorKind::Client, "key encode")))?;
-                    pipe.atomic();
                     pipe.set(&key_row, &key_json).ignore();
                     pipe.sadd(KEYS_INDEX, &key.id).ignore();
                     pipe.zadd(KEYS_BYREV, &key.id, key.revision).ignore();
@@ -1745,11 +1883,13 @@ impl ValkeyStore {
         let members: Vec<String> = with_conn!(self, |c| c.smembers(cred_ids_key(key_id)).await)?;
         let row_keys: Vec<String> = members
             .iter()
-            .filter_map(|m| {
-                let (kind, slot) = parse_member(m)?;
-                Some(cred_row_key(key_id, kind, slot))
+            .map(|m| {
+                let (kind, slot) = parse_member(m).ok_or_else(|| {
+                    RecordStoreError("list_credentials: corrupt credential index member".into())
+                })?;
+                Ok(cred_row_key(key_id, kind, slot))
             })
-            .collect();
+            .collect::<RecordStoreResult<_>>()?;
 
         let raws = self.get_all(c, &row_keys).await?;
         let mut metas = row_keys
@@ -1801,8 +1941,11 @@ impl ValkeyStore {
                         "revoke_credential: busbar:cred:id:{id} -> {ptr} names no credential row '{row_key}' (dangling pointer); nothing was revoked"
                     )));
                 };
-                let mut cred = cred_from_json("revoke_credential", &row_key, &raw)
-                    .map_err(|e| RedisError::refused(e.0))?;
+                let raw = Zeroizing::new(raw);
+                let mut cred = OwnedCredential(
+                    cred_from_json("revoke_credential", &row_key, &raw)
+                        .map_err(|e| RedisError::refused(e.0))?,
+                );
                 if cred.meta.id != id || slot_pointer(&cred.meta) != ptr {
                     return Err(RedisError::refused(format!(
                         "revoke_credential: stale pointer busbar:cred:id:{id} -> {ptr} holds credential '{}' at row '{row_key}'; nothing was revoked",
@@ -1820,11 +1963,11 @@ impl ValkeyStore {
                 cred.meta.revision = rev;
                 // Destroy the secret material on revoke — defense in depth: a revoked credential's
                 // plaintext has no further legitimate reader, so there is no reason to retain it.
-                cred.secret = String::new();
+                cred.secret.zeroize();
                 cred.meta.secret_form = SecretForm::None;
                 let json = cred_to_json(&cred)
                     .map_err(|_| RedisError::from((ErrorKind::Client, "cred encode")))?;
-                pipe.set(&row_key, &json).ignore();
+                pipe.set(&row_key, json.as_str()).ignore();
                 pipe.zadd(CREDS_BYREV, pointer(&key_id, &kind, slot), rev)
                     .ignore();
                 pipe.query(c).await
@@ -1911,6 +2054,7 @@ impl ValkeyStore {
 }
 
 /// Current unix time in seconds, stamped on tombstones and revocations (advisory metadata; the store
+/// has no injected clock and does no admission math with it).
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2077,6 +2221,7 @@ fn json_type(v: &serde_json::Value) -> &'static str {
 mod slots;
 
 /// The store door (store v3, `busbar_contract::abi::store`): every slot of the store v3 table over
+/// [`ValkeyStore`], through the contract's store SDK.
 pub use slots::door;
 
 /// Unlike the legacy three/four-component row key, this always has six escaped components.
@@ -2100,6 +2245,7 @@ fn attributed_metering_row(
 }
 
 /// Rename whole hashes without decoding or rewriting their counters or unknown fields.
+/// Every fallible shape/identity check precedes the first mutation: Lua errors do not roll back.
 static MIGRATE_METERING_ATTRIBUTION: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(
         r#"
@@ -2138,11 +2284,11 @@ impl ValkeyStore {
             }
             let bucket = suffix
                 .parse::<u64>()
-                .map_err(|_| RecordStoreError("invalid metering bucket index".into()))?;
+                .map_err(|_| RecordStoreError(format!("invalid metering bucket index {set:?}")))?;
             if set != metering_set(bucket) {
-                return Err(RecordStoreError(
-                    "noncanonical metering bucket index".into(),
-                ));
+                return Err(RecordStoreError(format!(
+                    "noncanonical metering bucket index {set:?}"
+                )));
             }
             let rows: Vec<String> = with_conn!(self, |c| c.smembers(&set).await)?;
             for row in rows {
@@ -2177,9 +2323,9 @@ impl ValkeyStore {
                 }
                 let get = |index: usize| fields[index].as_deref().unwrap_or("");
                 let price = fields[3].as_deref().unwrap_or("0");
-                let priced_from = price
-                    .parse::<u64>()
-                    .map_err(|_| RecordStoreError("invalid metering price instant".into()))?;
+                let priced_from = price.parse::<u64>().map_err(|_| {
+                    RecordStoreError(format!("invalid metering price instant at {row:?}"))
+                })?;
                 let target = attributed_metering_row(
                     bucket,
                     get(0),
@@ -2191,9 +2337,9 @@ impl ValkeyStore {
                 );
                 if row != target && row != metering_row(bucket, get(0), get(1), get(2), priced_from)
                 {
-                    return Err(RecordStoreError(
-                        "metering row key disagrees with attribution".into(),
-                    ));
+                    return Err(RecordStoreError(format!(
+                        "metering row {row:?} disagrees with attribution"
+                    )));
                 }
                 let why: String = with_conn!(self, |c| MIGRATE_METERING_ATTRIBUTION
                     .key(&set)
@@ -2227,4 +2373,42 @@ impl ValkeyStore {
 }
 
 #[cfg(test)]
+#[path = "tests.rs"]
 mod tests;
+
+/// An internal credential copy whose secret is wiped on every exit, including refusals.
+struct OwnedCredential(CredentialSecret);
+impl std::ops::Deref for OwnedCredential {
+    type Target = CredentialSecret;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for OwnedCredential {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl Drop for OwnedCredential {
+    fn drop(&mut self) {
+        self.0.secret.zeroize();
+    }
+}
+
+/// Captured operation inputs retain wiping ownership while an async operation is pending.
+trait SecureOwned {
+    type Owned;
+    fn secure_owned(&self) -> Self::Owned;
+}
+impl SecureOwned for CredentialSecret {
+    type Owned = OwnedCredential;
+    fn secure_owned(&self) -> Self::Owned {
+        OwnedCredential(self.clone())
+    }
+}
+impl SecureOwned for str {
+    type Owned = Zeroizing<String>;
+    fn secure_owned(&self) -> Self::Owned {
+        Zeroizing::new(self.to_owned())
+    }
+}

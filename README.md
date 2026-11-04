@@ -79,7 +79,7 @@ next connect (two nodes upgrading at once land in the same place).
 - **Schema v6** (the plugin released with busbar 1.5.5): upgrades directly to **v7**.
   Typed task, task-event, demotion and spent-approval keys are copied into the plane keyspace,
   then removed. A conflicting task-event position keeps its v6 source key for an operator.
-  `busbar:mcp:*` is neither migrated nor removed. The same migration removes retired slot keys,
+  Other `busbar:mcp:*` keys are neither migrated nor removed. The same migration removes retired slot keys,
   scrubs revoked credential secrets, preserves attribution while renaming metering hashes,
   and repairs token cleanup against stored absolute expiry using server TIME. Counters,
   unknown hash fields and replay receipts remain unchanged. Ambiguous destinations or missing
@@ -115,14 +115,14 @@ for usage, metering and plane append, or `WATCH`/`MULTI`/`EXEC` for conditional 
 are an additive keyspace beside the v7 ones. The store keeps ledger counts, not money: busbar
 derives money from the counts and its rate card.
 
-Schema v9 deletes what the deleted store slots kept: on the first connect of a v6 or v7
+The v6 → v7 upgrade deletes what the deleted store slots kept: on the first connect of a v6
 namespace it removes the money keys (`busbar:cap:*`, `busbar:slice:*`, `busbar:open:*`,
 `busbar:slices`, `busbar:epoch`), the journal (`busbar:journal:*`) and the sessions
 (`busbar:session:*`, `busbar:sessions:*`) with `SCAN` and `UNLINK`, and the `busbar:op:*` dedupe
 hashes of the deleted slots. The dedupe hash of a kept slot is untouched, so a retry across the
 upgrade still answers its original. A namespace newer than the build is refused.
 
-Schema v10 clears secret material and resets the secret form on previously revoked credentials,
+The same v7 upgrade clears secret material and resets the secret form on previously revoked credentials,
 preserving their revocation time and reason. Each repair advances the credential revision so hydrated
 caches observe it. Clean revoked rows and live credentials remain unchanged; concurrent slot remints
 are reread before a repair can commit. Retire older writers before upgrading: an already-connected
@@ -134,8 +134,8 @@ older node could otherwise write the old revoked form again.
   behind the engine's in-memory enforcement counters (boot-hydrate +
   periodic write-behind flush), not a request-hot-path dependency.
 - **Fleet-honest accrual**: `add_usage_batch` and `add_metering_batch` are
-  atomic server-side scripts (`HINCRBY`; usage counters floored at 0, every
-  counter pinned at `i64::MAX`) that validate every cell, apply them all and
+  atomic server-side scripts (usage counters floored at 0 and saturated at
+  `u64::MAX`; metering counters pinned at `i64::MAX`) that validate every cell, apply them all and
   record the op under its `op_id`, so a replay applies nothing; N nodes each flushing their own
   delta-since-last sum to the true fleet total (an absolute `put_usage`
   overwrite would be last-writer-wins across nodes).
@@ -174,6 +174,13 @@ config, mirroring how the Postgres store plugin receives its libpq URL:
 The SDK captures URL passwords while parsing settings, including host-lent secret markers. The
 store retains opaque credentials and sends the SDK's complete sealed RESP `AUTH` command through
 the host wire. Error redaction covers the raw and decoded password spellings.
+
+## Differences from 1.5.5
+
+The store refuses unknown URL query options instead of silently ignoring them. RESP replies
+are bounded to 512 MiB including framing, one million array entries and 64 KiB status/header
+lines; SCAN is bounded to one million pages per operation and one million collected keys.
+Malformed replies and control characters in server diagnostics are handled defensively.
 
 ## Build
 

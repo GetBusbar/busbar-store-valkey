@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! Whole-database test custody, shared by the logic and plugin test binaries.
+//! Separate file handles take an exclusive OS lock, including across nextest processes.
+//! Never unlink the lock file: waiters must continue locking the same inode.
 
 use std::hash::{Hash, Hasher};
 

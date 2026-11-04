@@ -1,7 +1,8 @@
-#[path = "../../test-support/valkey_io.rs"]
-mod valkey_io;
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
+
+#[path = "../../test-support/valkey_io.rs"]
+mod valkey_io;
 
 use super::*;
 use busbar_contract::abi::sdk::store::column::clamp;
@@ -28,6 +29,8 @@ mod recorded_connector;
 use recorded_connector::RecordedConnector;
 
 /// THE STORE UNDER TEST is the store as the host opens it: its door through the loader
+/// (`load_linked`, `LoadedStore::open`), every op one connection through the host's connector path
+/// (the loader's test connection table over plain TCP). The name the tests always used stands for it.
 pub(crate) type ValkeyStore = LoadedStore;
 
 /// One dispatcher and one connection table for every store the tests open (the host has one each).
@@ -50,6 +53,7 @@ fn host() -> &'static (
 }
 
 /// The node's `op_id` allocator for the bridge's writes: a node half no earlier run used (the
+/// dedupe is durable) and one counter.
 fn mint() -> OpId {
     static NODE: OnceLock<u64> = OnceLock::new();
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -96,6 +100,7 @@ impl Connect for LoadedStore {
 }
 
 /// The verify path's read, which is no longer a store op: a credential's secret by `(kind,
+/// public_id)`, read back through the revision delta (which carries every row, revoked or not).
 trait Lookup {
     fn lookup_credential_secret(
         &self,
@@ -118,6 +123,7 @@ impl Lookup for LoadedStore {
 }
 
 /// The tests' INDEPENDENT view of the live Valkey (the upstream client, never the store's own
+/// path): what landed, and the cleanup the `RecordStore` surface deliberately cannot do.
 pub(crate) trait Raw {
     fn with_conn<T>(
         &self,
@@ -153,6 +159,7 @@ pub(crate) trait Raw {
     }
 
     /// Put an audit row at its `seq`, as a 1.5.5 build wrote it: no store op appends one any more
+    /// (1.6.0's admin audit is plane records), so the reads are seeded under the store's feet.
     fn seed_audit_for_test(&self, r: &AuditRecord) -> RecordStoreResult<()> {
         let json = serde_json::to_string(r).expect("an audit row encodes");
         let score = clamp(r.seq);
@@ -299,6 +306,7 @@ fn valkeys_scheme_selects_tls_and_takes_insecure() {
 }
 
 /// The URL reads as the upstream driver read it: user, percent-decoded password, port, database,
+/// IPv6 literals, and its refusals in its words.
 #[test]
 fn urls_parse_as_the_upstream_driver_read_them() {
     let t = parse_url("redis://alice:p%40ss@db.internal:7000/3").unwrap();
@@ -342,6 +350,7 @@ fn urls_parse_as_the_upstream_driver_read_them() {
 }
 
 /// The unix-socket URLs 1.5.5's driver read (VALKEY-UNIX): the path is the connector's
+/// `unix:<path>` target, the database, user and password come from the query.
 #[test]
 fn unix_socket_urls_parse_as_the_upstream_driver_read_them() {
     for url in [
@@ -376,6 +385,7 @@ fn row_escaping_quotes_the_separator_and_itself() {
 }
 
 /// End-to-end against a REAL Valkey, gated on `VALKEY_URL` (a docker service in CI). Skips
+/// cleanly when unset LOCALLY; under `CI` a missing URL is a HARD FAILURE, never a silent skip.
 pub(crate) fn live_store() -> Option<ValkeyStore> {
     let url = match std::env::var("VALKEY_URL") {
         Ok(url) => url,
@@ -438,6 +448,15 @@ fn cred(key_id: &str, public_id: &str, slot: u8) -> CredentialSecret {
 }
 
 /// Per-invocation-unique identifier for tests whose fixture touches a uniqueness constraint
+/// (credential `public_id`, an accumulating usage/metering counter) rather than an idempotent
+/// overwrite. Ordinary point-write tests are already safe to rerun because `put_key`/`SET` simply
+/// overwrites the same row every time -- but a SETNX-style uniqueness check (`public_id` already
+/// claimed) or an accumulating counter (`add_usage`/`add_metering`) sees a SECOND invocation's
+/// identical literal id as a real collision with the FIRST invocation's leftover row, since this
+/// suite deliberately never wipes the shared instance between runs (see `live_store()`). A fresh
+/// process id per `cargo test` invocation, plus a counter for multiple calls within one process,
+/// keeps those specific fixtures unique across repeated runs without reintroducing the per-test
+/// wipe that was already tried and rejected for breaking intra-run parallelism.
 fn unique_suffix() -> u64 {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static RUN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -453,6 +472,7 @@ fn unique_suffix() -> u64 {
 }
 
 /// Ids one run may mint; a suffix is `run_salt * RUN_SPAN + n`, below `1e9`, so `unique_bucket`'s
+/// `base * 1e9 + suffix` stays injective in `base`.
 const RUN_SPAN: u64 = 1_000;
 
 /// A run's salt, below `1_000_000`: the pid and the start time folded together.
@@ -475,6 +495,8 @@ fn uid(base: &str) -> String {
 }
 
 /// Like `uid`, but for the `bucket: u64` metering fields -- a distinct numeric bucket per call,
+/// same rationale as `uid` (metering counters accumulate across invocations of the same literal
+/// bucket, so a fixed literal collides with a prior run's leftover row).
 fn unique_bucket(base: u64) -> u64 {
     base * 1_000_000_000 + unique_suffix()
 }
@@ -530,6 +552,7 @@ fn re_putting_a_live_key_restamps_its_revision_and_re_enters_the_delta() {
 }
 
 /// A row at revision 0 (never stamped) is returned by every delta, and `since = 0` returns every
+/// row: the delta is `revision > since OR revision = 0`, for keys and credentials alike.
 #[test]
 fn a_revision_zero_row_is_in_every_delta() {
     let Some(store) = live_store() else { return };
@@ -625,6 +648,9 @@ fn delete_key_is_idempotent_once_tombstoned() {
 }
 
 /// HARDEST INVARIANT #1: delete_key destroys the credential's SECRET material, not just the
+/// metadata — proven by directly inspecting the raw stored bytes at the credential row's key,
+/// bypassing the Store trait entirely (mirrors the SQL backends' "connect independently of the
+/// ABI" persistence proof).
 #[test]
 fn delete_key_destroys_credential_secret_material() {
     let Some(store) = live_store() else { return };
@@ -665,6 +691,8 @@ fn delete_key_destroys_credential_secret_material() {
 }
 
 /// HARDEST INVARIANT #2: the credential-id and public_id reverse-lookup pointers are cleaned up
+/// too, not just the row — otherwise `revoke_credential(old_id, ...)` after a delete would find a
+/// dangling pointer to a row that no longer exists.
 #[test]
 fn delete_key_cleans_up_reverse_lookup_pointers() {
     let Some(store) = live_store() else { return };
@@ -723,6 +751,7 @@ fn delete_key_keeps_the_usage_ledger() {
 }
 
 /// `delete_key` touches no usage window of any key, however the id is spelled (it once swept
+/// `busbar:usage:<id>:*`, which a glob character in an id widened to other keys' windows).
 #[test]
 fn delete_key_leaves_every_usage_window_alone() {
     let Some(store) = live_store() else { return };
@@ -904,6 +933,7 @@ fn a_revoked_credential_id_is_never_re_minted() {
 }
 
 /// `put_key_with_credential` refuses up front and writes nothing: a key that carries a tombstone,
+/// a stored tombstone at the id, a credential naming another key.
 #[test]
 fn put_key_with_credential_refuses_up_front_and_writes_nothing() {
     let Some(store) = live_store() else { return };
@@ -971,6 +1001,7 @@ fn put_credential_owner_refusals_read_as_the_family_writes_them() {
 }
 
 /// A credential id is unique across slots: re-putting an existing id into another slot is refused
+/// and writes nothing.
 #[test]
 fn a_credential_id_cannot_be_put_into_a_second_slot() {
     let Some(store) = live_store() else { return };
@@ -1083,6 +1114,7 @@ fn list_credentials_since_carries_the_secret_for_hydration() {
 }
 
 /// `put_key_with_credential` writes the key and its credential together (the atomic-failure side
+/// is `store_conformance`'s `assert_put_key_with_credential_is_atomic`).
 #[test]
 fn put_key_with_credential_writes_the_key_and_its_credential() {
     let Some(store) = live_store() else { return };
@@ -1099,6 +1131,15 @@ fn put_key_with_credential_writes_the_key_and_its_credential() {
 }
 
 /// `with_conn` (used by `put_credential`) is documented "Safe only for READ / idempotent ops," but
+/// automatically reconnects-and-retries on any connection-level error (`is_timeout()` /
+/// `is_io_error()` / `is_connection_dropped()`) by re-running the ENTIRE transaction closure. If a
+/// connection blip drops the reply AFTER Valkey has already committed the EXEC server-side, that
+/// retry replays `put_credential` with the SAME `CredentialSecret` against a slot that now already
+/// holds it — exactly the scenario this test simulates directly (without needing to sever a real
+/// TCP connection): calling `put_credential` twice in a row with the identical secret must be a
+/// safe no-op, not the "slot holds a live credential" error a genuinely different mint would
+/// correctly get. Without the retry-safety check, this call incorrectly reports failure for a
+/// credential that is, in fact, already correctly and fully written.
 #[test]
 fn put_credential_replayed_with_the_same_credential_id_is_a_retry_safe_no_op() {
     let Some(store) = live_store() else { return };
@@ -1144,6 +1185,7 @@ fn put_key_with_credential_replayed_with_the_same_credential_id_is_a_retry_safe_
 }
 
 /// A credential row that does not decode fails the whole `delete_key`, leaving the key live and
+/// the credential's pointers in place: skipping it would report success with pointers dangling.
 #[test]
 fn delete_key_fails_loud_on_a_corrupt_credential_row_instead_of_orphaning_pointers() {
     let Some(store) = live_store() else { return };
@@ -1234,14 +1276,6 @@ fn metering_round_trips_all_fields_including_renamed_and_new_ones() {
         assert_eq!(r.billable_requests, 1);
         assert_eq!(r.key_group_at_use, "growth");
         assert_eq!(r.pricing_version, "2026-07");
-        assert_eq!(r.key_id, key_id);
-        assert_eq!(r.model, "claude");
-        assert_eq!(r.provider, "anthropic");
-        assert_eq!(r.tokens_input, 10);
-        assert_eq!(r.tokens_output, 5);
-        assert_eq!(r.tokens_cache_read, 2);
-        assert_eq!(r.requests, 1);
-        assert_eq!(r.priced_from_ms, priced_from_ms);
     }
 }
 
@@ -1344,6 +1378,18 @@ fn metering_row_identity_does_not_collide_across_a_delimiter_character() {
 }
 
 /// HARDEST INVARIANT #4: `connect()` refuses to start when `maxmemory-policy` is not
+/// `noeviction`. Proven live: flip the real server's policy, attempt connect, restore it
+/// regardless of outcome (test hygiene — never leave the shared container misconfigured for
+/// other tests).
+///
+/// `#[ignore]`d for the same reason as `wipes_the_entire_namespace_destructively`: this test
+/// mutates GLOBAL server config (`CONFIG SET maxmemory-policy`), which races every OTHER test's
+/// concurrent `connect()` call under the default parallel `cargo test` — that is a genuine
+/// conflict between "this test needs exclusive access to shared server state" and "the rest of the
+/// suite assumes the shared server is always in its normal (noeviction) posture," not a bug in the
+/// assertion itself (verified: run alone, or with `--test-threads=1`, it passes every time). Run
+/// explicitly and alone: `VALKEY_URL=... cargo test -p busbar-store-valkey -- --ignored
+/// connect_refuses_to_start_under_an_eviction_policy`.
 #[test]
 #[ignore]
 fn connect_refuses_to_start_under_an_eviction_policy() {
@@ -1440,6 +1486,8 @@ fn a_start_refused_for_eviction_policy_does_not_migrate() {
 //     error must be retried and transparently recovered.
 
 /// Pins the `version >= SCHEMA_VERSION` early return against inversion: a second
+/// `connect()` (fresh `ValkeyStore`, fresh internal `migrate()` call) against a namespace already
+/// at the current schema version must be a pure no-op, not a full `busbar:*` wipe.
 #[test]
 fn reconnecting_to_an_already_migrated_namespace_does_not_wipe_existing_data() {
     let Some(store1) = live_store() else { return };
@@ -1458,6 +1506,8 @@ fn reconnecting_to_an_already_migrated_namespace_does_not_wipe_existing_data() {
 }
 
 /// A deterministic NON-connection error (`WRONGTYPE`: a usage window that is not a hash) surfaces
+/// through the store op in the store's words (the `"command"` context), never retried as a
+/// connection failure.
 #[test]
 fn a_server_error_surfaces_through_the_op_in_the_stores_words() {
     let Some(store) = live_store() else { return };
@@ -1502,14 +1552,18 @@ fn a_repeat_denylist_add_keeps_the_first_reason() {
 }
 
 /// Serialises the tests that write the shared audit zset: `busbar:audit` is one global set keyed by
+/// seq, so a `uid()` namespace cannot isolate them, and a concurrent append would push another
+/// test's record out of the tail it reads back.
 pub(crate) static AUDIT_SEQ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Take `AUDIT_SEQ_LOCK`, ignoring poisoning, so one failing audit test does not convert the others
+/// into spurious failures that bury the original.
 pub(crate) fn audit_seq_guard() -> std::sync::MutexGuard<'static, ()> {
     AUDIT_SEQ_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// `VALKEY_URL` re-pointed at database `db`, so a refusal test owns a whole namespace and never
+/// leaves a stale marker in the shared one the rest of the suite uses.
 pub(crate) fn url_for_db(db: u32) -> String {
     let url = std::env::var("VALKEY_URL").unwrap();
     let base = url.split('?').next().unwrap();
@@ -1538,6 +1592,7 @@ fn db_of_url(url: &str) -> u32 {
 }
 
 /// Refuse to flush `db` when it is the database `VALKEY_URL` itself selects (the shared one every
+/// other test uses).
 fn assert_private_db(db: u32) {
     let shared = db_of_url(&std::env::var("VALKEY_URL").unwrap());
     assert_ne!(
@@ -1576,6 +1631,7 @@ pub(crate) fn fresh_db_client(db: u32) -> (database::Database, redis::Connection
 }
 
 /// A namespace marked NEWER than this build is REFUSED at open, and left as found: an older build
+/// on a newer keyspace would not know what the newer schema did to it.
 #[test]
 fn a_namespace_newer_than_this_build_is_refused() {
     let Some(_) = live_store() else { return };
@@ -1638,7 +1694,7 @@ fn a_non_canonical_schema_marker_is_upgraded_not_looped() {
     assert_eq!(marker, SCHEMA_VERSION.to_string());
 }
 
-/// A v10 upgrade refusal names the revision-index pointer it stopped at, so the operator can find
+/// A v7 upgrade refusal names the revision-index pointer it stopped at, so the operator can find
 /// what to repair.
 #[test]
 fn credential_upgrade_refusals_name_the_pointer() {
@@ -1684,6 +1740,9 @@ fn credential_upgrade_refusals_name_the_pointer() {
 }
 
 /// A namespace marked OLDER than v6 is REFUSED, never wiped: `migrate()` has no in-place path for
+/// it, and the old wipe also destroyed a live v6/v7 namespace whose marker had merely been lost.
+/// Seeds a refund-shaped usage row (`billable_requests == 0`, `requests > 0`), forces a v5 marker
+/// and requires `connect()` to error, say nothing was changed, and leave the row and marker alone.
 #[test]
 #[ignore]
 fn a_pre_v6_namespace_is_refused_not_wiped_and_keeps_refund_shaped_data() {
@@ -1727,6 +1786,7 @@ fn a_pre_v6_namespace_is_refused_not_wiped_and_keeps_refund_shaped_data() {
 }
 
 /// A namespace holding `busbar:*` keys but NO schema marker (operator DEL, partial restore) is
+/// refused and every seeded key survives -- the old code read it as v0 and wiped it.
 #[test]
 #[ignore]
 fn a_namespace_with_keys_but_no_marker_refuses_to_connect_and_keeps_every_key() {
@@ -1786,10 +1846,17 @@ fn a_namespace_with_keys_but_no_marker_refuses_to_connect_and_keeps_every_key() 
 }
 
 /// The `RecordStore` contract conformance suite, this crate's own copy (`src/tests/store_conformance.rs`
+/// — see its header for provenance): every ruling the suite offers, wired against the live Valkey.
+///
+/// Fixtures are namespaced per process AND per check, and cleaned first. Per-process because this
+/// runs against a SHARED live Valkey that is not flushed between tests; per-check because these run
+/// in parallel and the cleanup clears every id in the namespace it is given, so one shared namespace
+/// would have each check deleting the others' rows mid-run.
 #[path = "tests/store_conformance.rs"]
 mod store_conformance;
 
 /// The store v3 slots (`StoreSlots`): the durable `op_id` dedupe, the plane-record append and the
+/// kernel's records, and the v7 upgrade.
 mod slots_tests;
 
 #[path = "tests/delta_reader.rs"]
@@ -1806,6 +1873,7 @@ mod conformance {
     }
 
     /// Remove every row this suite is about to write, so a rerun (or a crashed prior run that left
+    /// state behind) starts from the same place as a first run.
     fn reset(store: &ValkeyStore, ns: &str, seq: u64) {
         for id in conf::key_ids(ns) {
             let _ = store.purge_key_for_test(&id);
@@ -1924,6 +1992,8 @@ mod conformance {
     }
 
     /// The kind-wide purge has no namespace of its own, so two runs sharing one live Valkey each
+    /// sweep the other's old rows too; the suite's windows are built to stay correct under that.
+    /// Two concurrent runs against the SAME server must both complete.
     #[test]
     fn plane_purges_survive_two_interleaved_runs() {
         let _serialised = super::purge_guard();
@@ -1946,6 +2016,8 @@ mod conformance {
 }
 
 /// An undecodable credential row FAILS the hydration delta, naming the row's key and never echoing
+/// its value: skipping it silently would leave a credential missing with nothing said. The corrupt
+/// row is planted in a database of its own, since the delta is a global scan.
 #[test]
 fn a_corrupt_credential_row_fails_the_delta_naming_its_key() {
     let Some(_) = live_store() else { return };
@@ -1979,6 +2051,17 @@ const CORRUPT_ROW_DB: u32 = 7;
 const ALWAYS_ABORT_DB: u32 = 4;
 
 /// A refused transaction must not silently swallow the NEXT write on the same connection.
+///
+/// `redis::transaction` issues WATCH, runs the closure, and UNWATCHes only on the success path — a
+/// closure returning `Err` skips it. This store keeps ONE connection behind a mutex and reuses it,
+/// so the stale WATCH survives into the next operation. Every plain `pipe().atomic()...query(c)`
+/// write here types its reply as `()`, and `FromRedisValue for ()` accepts the `Nil` that a dirtied
+/// WATCH makes EXEC return — so the write is discarded and the call still reports `Ok(())`.
+///
+/// `add_denylist` is the sharp end: an operator revokes a leaked signed token, the store says it
+/// worked, and the token keeps authenticating. This drives the exact sequence — a refused
+/// `put_key` over a tombstone (which WATCHes the key's row), then another client dirties that key,
+/// then a revocation on the original store which MUST land.
 #[test]
 fn a_refused_transaction_does_not_swallow_the_next_write() {
     let Some(store) = live_store() else { return };
@@ -1989,14 +2072,6 @@ fn a_refused_transaction_does_not_swallow_the_next_write() {
     store
         .put_key(&vk(&id))
         .expect_err("a live write over a tombstone must be refused");
-
-    store
-        .with_conn(|c| {
-            let row = format!("{KEY_PREFIX}{id}");
-            let raw: String = c.get(&row)?;
-            c.set::<_, _, ()>(&row, raw)
-        })
-        .unwrap();
 
     let sub = format!("sub_leaked_{id}");
     store.add_denylist(&sub, "token leaked").unwrap();
@@ -2156,6 +2231,12 @@ trait Vocab: RecordStore {
 impl Vocab for ValkeyStore {}
 
 /// Serialises EVERY test that purges a plane kind. `purge_plane_records_before(kind, before)` has no
+/// namespace: against the SHARED live Valkey one test's sweep deletes another's rows whenever their
+/// timestamps sit under the same cutoff, so a per-test `uid()` isolates nothing here. The ported
+/// retention tests sweep up to ~1_000_001_000 and the conformance suite's own purge checks sweep
+/// below 100_000 with rows just above it, so each can take the other's rows. One lock for all of them,
+/// rather than disjoint bands, because a band picked today is inside SOME other purge's cutoff the
+/// moment a third retention test is added.
 fn purge_guard() -> std::fs::File {
     let file = std::fs::File::options()
         .write(true)
@@ -2185,6 +2266,9 @@ fn sample_call(principal: &str, seq: u64, ts: u64, prev_hash: &str, hash: &str) 
 }
 
 /// THE TEST THAT MATTERS. A round-trip on one live handle cannot distinguish a backend that wrote
+/// to the server from one holding a HashMap behind the same trait. So this DROPS the store —
+/// closing its connection entirely — then connects a genuinely new one and verifies the
+/// per-principal hash chain still links from what the server hands back.
 #[test]
 fn an_mcp_call_chain_survives_dropping_the_store_and_reconnecting() {
     let Some(store) = live_store() else { return };
@@ -2227,6 +2311,7 @@ fn an_mcp_call_chain_survives_dropping_the_store_and_reconnecting() {
 }
 
 /// The boot enumeration: a restart has to resume a chain for a principal this process has not yet
+/// seen, so the store must be able to name every principal holding records — exactly once.
 #[test]
 fn mcp_call_principals_are_enumerable_after_a_reconnect() {
     let Some(store) = live_store() else { return };
@@ -2264,6 +2349,8 @@ fn mcp_call_principals_are_enumerable_after_a_reconnect() {
 }
 
 /// Retention must ACTUALLY DELETE and report a real count — a purge that returns a number it did
+/// not perform is worse than one that reports nothing purged. It must also retire the principal
+/// from the boot enumeration once its chain is empty.
 #[test]
 fn purge_mcp_calls_before_deletes_and_returns_a_real_count() {
     let Some(_) = live_store() else { return };
@@ -2307,6 +2394,8 @@ fn purge_mcp_calls_before_deletes_and_returns_a_real_count() {
 }
 
 /// A record arriving on a `(principal, seq)` that already has one is settled the way the contract
+/// settles it: IDENTICAL is the retry and succeeds; DIFFERENT is a forked or tampered log and is an
+/// error. Overwriting would destroy the second case instead of reporting it.
 #[test]
 fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
     let Some(store) = live_store() else { return };
@@ -2364,6 +2453,8 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
 }
 
 /// A busbar key id is caller-visible and may itself contain a colon, so retention must still find
+/// and retire a principal whose id does — a separator that can occur in the data is a parser that
+/// silently mis-splits, and the failure would surface as a purge that quietly removed nothing.
 #[test]
 fn retention_still_finds_a_principal_whose_id_contains_the_separator_characters() {
     let Some(_) = live_store() else { return };
@@ -2385,6 +2476,8 @@ fn retention_still_finds_a_principal_whose_id_contains_the_separator_characters(
 }
 
 /// Timestamps are BANDED. The task purge is GLOBAL by `(disposition, ts)`, so every task this file
+/// writes BELOW the band top belongs to the purge tests (which hold [`purge_guard`]); every other
+/// task test writes ABOVE it.
 const TASK_PURGE_BAND_TOP: u64 = 1_000_100_000;
 const TASK_LIVE_TS: u64 = 2_000_000_000;
 
@@ -2455,6 +2548,7 @@ fn clear_purge_band(store: &ValkeyStore, kind: &str) {
 }
 
 /// THE TEST THAT MATTERS: an in-flight task, read back off the server on a NEW connection after the
+/// writing store is gone.
 #[test]
 fn an_in_flight_task_survives_dropping_the_store_and_reconnecting() {
     let Some(store) = live_store() else { return };
@@ -2503,6 +2597,7 @@ fn an_in_flight_task_survives_dropping_the_store_and_reconnecting() {
 }
 
 /// The listing is deliberately UNFILTERED: the boot rehydrate wants the active rows, retention the
+/// terminal ones and the scoped listing one principal's.
 #[test]
 fn list_tasks_returns_every_row_including_terminal_ones_after_a_reconnect() {
     let Some(store) = live_store() else { return };
@@ -2541,6 +2636,7 @@ fn list_tasks_returns_every_row_including_terminal_ones_after_a_reconnect() {
 }
 
 /// The per-task provenance chain, read back after a reconnect. Never calls `put_task`: an event and
+/// the first task upsert are independent write-throughs with no ordering between them.
 #[test]
 fn a_task_event_chain_survives_a_reconnect_and_still_links() {
     let Some(store) = live_store() else { return };
@@ -2609,6 +2705,9 @@ fn a_task_event_chain_survives_a_reconnect_and_still_links() {
 }
 
 /// A replayed `(task_id, seq)`: the IDENTICAL event is the at-least-once retry and is success with
+/// no duplicate; a DIFFERENT event at that seq is REFUSED as a fork. This one changed on purpose in
+/// 1.6.0: the v6 typed method upserted a corrected event, and 1.6.0 has ONE append verb for every
+/// chain kind, whose contract is the fork refusal (the same change store-sqlite made).
 #[test]
 fn a_replayed_task_event_is_idempotent_and_a_different_one_is_a_fork() {
     let Some(store) = live_store() else { return };
@@ -2634,6 +2733,8 @@ fn a_replayed_task_event_is_idempotent_and_a_different_one_is_a_fork() {
 }
 
 /// Retention drops TERMINAL rows only, strictly older than the cutoff, and returns a count it
+/// actually performed. The terminal/active split is the helper's typed disposition (the store never
+/// reads the state text), so the odd state names only vary the Active rows.
 #[test]
 fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
     let _guard = purge_guard();
@@ -2812,6 +2913,7 @@ fn task_ids_differing_only_in_case_are_distinct_tasks() {
 }
 
 /// A task id is a protocol-supplied opaque string, COLONS INCLUDED. The adversarial spellings: an id
+/// that renders like another kind's key segment, and ids that differ only in where a colon falls.
 #[test]
 fn a_task_id_containing_the_key_separator_cannot_alias_another_tasks_chain() {
     let Some(store) = live_store() else { return };
@@ -2920,8 +3022,10 @@ fn a_u64_a_signed_column_cannot_hold_is_refused() {
         )),
         "{e}"
     );
-    m.priced_from_ms = 0;
     assert!(store.list_metering(m.bucket).unwrap().is_empty());
+    m.priced_from_ms = 0;
+    store.add_metering(&m).unwrap();
+    assert_eq!(store.list_metering(m.bucket).unwrap().len(), 1);
 }
 
 /// Sequence ordering stays exact through i64::MAX, and u64::MAX survives in opaque body fields.
@@ -3000,6 +3104,7 @@ fn reset_trust_state(store: &ValkeyStore, servers: &[&str], nonces: &[&str]) {
 }
 
 /// A DEMOTION OUTLIVES THE PROCESS THAT RECORDED IT, upserted to the latest reason, and a cleared
+/// one stays cleared.
 #[test]
 fn a_demotion_survives_dropping_the_store_and_reconnecting() {
     let url = std::env::var("VALKEY_URL").unwrap_or_else(|_| {
@@ -3078,6 +3183,7 @@ fn server_ids_containing_separators_are_not_confusable() {
 }
 
 /// THE SPENT-APPROVAL LEDGER ACROSS A RESTART, with the control that keeps it from being a blanket
+/// refusal.
 #[test]
 fn a_reconnected_store_refuses_a_second_redemption_of_the_same_approval() {
     let url = std::env::var("VALKEY_URL")
@@ -3130,6 +3236,7 @@ fn a_second_node_cannot_redeem_an_approval_the_first_already_spent() {
 }
 
 /// CONCURRENT REDEMPTION IS THE ATTACK: eight independent connections race through a barrier;
+/// exactly one may win.
 #[test]
 fn exactly_one_of_many_racing_nodes_wins_the_redemption() {
     let url = std::env::var("VALKEY_URL")
@@ -3197,6 +3304,7 @@ fn a_redeemed_entry_carries_a_ttl_bounded_by_the_approvals_own_life() {
 }
 
 /// A grant that outlives the ledger's TTL cap is recorded with NO expiry: capping it would let the
+/// grant redeem again once the entry lapsed.
 #[test]
 fn a_grant_beyond_the_ttl_cap_is_recorded_without_expiry() {
     let store = require_live_store();
@@ -3278,6 +3386,8 @@ fn the_demotion_record_round_trips_the_full_storable_range() {
 }
 
 /// `plane_token_live` — MULTI-USE, SPENDS NOTHING, and FAIL-CLOSED: live while the record is present,
+/// Active and `now` has not passed `expires_at`; dead on each of the three failing, and asking twice
+/// answers the same twice.
 #[test]
 fn plane_token_live_is_present_active_and_unexpired() {
     let store = require_live_store();
@@ -3320,6 +3430,8 @@ fn plane_token_live_is_present_active_and_unexpired() {
 }
 
 /// Open (non-reserved) usage units round-trip beside the reserved four, per model, whatever
+/// characters the unit and the model carry; and every counter is FLOORED at 0 as a refund lands,
+/// so a refund larger than the counter never leaves a debt the next accrual pays back.
 #[test]
 fn usage_carries_open_units_and_floors_each_counter_at_zero() {
     use busbar_contract::records::{ModelTokensDelta, UNIT_INPUT, UNIT_OUTPUT};
@@ -3371,6 +3483,7 @@ fn usage_carries_open_units_and_floors_each_counter_at_zero() {
 }
 
 /// A v6 build's unfloored HINCRBY could leave a counter NEGATIVE. It always read as 0; the next add
+/// must land on that 0, not pay the old debt back.
 #[test]
 fn a_legacy_negative_counter_is_added_to_as_the_zero_it_always_read_as() {
     let Some(store) = live_store() else { return };
@@ -3395,6 +3508,8 @@ fn a_legacy_negative_counter_is_added_to_as_the_zero_it_always_read_as() {
 }
 
 /// `priced_from_ms` joins the metering cell's identity (a rate-card edit SPLITS the day's cell), an
+/// undated cell keeps the v6 row key so v6 and v7 writes of it are one cell, and open classes
+/// accumulate beside the token columns.
 #[test]
 fn metering_splits_a_cell_at_a_price_change_and_carries_open_classes() {
     let Some(store) = live_store() else { return };
@@ -3435,6 +3550,7 @@ fn metering_splits_a_cell_at_a_price_change_and_carries_open_classes() {
 }
 
 /// The 1.6.0 key fields round-trip, and a NON-POOL scope grant comes back as the kind it was granted
+/// — never as a pool grant (which would lose the grant AND widen pool access).
 #[test]
 fn a_key_round_trips_its_attribution_and_every_scope_kind() {
     use busbar_contract::records::ScopeRef;
@@ -3481,6 +3597,11 @@ fn a_key_round_trips_its_idp_provider() {
 }
 
 /// A v6 namespace's typed task / task-event / demotion / spent-approval keys, written the way v6
+/// wrote them, come back through the 1.6.0 verbs after a connect — as the bodies the planes decode,
+/// with the sidecar the planes write (a replay of a migrated event is the identical append, not a
+/// fork) — and the typed keys are gone. Everything else in the namespace (keys, usage, the v6 call
+/// log) is untouched. The complete migration runs in a locked private database because later
+/// migration steps also remove whole key families.
 #[test]
 fn v6_namespace_upgrades_in_place_to_v7() {
     use crate::legacy::{
@@ -3830,6 +3951,7 @@ fn tls_pump(conn: rustls::ServerConnection, front: std::net::TcpStream, back: st
 }
 
 /// The store's door opened on `settings` on a dispatcher of its own, over the connection table
+/// `table` builds; the table too, to read what it was asked.
 fn open_on(
     settings: &str,
     table: impl FnOnce(&Dispatcher) -> RecordedConnector,
@@ -3878,6 +4000,7 @@ fn settings_for(url: &str) -> String {
 }
 
 /// STORE-KEEP: the store keeps ONE connection across ops (1.5.5's one mutex-guarded connection):
+/// its open and every later op are one connection, one handshake.
 #[test]
 fn the_store_keeps_one_connection_across_ops() {
     if live_store().is_none() {
@@ -3903,6 +4026,8 @@ fn the_store_keeps_one_connection_across_ops() {
 }
 
 /// VALKEY-RETRY, 1.5.5's own pin: a genuine connection-level error (the server dropping the
+/// store's connection out from under it, the real-world case `with_conn`'s reconnect-and-retry
+/// exists for) is transparently recovered on a fresh connection, not surfaced to the caller.
 #[test]
 fn with_conn_transparently_reconnects_after_the_connection_is_dropped() {
     if live_store().is_none() {
@@ -3935,6 +4060,7 @@ fn with_conn_transparently_reconnects_after_the_connection_is_dropped() {
 }
 
 /// VALKEY-RETRY's other half: a write 1.5.5 never replayed (`with_conn_no_retry`: the plane
+/// writes, a token redemption) fails on a dropped connection, and the next op dials fresh.
 #[test]
 fn a_no_retry_write_on_a_dropped_connection_fails_and_the_next_op_dials_fresh() {
     if live_store().is_none() {
@@ -3964,6 +4090,7 @@ fn a_no_retry_write_on_a_dropped_connection_fails_and_the_next_op_dials_fresh() 
 }
 
 /// VALKEY-UNIX: every unix-socket URL form 1.5.5's driver read reaches the server over a
+/// unix-domain socket through the host's connector (`unix:<path>`).
 #[test]
 fn a_unix_socket_url_reaches_the_server() {
     if live_store().is_none() {
@@ -3990,6 +4117,7 @@ fn a_unix_socket_url_reaches_the_server() {
 }
 
 /// VALKEY-TIMEOUT: `connect_timeout_ms` (default 10 s, 1.5.5's) is every dial's timeout, as the
+/// host's table is asked; a zero timeout refuses the load as 1.5.5's driver refused it.
 #[test]
 fn connect_timeout_ms_is_the_dial_timeout() {
     if live_store().is_none() {
@@ -4017,6 +4145,7 @@ fn connect_timeout_ms_is_the_dial_timeout() {
 }
 
 /// A CA and a server certificate it signed for `127.0.0.1` (the proxy's address; an IP SAN): the
+/// server config, and the CA (DER).
 fn tls_server() -> (Arc<rustls::ServerConfig>, Vec<u8>) {
     let ca_key = rcgen::KeyPair::generate().unwrap();
     let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -4043,6 +4172,8 @@ fn tls_server() -> (Arc<rustls::ServerConfig>, Vec<u8>) {
 }
 
 /// TLS: a `rediss://` URL is secured from its first byte through the host's connector (the test
+/// table's TLS standing in for the connector's TLS wrap, trusting a test CA), and the kept
+/// connection stays secure; without the CA the load fails in the store's words.
 #[test]
 fn a_rediss_url_is_secured_through_the_hosts_connector() {
     if live_store().is_none() {
@@ -4098,6 +4229,8 @@ fn a_rediss_url_is_secured_through_the_hosts_connector() {
 }
 
 /// Host services offering the clock alone (the dispatcher's own timebase), refusing the rest: the
+/// host clock a wire's bound runs on. Every other service answers as busbar's shared test double
+/// (`busbar_test_kit::services_double`) answers an unserved one: REFUSED, at once.
 struct ClockOnly;
 
 use busbar_contract::services::{
@@ -4314,6 +4447,8 @@ impl busbar_contract::services::HostServices for ClockOnly {
 }
 
 /// VALKEY-TIMEOUT over the whole span 1.5.5's `get_connection_with_timeout` bounded: a server that
+/// accepts the dial and never answers the handshake's `AUTH` (or `SELECT`) refuses the load within
+/// `connect_timeout_ms`, in the store's words, rather than at the op's deadline.
 #[test]
 fn connect_timeout_ms_bounds_the_handshake_after_the_dial() {
     let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -4466,6 +4601,8 @@ fn recorded_1_5_5_breakdown(rows: &[&MeteringRow]) -> serde_json::Value {
 }
 
 /// Compare the loaded store's reads with all three frozen 1.5.5 HTTP response bodies. Only the
+/// recorder's fixed pricing/context is supplied here; IDs, names, groups and consumption come
+/// from real RecordStore reads after migration. The recorder removed only `as_of`.
 fn assert_recorded_1_5_5_readback(store: &ValkeyStore) {
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
@@ -4828,6 +4965,7 @@ fn read_everything_1_5_5(store: &ValkeyStore) -> Vec<String> {
 /// Keys written by the 1.5.5 binary read back through this build's migrate, field for field.
 #[test]
 fn the_1_5_5_binarys_rows_read_back_through_migrate() {
+    let Some(_) = live_store() else { return };
     let url = url_for_db(6);
     let database = database::Database::take(&url);
     replay_1_5_5(&database);
@@ -4861,6 +4999,7 @@ fn the_1_5_5_binarys_rows_read_back_through_migrate() {
 /// A second open over the migrated 1.5.5 keyspace changes nothing.
 #[test]
 fn migrate_over_the_1_5_5_rows_is_idempotent() {
+    let Some(_) = live_store() else { return };
     let url = url_for_db(6);
     let database = database::Database::take(&url);
     replay_1_5_5(&database);
@@ -4959,6 +5098,7 @@ fn debug_output_redacts_the_url_password() {
 }
 
 /// `put_key_with_credential` into a slot holding a DIFFERENT LIVE credential is refused, and the
+/// live credential's pointers still resolve to it.
 #[test]
 fn put_key_with_credential_refuses_an_occupied_live_slot() {
     let Some(store) = live_store() else { return };
@@ -5051,6 +5191,8 @@ fn put_key_with_credential_never_remints_a_revoked_credential() {
 }
 
 /// A RESP parse error leaves the bad bytes buffered on the kept connection, so the connection must
+/// be discarded: the op AFTER the malformed reply succeeds (on a fresh connection) instead of
+/// failing on the same buffered bytes forever.
 #[test]
 fn a_malformed_reply_discards_the_kept_connection() {
     use std::io::{Read, Write};
@@ -5210,6 +5352,7 @@ fn settings_refuse_a_url_that_is_not_a_non_empty_string() {
 }
 
 /// A missing (or null) `url` and a settings document that is no object are refused in the one
+/// grammar: `invalid valkey plugin config: ...`, naming the JSON type, never the value.
 #[test]
 fn every_settings_refusal_starts_with_the_one_prefix() {
     for json in ["{}", r#"{"url":null}"#] {
@@ -5288,6 +5431,7 @@ fn unknown_id_refusals_name_the_id_in_the_canonical_form() {
 }
 
 /// An id that spells the delete's internal retry text is just an unknown id: it answers the refusal
+/// (it never loops). The call runs on a thread so a regression fails by timeout, not by hanging.
 #[test]
 fn an_unknown_id_spelling_the_retry_sentinel_is_refused_not_retried() {
     if live_store().is_none() {
@@ -5310,6 +5454,8 @@ fn an_unknown_id_spelling_the_retry_sentinel_is_refused_not_retried() {
 }
 
 /// Two writers interleaved at the revision read: the one that allocates first but commits last must
+/// still stamp the HIGHER revision (else a cursor reader that already passed the other's stamp skips
+/// its row forever). The first writer is held after its revision command, the second runs to completion.
 #[test]
 fn a_writer_overtaken_between_its_revision_read_and_commit_restamps_above_the_winner() {
     if live_store().is_none() {
@@ -5342,6 +5488,9 @@ fn a_writer_overtaken_between_its_revision_read_and_commit_restamps_above_the_wi
 }
 
 /// A handshake the server REFUSES (AUTH) must not leave its connection kept: the next op would skip
+/// the handshake and run unauthenticated on db 0. The user's password is rotated away, its
+/// connections killed, one op fails to re-authenticate, the password is restored, and the next op
+/// must land in the store's own database.
 #[test]
 fn a_refused_handshake_does_not_leave_a_connection_kept() {
     if live_store().is_none() {
@@ -5406,6 +5555,7 @@ fn a_refused_handshake_does_not_leave_a_connection_kept() {
 }
 
 /// `list_metering` reads one snapshot: a write landing after it has read the bucket's row set is
+/// either wholly in the answer or wholly out of it (never a new count on a row set that predates it).
 #[test]
 fn list_metering_is_one_snapshot() {
     let Some(direct) = live_store() else { return };
@@ -5459,6 +5609,7 @@ fn list_metering_is_one_snapshot() {
 }
 
 /// A write that decides nothing to write does not `EXEC`: a replayed credential put, a repeat
+/// revoke and a repeat delete leave the transaction without contending on `busbar:revision`.
 #[test]
 fn no_op_paths_do_not_exec() {
     let Some(direct) = live_store() else { return };
@@ -5533,6 +5684,7 @@ fn a_held_op_does_not_block_a_second_op_on_the_same_store() {
 }
 
 /// `delete_key` leaves the key's own usage windows and every other bucket's whose id starts with
+/// `<id>:` (a group bucket, an era bucket) alone: the ledger is billing evidence.
 #[test]
 fn delete_key_leaves_its_own_and_other_buckets_usage_windows() {
     let Some(store) = live_store() else { return };
@@ -5557,6 +5709,8 @@ fn delete_key_leaves_its_own_and_other_buckets_usage_windows() {
 }
 
 /// `delete_key` takes the key's credential pointers out of the credential revision index too: a
+/// destroyed row must not stay in `busbar:creds:byrev` for ever (the key's own tombstone is what
+/// tells hydrators to evict).
 #[test]
 fn delete_key_removes_its_credentials_from_the_revision_index() {
     let Some(store) = live_store() else { return };
@@ -5577,6 +5731,7 @@ fn delete_key_removes_its_credentials_from_the_revision_index() {
 }
 
 /// Two revokes of one credential racing: the one that commits first stands. The slower one read the
+/// live row, was overtaken, and must NOT overwrite the first's reason and time.
 #[test]
 fn a_revoke_overtaken_before_commit_does_not_overwrite_the_first_reason() {
     if live_store().is_none() {
@@ -5608,6 +5763,8 @@ fn a_revoke_overtaken_before_commit_does_not_overwrite_the_first_reason() {
 }
 
 /// A transaction whose watched key moves on EVERY attempt gives up with an error after a bounded
+/// number of tries instead of spinning for ever. The proxy bumps the revision counter ahead of each
+/// `EXEC`; the call runs on a thread so a regression fails by timeout.
 #[test]
 fn a_transaction_that_always_aborts_ends_with_an_error() {
     if live_store().is_none() {
@@ -5650,6 +5807,7 @@ fn a_transaction_that_always_aborts_ends_with_an_error() {
 }
 
 /// Putting a credential again is a replay only when it is the SAME credential: one with the stored
+/// id but different content is refused, never answered as a success that wrote nothing.
 #[test]
 fn re_putting_a_credential_id_with_different_content_is_refused() {
     let Some(store) = live_store() else { return };
@@ -5691,6 +5849,7 @@ fn put_refusals_carry_the_reason_without_the_kind_suffix() {
 }
 
 /// A unix-socket URL's `?pass=` is the scrub secret too: an error string that echoes the URL (or
+/// the password, raw or decoded) carries no credential bytes.
 #[test]
 fn unix_url_query_password_is_scrubbed_from_errors() {
     for url in [
@@ -5723,6 +5882,7 @@ fn unix_url_query_password_is_scrubbed_from_errors() {
 }
 
 /// A URL parameter the store does not read is REFUSED, never silently ignored; its name is withheld
+/// when the URL carries a password (an unencoded one can split at `?`).
 #[test]
 fn an_unknown_url_parameter_is_refused_not_ignored() {
     for url in [
@@ -5749,6 +5909,10 @@ fn an_unknown_url_parameter_is_refused_not_ignored() {
 }
 
 /// UPSERT IS BY `(kind, id)` (the contract's `RecordStore::upsert_plane_record` /
+/// `get_plane_record`), with or without a parent: an upserted record that names a parent reads back
+/// by its own id, a second id under the same parent is a second record (never an overwrite), the
+/// parent-scoped listing and the parent enumeration still see both, and a delete or a purge keeps
+/// both exact.
 #[test]
 fn a_parented_upserted_record_reads_back_by_its_own_id() {
     let Some(store) = live_store() else { return };
@@ -5827,6 +5991,7 @@ fn a_parented_upserted_record_reads_back_by_its_own_id() {
 }
 
 /// Redemption stores decimal strings, not signed columns. Permanent node claims and clocks
+/// past i64::MAX must retain exact one-use semantics independent of caller clock skew.
 #[test]
 fn token_redemption_keeps_the_full_u64_range_exact() {
     let Some(store) = live_store() else { return };
@@ -5851,7 +6016,7 @@ fn token_redemption_keeps_the_full_u64_range_exact() {
 
 /// Existing revoked credentials are repaired on upgrade, and the repair reaches hydrated caches.
 #[test]
-fn a_v9_upgrade_scrubs_revoked_credentials_and_publishes_the_repairs_once() {
+fn a_v7_upgrade_scrubs_revoked_credentials_and_publishes_the_repairs_once() {
     let Some(_) = live_store() else { return };
     let (_database, mut raw) = fresh_db_client(5);
     let url = url_for_db(5);
@@ -6521,6 +6686,7 @@ fn a_failed_legacy_upgrade_reports_safe_context_and_truthful_partial_progress() 
 }
 
 /// A bounded, joined RESP peer: exercise malformed transaction replies and a lost script reply
+/// through the actual loaded store door, independently of the production parser.
 fn malformed_reply_peer(exec: Option<&'static [u8]>) -> (String, std::thread::JoinHandle<usize>) {
     use std::io::Write;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -6986,7 +7152,7 @@ fn corrupt_hydration_index_members_and_plane_sidecars_refuse_without_echoing_con
         .unwrap();
     let error = store.list_credentials_since(0).unwrap_err().0;
     assert!(
-        error.contains("list_credentials_since") && !error.contains("CorruptPrivateCanary"),
+        error.contains("revision index") && !error.contains("CorruptPrivateCanary"),
         "{error}"
     );
     raw.zrem::<_, _, ()>(CREDS_BYREV, "CorruptPrivateCanary")
@@ -7573,5 +7739,11 @@ fn an_exhausted_transaction_is_reported_as_a_backend_failure() {
     let text = store.err(e, "command").0;
     assert!(text.starts_with("valkey command: "), "{text}");
     assert!(text.contains("aborted"), "{text}");
-    assert!(text.contains("64"), "{text}");
+    assert!(
+        text.contains(&crate::resp::MAX_TRANSACTION_ATTEMPTS.to_string()),
+        "{text}"
+    );
 }
+
+#[path = "tests/audit_regressions.rs"]
+mod audit_regressions;

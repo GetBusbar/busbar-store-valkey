@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! Server-free unit tests for the store v3 keyspace's encodings and the admission rule
+//! (`src/slots.rs`).
 
 use super::*;
 

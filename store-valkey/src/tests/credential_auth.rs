@@ -80,7 +80,7 @@ impl Conns for Fragmented {
         let n = bytes.len().min(3);
         let stream = s.streams.get_mut(&id).unwrap();
         stream.input.extend_from_slice(&bytes[..n]);
-        let Some((value, used)) = resp::parse(&stream.input).unwrap() else {
+        let Some((value, used)) = resp::tests::parse(&stream.input).unwrap() else {
             return Ok(n);
         };
         let packet: Vec<u8> = stream.input.drain(..used).collect();

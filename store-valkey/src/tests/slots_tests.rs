@@ -2,6 +2,12 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The store v3 slots ([`StoreSlots`]) against a live Valkey: the durable `op_id` dedupe (S1-S4),
+//! the usage and metering batches, the plane-record append and the kernel's records, and the v7
+//! upgrade that drops what the deleted slots kept. The settings refusals need no server and always
+//! run.
+//!
+//! Every test names its own buckets, schemas and keys freshly (process, clock, counter), so
+//! the suite runs in parallel against the one shared Valkey and leaves nothing another test reads.
 
 use super::{live_store, Connect};
 use crate::ValkeyStore as Door;
@@ -57,6 +63,8 @@ fn call<T, E: FromFailure>(
 }
 
 /// The store v3 slots these tests drive, through the store's async calls (`StoreCalls`, named by
+/// path only: its methods share these names), answered
+/// synchronously in each slot's own result type.
 trait Slots {
     fn add_usage_batch(&self, op: OpId, cells: &[(&str, u64, UsageDelta)]) -> OpResult<()>;
     fn add_metering_batch(
@@ -184,6 +192,7 @@ fn open_refuses_settings_it_cannot_run_in_its_own_words() {
 }
 
 /// S1/S2/S3/S4: a replay applies nothing and answers the original, a different body is a conflict
+/// and applies nothing, and the record survives a reconnect (it is in Valkey, not the process).
 #[test]
 fn an_op_id_write_applies_once_durably_and_a_different_body_conflicts() {
     let Some(s) = live_store() else { return };
@@ -265,6 +274,9 @@ fn a_usage_and_a_metering_batch_apply_once() {
 }
 
 /// A store over a DATABASE of its own (`VALKEY_URL` re-pointed at `db`, emptied first and on drop):
+/// a test that seeds whole key families and asserts they are gone must not do it in the shared
+/// database 0. The guard holds an OS lock for the complete lifetime, including across test binaries
+/// and nextest processes that reuse the same private database number.
 struct Iso {
     url: String,
     store: Option<ValkeyStore>,
@@ -312,6 +324,7 @@ impl Drop for Iso {
 use redis::Commands as _;
 
 /// S2 for the batch slots: the same `op_id` with a DIFFERENT body answers `Conflict` and
+/// applies nothing.
 #[test]
 fn the_same_op_id_with_a_different_body_conflicts_on_every_batch_slot() {
     let Some(s) = live_store() else { return };
@@ -740,6 +753,7 @@ fn a_plane_replacement_validates_old_and_new_links_before_unlinking() {
 }
 
 /// A body an older build recorded (`<slot>:<values {:?}>`) still dedupes after the upgrade: the
+/// same op replays and applies nothing, a different op under its id conflicts.
 #[test]
 fn an_older_builds_recorded_body_replays_and_a_different_op_conflicts() {
     let Some(s) = live_store() else { return };
@@ -921,11 +935,13 @@ fn an_op_id_write_runs_after_the_script_cache_is_flushed() {
     assert_eq!(s.get_usage(&bucket, 0).unwrap().requests, 2);
 }
 
-/// The v8 -> v9 step: every key the deleted slots kept (the money keys, the journal, the sessions)
+/// The v6 -> v7 step: every key the deleted slots kept (the money keys, the journal, the sessions)
+/// is gone after the upgrade, and so are the dedupe hashes of the deleted slots; the dedupe hash of
+/// a kept slot survives, so its op replays across the upgrade and applies nothing.
 #[test]
-fn the_v9_upgrade_drops_the_money_and_dead_slot_keys() {
+fn the_v7_upgrade_drops_the_money_and_dead_slot_keys() {
     let Some(mut iso) = Iso::new(8) else { return };
-    let bucket = fresh("v9");
+    let bucket = fresh("v7");
     let delta = UsageDelta {
         requests: 3,
         billable_requests: 2,
@@ -935,7 +951,7 @@ fn the_v9_upgrade_drops_the_money_and_dead_slot_keys() {
     let kept = op(40);
     iso.s().add_usage_batch(kept, &cells).expect("applies");
     iso.s()
-        .record_put("v9-schema", b"k", b"v")
+        .record_put("v7-schema", b"k", b"v")
         .expect("a record the upgrade must keep");
 
     let dead_ops = [
@@ -971,7 +987,7 @@ fn the_v9_upgrade_drops_the_money_and_dead_slot_keys() {
     let kept_key = format!("busbar:op:{}", crate::hex(&kept.0));
     let v8_body = format!("add_usage_batch:{:?}", &cells[..]);
     let _: () = c.hset(&kept_key, "b", v8_body).unwrap();
-    let _: () = c.set("busbar:schema", 8).unwrap();
+    let _: () = c.set("busbar:schema", 6).unwrap();
     drop(c);
 
     iso.restart();
@@ -1006,7 +1022,7 @@ fn the_v9_upgrade_drops_the_money_and_dead_slot_keys() {
         Err(OpRefused::Conflict),
         "the kept op's record survived, so a different body still conflicts"
     );
-    let got = iso.s().record_get("v9-schema", b"k").unwrap();
+    let got = iso.s().record_get("v7-schema", b"k").unwrap();
     assert_eq!(got.as_ref().map(RecordBytes::as_slice), Some(&b"v"[..]));
 }
 
@@ -1070,6 +1086,7 @@ fn a_metering_counter_at_i64_max_pins_instead_of_failing() {
 }
 
 /// A cell the batch cannot add to refuses the WHOLE batch: no other cell applies and the op is not
+/// recorded, so a retry under the same op id with the key fixed applies.
 #[test]
 fn a_batch_with_an_unusable_cell_applies_nothing_and_records_nothing() {
     let Some(s) = live_store() else { return };
@@ -1145,9 +1162,10 @@ fn a_metering_batch_with_a_wrong_typed_row_applies_nothing() {
     assert_eq!(s.list_metering(good).unwrap().len(), 1);
 }
 
-/// The v9 step keeps an op record whose body is a kept slot's digest (32 bytes, or 64 lowercase hex):
+/// The v7 step keeps an op record whose body is a kept slot's digest (32 bytes, or 64 lowercase hex):
+/// a node upgrading concurrently with live writers must not erase their dedupe records.
 #[test]
-fn the_v9_upgrade_keeps_digest_bodied_op_records() {
+fn the_v7_upgrade_keeps_digest_bodied_op_records() {
     let Some(mut iso) = Iso::new(9) else { return };
     let mut c = iso.raw();
     let mut raw32 = [0xABu8; 32];
@@ -1156,7 +1174,7 @@ fn the_v9_upgrade_keeps_digest_bodied_op_records() {
     let _: () = c.hset("busbar:op:digest32", "b", &raw32[..]).unwrap();
     let _: () = c.hset("busbar:op:digest64", "b", &hex64).unwrap();
     let _: () = c.hset("busbar:op:deadtext", "b", "reserve:0:[]").unwrap();
-    let _: () = c.set("busbar:schema", 8).unwrap();
+    let _: () = c.set("busbar:schema", 6).unwrap();
     drop(c);
 
     iso.restart();
@@ -1171,6 +1189,8 @@ fn the_v9_upgrade_keeps_digest_bodied_op_records() {
 }
 
 /// A terminal-only purge over more records than one script call handles: every terminal row goes,
+/// none of the active rows at the cutoff is touched, and the count is the whole sweep's. Both
+/// timestamps round to the same ZSET score.
 #[test]
 fn a_purge_larger_than_one_batch_counts_and_removes_exactly_the_terminal_rows() {
     let Some(s) = live_store() else { return };
@@ -1393,6 +1413,7 @@ fn plane_retention_uses_exact_timestamps_and_cleans_every_index() {
 }
 
 /// The v6 -> v7 copy never deletes a v6 task-event chain whose position holds a DIFFERENT record
+/// already (a fork): the v6 event is the only copy of that evidence, so it stays for an operator.
 #[test]
 fn the_v6_copy_keeps_an_event_chain_whose_position_forked() {
     use crate::legacy::TASK_EVENTS_PREFIX;
@@ -1432,6 +1453,7 @@ fn the_v6_copy_keeps_an_event_chain_whose_position_forked() {
 }
 
 /// A page is read at ONE instant: a strike landing while the scan is in flight cannot shorten it.
+/// The scan is held right after its key range is read; the row is struck; the scan is released.
 #[test]
 fn a_record_scan_page_is_not_shortened_by_a_concurrent_strike() {
     let Some(direct) = live_store() else { return };
@@ -1459,6 +1481,7 @@ fn a_record_scan_page_is_not_shortened_by_a_concurrent_strike() {
 }
 
 /// The contract upserts by `(kind, id)` and reads at seq 0: a second upsert of an id with another
+/// `seq` replaces the first, never stands beside it.
 #[test]
 fn an_upsert_replaces_by_id_whatever_its_seq() {
     let Some(s) = live_store() else { return };
@@ -1485,6 +1508,7 @@ fn an_upsert_replaces_by_id_whatever_its_seq() {
 }
 
 /// A reply that does not fit is refused by naming where and what was expected, never by echoing the
+/// stored value into the error.
 #[test]
 fn a_malformed_stored_value_is_not_echoed_into_the_error() {
     let Some(s) = live_store() else { return };
@@ -1508,6 +1532,7 @@ fn a_malformed_stored_value_is_not_echoed_into_the_error() {
 }
 
 /// A fork-refused append records nothing under its op id: the same op id retried with a record that
+/// does not fork applies, instead of conflicting with a body the refusal wrongly recorded.
 #[test]
 fn a_fork_refused_append_records_nothing_under_its_op_id() {
     let Some(s) = live_store() else { return };
@@ -1697,7 +1722,7 @@ fn historical_metering_attribution_survives_batch_replay_and_reopen() {
 }
 
 #[test]
-fn v10_metering_migration_preserves_raw_rows_and_replays() {
+fn v6_metering_migration_preserves_raw_rows_and_replays() {
     let Some(mut iso) = Iso::new(12) else { return };
     let bucket = u64::MAX;
     let mut r = iso.raw();
@@ -1745,7 +1770,7 @@ fn v10_metering_migration_preserves_raw_rows_and_replays() {
         .query(&mut r)
         .unwrap();
     let _: () = r.sadd(&set, &[&old, &unknown]).unwrap();
-    let _: () = r.set("busbar:schema", 10).unwrap();
+    let _: () = r.set("busbar:schema", 6).unwrap();
     iso.restart();
     iso.restart();
     let rows = iso.s().list_metering(bucket).unwrap();
@@ -1798,7 +1823,7 @@ fn v10_metering_migration_preserves_raw_rows_and_replays() {
 }
 
 #[test]
-fn v10_metering_destination_collision_refuses_without_overwriting_evidence() {
+fn v6_metering_destination_collision_refuses_without_overwriting_evidence() {
     let Some(mut iso) = Iso::new(12) else { return };
     let mut r = iso.raw();
     let set = "busbar:metering:17";
@@ -1824,11 +1849,11 @@ fn v10_metering_destination_collision_refuses_without_overwriting_evidence() {
         .unwrap();
     let _: () = r.sadd(set, old).unwrap();
     let _: () = r.set(destination, "retained collision").unwrap();
-    let _: () = r.set("busbar:schema", 10).unwrap();
+    let _: () = r.set("busbar:schema", 6).unwrap();
     iso.store = None;
     assert!(ValkeyStore::connect(&iso.url).is_err());
     let stamp: i64 = r.get("busbar:schema").unwrap();
-    assert_eq!(stamp, 10);
+    assert_eq!(stamp, 6, "a refused migration preserves the source schema");
     let value: String = r.get(destination).unwrap();
     assert_eq!(value, "retained collision");
     let count: String = r.hget(old, "tokens_input").unwrap();
@@ -1845,13 +1870,13 @@ fn v10_metering_destination_collision_refuses_without_overwriting_evidence() {
         ("g", "v")
     );
 
-    let _: () = r.set("busbar:schema", 10).unwrap();
+    let _: () = r.set("busbar:schema", 6).unwrap();
     iso.restart();
     assert_eq!(iso.s().list_metering(17).unwrap(), rows);
 }
 
 #[test]
-fn v10_metering_upgrade_keeps_the_existing_replay_receipt_and_same_cell() {
+fn v6_metering_upgrade_keeps_the_existing_replay_receipt_and_same_cell() {
     let Some(mut iso) = Iso::new(12) else { return };
     let bucket = 19;
     let mut delta = metering_delta(bucket, 7);
@@ -1876,7 +1901,7 @@ fn v10_metering_upgrade_keeps_the_existing_replay_receipt_and_same_cell() {
     }
     let _: () = r.del(&set).unwrap();
     let _: () = r.sadd(&set, &old).unwrap();
-    let _: () = r.set("busbar:schema", 10).unwrap();
+    let _: () = r.set("busbar:schema", 6).unwrap();
     iso.restart();
     iso.s().add_metering_batch(id, &[delta.clone()]).unwrap();
     let rows = iso.s().list_metering(bucket).unwrap();
