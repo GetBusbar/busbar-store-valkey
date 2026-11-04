@@ -1857,11 +1857,13 @@ mod store_conformance;
 
 /// The store v3 slots (`StoreSlots`): the durable `op_id` dedupe, the plane-record append and the
 /// kernel's records, and the v7 upgrade.
+#[path = "tests/slots_tests.rs"]
 mod slots_tests;
 
 #[path = "tests/delta_reader.rs"]
 mod delta_reader;
 /// A proxy that holds one client mid-op, for deterministic interleavings.
+#[path = "tests/interleave.rs"]
 mod interleave;
 
 mod conformance {
