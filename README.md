@@ -76,25 +76,25 @@ Stop older busbar nodes before opening this build on the existing Valkey. The co
 once, and writes the `busbar:schema` marker last, so a crash mid-upgrade re-runs the step on the
 next connect (two nodes upgrading at once land in the same place).
 
-- **Schema v6** (plugin v1.0.x, busbar 1.5.x): the typed task, task-event, demotion and
-  spent-approval keys are copied into the plane keyspace, then removed, and the v9–v11 steps below run.
-  A task event whose position holds a different record already keeps its v6 source key for an
-  operator. `busbar:mcp:*` (the v6 tool-call log) is neither migrated nor removed.
-- **Schema v7/v8:** the v9–v11 steps.
-- **Schema v9:** the v10 and v11 steps.
-- **Schema v10:** v11 renames metering hashes to include their recorded group and price version; counters, unknown hash fields and existing replay receipts remain unchanged. Ambiguous destinations or missing indexed rows refuse migration without guessing.
-- **Schema v11:** v12 repairs spent-token cleanup against each stored absolute expiry, using server TIME.
-- **Schema v12:** current; no migration.
+- **Schema v6** (the plugin released with busbar 1.5.5): upgrades directly to **v7**.
+  Typed task, task-event, demotion and spent-approval keys are copied into the plane keyspace,
+  then removed. A conflicting task-event position keeps its v6 source key for an operator.
+  `busbar:mcp:*` is neither migrated nor removed. The same migration removes retired slot keys,
+  scrubs revoked credential secrets, preserves attribution while renaming metering hashes,
+  and repairs token cleanup against stored absolute expiry using server TIME. Counters,
+  unknown hash fields and replay receipts remain unchanged. Ambiguous destinations or missing
+  indexed rows refuse migration without guessing.
+- **Schema v7:** current; no migration.
 - **Older than v6, or keys with no marker:** refused, with the key prefixes found, and NOTHING is
   changed; if the marker was lost from a current namespace, `SET busbar:schema 6` and restart.
 - **Newer than this build:** refused. Run a build of that version or later.
 
-Metering rows preserve their recorded historical attribution through v11. Previously combined history cannot be reconstructed. Each hash rename and index update is atomic and repeatable after a lost reply; the schema marker advances only after all rows have moved. Keep older nodes stopped throughout the upgrade and subsequent operation.
+Metering rows preserve their recorded historical attribution through v7. Previously combined history cannot be reconstructed. Each hash rename and index update is atomic and repeatable after a lost reply; the schema marker advances only after all rows have moved. Keep older nodes stopped throughout the upgrade and subsequent operation.
 
 Single-use token redemption reads server TIME inside its atomic script. Caller `now` cannot expire
 or reclaim a receipt. A candidate expires only after its absolute second; cleanup is scheduled at
 the first second after that boundary. Grants beyond the existing TTL cap remain without TTL.
-Schema v12 repairs surviving older receipts, including imported v6 approvals, before admitting new
+Schema v7 repairs surviving older receipts, including imported v6 approvals, before admitting new
 operations. Receipts already deleted by an older writer's early TTL cannot be reconstructed. Drain
 older nodes before upgrade. Generic multi-use token checks retain their separate policy. Reserved ticket preflight reads a terminal record with the exact signed deadline against the store clock and never spends the token. The reserved kernel `ticket` record kind stores an absolute deadline in `ts`; its age cleanup is capped at the same store clock. Other record kinds keep their existing retention policy.
 
