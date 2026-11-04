@@ -1648,7 +1648,7 @@ fn credential_upgrade_refusals_name_the_pointer() {
         redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
         redis::cmd("SET")
             .arg("busbar:schema")
-            .arg(9)
+            .arg(FIRST_MIGRATED_SCHEMA)
             .query::<()>(&mut up)
             .unwrap();
         redis::cmd("ZADD")
@@ -5886,7 +5886,7 @@ fn a_v9_upgrade_scrubs_revoked_credentials_and_publishes_the_repairs_once() {
         .map(|(_, row, _)| row.meta.revision)
         .max()
         .unwrap();
-    raw.set::<_, _, ()>(SCHEMA_KEY, 9).unwrap();
+    raw.set::<_, _, ()>(SCHEMA_KEY, 6).unwrap();
     drop(store);
     let reopened = ValkeyStore::connect(&url).expect("the supported old namespace upgrades");
     let mut repaired_bytes = Vec::new();
@@ -5937,7 +5937,7 @@ fn a_v9_upgrade_scrubs_revoked_credentials_and_publishes_the_repairs_once() {
     let revision: u64 = raw.get(REVISION_KEY).unwrap();
     drop(reopened);
 
-    raw.set::<_, _, ()>(SCHEMA_KEY, 9).unwrap();
+    raw.set::<_, _, ()>(SCHEMA_KEY, 6).unwrap();
     let direct = ValkeyStore::connect(&url).unwrap();
     let marker: i64 = raw.get(SCHEMA_KEY).unwrap();
     assert_eq!(marker, SCHEMA_VERSION);
@@ -5965,7 +5965,7 @@ fn a_v9_upgrade_scrubs_revoked_credentials_and_publishes_the_repairs_once() {
     dirty.meta.secret_form = SecretForm::Recoverable;
     raw.set::<_, _, ()>(&row_key, cred_to_json(&dirty).unwrap())
         .unwrap();
-    raw.set::<_, _, ()>(SCHEMA_KEY, 9).unwrap();
+    raw.set::<_, _, ()>(SCHEMA_KEY, 6).unwrap();
     let gate = interleave::gate(&url, true, |chunk| {
         interleave::contains(chunk, b"$4\r\nEXEC\r\n")
     });
@@ -6010,13 +6010,13 @@ fn a_v9_upgrade_scrubs_revoked_credentials_and_publishes_the_repairs_once() {
 
     let malformed = r#"{"meta":"migration-private-marker","secret":"migration-private-marker"}"#;
     raw.set::<_, _, ()>(&row_key, malformed).unwrap();
-    raw.set::<_, _, ()>(SCHEMA_KEY, 9).unwrap();
+    raw.set::<_, _, ()>(SCHEMA_KEY, 6).unwrap();
     let error = match ValkeyStore::connect(&url) {
         Ok(_) => panic!("an undecodable indexed credential refuses migration"),
         Err(error) => error,
     };
     assert!(!error.to_string().contains("migration-private-marker"));
-    assert_eq!(raw.get::<_, i64>(SCHEMA_KEY).unwrap(), 9);
+    assert_eq!(raw.get::<_, i64>(SCHEMA_KEY).unwrap(), 6);
     assert_eq!(raw.get::<_, String>(&row_key).unwrap(), malformed);
 }
 
@@ -7126,7 +7126,7 @@ fn caller_clock_token_ttls_are_repaired_before_reopening_the_store() {
     const TOKEN_KIND: &str = "clock-upgrade";
     const LIVE_LIFE: u64 = 900;
     const EARLY_CLEANUP: u64 = 60;
-    const CALLER_CLOCK_SCHEMA: i64 = 11;
+    const CALLER_CLOCK_SCHEMA: i64 = FIRST_MIGRATED_SCHEMA;
     let Some(_) = live_store() else { return };
     let (database, _raw) = fresh_db_client(TOKEN_CLOCK_DATABASE);
     let url = url_for_db(TOKEN_CLOCK_DATABASE);

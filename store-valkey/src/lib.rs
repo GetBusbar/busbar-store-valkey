@@ -85,8 +85,8 @@ const DENYLIST_INDEX: &str = "busbar:denylist";
 const REVISION_KEY: &str = "busbar:revision";
 /// The schema marker. v6 is the oldest namespace migrated in place (older is REFUSED, never wiped);
 const SCHEMA_KEY: &str = "busbar:schema";
-const ATTRIBUTED_METERING_SCHEMA: i64 = 11;
-const SCHEMA_VERSION: i64 = 12;
+const ATTRIBUTED_METERING_SCHEMA: i64 = SCHEMA_VERSION;
+const SCHEMA_VERSION: i64 = 7;
 /// The slots whose `busbar:op:*` dedupe hashes survive the v9 upgrade.
 const KEPT_OP_SLOTS: [&str; 3] = [
     "add_usage_batch",
@@ -642,7 +642,7 @@ impl ValkeyStore {
                 if version < 7 {
                     legacy::migrate_v6_to_v7(self, c).await?;
                 }
-                if version < 9 {
+                if version < SCHEMA_VERSION {
                     self.drop_dead_slot_keys(c).await?;
                 }
                 self.scrub_revoked_credentials(c).await?;
