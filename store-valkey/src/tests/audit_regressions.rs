@@ -14,10 +14,10 @@ fn schema_marker_disappearance_is_not_success() {
     assert_eq!(got.as_deref(), Some("missing"));
     assert!(!raw.exists::<_, bool>(SCHEMA_KEY).unwrap());
     raw.set::<_, _, ()>(SCHEMA_KEY, "not-a-number").unwrap();
-    let error = ValkeyStore::connect(&url_for_db(6))
-        .err()
-        .expect("corrupt marker refused")
-        .0;
+    let error = match ValkeyStore::connect(&url_for_db(6)) {
+        Ok(_) => panic!("corrupt marker refused"),
+        Err(error) => error,
+    };
     assert!(error.contains("busbar:schema") && error.contains("NOTHING was changed"));
     assert_eq!(raw.get::<_, String>(SCHEMA_KEY).unwrap(), "not-a-number");
 }
