@@ -244,15 +244,17 @@ fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
         store.put_credential(&cred("orphan", &format!("{ns}_nokey")))
     ));
     t.push(r(store.put_credential(&cred("c1", &key_id))));
-    t.push(format!(
-        "lookup:{:?}",
-        store
+    t.push({
+        let credential = store
             .list_credentials_since(0)
             .unwrap()
             .into_iter()
-            .find(|c| c.meta.kind == "sigv4" && c.meta.public_id == format!("AKIA{ns}c1"))
-            .map(|c| (c.meta.id, c.secret))
-    ));
+            .find(|c| c.meta.kind == "sigv4" && c.meta.public_id == format!("AKIA{ns}c1"));
+        format!(
+            "lookup:{:?}",
+            credential.as_ref().map(|c| (&c.meta.id, &c.secret))
+        )
+    });
     t.push(r(store.revoke_credential(&format!("{ns}_c1"), "leaked")));
     t.push(r(store.revoke_credential(&format!("{ns}_nope"), "x")));
 

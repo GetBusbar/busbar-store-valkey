@@ -110,8 +110,8 @@ fn a_delta_cannot_advance_past_a_row_inserted_between_index_and_value_reads() {
             fast.put_credential(&old).unwrap();
             let held = fast.lookup_credential_secret("sigv4", &a).unwrap().unwrap();
             (
-                old.meta.id,
-                next.meta.id,
+                old.meta.id.clone(),
+                next.meta.id.clone(),
                 cred_row_key(&owner, "sigv4", 0),
                 held.meta.revision,
             )
@@ -133,7 +133,7 @@ fn a_delta_cannot_advance_past_a_row_inserted_between_index_and_value_reads() {
             if credentials {
                 slow.list_credentials_since(old_revision - 1).map(|rows| {
                     rows.into_iter()
-                        .map(|row| (row.meta.id, row.meta.revision))
+                        .map(|row| (row.meta.id.clone(), row.meta.revision))
                         .collect()
                 })
             } else {

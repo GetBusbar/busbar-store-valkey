@@ -1930,7 +1930,7 @@ impl ValkeyStore {
             .iter()
             .zip(raws)
             .filter_map(|(row, raw)| Some((row, raw?)))
-            .map(|(row, raw)| cred_from_json("list_credentials", row, &raw).map(|c| c.meta))
+            .map(|(row, raw)| cred_from_json("list_credentials", row, &raw).map(|c| c.meta.clone()))
             .collect::<RecordStoreResult<Vec<_>>>()?;
         metas.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.slot.cmp(&b.slot)));
         Ok(metas)
