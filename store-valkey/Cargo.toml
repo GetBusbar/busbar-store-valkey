@@ -34,6 +34,7 @@ url = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+jsonschema = { workspace = true }
 # The live tests open the store the way the host does: its door through the loader (`load_linked`,
 # `LoadedStore`), over the loader's test connection table (`TcpConns`, `test-support`), with a
 # runtime for the async `StoreCalls`. The upstream RESP client verifies what landed in Valkey

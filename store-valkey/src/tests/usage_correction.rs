@@ -38,18 +38,25 @@ fn setup() -> Option<(database::Database, redis::Connection, ValkeyStore, String
 }
 
 fn ledger(count: u64) -> UsageLedger {
+    ledger_parts(count, count)
+}
+
+/// Request width and quantity width are independent: these fixtures state both explicitly.
+fn ledger_parts(requests: u64, quantity: u64) -> UsageLedger {
     UsageLedger {
-        requests: count,
-        billable_requests: count,
+        requests,
+        billable_requests: requests,
         models: vec![ModelTokens {
+            scale: 6,
             model: FIXTURE_MODEL.into(),
-            usage_units: [(UNIT_INPUT.into(), count), (OPEN_UNIT.into(), count)].into(),
+            usage_units: [(UNIT_INPUT.into(), quantity), (OPEN_UNIT.into(), quantity)].into(),
         }],
     }
 }
 
 fn metering(key: &str) -> MeteringDelta {
     MeteringDelta {
+        scale: 6,
         bucket: DAY_START,
         key_id: key.into(),
         model: FIXTURE_MODEL.into(),
@@ -250,7 +257,7 @@ fn absence_and_full_u64_rows_are_compared_and_replaced_without_float_or_signed_n
             window_start: u64::MAX,
         },
         expected: UsageLedger::default(),
-        replacement: ledger(u64::MAX),
+        replacement: ledger_parts(u64::MAX, i64::MAX as u64),
     });
     request.usage.sort_by(|a, b| a.address.cmp(&b.address));
     assert_eq!(apply(&store, &request).unwrap(), Decision::Applied);
@@ -276,7 +283,7 @@ fn absence_and_full_u64_rows_are_compared_and_replaced_without_float_or_signed_n
         .find(|change| change.replacement.requests == u64::MAX)
         .unwrap();
     wide.expected.requests = u64::MAX;
-    wide.replacement = ledger(u64::MAX - 1);
+    wide.replacement = ledger_parts(u64::MAX - 1, i64::MAX as u64 - 1);
     assert_eq!(apply(&store, &next).unwrap(), Decision::Applied);
     for (index, change) in next.usage.iter().enumerate() {
         assert_eq!(read(&store, &next, index), change.replacement);
@@ -550,10 +557,15 @@ fn high_correction_survives_accrual_refund_saturation_and_reopen() {
     };
     let mut request = candidate(&store);
     const HIGH: u64 = u64::MAX - 10;
-    request.usage[0].replacement = ledger(HIGH);
+    request.usage[0].replacement = ledger_parts(HIGH, i64::MAX as u64 - 10);
     request.usage[0].replacement.models.push(ModelTokens {
+        scale: 6,
         model: String::new(),
-        usage_units: [(UNIT_INPUT.into(), HIGH), (OPEN_UNIT.into(), HIGH)].into(),
+        usage_units: [
+            (UNIT_INPUT.into(), i64::MAX as u64 - 10),
+            (OPEN_UNIT.into(), i64::MAX as u64 - 10),
+        ]
+        .into(),
     });
     correction::canonical_ledger(&mut request.usage[0].replacement).unwrap();
     assert_eq!(apply(&store, &request).unwrap(), Decision::Applied);
@@ -563,6 +575,7 @@ fn high_correction_survives_accrual_refund_saturation_and_reopen() {
         models: [String::new(), FIXTURE_MODEL.into()]
             .into_iter()
             .map(|model| ModelTokensDelta {
+                scale: 6,
                 model,
                 usage_units: [(UNIT_INPUT.into(), count), (OPEN_UNIT.into(), count)].into(),
             })
@@ -572,7 +585,15 @@ fn high_correction_survives_accrual_refund_saturation_and_reopen() {
     let mut expected = request.usage[0].replacement.clone();
     for count in [3, -7, i64::MAX, i64::MIN, i64::MIN] {
         let change = delta(count);
-        expected.apply_delta(&change);
+        let mut next = expected.clone();
+        if next.checked_apply_delta(&change).is_err() {
+            assert!(
+                Slots::add_usage_batch(&store, op(60), &[(bucket, DAY_START, change)]).is_err()
+            );
+            assert_eq!(read(&store, &request, 0), expected);
+            continue;
+        }
+        expected = next;
         Slots::add_usage_batch(&store, op(60), &[(bucket, DAY_START, change)]).unwrap();
         let reopened = ValkeyStore::connect(&url).unwrap();
         let mut actual = read(&reopened, &request, 0);
@@ -582,9 +603,12 @@ fn high_correction_survives_accrual_refund_saturation_and_reopen() {
     }
 
     store
-        .put_usage(bucket, DAY_START, &ledger(u64::MAX))
+        .put_usage(bucket, DAY_START, &ledger_parts(u64::MAX, i64::MAX as u64))
         .unwrap();
-    assert_eq!(read(&store, &request, 0), ledger(u64::MAX));
+    assert_eq!(
+        read(&store, &request, 0),
+        ledger_parts(u64::MAX, i64::MAX as u64)
+    );
 }
 
 #[test]

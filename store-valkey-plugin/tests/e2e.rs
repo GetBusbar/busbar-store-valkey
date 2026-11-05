@@ -485,6 +485,7 @@ fn ledger() -> UsageLedger {
         requests: 5,
         billable_requests: 5,
         models: vec![ModelTokens {
+            scale: 6,
             model: "gpt-5".into(),
             usage_units: [("input".to_string(), 20), ("output".to_string(), 8)]
                 .into_iter()

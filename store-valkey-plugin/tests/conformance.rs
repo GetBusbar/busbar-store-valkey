@@ -272,6 +272,7 @@ fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
         requests: input.signum(),
         billable_requests: 0,
         models: vec![ModelTokensDelta {
+            scale: 6,
             model: "m".into(),
             usage_units: [
                 ("input".to_string(), input),
@@ -289,6 +290,7 @@ fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
     let bucket_n: u64 = 7_000_000_000 + u64::from(std::process::id());
     for priced_from_ms in [0, 0, 5_000] {
         t.push(r(store.add_metering(&MeteringDelta {
+            scale: 6,
             key_id: key_id.clone(),
             bucket: bucket_n,
             model: "m".into(),

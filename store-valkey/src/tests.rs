@@ -909,7 +909,9 @@ fn revoke_credential_unknown_id_errors() {
     let Some(store) = live_store() else { return };
 
     assert!(
-        store.revoke_credential("cred_never_existed", "n/a").is_err(),
+        store
+            .revoke_credential("cred_never_existed", "n/a")
+            .is_err(),
         "revoking an id that names no credential must error, distinct from re-revoking a revoked one"
     );
 }
@@ -1238,6 +1240,7 @@ fn metering_round_trips_all_fields_including_renamed_and_new_ones() {
         let bucket = unique_bucket(20260731);
         store
             .add_metering(&MeteringDelta {
+                scale: 6,
                 key_id: key_id.clone(),
                 bucket,
                 model: "claude".to_string(),
@@ -1284,6 +1287,7 @@ fn metering_keeps_each_historical_attribution_with_its_own_counts() {
     let Some(store) = live_store() else { return };
     let bucket = unique_bucket(20260801);
     let base = MeteringDelta {
+        scale: 6,
         key_id: uid("vk_snap"),
         bucket,
         model: "m".to_string(),
@@ -1333,6 +1337,7 @@ fn metering_row_identity_does_not_collide_across_a_delimiter_character() {
 
     store
         .add_metering(&MeteringDelta {
+            scale: 6,
             key_id: key_id.clone(),
             bucket,
             model: "a|b".to_string(),
@@ -1351,6 +1356,7 @@ fn metering_row_identity_does_not_collide_across_a_delimiter_character() {
         .unwrap();
     store
         .add_metering(&MeteringDelta {
+            scale: 6,
             key_id: key_id.clone(),
             bucket,
             model: "a".to_string(),
@@ -3002,6 +3008,7 @@ fn a_u64_a_signed_column_cannot_hold_is_refused() {
     store.delete_plane_record(&kind, "p1").unwrap();
 
     let mut m = MeteringDelta {
+        scale: 6,
         key_id: uid("vk_unstorable"),
         bucket: unique_bucket(20260803),
         model: "m".to_string(),
@@ -3443,6 +3450,7 @@ fn usage_carries_open_units_and_floors_each_counter_at_zero() {
         requests,
         billable_requests: requests,
         models: vec![ModelTokensDelta {
+            scale: 6,
             model: model.into(),
             usage_units: units.iter().map(|(u, n)| (u.to_string(), *n)).collect(),
         }],
@@ -3518,6 +3526,7 @@ fn metering_splits_a_cell_at_a_price_change_and_carries_open_classes() {
     let bucket = unique_bucket(20260926);
     let key_id = uid("vk_priced");
     let d = |priced_from_ms: u64, class_n: u64| MeteringDelta {
+        scale: 6,
         key_id: key_id.clone(),
         bucket,
         model: "m".into(),
@@ -4716,8 +4725,13 @@ fn assert_recorded_1_5_5_readback(store: &ValkeyStore) {
             "the complete recorded key usage response for {id}"
         );
         if let Some(group) = key.group.as_deref() {
-            assert_eq!(store.get_usage(&format!("group:{group}@day"), start).unwrap(), ledger,
-                "the group's daily budget and the key's all-time attribution preserve the same recorded usage");
+            assert_eq!(
+                store
+                    .get_usage(&format!("group:{group}@day"), start)
+                    .unwrap(),
+                ledger,
+                "the group's daily budget and the key's all-time attribution preserve the same recorded usage"
+            );
         }
     }
 }
@@ -5564,6 +5578,7 @@ fn list_metering_is_one_snapshot() {
     let url = std::env::var("VALKEY_URL").unwrap();
     let bucket = unique_bucket(20260802);
     let delta = |model: &str, requests: u64| MeteringDelta {
+        scale: 6,
         key_id: uid("vk_snapshot"),
         bucket,
         model: model.to_string(),
@@ -6202,6 +6217,7 @@ fn usage_cleanup_preserves_full_width_boundaries_billing_and_other_namespaces() 
         models: ["alpha", "beta"]
             .into_iter()
             .map(|model| ModelTokens {
+                scale: 6,
                 model: model.to_owned(),
                 usage_units: [
                     (RESERVED_UNITS[0].to_owned(), 5),
@@ -7749,3 +7765,6 @@ fn an_exhausted_transaction_is_reported_as_a_backend_failure() {
 
 #[path = "tests/audit_regressions.rs"]
 mod audit_regressions;
+
+#[path = "tests/exact_counts.rs"]
+mod exact_counts;

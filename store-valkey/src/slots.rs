@@ -57,11 +57,16 @@ busbar_contract::statement_extensions!(EXTENSIONS: [
     (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["url"]"#),
     (busbar_contract::abi::sdk::store::rewrap::INTENT, b"1"),
     (conditional::CAPABILITY, b"1"),
+    ("busbar.store.count-scale", b"6"),
     (correction::CAPABILITY, correction::CAPABILITY_VALUE),
 ]);
 
 /// Ops admitted at once: each kept connection serves one, and up to seven more wait on it.
 const MAX_INFLIGHT: u32 = 8 * crate::KEPT_CONNECTIONS as u32;
+
+/// The settings accepted by this plugin's lifecycle parser.
+const SETTINGS_SCHEMA: busbar_contract::abi::mechanism::call::Blob =
+    busbar_contract::abi::mechanism::call::Blob::json(include_bytes!("settings.schema.json"));
 
 busbar_contract::store_door!(
     ValkeyStore,
@@ -69,7 +74,8 @@ busbar_contract::store_door!(
     env!("CARGO_PKG_VERSION"),
     MAX_INFLIGHT,
     needs: NEEDS,
-    extensions: EXTENSIONS
+    extensions: EXTENSIONS,
+    settings_schema: SETTINGS_SCHEMA
 );
 
 /// The record of one `op_id`.
@@ -512,6 +518,23 @@ local function usage_sub(a, b)
     end
     return (string.gsub(string.reverse(table.concat(out)), '^0+', ''))
 end
+local pending_quantities = {}
+local function checked_quantity(key, field, delta)
+    local fields = pending_quantities[key]
+    if not fields then fields = {}; pending_quantities[key] = fields end
+    local current = fields[field] or redis.call('HGET', key, field) or '0'
+    if not is_usage_count(current) or usage_cmp(current, MAX) > 0 then
+        return 'exact quantity is outside the scale-6 range'
+    end
+    local next
+    if string.sub(delta, 1, 1) == '-' then
+        next = usage_sub(current, string.sub(delta, 2))
+    else
+        next = usage_add(current, delta)
+    end
+    if usage_cmp(next, MAX) > 0 then return 'exact quantity aggregate overflow' end
+    fields[field] = next
+end
 local function usage_apply(key, field, delta)
     local current = redis.call('HGET', key, field) or '0'
     if string.sub(current, 1, 1) == '-' then current = '0' end
@@ -540,6 +563,9 @@ static USAGE_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
             local why = bad_key(KEYS[k], 'hash')
             for i = a + 1, a + 2 * n - 1, 2 do
                 why = why or usage_bad_field(KEYS[k], ARGV[i])
+                if ARGV[i] ~= 'requests' and ARGV[i] ~= 'billable_requests' then
+                    why = why or checked_quantity(KEYS[k], ARGV[i], ARGV[i + 1])
+                end
             end
             if why then
                 return {{'refused', why}}
@@ -565,7 +591,7 @@ static USAGE_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 /// (including empty values). Validate-then-apply as [`USAGE_OP`].
 static METERING_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
-        "{LUA_SEEN}
+        "{LUA_SEEN}{LUA_USAGE_COUNTS}
         local counters = {{'tokens_input', 'tokens_output', 'tokens_cache_read',
                           'tokens_cache_write', 'requests', 'billable_requests'}}
         local function walk(count, finish)
@@ -586,8 +612,11 @@ static METERING_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
             end
         end
         local why
-        walk(function(set, row, f)
+        walk(function(set, row, f, delta)
             why = why or bad_key(set, 'set') or bad_key(row, 'hash') or bad_field(row, f)
+            if f ~= 'requests' and f ~= 'billable_requests' then
+                why = why or checked_quantity(row, f, delta)
+            end
         end, function() end)
         if why then
             return {{'refused', why}}
@@ -785,6 +814,13 @@ impl StoreSlots for ValkeyStore {
         cells: &[(&str, u64, UsageDelta)],
     ) -> Step<OpResult<()>> {
         let d = Dedupe::usage(cells);
+        let mut normalized = cells.to_vec();
+        for (_, _, delta) in &mut normalized {
+            if let Err(error) = delta.normalize_scale6() {
+                return Step::Ready(Err(OpRefused::Refused(error.to_string())));
+            }
+        }
+        let cells = &normalized;
         let mut inv = op_call(&USAGE_OP, op, &d);
 
         inv.arg(
@@ -819,6 +855,13 @@ impl StoreSlots for ValkeyStore {
             }
         }
         let d = Dedupe::metering(deltas);
+        let mut normalized = deltas.to_vec();
+        for delta in &mut normalized {
+            if let Err(error) = delta.normalize_scale6() {
+                return Step::Ready(Err(OpRefused::Refused(error.to_string())));
+            }
+        }
+        let deltas = &normalized;
         let mut inv = op_call(&METERING_OP, op, &d);
         for m in deltas {
             inv.key(metering_set(m.bucket)).key(attributed_metering_row(
@@ -1025,3 +1068,7 @@ async fn range_members(
         "record range SCAN exceeded the page limit",
     ))
 }
+
+#[cfg(test)]
+#[path = "settings_schema_tests.rs"]
+mod settings_schema_tests;

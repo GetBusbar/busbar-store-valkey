@@ -7,7 +7,7 @@
 //! runtime of its own. `redis://` / `rediss://` URLs (and the `valkey://` spellings) are read as
 //! the upstream `redis` driver reads them.
 //!
-//! ## Keyspace (schema v7, every key under `busbar:`)
+//! ## Keyspace (schema v8, every key under `busbar:`)
 //!
 //! - **keys**: `key:<id>` (JSON [`VirtualKey`], tombstoned on delete, never removed), `keys` (SET of
 //!   ids), `keys:byrev` (ZSET by revision, for `list_keys_since`).
@@ -132,7 +132,8 @@ const REVISION_KEY: &str = "busbar:revision";
 const SCHEMA_KEY: &str = "busbar:schema";
 /// v7 upgrades the released v6 schema: copy typed plane rows, remove retired slots,
 /// scrub revoked credentials, preserve metering attribution and repair token expiries.
-const SCHEMA_VERSION: i64 = 7;
+/// v8 converts quantity aggregates to micro-units, atomically with its schema marker.
+const SCHEMA_VERSION: i64 = 8;
 /// The slots whose `busbar:op:*` dedupe hashes survive the v6 -> v7 upgrade.
 const KEPT_OP_SLOTS: [&str; 3] = [
     "add_usage_batch",
@@ -362,7 +363,10 @@ fn url_refused(why: &'static str) -> RedisError {
 /// The parameter's name is echoed only when the URL carries no password: a password written
 /// unencoded can split at `?` and arrive here as a "name" (one holding the `@` that ended it).
 fn check_query(url: &url::Url, known: &[&str], has_secret: bool) -> RedisResult<()> {
-    match url.query_pairs().find(|(k, _)| !known.contains(&k.as_ref())) {
+    match url
+        .query_pairs()
+        .find(|(k, _)| !known.contains(&k.as_ref()))
+    {
         None => Ok(()),
         Some((k, _)) if has_secret || k.contains('@') || query_has_at(url) => Err(url_refused(
             "an unknown URL parameter is not supported (its name is withheld: the URL carries a password)",
@@ -737,12 +741,14 @@ impl ValkeyStore {
                 return Ok(());
             }
             if version >= FIRST_MIGRATED_SCHEMA {
-                legacy::migrate_v6_to_v7(self, c).await?;
-                self.drop_dead_slot_keys(c).await?;
-                self.scrub_revoked_credentials(c).await?;
-                self.migrate_metering_attribution(c).await?;
-                self.repair_token_expiries(c).await?;
-                match self.mark_schema(c, marker).await? {
+                if version < 7 {
+                    legacy::migrate_v6_to_v7(self, c).await?;
+                    self.drop_dead_slot_keys(c).await?;
+                    self.scrub_revoked_credentials(c).await?;
+                    self.migrate_metering_attribution(c).await?;
+                    self.repair_token_expiries(c).await?;
+                }
+                match self.migrate_exact_counts(c, marker).await? {
                     None => return Ok(()),
                     // A peer marked it meanwhile: judge the new marker, never overwrite it.
                     Some(now) => {
@@ -792,11 +798,9 @@ impl ValkeyStore {
                 "{found} (a version below {FIRST_MIGRATED_SCHEMA} cannot be \
                  upgraded in place) but the namespace holds other `busbar:*` keys (e.g. {}); \
                  refusing to start. NOTHING was changed: no key was deleted and no marker written. \
-                 If this is a current namespace whose marker was lost, restore it with \
-                 `SET {SCHEMA_KEY} {FIRST_MIGRATED_SCHEMA}` and restart ({FIRST_MIGRATED_SCHEMA} is safe \
-                 either way: the v6->v7 copy is append-if-absent and the retired-slot cleanup step deletes keys a v6/v7 namespace already lacks or no longer reads, \
-                 so both are safe on a namespace already past them, whereas {SCHEMA_VERSION} on a namespace last run by a v6 build would skip the copy \
-                 and strand its task and ask-state data). If it was written by plugin v1.0.0 or an earlier 1.5.0 \
+                 If a namespace's marker was lost, restore only the original version verified \
+                 from a backup or deployment record. Never guess a legacy version: v8 converted \
+                 quantities to micro-units, and a guessed older marker would multiply them again. If it was written by plugin v1.0.0 or an earlier 1.5.0 \
                  development build, it cannot be migrated: back it up if needed, delete the \
                  `busbar:*` keys, and restart to start a fresh namespace.",
                 sample.join(", ")
@@ -812,6 +816,28 @@ impl ValkeyStore {
                     "the `busbar:schema` marker is not a number; NOTHING was changed".into(),
                 )
             })
+        })
+        .transpose()
+    }
+
+    /// One atomic script preflights every quantity, converts exact decimal strings and
+    /// advances the schema together. Reopening an already migrated namespace changes nothing.
+    async fn migrate_exact_counts(
+        &self,
+        c: &mut Conn,
+        read: Option<i64>,
+    ) -> RecordStoreResult<Option<i64>> {
+        let expected = read.map(|v| v.to_string()).unwrap_or_default();
+        let now: Option<String> = with_conn!(self, |c| MIGRATE_EXACT_COUNTS
+            .key(SCHEMA_KEY)
+            .arg(&expected)
+            .arg(SCHEMA_VERSION)
+            .invoke(c)
+            .await)?;
+        now.map(|value| {
+            value
+                .parse()
+                .map_err(|_| RecordStoreError("invalid exact count schema marker".into()))
         })
         .transpose()
     }
@@ -1267,6 +1293,7 @@ fn usage_from_fields(fields: Vec<(String, String)>) -> RecordStoreResult<UsageLe
         let index = *positions.entry(model.clone()).or_insert_with(|| {
             let index = ledger.models.len();
             ledger.models.push(ModelTokens {
+                scale: 6,
                 model,
                 ..Default::default()
             });
@@ -1285,6 +1312,7 @@ fn usage_from_fields(fields: Vec<(String, String)>) -> RecordStoreResult<UsageLe
 /// Decode all C4 counts and historical pricing fields without signed narrowing.
 fn metering_from_fields(fields: Vec<(String, String)>) -> RecordStoreResult<MeteringRow> {
     let mut m = MeteringRow {
+        scale: 6,
         key_id: String::new(),
         model: String::new(),
         provider: String::new(),
@@ -1634,6 +1662,12 @@ impl ValkeyStore {
         window_start: u64,
         ledger: &UsageLedger,
     ) -> RecordStoreResult<()> {
+        let mut ledger = ledger.clone();
+        ledger
+            .normalize_scale6()
+            .map_err(|e| RecordStoreError(e.to_string()))?;
+        let ledger = &ledger;
+
         if busbar_contract::abi::sdk::store::correction::reserved_bucket(bucket_id) {
             return Err(RecordStoreError(
                 "reserved adjustment rows require atomic usage correction".into(),
@@ -2412,3 +2446,62 @@ impl SecureOwned for str {
         Zeroizing::new(self.to_owned())
     }
 }
+
+/// No Lua numeric conversion touches a quantity: appending six zeroes is exact even beyond
+/// IEEE-754's integer range. Every read/type/range check precedes the first write.
+static MIGRATE_EXACT_COUNTS: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
+    Script::new(
+        r#"
+        local marker = redis.call('GET', KEYS[1]) or ''
+        if marker ~= ARGV[1] then return marker end
+        local changes = {}
+        local seen = {}
+        for _, pattern in ipairs({'busbar:usage:*', 'busbar:metering:*'}) do
+            local cursor = '0'
+            repeat
+                local page = redis.call('SCAN', cursor, 'MATCH', pattern, 'COUNT', 1000)
+                cursor = page[1]
+                for _, key in ipairs(page[2]) do
+                    if not seen[key] then
+                        seen[key] = true
+                        local kind = redis.call('TYPE', key).ok
+                        local usage = string.sub(key, 1, 13) == 'busbar:usage:'
+                        if kind ~= 'hash' and kind ~= 'none' and not (not usage and kind == 'set') then
+                            return redis.error_reply('exact count migration: invalid quantity key type; nothing converted')
+                        end
+                        if kind == 'hash' then
+                            local fields = redis.call('HGETALL', key)
+                            for i = 1, #fields, 2 do
+                                local field, value = fields[i], fields[i + 1]
+                                local quantity = usage and field ~= 'requests' and field ~= 'billable_requests'
+                                if not usage then
+                                    quantity = field == 'tokens_input' or field == 'tokens_output'
+                                        or field == 'tokens_cache_read' or field == 'tokens_cache_write'
+                                        or string.sub(field, 1, 2) == 'u:'
+                                end
+                                if quantity then
+                                    if not string.match(value, '^%d+$') then
+                                        return redis.error_reply('exact count migration: invalid quantity; nothing converted')
+                                    end
+                                    value = string.gsub(value, '^0+', '')
+                                    if value == '' then value = '0' end
+                                    if #value > 13 or (#value == 13 and value > '9223372036854') then
+                                        return redis.error_reply('exact count migration: quantity outside scale-6 range; nothing converted')
+                                    end
+                                    local scaled = value == '0' and '0' or value .. '000000'
+                                    changes[#changes + 1] = {key, field, scaled}
+                                end
+                            end
+                        end
+                    end
+                end
+            until cursor == '0'
+        end
+        for _, change in ipairs(changes) do
+            redis.call('HSET', change[1], change[2], change[3])
+        end
+        redis.call('SET', KEYS[1], ARGV[2])
+        return false
+    "#,
+    )
+});

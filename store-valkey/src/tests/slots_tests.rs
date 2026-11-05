@@ -248,6 +248,7 @@ fn a_usage_and_a_metering_batch_apply_once() {
 
     let bucket = super::unique_bucket(31);
     let m = busbar_contract::records::MeteringDelta {
+        scale: 6,
         key_id: fresh("vk"),
         bucket,
         model: "m".into(),
@@ -346,6 +347,7 @@ fn the_same_op_id_with_a_different_body_conflicts_on_every_batch_slot() {
 
     let bucket = super::unique_bucket(88);
     let m = |n| busbar_contract::records::MeteringDelta {
+        scale: 6,
         key_id: fresh("vk"),
         bucket,
         model: "m".into(),
@@ -366,6 +368,7 @@ fn the_same_op_id_with_a_different_body_conflicts_on_every_batch_slot() {
     s.add_metering_batch(id, std::slice::from_ref(&first))
         .expect("applies");
     let other = busbar_contract::records::MeteringDelta {
+        scale: 6,
         tokens_input: 99,
         ..first.clone()
     };
@@ -789,6 +792,7 @@ fn an_older_builds_recorded_body_replays_and_a_different_op_conflicts() {
 
     let mbucket = super::unique_bucket(91);
     let m = busbar_contract::records::MeteringDelta {
+        scale: 6,
         key_id: fresh("vk"),
         bucket: mbucket,
         model: "m".into(),
@@ -809,6 +813,7 @@ fn an_older_builds_recorded_body_replays_and_a_different_op_conflicts() {
     seed(id, format!("add_metering_batch:{:?}", &deltas[..]));
     s.add_metering_batch(id, &deltas).expect("replays");
     let other = busbar_contract::records::MeteringDelta {
+        scale: 6,
         tokens_input: 6,
         ..m
     };
@@ -1035,6 +1040,7 @@ fn raw_conn() -> redis::Connection {
 
 fn metering_delta(bucket: u64, tokens_input: u64) -> busbar_contract::records::MeteringDelta {
     busbar_contract::records::MeteringDelta {
+        scale: 6,
         key_id: "vk-pin".into(),
         bucket,
         model: "m".into(),
@@ -1074,13 +1080,17 @@ fn a_usage_counter_crosses_i64_max_without_narrowing() {
 }
 
 #[test]
-fn a_metering_counter_at_i64_max_pins_instead_of_failing() {
+fn a_metering_quantity_at_i64_max_refuses_overflow() {
     let Some(s) = live_store() else { return };
     let bucket = super::unique_bucket(41);
-    s.add_metering_batch(op(41), &[metering_delta(bucket, u64::MAX)])
-        .expect("fills the counter to i64::MAX");
-    s.add_metering_batch(op(42), &[metering_delta(bucket, 1)])
-        .expect("pins, does not fail");
+    assert!(s
+        .add_metering_batch(op(41), &[metering_delta(bucket, u64::MAX)])
+        .is_err());
+    s.add_metering_batch(op(41), &[metering_delta(bucket, i64::MAX as u64)])
+        .expect("exact quantity at i64::MAX");
+    assert!(s
+        .add_metering_batch(op(42), &[metering_delta(bucket, 1)])
+        .is_err());
     let rows = s.list_metering(bucket).expect("list");
     assert_eq!(rows[0].tokens_input, i64::MAX as u64, "{rows:?}");
 }
@@ -1648,6 +1658,7 @@ fn historical_metering_attribution_survives_batch_replay_and_reopen() {
     let bucket = u64::MAX;
 
     let make = |group: &str, version: &str, n| MeteringDelta {
+        scale: 6,
         key_id: "history|key%".into(),
         bucket,
         model: "m|%".into(),
