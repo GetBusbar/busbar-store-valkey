@@ -4595,9 +4595,9 @@ const FIXTURE_KEYS_1_5_5: &str = include_str!("../tests/fixtures/1.5.5/keys.json
 const FIXTURE_TTL_SECS: u64 = 31 * 24 * 3600;
 
 /// The frozen HTTP witnesses use whole tokens; decode migrated mantissas exactly, never round.
-fn recorded_1_5_5_whole_quantity(value: u64, scale: u32) -> u64 {
+fn recorded_1_5_5_whole_quantity(value: i128, scale: u32) -> u64 {
     assert_eq!(scale, 6, "the historical quantity migrated to micro-units");
-    busbar_contract::count::Count::from_stored(i128::from(value), scale)
+    busbar_contract::count::Count::from_stored(value, scale)
         .and_then(busbar_contract::count::Count::whole_u64)
         .expect("the frozen historical quantity is an exact whole number")
 }
