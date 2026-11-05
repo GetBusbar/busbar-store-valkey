@@ -755,10 +755,10 @@ fn a_plane_replacement_validates_old_and_new_links_before_unlinking() {
     }
 }
 
-/// A body an older build recorded (`<slot>:<values {:?}>`) still dedupes after the upgrade: the
-/// same op replays and applies nothing, a different op under its id conflicts.
+/// Retired Debug-form receipts are not current fingerprints: even the same inputs conflict,
+/// and neither the original nor changed inputs may apply an effect under that id.
 #[test]
-fn an_older_builds_recorded_body_replays_and_a_different_op_conflicts() {
+fn retired_debug_receipts_conflict_without_applying_writes() {
     let Some(s) = live_store() else { return };
     let mut raw = redis::Client::open(std::env::var("VALKEY_URL").expect("live_store read it"))
         .and_then(|c| c.get_connection())
@@ -779,7 +779,7 @@ fn an_older_builds_recorded_body_replays_and_a_different_op_conflicts() {
     let cells = [(bucket.as_str(), 0, d(2))];
     let id = op(90);
     seed(id, format!("add_usage_batch:{:?}", &cells[..]));
-    s.add_usage_batch(id, &cells).expect("replays");
+    assert_eq!(s.add_usage_batch(id, &cells), Err(OpRefused::Conflict));
     assert_eq!(
         s.add_usage_batch(id, &[(bucket.as_str(), 0, d(3))]),
         Err(OpRefused::Conflict)
@@ -817,7 +817,7 @@ fn an_older_builds_recorded_body_replays_and_a_different_op_conflicts() {
             m.key_id,
         ),
     );
-    s.add_metering_batch(id, &deltas).expect("replays");
+    assert_eq!(s.add_metering_batch(id, &deltas), Err(OpRefused::Conflict));
     let scaled = busbar_contract::records::MeteringDelta {
         scale: 6,
         tokens_input: 5_000_000,
@@ -852,7 +852,10 @@ fn an_older_builds_recorded_body_replays_and_a_different_op_conflicts() {
     let one = rec(b"one");
     let id = op(93);
     seed(id, format!("append_plane_record:{:?}", one.view()));
-    s.append_plane_record_op(id, one.view()).expect("replays");
+    assert_eq!(
+        s.append_plane_record_op(id, one.view()),
+        Err(OpRefused::Conflict)
+    );
     assert_eq!(
         s.append_plane_record_op(id, rec(b"two").view()),
         Err(OpRefused::Conflict)
@@ -1005,9 +1008,8 @@ fn the_v7_upgrade_drops_the_money_and_dead_slot_keys() {
         let _: () = c.hset_multiple(&k, &[("b", *body), ("a", "")]).unwrap();
     }
 
-    let kept_key = format!("busbar:op:{}", crate::hex(&kept.0));
-    let v8_body = format!("add_usage_batch:{:?}", &cells[..]);
-    let _: () = c.hset(&kept_key, "b", v8_body).unwrap();
+    // Keep the current hash receipt produced by the real write above. A retired Debug body
+    // is a conflict, not an interchangeable representation of that receipt.
     let _: () = c.set("busbar:schema", 6).unwrap();
     drop(c);
 
@@ -1054,7 +1056,7 @@ fn raw_conn() -> redis::Connection {
         .expect("an independent client")
 }
 
-fn metering_delta(bucket: u64, tokens_input: u64) -> busbar_contract::records::MeteringDelta {
+fn metering_delta(bucket: u64, tokens_input: i128) -> busbar_contract::records::MeteringDelta {
     busbar_contract::records::MeteringDelta {
         scale: 6,
         key_id: "vk-pin".into(),
@@ -1096,19 +1098,83 @@ fn a_usage_counter_crosses_i64_max_without_narrowing() {
 }
 
 #[test]
-fn a_metering_quantity_at_i64_max_refuses_overflow() {
+fn metering_request_counters_preserve_u64_boundaries_and_replays() {
+    let Some(s) = live_store() else { return };
+    let bucket = super::unique_bucket(241);
+    let mut delta = metering_delta(bucket, 0);
+    delta.requests = i64::MAX as u64 + 1;
+    delta.billable_requests = delta.requests;
+    let first = op(241);
+    s.add_metering_batch(first, std::slice::from_ref(&delta))
+        .unwrap();
+    s.add_metering_batch(first, std::slice::from_ref(&delta))
+        .unwrap();
+    let rows = s.list_metering(bucket).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].requests, delta.requests);
+    assert_eq!(rows[0].billable_requests, delta.billable_requests);
+    assert_eq!(rows[0].tokens_input, 0);
+
+    delta.requests = u64::MAX;
+    delta.billable_requests = u64::MAX;
+    assert_eq!(
+        s.add_metering_batch(first, std::slice::from_ref(&delta)),
+        Err(OpRefused::Conflict)
+    );
+    let second = op(242);
+    s.add_metering_batch(second, std::slice::from_ref(&delta))
+        .unwrap();
+    let again = ValkeyStore::connect(&std::env::var("VALKEY_URL").unwrap()).unwrap();
+    again.add_metering_batch(second, &[delta]).unwrap();
+    let rows = again.list_metering(bucket).unwrap();
+    assert_eq!(rows[0].requests, u64::MAX);
+    assert_eq!(rows[0].billable_requests, u64::MAX);
+    assert_eq!(rows[0].tokens_input, 0);
+}
+
+#[test]
+fn metering_request_counter_crossing_keeps_quantity_overflow_atomic() {
+    let Some(s) = live_store() else { return };
+    let bucket = super::unique_bucket(243);
+    let mut delta = metering_delta(bucket, i128::MAX - 1);
+    delta.requests = i64::MAX as u64;
+    delta.billable_requests = delta.requests;
+    s.add_metering_batch(op(243), std::slice::from_ref(&delta))
+        .unwrap();
+    let before = s.list_metering(bucket).unwrap();
+
+    delta.tokens_input = 1;
+    delta.requests = 1;
+    delta.billable_requests = 1;
+    let next = op(244);
+    assert!(s
+        .add_metering_batch(next, &[delta.clone(), delta.clone()])
+        .is_err());
+    assert_eq!(s.list_metering(bucket).unwrap(), before);
+    // A refused batch recorded no receipt; the corrected input can use the same id.
+    s.add_metering_batch(next, std::slice::from_ref(&delta))
+        .unwrap();
+    s.add_metering_batch(next, &[delta]).unwrap();
+    let rows = s.list_metering(bucket).unwrap();
+    assert_eq!(rows[0].tokens_input, i128::MAX);
+    assert_eq!(rows[0].requests, i64::MAX as u64 + 1);
+    assert_eq!(rows[0].billable_requests, i64::MAX as u64 + 1);
+}
+
+#[test]
+fn a_metering_quantity_at_i128_max_refuses_overflow() {
     let Some(s) = live_store() else { return };
     let bucket = super::unique_bucket(41);
     assert!(s
-        .add_metering_batch(op(41), &[metering_delta(bucket, u64::MAX)])
+        .add_metering_batch(op(41), &[metering_delta(bucket, -1)])
         .is_err());
-    s.add_metering_batch(op(41), &[metering_delta(bucket, i64::MAX as u64)])
-        .expect("exact quantity at i64::MAX");
+    s.add_metering_batch(op(41), &[metering_delta(bucket, i128::MAX)])
+        .expect("exact quantity at i128::MAX");
     assert!(s
         .add_metering_batch(op(42), &[metering_delta(bucket, 1)])
         .is_err());
     let rows = s.list_metering(bucket).expect("list");
-    assert_eq!(rows[0].tokens_input, i64::MAX as u64, "{rows:?}");
+    assert_eq!(rows[0].tokens_input, i128::MAX, "{rows:?}");
 }
 
 /// A cell the batch cannot add to refuses the WHOLE batch: no other cell applies and the op is not
@@ -1743,7 +1809,10 @@ fn historical_metering_attribution_survives_batch_replay_and_reopen() {
                 (n + 3) * repeats
             )
         );
-        assert_eq!((r.requests, r.billable_requests), (repeats, repeats));
+        assert_eq!(
+            (r.requests, r.billable_requests),
+            (repeats as u64, repeats as u64)
+        );
         assert_eq!(r.usage_units.get("tool_calls"), Some(&((n + 4) * repeats)));
     }
 }

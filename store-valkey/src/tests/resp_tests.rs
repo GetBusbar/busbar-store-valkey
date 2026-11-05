@@ -228,3 +228,14 @@ fn server_error_controls_are_escaped_and_numeric_range_is_named() {
         .to_string()
         .contains("u32"));
 }
+
+#[test]
+fn i128_quantity_arguments_are_exact_decimal_bulk_strings() {
+    for count in [i128::MIN, i128::MAX, i128::from(u64::MAX) + 1] {
+        assert_eq!(args_of(count), vec![count.to_string().into_bytes()]);
+        let mut wire = Vec::new();
+        encode(&args_of(count), &mut wire);
+        let expected = format!("*1\r\n${}\r\n{count}\r\n", count.to_string().len());
+        assert_eq!(wire, expected.as_bytes());
+    }
+}

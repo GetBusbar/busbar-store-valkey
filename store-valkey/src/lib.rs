@@ -7,7 +7,7 @@
 //! runtime of its own. `redis://` / `rediss://` URLs (and the `valkey://` spellings) are read as
 //! the upstream `redis` driver reads them.
 //!
-//! ## Keyspace (schema v8, every key under `busbar:`)
+//! ## Keyspace (schema v9, every key under `busbar:`)
 //!
 //! - **keys**: `key:<id>` (JSON [`VirtualKey`], tombstoned on delete, never removed), `keys` (SET of
 //!   ids), `keys:byrev` (ZSET by revision, for `list_keys_since`).
@@ -133,7 +133,8 @@ const SCHEMA_KEY: &str = "busbar:schema";
 /// v7 upgrades the released v6 schema: copy typed plane rows, remove retired slots,
 /// scrub revoked credentials, preserve metering attribution and repair token expiries.
 /// v8 converts quantity aggregates to micro-units, atomically with its schema marker.
-const SCHEMA_VERSION: i64 = 8;
+/// v9 admits the full nonnegative i128 mantissa range; v8 micro-units are never scaled again.
+const SCHEMA_VERSION: i64 = 9;
 /// The slots whose `busbar:op:*` dedupe hashes survive the v6 -> v7 upgrade.
 const KEPT_OP_SLOTS: [&str; 3] = [
     "add_usage_batch",
@@ -834,12 +835,19 @@ impl ValkeyStore {
             .arg(SCHEMA_VERSION)
             .invoke(c)
             .await)?;
-        now.map(|value| {
-            value
-                .parse()
-                .map_err(|_| RecordStoreError("invalid exact count schema marker".into()))
-        })
-        .transpose()
+        let now = now
+            .map(|value| {
+                value
+                    .parse()
+                    .map_err(|_| RecordStoreError("invalid exact count schema marker".into()))
+            })
+            .transpose()?;
+        if now.is_some() && now == read {
+            return Err(RecordStoreError(
+                "exact count migration made no schema progress; refusing to repeat it".into(),
+            ));
+        }
+        Ok(now)
     }
 
     /// Write the current schema marker if it still is `read` (what this run saw); `None` when
@@ -1235,10 +1243,13 @@ fn parse_slot_pointer(s: &str) -> Option<(String, String, u8)> {
 
 /// The fields one usage delta adds, as `(hash field, delta)` pairs for `add_usage_batch`: the two
 /// request counters always, and every non-zero unit.
-fn usage_fields(delta: &UsageDelta) -> Vec<(String, i64)> {
-    let mut fields: Vec<(String, i64)> = vec![
-        ("requests".to_string(), delta.requests),
-        ("billable_requests".to_string(), delta.billable_requests),
+fn usage_fields(delta: &UsageDelta) -> Vec<(String, i128)> {
+    let mut fields: Vec<(String, i128)> = vec![
+        ("requests".to_string(), i128::from(delta.requests)),
+        (
+            "billable_requests".to_string(),
+            i128::from(delta.billable_requests),
+        ),
     ];
     for m in &delta.models {
         for (unit, d) in &m.usage_units {
@@ -1271,18 +1282,27 @@ fn ledger_count(value: &str) -> RecordStoreResult<u64> {
         .map_err(|_| RecordStoreError("invalid ledger counter".into()))
 }
 
+/// Quantity mantissas are exact signed-i128 values with a nonnegative persisted-total invariant.
+/// Request counters retain their separate unsigned reader and are never scaled.
+fn quantity_count(value: &str) -> RecordStoreResult<i128> {
+    value
+        .parse::<i128>()
+        .ok()
+        .filter(|count| *count >= 0)
+        .ok_or_else(|| RecordStoreError("invalid nonnegative quantity mantissa".into()))
+}
+
 /// The ordinary reader and correction predicate use the same canonical raw ledger.
 fn usage_from_fields(fields: Vec<(String, String)>) -> RecordStoreResult<UsageLedger> {
     let mut ledger = UsageLedger::default();
     let mut positions = std::collections::HashMap::new();
     for (name, v) in fields {
-        let count = ledger_count(&v)?;
         if name == "requests" {
-            ledger.requests = count;
+            ledger.requests = ledger_count(&v)?;
             continue;
         }
         if name == "billable_requests" {
-            ledger.billable_requests = count;
+            ledger.billable_requests = ledger_count(&v)?;
             continue;
         }
         let Some((model, unit)) = parse_usage_field(&name) else {
@@ -1290,6 +1310,7 @@ fn usage_from_fields(fields: Vec<(String, String)>) -> RecordStoreResult<UsageLe
                 "unreadable usage field {name}; refusing to report a partial ledger"
             )));
         };
+        let count = quantity_count(&v)?;
         let index = *positions.entry(model.clone()).or_insert_with(|| {
             let index = ledger.models.len();
             ledger.models.push(ModelTokens {
@@ -1329,7 +1350,7 @@ fn metering_from_fields(fields: Vec<(String, String)>) -> RecordStoreResult<Mete
     };
     for (name, val) in fields {
         if let Some(class) = name.strip_prefix(METERING_UNIT_PREFIX) {
-            let n = ledger_count(&val)?;
+            let n = quantity_count(&val)?;
             if n != 0 {
                 m.usage_units.insert(class.to_string(), n);
             }
@@ -1339,10 +1360,10 @@ fn metering_from_fields(fields: Vec<(String, String)>) -> RecordStoreResult<Mete
             "key_id" => m.key_id = val,
             "model" => m.model = val,
             "provider" => m.provider = val,
-            "tokens_input" => m.tokens_input = ledger_count(&val)?,
-            "tokens_output" => m.tokens_output = ledger_count(&val)?,
-            "tokens_cache_read" => m.tokens_cache_read = ledger_count(&val)?,
-            "tokens_cache_write" => m.tokens_cache_write = ledger_count(&val)?,
+            "tokens_input" => m.tokens_input = quantity_count(&val)?,
+            "tokens_output" => m.tokens_output = quantity_count(&val)?,
+            "tokens_cache_read" => m.tokens_cache_read = quantity_count(&val)?,
+            "tokens_cache_write" => m.tokens_cache_write = quantity_count(&val)?,
             "requests" => m.requests = ledger_count(&val)?,
             "billable_requests" => m.billable_requests = ledger_count(&val)?,
             "priced_from_ms" => {
@@ -2453,9 +2474,13 @@ static MIGRATE_EXACT_COUNTS: std::sync::LazyLock<Script> = std::sync::LazyLock::
     Script::new(
         r#"
         local marker = redis.call('GET', KEYS[1]) or ''
-        if marker ~= ARGV[1] then return marker end
+        -- Rust already parsed a supported small schema version. Match its value too, so a
+        -- verified restored marker spelled '06' or '+6' does not prevent atomic migration.
+        if marker ~= ARGV[1] and tonumber(marker) ~= tonumber(ARGV[1]) then return marker end
         local changes = {}
         local seen = {}
+        local whole_units = tonumber(ARGV[1]) < 8
+        local quantity_max = '170141183460469231731687303715884105727'
         for _, pattern in ipairs({'busbar:usage:*', 'busbar:metering:*'}) do
             local cursor = '0'
             repeat
@@ -2485,10 +2510,10 @@ static MIGRATE_EXACT_COUNTS: std::sync::LazyLock<Script> = std::sync::LazyLock::
                                     end
                                     value = string.gsub(value, '^0+', '')
                                     if value == '' then value = '0' end
-                                    if #value > 13 or (#value == 13 and value > '9223372036854') then
-                                        return redis.error_reply('exact count migration: quantity outside scale-6 range; nothing converted')
+                                    local scaled = whole_units and value ~= '0' and value .. '000000' or value
+                                    if #scaled > #quantity_max or (#scaled == #quantity_max and scaled > quantity_max) then
+                                        return redis.error_reply('exact count migration: quantity outside i128 scale-6 range; nothing converted')
                                     end
-                                    local scaled = value == '0' and '0' or value .. '000000'
                                     changes[#changes + 1] = {key, field, scaled}
                                 end
                             end

@@ -76,17 +76,28 @@ Stop older busbar nodes before opening this build on the existing Valkey. The co
 once, and writes the `busbar:schema` marker last, so a crash mid-upgrade re-runs the step on the
 next connect (two nodes upgrading at once land in the same place).
 
-- **Schema v6** (the plugin released with busbar 1.5.5): upgrades directly to **v7**.
-  Typed task, task-event, demotion and spent-approval keys are copied into the plane keyspace,
-  then removed. A conflicting task-event position keeps its v6 source key for an operator.
-  Other `busbar:mcp:*` keys are neither migrated nor removed. The same migration removes retired slot keys,
-  scrubs revoked credential secrets, preserves attribution while renaming metering hashes,
-  and repairs token cleanup against stored absolute expiry using server TIME. Counters,
-  unknown hash fields and replay receipts remain unchanged. Ambiguous destinations or missing
-  indexed rows refuse migration without guessing.
-- **Schema v7:** current; no migration.
-- **Older than v6, or keys with no marker:** refused, with the key prefixes found, and NOTHING is
-  changed; if the marker was lost from a current namespace, `SET busbar:schema 6` and restart.
+- **Schema v6** (the plugin released with busbar 1.5.5): upgrades directly to **v9**.
+  The upgrade scrubs revoked credential secrets and preserves historical metering attribution.
+  It also handles typed task, task-event, demotion, spent-approval and retired-slot data from
+  later development schemas; those rows are not evidence of released 1.5.5 features.
+  A conflicting task-event position keeps its source key for an operator. Other `busbar:mcp:*`
+  keys are neither migrated nor removed. Ambiguous destinations or missing indexed rows refuse
+  migration without guessing.
+- **Schema v7:** upgrades to **v9** by converting quantity aggregates from whole units to exact
+  micro-units. The same conversion runs after the v6 upgrade steps. Each quantity is multiplied
+  by 1,000,000; request and billable-request counters remain unscaled. All quantity conversions
+  and the v9 marker update are atomic, so reopening cannot scale the same namespace twice.
+  Whole-unit quantities above 170,141,183,460,469,231,731,687,303,715,884 or invalid stored quantities refuse conversion
+  without changing any quantity. Earlier v6 migration steps may already have completed; back up
+  the namespace before upgrading.
+- **Schema v8:** validates existing micro-unit quantities and advances the marker to **v9**
+  atomically, without scaling them again.
+- **Schema v9:** current; nonnegative quantity mantissas through `i128::MAX` at scale 6.
+- **Older than v6, or keys with no marker:** refused without changing the namespace. If the marker
+  was lost, restore only the original schema version verified from a backup or deployment record.
+  Never guess an older marker: marking an already migrated v8 or v9 namespace as v6 or v7 would multiply
+  its micro-unit quantities again. If the original version cannot be established, restore a
+  verified backup before opening the store.
 - **Newer than this build:** refused. Run a build of that version or later.
 
 Metering rows preserve their recorded historical attribution through v7. Previously combined history cannot be reconstructed. Each hash rename and index update is atomic and repeatable after a lost reply; the schema marker advances only after all rows have moved. Keep older nodes stopped throughout the upgrade and subsequent operation.
@@ -134,11 +145,13 @@ older node could otherwise write the old revoked form again.
   behind the engine's in-memory enforcement counters (boot-hydrate +
   periodic write-behind flush), not a request-hot-path dependency.
 - **Fleet-honest accrual**: `add_usage_batch` and `add_metering_batch` are
-  atomic server-side scripts (usage counters floored at 0 and saturated at
-  `u64::MAX`; metering counters pinned at `i64::MAX`) that validate every cell, apply them all and
+  atomic server-side scripts that validate every cell, apply them all and
   record the op under its `op_id`, so a replay applies nothing; N nodes each flushing their own
   delta-since-last sum to the true fleet total (an absolute `put_usage`
-  overwrite would be last-writer-wins across nodes).
+  overwrite would be last-writer-wins across nodes). Request and billable-request counters remain
+  unscaled `u64` values and saturate at `u64::MAX`. Quantities use exact decimal arithmetic with
+  nonnegative `i128` totals: positive overflow refuses the whole batch, and ordinary usage
+  refunds floor at zero. Corrections conditionally replace the exact observed state.
 
 This crate (`busbar-store-valkey-plugin`) is intentionally a thin
 adapter: all the Valkey schema/serialization logic — and the `open`

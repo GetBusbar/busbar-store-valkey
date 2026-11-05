@@ -32,7 +32,7 @@
 //! answers. The body is the blocking client's body, `async`.
 
 use busbar_contract::abi::sdk::conn::Host;
-use busbar_contract::abi::sdk::store::column::{clamp, prefix_end, storable_i64};
+use busbar_contract::abi::sdk::store::column::{prefix_end, storable_i64};
 use busbar_contract::abi::sdk::store::dedupe::Dedupe;
 use busbar_contract::abi::sdk::store::wire::drive_kept;
 use busbar_contract::abi::sdk::store::{conditional, correction};
@@ -58,6 +58,7 @@ busbar_contract::statement_extensions!(EXTENSIONS: [
     (busbar_contract::abi::sdk::store::rewrap::INTENT, b"1"),
     (conditional::CAPABILITY, b"1"),
     ("busbar.store.count-scale", b"6"),
+    ("busbar.store.count-range", b"i128"),
     (correction::CAPABILITY, correction::CAPABILITY_VALUE),
 ]);
 
@@ -441,23 +442,6 @@ local function is_i64(s)
     end
     return digits <= limit
 end
-local function bad_field(key, field)
-    local v = redis.call('HGET', key, field)
-    if v and not is_i64(v) then
-        return key .. ' field ' .. field .. ' is not an integer'
-    end
-end
-local function add_pinned(key, field, delta)
-    local ok, v = pcall(redis.call, 'HINCRBY', key, field, delta)
-    if ok then
-        return v
-    end
-    if string.find(type(v) == 'table' and v.err or tostring(v), 'overflow', 1, true) then
-        redis.call('HSET', key, field, MAX)
-        return nil
-    end
-    error(v)
-end
 ";
 
 /// The end of an `op_id` write's script: record the body (`ARGV[1]`) for `ARGV[2]` seconds. It
@@ -469,9 +453,9 @@ redis.call('EXPIRE', KEYS[1], ARGV[2])
 return false
 ";
 
-/// Exact decimal arithmetic for unsigned usage counters. Only individual decimal digits enter
-/// Lua arithmetic; whole counters never pass through Lua's floating-point number representation.
-/// This matches `UsageLedger::apply_delta`: saturating unsigned addition and zero-floored refunds.
+/// Exact decimal arithmetic for request counters and quantity mantissas. Only individual digits
+/// enter Lua arithmetic. Requests saturate at u64::MAX; quantities refuse positive i128 overflow.
+/// Ordinary usage refunds retain the shared checked_apply_delta zero floor.
 const LUA_USAGE_COUNTS: &str = r"
 local USAGE_MAX = '18446744073709551615'
 local RADIX = 10
@@ -492,7 +476,7 @@ local function usage_bad_field(key, field)
         return key .. ' field ' .. field .. ' is not an unsigned usage counter'
     end
 end
-local function usage_add(a, b)
+local function decimal_add(a, b)
     local i, j, carry, out = #a, #b, 0, {}
     while i > 0 or j > 0 or carry > 0 do
         local left = i > 0 and string.byte(a, i) - ZERO_BYTE or 0
@@ -502,7 +486,10 @@ local function usage_add(a, b)
         carry = math.floor(sum / RADIX)
         i, j = i - 1, j - 1
     end
-    local result = string.reverse(table.concat(out))
+    return string.reverse(table.concat(out))
+end
+local function usage_add(a, b)
+    local result = decimal_add(a, b)
     return usage_cmp(result, USAGE_MAX) > 0 and USAGE_MAX or result
 end
 local function usage_sub(a, b)
@@ -518,22 +505,36 @@ local function usage_sub(a, b)
     end
     return (string.gsub(string.reverse(table.concat(out)), '^0+', ''))
 end
+local QUANTITY_MAX = '170141183460469231731687303715884105727'
+local QUANTITY_MIN_MAGNITUDE = '170141183460469231731687303715884105728'
+local function decimal_magnitude(value, limit)
+    return (value == '0' or string.match(value, '^[1-9]%d*$'))
+        and usage_cmp(value, limit) <= 0
+end
 local pending_quantities = {}
 local function checked_quantity(key, field, delta)
     local fields = pending_quantities[key]
     if not fields then fields = {}; pending_quantities[key] = fields end
     local current = fields[field] or redis.call('HGET', key, field) or '0'
-    if not is_usage_count(current) or usage_cmp(current, MAX) > 0 then
-        return 'exact quantity is outside the scale-6 range'
+    if not decimal_magnitude(current, QUANTITY_MAX) then
+        return 'exact quantity is outside the nonnegative i128 scale-6 range'
     end
-    local next
-    if string.sub(delta, 1, 1) == '-' then
-        next = usage_sub(current, string.sub(delta, 2))
-    else
-        next = usage_add(current, delta)
+    local negative = string.sub(delta, 1, 1) == '-'
+    local magnitude = negative and string.sub(delta, 2) or delta
+    local limit = negative and QUANTITY_MIN_MAGNITUDE or QUANTITY_MAX
+    if not decimal_magnitude(magnitude, limit) then
+        return 'exact quantity delta is outside the i128 scale-6 range'
     end
-    if usage_cmp(next, MAX) > 0 then return 'exact quantity aggregate overflow' end
+    -- Ordinary refunds retain the zero floor, including i128::MIN. Never negate a signed
+    -- minimum: its magnitude stays a decimal string. Corrections use exact replacement CAS.
+    local next = negative and usage_sub(current, magnitude) or decimal_add(current, magnitude)
+    if usage_cmp(next, QUANTITY_MAX) > 0 then return 'exact quantity aggregate overflow' end
     fields[field] = next
+end
+local function apply_quantities()
+    for key, fields in pairs(pending_quantities) do
+        for field, value in pairs(fields) do redis.call('HSET', key, field, value) end
+    end
 end
 local function usage_apply(key, field, delta)
     local current = redis.call('HGET', key, field) or '0'
@@ -550,7 +551,7 @@ end
 
 /// `add_usage_batch`: per cell `KEYS[k]` = its usage hash; `ARGV` from 4 = per cell `n`, then `n`
 /// `field, delta` pairs. ARGV[3] refuses fresh reserved-adjustment writes after receipt lookup.
-/// Validate every target before applying; exact decimal arithmetic preserves the full u64 range.
+/// Validate every target before applying; requests retain u64 range and quantities i128 range.
 static USAGE_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_SEEN}{LUA_USAGE_COUNTS}
@@ -562,8 +563,9 @@ static USAGE_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
             local n = tonumber(ARGV[a])
             local why = bad_key(KEYS[k], 'hash')
             for i = a + 1, a + 2 * n - 1, 2 do
-                why = why or usage_bad_field(KEYS[k], ARGV[i])
-                if ARGV[i] ~= 'requests' and ARGV[i] ~= 'billable_requests' then
+                if ARGV[i] == 'requests' or ARGV[i] == 'billable_requests' then
+                    why = why or usage_bad_field(KEYS[k], ARGV[i])
+                else
                     why = why or checked_quantity(KEYS[k], ARGV[i], ARGV[i + 1])
                 end
             end
@@ -576,10 +578,13 @@ static USAGE_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
         for k = 2, #KEYS do
             local n = tonumber(ARGV[a])
             for i = a + 1, a + 2 * n - 1, 2 do
-                usage_apply(KEYS[k], ARGV[i], ARGV[i + 1])
+                if ARGV[i] == 'requests' or ARGV[i] == 'billable_requests' then
+                    usage_apply(KEYS[k], ARGV[i], ARGV[i + 1])
+                end
             end
             a = a + 1 + 2 * n
         end
+        apply_quantities()
         {LUA_RECORD}"
     ))
 });
@@ -587,8 +592,9 @@ static USAGE_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
 /// `add_metering_batch`: per delta `KEYS[k], KEYS[k + 1]` = its bucket's set and its row; `ARGV`
 /// from 3 = per delta the six counters, `n`, `n` `unit field, count` pairs, then `key_id`, `model`,
 /// `provider`, `priced_from_ms`, `key_group_at_use`, `pricing_version`. The row joins its set,
-/// every count is an `HINCRBY` pinned at `i64::MAX`, the attribution snapshot is in the row key
-/// (including empty values). Validate-then-apply as [`USAGE_OP`].
+/// quantities use checked i128 decimal-string arithmetic and `HSET`; unscaled request
+/// counters use exact unsigned addition saturating at `u64::MAX`. The attribution snapshot is in
+/// the row key (including empty values). Validate-then-apply as [`USAGE_OP`].
 static METERING_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
     Script::new(&format!(
         "{LUA_SEEN}{LUA_USAGE_COUNTS}
@@ -613,8 +619,10 @@ static METERING_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
         end
         local why
         walk(function(set, row, f, delta)
-            why = why or bad_key(set, 'set') or bad_key(row, 'hash') or bad_field(row, f)
-            if f ~= 'requests' and f ~= 'billable_requests' then
+            why = why or bad_key(set, 'set') or bad_key(row, 'hash')
+            if f == 'requests' or f == 'billable_requests' then
+                why = why or usage_bad_field(row, f)
+            else
                 why = why or checked_quantity(row, f, delta)
             end
         end, function() end)
@@ -622,7 +630,9 @@ static METERING_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
             return {{'refused', why}}
         end
         walk(function(_, row, f, n)
-            add_pinned(row, f, n)
+            if f == 'requests' or f == 'billable_requests' then
+                usage_apply(row, f, n)
+            end
         end, function(set, row, a)
             redis.call('SADD', set, row)
             redis.call('HSET', row, 'key_id', ARGV[a], 'model', ARGV[a + 1], 'provider', ARGV[a + 2])
@@ -630,12 +640,13 @@ static METERING_OP: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
             redis.call('HSET', row, 'key_group_at_use', ARGV[a + 4])
             redis.call('HSET', row, 'pricing_version', ARGV[a + 5])
         end)
+        apply_quantities()
         {LUA_RECORD}"
     ))
 });
 
 /// An `op_id` write's script call over the op's record, with the body `d` records.
-fn op_call(script: &'static Script, op: OpId, d: &Dedupe<'_>) -> ScriptInvocation<'static> {
+fn op_call(script: &'static Script, op: OpId, d: &Dedupe) -> ScriptInvocation<'static> {
     let mut inv = script.key(op_key(op));
     inv.arg(&d.body()[..]).arg(OP_ID_RETENTION_SECS);
     inv
@@ -878,15 +889,13 @@ impl StoreSlots for ValkeyStore {
                 m.tokens_output,
                 m.tokens_cache_read,
                 m.tokens_cache_write,
-                m.requests,
-                m.billable_requests,
             ] {
-                inv.arg(clamp(n));
+                inv.arg(n);
             }
+            inv.arg(m.requests).arg(m.billable_requests);
             inv.arg(m.usage_units.len());
             for (class, n) in &m.usage_units {
-                inv.arg(format!("{METERING_UNIT_PREFIX}{class}"))
-                    .arg(clamp(*n));
+                inv.arg(format!("{METERING_UNIT_PREFIX}{class}")).arg(*n);
             }
             inv.arg(&m.key_id)
                 .arg(&m.model)

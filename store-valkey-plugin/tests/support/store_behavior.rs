@@ -45,7 +45,7 @@ fn key(id: &str, group: Option<&str>) -> VirtualKey {
     }
 }
 
-fn delta(requests: i64, input: i64) -> UsageDelta {
+fn delta(requests: i64, input: i128) -> UsageDelta {
     UsageDelta {
         requests,
         billable_requests: requests,
@@ -57,7 +57,7 @@ fn delta(requests: i64, input: i64) -> UsageDelta {
     }
 }
 
-fn meter(key_id: &str, provider: &str, input: u64) -> MeteringDelta {
+fn meter(key_id: &str, provider: &str, input: i128) -> MeteringDelta {
     MeteringDelta {
         scale: 6,
         key_id: key_id.into(),
@@ -310,7 +310,7 @@ pub(super) fn behavior(
         answers.insert("usage", value)
     };
     let mut set = UsageLedger::default();
-    set.apply_delta(&delta(9, 1));
+    set.checked_apply_delta(&delta(9, 1)).unwrap();
     {
         let before = count();
         let value = { ans(b.put_usage("j", w * 2, &set)) };

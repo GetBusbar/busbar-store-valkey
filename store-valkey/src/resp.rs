@@ -467,7 +467,7 @@ macro_rules! numeric_args {
         }
     )*};
 }
-numeric_args!(i64, u64, i32, u32, usize, isize);
+numeric_args!(i128, i64, u64, i32, u32, usize, isize);
 
 impl<T: ToArgs> ToArgs for [T] {
     fn write_args(&self, out: &mut Vec<Vec<u8>>) {

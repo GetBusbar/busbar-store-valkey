@@ -1666,38 +1666,52 @@ fn a_namespace_newer_than_this_build_is_refused() {
     redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
 }
 
-/// A marker an operator restored in a non-canonical spelling (`06`) must still be upgraded and
-/// re-marked: the compare-and-set judges it by value, so `connect()` completes instead of looping
-/// through the upgrade steps forever.
+/// Restoring a verified schema version with leading zeros or a plus sign must migrate once,
+/// preserve unscaled counters, and complete instead of repeating the migration forever.
 #[test]
 fn a_non_canonical_schema_marker_is_upgraded_not_looped() {
     let Some(_) = live_store() else { return };
     let (_database, mut up) = fresh_db_client(10);
-    redis::cmd("SET")
-        .arg("busbar:schema")
-        .arg("06")
-        .query::<()>(&mut up)
-        .unwrap();
-    let url = url_for_db(10);
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(
-            ValkeyStore::connect(&url)
-                .map(|_| ())
-                .map_err(|e| e.to_string()),
+    for restored in ["06", "+6", "07", "+7"] {
+        redis::pipe()
+            .set(SCHEMA_KEY, restored)
+            .ignore()
+            .hset("busbar:usage:restored:0", "m:model:input", 2)
+            .ignore()
+            .hset("busbar:usage:restored:0", "requests", 3)
+            .ignore()
+            .query::<()>(&mut up)
+            .unwrap();
+        let url = url_for_db(10);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(
+                ValkeyStore::connect(&url)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+            );
+        });
+        let done = rx.recv_timeout(std::time::Duration::from_secs(20));
+        let marker: String = up.get(SCHEMA_KEY).unwrap();
+        let quantity: String = up.hget("busbar:usage:restored:0", "m:model:input").unwrap();
+        let requests: String = up.hget("busbar:usage:restored:0", "requests").unwrap();
+        if matches!(done, Ok(Ok(()))) {
+            let reopened = ValkeyStore::connect(&url_for_db(10)).unwrap();
+            let ledger = reopened.get_usage("restored", 0).unwrap();
+            assert_eq!(ledger.models[0].usage_units["input"], 2_000_000);
+            assert_eq!(ledger.requests, 3);
+        }
+        // Release a regressed migration loop before asserting; never leave its worker behind.
+        redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
+        worker.join().expect("migration worker");
+        assert!(
+            matches!(done, Ok(Ok(()))),
+            "connect() must complete over a {restored} marker: {done:?}"
         );
-    });
-    let done = rx.recv_timeout(std::time::Duration::from_secs(20));
-    let marker: String = redis::cmd("GET")
-        .arg("busbar:schema")
-        .query(&mut up)
-        .unwrap();
-    redis::cmd("FLUSHDB").query::<()>(&mut up).unwrap();
-    assert!(
-        matches!(done, Ok(Ok(()))),
-        "connect() must complete over a `06` marker: {done:?}"
-    );
-    assert_eq!(marker, SCHEMA_VERSION.to_string());
+        assert_eq!(marker, SCHEMA_VERSION.to_string());
+        assert_eq!(quantity, "2000000");
+        assert_eq!(requests, "3");
+    }
 }
 
 /// A v7 upgrade refusal names the revision-index pointer it stopped at, so the operator can find
@@ -3446,7 +3460,7 @@ fn usage_carries_open_units_and_floors_each_counter_at_zero() {
     use busbar_contract::records::{ModelTokensDelta, UNIT_INPUT, UNIT_OUTPUT};
     let Some(store) = live_store() else { return };
     let bucket = uid("vk_units");
-    let delta = |model: &str, units: &[(&str, i64)], requests: i64| UsageDelta {
+    let delta = |model: &str, units: &[(&str, i128)], requests: i64| UsageDelta {
         requests,
         billable_requests: requests,
         models: vec![ModelTokensDelta {
@@ -3525,7 +3539,7 @@ fn metering_splits_a_cell_at_a_price_change_and_carries_open_classes() {
     let Some(store) = live_store() else { return };
     let bucket = unique_bucket(20260926);
     let key_id = uid("vk_priced");
-    let d = |priced_from_ms: u64, class_n: u64| MeteringDelta {
+    let d = |priced_from_ms: u64, class_n: i128| MeteringDelta {
         scale: 6,
         key_id: key_id.clone(),
         bucket,

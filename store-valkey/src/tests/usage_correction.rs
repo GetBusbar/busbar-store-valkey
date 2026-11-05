@@ -38,11 +38,11 @@ fn setup() -> Option<(database::Database, redis::Connection, ValkeyStore, String
 }
 
 fn ledger(count: u64) -> UsageLedger {
-    ledger_parts(count, count)
+    ledger_parts(count, i128::from(count))
 }
 
 /// Request width and quantity width are independent: these fixtures state both explicitly.
-fn ledger_parts(requests: u64, quantity: u64) -> UsageLedger {
+fn ledger_parts(requests: u64, quantity: i128) -> UsageLedger {
     UsageLedger {
         requests,
         billable_requests: requests,
@@ -61,16 +61,16 @@ fn metering(key: &str) -> MeteringDelta {
         key_id: key.into(),
         model: FIXTURE_MODEL.into(),
         provider: FIXTURE_PROVIDER.into(),
-        tokens_input: INITIAL,
-        tokens_output: INITIAL + 1,
-        tokens_cache_read: INITIAL + 2,
-        tokens_cache_write: INITIAL + 3,
+        tokens_input: i128::from(INITIAL),
+        tokens_output: i128::from(INITIAL) + 1,
+        tokens_cache_read: i128::from(INITIAL) + 2,
+        tokens_cache_write: i128::from(INITIAL) + 3,
         requests: INITIAL + 4,
         billable_requests: INITIAL + 5,
         key_group_at_use: FIXTURE_GROUP.into(),
         pricing_version: FIXTURE_PRICE.into(),
         priced_from_ms: PRICED_FROM_MS,
-        usage_units: [(OPEN_UNIT.into(), INITIAL + 6)].into(),
+        usage_units: [(OPEN_UNIT.into(), i128::from(INITIAL) + 6)].into(),
     }
 }
 
@@ -257,7 +257,7 @@ fn absence_and_full_u64_rows_are_compared_and_replaced_without_float_or_signed_n
             window_start: u64::MAX,
         },
         expected: UsageLedger::default(),
-        replacement: ledger_parts(u64::MAX, i64::MAX as u64),
+        replacement: ledger_parts(u64::MAX, i128::MAX),
     });
     request.usage.sort_by(|a, b| a.address.cmp(&b.address));
     assert_eq!(apply(&store, &request).unwrap(), Decision::Applied);
@@ -283,7 +283,7 @@ fn absence_and_full_u64_rows_are_compared_and_replaced_without_float_or_signed_n
         .find(|change| change.replacement.requests == u64::MAX)
         .unwrap();
     wide.expected.requests = u64::MAX;
-    wide.replacement = ledger_parts(u64::MAX - 1, i64::MAX as u64 - 1);
+    wide.replacement = ledger_parts(u64::MAX - 1, i128::MAX - 1);
     assert_eq!(apply(&store, &next).unwrap(), Decision::Applied);
     for (index, change) in next.usage.iter().enumerate() {
         assert_eq!(read(&store, &next, index), change.replacement);
@@ -557,13 +557,13 @@ fn high_correction_survives_accrual_refund_saturation_and_reopen() {
     };
     let mut request = candidate(&store);
     const HIGH: u64 = u64::MAX - 10;
-    request.usage[0].replacement = ledger_parts(HIGH, i64::MAX as u64 - 10);
+    request.usage[0].replacement = ledger_parts(HIGH, i128::MAX - 10);
     request.usage[0].replacement.models.push(ModelTokens {
         scale: 6,
         model: String::new(),
         usage_units: [
-            (UNIT_INPUT.into(), i64::MAX as u64 - 10),
-            (OPEN_UNIT.into(), i64::MAX as u64 - 10),
+            (UNIT_INPUT.into(), i128::MAX - 10),
+            (OPEN_UNIT.into(), i128::MAX - 10),
         ]
         .into(),
     });
@@ -577,7 +577,11 @@ fn high_correction_survives_accrual_refund_saturation_and_reopen() {
             .map(|model| ModelTokensDelta {
                 scale: 6,
                 model,
-                usage_units: [(UNIT_INPUT.into(), count), (OPEN_UNIT.into(), count)].into(),
+                usage_units: [
+                    (UNIT_INPUT.into(), i128::from(count)),
+                    (OPEN_UNIT.into(), i128::from(count)),
+                ]
+                .into(),
             })
             .collect(),
     };
@@ -603,12 +607,9 @@ fn high_correction_survives_accrual_refund_saturation_and_reopen() {
     }
 
     store
-        .put_usage(bucket, DAY_START, &ledger_parts(u64::MAX, i64::MAX as u64))
+        .put_usage(bucket, DAY_START, &ledger_parts(u64::MAX, i128::MAX))
         .unwrap();
-    assert_eq!(
-        read(&store, &request, 0),
-        ledger_parts(u64::MAX, i64::MAX as u64)
-    );
+    assert_eq!(read(&store, &request, 0), ledger_parts(u64::MAX, i128::MAX));
 }
 
 #[test]
@@ -708,4 +709,54 @@ fn cross_slot_rejection_never_enters_multi_or_writes_a_receipt() {
     assert_eq!(proxy.execs.load(Ordering::SeqCst), 0);
     assert!(!raw.exists::<_, bool>(receipt(&request)).unwrap());
     assert_eq!(read(&fast, &request, 0), ledger(INITIAL));
+}
+
+#[test]
+fn i128_correction_checks_exact_prestate_rejects_negative_and_replays() {
+    let Some((_database, mut raw, store, url)) = setup() else {
+        return;
+    };
+    let mut request = candidate(&store);
+    let wide = i128::from(u64::MAX) + 1;
+    let baseline = ledger_parts(u64::MAX, wide);
+    let address = &request.usage[0].address;
+    store
+        .put_usage(&address.bucket_id, address.window_start, &baseline)
+        .unwrap();
+    let mut extra = metering(&request.key_id);
+    extra.tokens_input = wide;
+    extra.tokens_output = wide;
+    extra.tokens_cache_read = wide;
+    extra.tokens_cache_write = wide;
+    extra.usage_units.insert(OPEN_UNIT.into(), wide);
+    store.add_metering(&extra).unwrap();
+    request.metering = store
+        .list_metering(DAY_START)
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.key_id == request.key_id)
+        .collect();
+    correction::canonical_metering(&mut request.metering);
+    request.usage[0].expected = ledger_parts(u64::MAX, wide - 1);
+    request.usage[0].replacement = ledger_parts(u64::MAX, i128::MAX);
+    assert_eq!(
+        apply(&store, &request).unwrap(),
+        Decision::ConditionConflict
+    );
+    assert_eq!(read(&store, &request, 0), baseline);
+    assert!(!raw.exists::<_, bool>(receipt(&request)).unwrap());
+    request.usage[0].expected = baseline.clone();
+    request.usage[0].replacement = ledger_parts(u64::MAX, -1);
+    assert!(apply(&store, &request).is_err());
+    assert_eq!(read(&store, &request, 0), baseline);
+    assert!(!raw.exists::<_, bool>(receipt(&request)).unwrap());
+    request.usage[0].replacement = ledger_parts(u64::MAX, i128::MAX);
+    assert_eq!(apply(&store, &request).unwrap(), Decision::Applied);
+    let reopened = ValkeyStore::connect(&url).unwrap();
+    assert_eq!(apply(&reopened, &request).unwrap(), Decision::Applied);
+    assert_eq!(read(&reopened, &request, 0), request.usage[0].replacement);
+    let mut changed = request.clone();
+    changed.usage[0].replacement = ledger_parts(u64::MAX, i128::MAX - 1);
+    assert_eq!(apply(&reopened, &changed), Err(OpRefused::Conflict));
+    assert_eq!(read(&reopened, &request, 0), request.usage[0].replacement);
 }

@@ -277,8 +277,8 @@ fn scenario(loaded: &LoadedStore, ns: &str) -> Vec<String> {
             scale: 6,
             model: "m".into(),
             usage_units: [
-                ("input".to_string(), input),
-                ("tool_calls".to_string(), calls),
+                ("input".to_string(), i128::from(input)),
+                ("tool_calls".to_string(), i128::from(calls)),
             ]
             .into_iter()
             .collect(),
