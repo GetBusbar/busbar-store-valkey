@@ -792,7 +792,7 @@ fn an_older_builds_recorded_body_replays_and_a_different_op_conflicts() {
 
     let mbucket = super::unique_bucket(91);
     let m = busbar_contract::records::MeteringDelta {
-        scale: 6,
+        scale: 0,
         key_id: fresh("vk"),
         bucket: mbucket,
         model: "m".into(),
@@ -810,10 +810,26 @@ fn an_older_builds_recorded_body_replays_and_a_different_op_conflicts() {
     };
     let deltas = [m.clone()];
     let id = op(92);
-    seed(id, format!("add_metering_batch:{:?}", &deltas[..]));
+    seed(
+        id,
+        format!(
+            r#"add_metering_batch:[MeteringDelta {{ key_id: {:?}, bucket: {mbucket}, model: "m", provider: "p", tokens_input: 5, tokens_output: 0, tokens_cache_read: 0, tokens_cache_write: 0, requests: 1, billable_requests: 1, key_group_at_use: "", pricing_version: "", priced_from_ms: 0, usage_units: {{}} }}]"#,
+            m.key_id,
+        ),
+    );
     s.add_metering_batch(id, &deltas).expect("replays");
-    let other = busbar_contract::records::MeteringDelta {
+    let scaled = busbar_contract::records::MeteringDelta {
         scale: 6,
+        tokens_input: 5_000_000,
+        ..m.clone()
+    };
+    assert_eq!(
+        s.add_metering_batch(id, &[scaled]),
+        Err(OpRefused::Conflict),
+        "a scaled body must not replay a pre-scale textual receipt"
+    );
+    let other = busbar_contract::records::MeteringDelta {
+        scale: 0,
         tokens_input: 6,
         ..m
     };
@@ -1791,17 +1807,20 @@ fn v6_metering_migration_preserves_raw_rows_and_replays() {
         (&*oldrow.key_group_at_use, &*oldrow.pricing_version),
         ("old|group", "old%version")
     );
+    assert_eq!(oldrow.scale, 6);
     assert_eq!(
         (oldrow.tokens_input, oldrow.priced_from_ms),
-        (7, 9007199254740993)
+        (7_000_000, 9007199254740993)
     );
-    assert_eq!(oldrow.usage_units.get("tool_calls"), Some(&11));
+    assert_eq!(oldrow.usage_units.get("tool_calls"), Some(&11_000_000));
     let unknownrow = rows.iter().find(|r| r.key_id == "unknown").unwrap();
+    assert_eq!(unknownrow.scale, 6);
+    assert_eq!(unknownrow.tokens_input, 3_000_000);
     assert_eq!(
         (&*unknownrow.key_group_at_use, &*unknownrow.pricing_version),
         ("", "")
     );
-    assert_eq!(unknownrow.usage_units.get("tool_calls"), Some(&5));
+    assert_eq!(unknownrow.usage_units.get("tool_calls"), Some(&5_000_000));
     let mut delta = metering_delta(bucket, 2);
     delta.key_id = "history".into();
     delta.key_group_at_use = "new".into();
@@ -1817,8 +1836,9 @@ fn v6_metering_migration_preserves_raw_rows_and_replays() {
         .iter()
         .find(|r| r.key_group_at_use == "old|group")
         .unwrap();
-    assert_eq!(oldrow.tokens_input, 7);
-    assert_eq!(oldrow.usage_units.get("tool_calls"), Some(&11));
+    assert_eq!(oldrow.scale, 6);
+    assert_eq!(oldrow.tokens_input, 7_000_000);
+    assert_eq!(oldrow.usage_units.get("tool_calls"), Some(&11_000_000));
     let names: Vec<String> = r.smembers(&set).unwrap();
     let mut opaque = 0;
     for name in names {
@@ -1854,6 +1874,8 @@ fn v6_metering_destination_collision_refuses_without_overwriting_evidence() {
             "pricing_version",
             "v",
             "tokens_input",
+            "9007199255",
+            "requests",
             "9007199254740993",
         ])
         .query(&mut r)
@@ -1868,20 +1890,28 @@ fn v6_metering_destination_collision_refuses_without_overwriting_evidence() {
     let value: String = r.get(destination).unwrap();
     assert_eq!(value, "retained collision");
     let count: String = r.hget(old, "tokens_input").unwrap();
-    assert_eq!(count, "9007199254740993");
+    assert_eq!(count, "9007199255");
+    let requests: String = r.hget(old, "requests").unwrap();
+    assert_eq!(requests, "9007199254740993");
     let names: Vec<String> = r.smembers(set).unwrap();
     assert_eq!(names, [old]);
     let _: () = r.del(destination).unwrap();
     iso.restart();
     let rows = iso.s().list_metering(17).unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].tokens_input, 9007199254740993);
+    assert_eq!(rows[0].scale, 6);
+    assert_eq!(rows[0].tokens_input, 9_007_199_255_000_000);
+    assert_eq!(rows[0].requests, 9_007_199_254_740_993);
     assert_eq!(
         (&*rows[0].key_group_at_use, &*rows[0].pricing_version),
         ("g", "v")
     );
 
-    let _: () = r.set("busbar:schema", 6).unwrap();
+    assert_eq!(
+        r.get::<_, i64>("busbar:schema").unwrap(),
+        crate::SCHEMA_VERSION,
+        "the completed migration keeps the scale-6 schema marker"
+    );
     iso.restart();
     assert_eq!(iso.s().list_metering(17).unwrap(), rows);
 }
@@ -1891,6 +1921,7 @@ fn v6_metering_upgrade_keeps_the_existing_replay_receipt_and_same_cell() {
     let Some(mut iso) = Iso::new(12) else { return };
     let bucket = 19;
     let mut delta = metering_delta(bucket, 7);
+    delta.scale = 0;
     delta.key_id = "history".into();
     delta.key_group_at_use = "g".into();
     delta.pricing_version = "v".into();
@@ -1910,6 +1941,13 @@ fn v6_metering_upgrade_keeps_the_existing_replay_receipt_and_same_cell() {
             .query(&mut r)
             .unwrap();
     }
+    // Current writes normalize scale 0; reconstruct the authentic whole-unit v6 hash.
+    let input: u64 = r.hget(&old, "tokens_input").unwrap();
+    let tools: u64 = r.hget(&old, "u:tool_calls").unwrap();
+    assert_eq!((input, tools), (7_000_000, 11_000_000));
+    let _: () = r
+        .hset_multiple(&old, &[("tokens_input", "7"), ("u:tool_calls", "11")])
+        .unwrap();
     let _: () = r.del(&set).unwrap();
     let _: () = r.sadd(&set, &old).unwrap();
     let _: () = r.set("busbar:schema", 6).unwrap();
@@ -1917,11 +1955,13 @@ fn v6_metering_upgrade_keeps_the_existing_replay_receipt_and_same_cell() {
     iso.s().add_metering_batch(id, &[delta.clone()]).unwrap();
     let rows = iso.s().list_metering(bucket).unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].tokens_input, 7);
-    assert_eq!(rows[0].usage_units.get("tool_calls"), Some(&11));
+    assert_eq!(rows[0].scale, 6);
+    assert_eq!(rows[0].tokens_input, 7_000_000);
+    assert_eq!(rows[0].usage_units.get("tool_calls"), Some(&11_000_000));
     iso.s().add_metering_batch(op(184), &[delta]).unwrap();
     let rows = iso.s().list_metering(bucket).unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].tokens_input, 14);
-    assert_eq!(rows[0].usage_units.get("tool_calls"), Some(&22));
+    assert_eq!(rows[0].scale, 6);
+    assert_eq!(rows[0].tokens_input, 14_000_000);
+    assert_eq!(rows[0].usage_units.get("tool_calls"), Some(&22_000_000));
 }

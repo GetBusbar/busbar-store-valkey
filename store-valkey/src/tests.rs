@@ -3769,19 +3769,40 @@ fn v6_namespace_upgrades_in_place_to_v7() {
             p.query::<()>(c)
         })
         .unwrap();
-    let upgraded = ValkeyStore::connect(&url).expect("a re-seeded v6 row upgrades on open");
-    assert_eq!(
-        upgraded.get_task(&t).unwrap(),
-        Some(live.clone()),
-        "the v7 record must not be overwritten by a stale v6 row"
-    );
-    assert!(
-        !database
-            .with_conn(|c| c.exists::<_, bool>(format!("{TASK_ROW_PREFIX}{t}")))
-            .unwrap(),
-        "the stale v6 row is removed"
-    );
-    assert_eq!(upgraded.list_task_events(&t).unwrap(), vec![e1, e2]);
+    for _ in 0..2 {
+        let Err(error) = ValkeyStore::connect(&url) else {
+            panic!("a conflicting re-seeded v6 row refuses migration");
+        };
+        assert!(
+            error.contains("conflicting task destination") && error.contains("source retained"),
+            "{error}"
+        );
+        assert_eq!(
+            upgraded.get_task(&t).unwrap(),
+            Some(live.clone()),
+            "a refused migration must not overwrite the v7 destination"
+        );
+        let retained: String = database
+            .with_conn(|c| c.get(format!("{TASK_ROW_PREFIX}{t}")))
+            .unwrap();
+        assert_eq!(
+            retained,
+            serde_json::to_string(&stale).unwrap(),
+            "conflicting source evidence stays intact"
+        );
+        assert!(database
+            .with_conn(|c| c.sismember::<_, _, bool>(TASKS_INDEX, &t))
+            .unwrap());
+        let marker: i64 = database.with_conn(|c| c.get(SCHEMA_KEY)).unwrap();
+        assert_eq!(
+            marker, 6,
+            "a refused migration does not stamp the destination schema"
+        );
+        assert_eq!(
+            upgraded.list_task_events(&t).unwrap(),
+            vec![e1.clone(), e2.clone()]
+        );
+    }
 }
 
 /// The front a proxy listens on.
@@ -4559,6 +4580,14 @@ const FIXTURE_KEYS_1_5_5: &str = include_str!("../tests/fixtures/1.5.5/keys.json
 /// A TTL comfortably longer than any test run, as 1.5.5 gave its metering rows.
 const FIXTURE_TTL_SECS: u64 = 31 * 24 * 3600;
 
+/// The frozen HTTP witnesses use whole tokens; decode migrated mantissas exactly, never round.
+fn recorded_1_5_5_whole_quantity(value: u64, scale: u32) -> u64 {
+    assert_eq!(scale, 6, "the historical quantity migrated to micro-units");
+    busbar_contract::count::Count::from_stored(i128::from(value), scale)
+        .and_then(busbar_contract::count::Count::whole_u64)
+        .expect("the frozen historical quantity is an exact whole number")
+}
+
 fn recorded_1_5_5_token_spend(
     model: &str,
     input: u64,
@@ -4591,17 +4620,24 @@ fn recorded_1_5_5_breakdown(rows: &[&MeteringRow]) -> serde_json::Value {
     let mut requests = 0;
     let mut spend = 0;
     for row in rows {
-        input += row.tokens_input;
-        output += row.tokens_output;
-        cache_read += row.tokens_cache_read;
-        cache_write += row.tokens_cache_write;
-        requests += row.requests;
-        spend += recorded_1_5_5_token_spend(
-            &row.model,
+        let [row_input, row_output, row_cache_read, row_cache_write] = [
             row.tokens_input,
             row.tokens_output,
             row.tokens_cache_read,
             row.tokens_cache_write,
+        ]
+        .map(|value| recorded_1_5_5_whole_quantity(value, row.scale));
+        input += row_input;
+        output += row_output;
+        cache_read += row_cache_read;
+        cache_write += row_cache_write;
+        requests += row.requests;
+        spend += recorded_1_5_5_token_spend(
+            &row.model,
+            row_input,
+            row_output,
+            row_cache_read,
+            row_cache_write,
         ) + row.billable_requests * 30_000;
     }
     serde_json::json!({
@@ -4706,17 +4742,17 @@ fn assert_recorded_1_5_5_readback(store: &ValkeyStore) {
             .map(|model| {
                 recorded_1_5_5_token_spend(
                     &model.model,
-                    model.tier("input"),
-                    model.tier("output"),
-                    model.tier("cache_read"),
-                    model.tier("cache_write"),
+                    recorded_1_5_5_whole_quantity(model.tier("input"), model.scale),
+                    recorded_1_5_5_whole_quantity(model.tier("output"), model.scale),
+                    recorded_1_5_5_whole_quantity(model.tier("cache_read"), model.scale),
+                    recorded_1_5_5_whole_quantity(model.tier("cache_write"), model.scale),
                 )
             })
             .sum::<u64>()
             + ledger.billable_requests * 30_000;
         let actual = json!({
             "id": &key.id, "group": &key.group, "budget_period": "total", "window_start": 0,
-            "requests": ledger.requests, "tokens": ledger.total_tokens(), "spend_cents": spend / 10_000,
+            "requests": ledger.requests, "tokens": recorded_1_5_5_whole_quantity(ledger.total_tokens(), 6), "spend_cents": spend / 10_000,
             // The recorder config gives the group only a budget; it has no requests/tokens rate cap.
             "rate_headroom": Option::<f64>::None,
         });
@@ -4850,6 +4886,7 @@ fn assert_1_5_5_keys_read_back(store: &ValkeyStore) {
                         && g.provider == fx_text(&w["provider"])
                 })
                 .unwrap_or_else(|| panic!("metering row missing after migrate: {w}"));
+            assert_eq!(row.scale, 6, "{w}");
             assert_eq!(row.requests, fx_num(&w["requests"]), "{w}");
             assert_eq!(
                 row.billable_requests,
@@ -4858,16 +4895,24 @@ fn assert_1_5_5_keys_read_back(store: &ValkeyStore) {
             );
             assert_eq!(row.key_group_at_use, fx_text(&w["key_group_at_use"]), "{w}");
             assert_eq!(row.pricing_version, fx_text(&w["pricing_version"]), "{w}");
-            assert_eq!(row.tokens_input, fx_num(&w["tokens_input"]), "{w}");
-            assert_eq!(row.tokens_output, fx_num(&w["tokens_output"]), "{w}");
+            assert_eq!(
+                row.tokens_input,
+                fx_num(&w["tokens_input"]) * 1_000_000,
+                "{w}"
+            );
+            assert_eq!(
+                row.tokens_output,
+                fx_num(&w["tokens_output"]) * 1_000_000,
+                "{w}"
+            );
             assert_eq!(
                 row.tokens_cache_read,
-                fx_num(&w["tokens_cache_read"]),
+                fx_num(&w["tokens_cache_read"]) * 1_000_000,
                 "{w}"
             );
             assert_eq!(
                 row.tokens_cache_write,
-                fx_num(&w["tokens_cache_write"]),
+                fx_num(&w["tokens_cache_write"]) * 1_000_000,
                 "{w}"
             );
             seen += 1;
@@ -4897,13 +4942,14 @@ fn assert_1_5_5_keys_read_back(store: &ValkeyStore) {
                     models
                         .entry(model.to_string())
                         .or_default()
-                        .insert(unit.to_string(), fx_num(v));
+                        .insert(unit.to_string(), fx_num(v) * 1_000_000);
                 }
             }
         }
         let got = store.get_usage(bucket, start).unwrap();
         assert_eq!(got.requests, requests, "{key}");
         assert_eq!(got.billable_requests, billable, "{key}");
+        assert!(got.models.iter().all(|model| model.scale == 6));
         let have: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> = got
             .models
             .iter()
