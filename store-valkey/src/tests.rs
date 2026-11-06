@@ -6786,6 +6786,7 @@ fn malformed_reply_peer(exec: Option<&'static [u8]>) -> (String, std::thread::Jo
                 Err(e) => panic!("accept mock RESP client: {e}"),
             };
             accepted += 1;
+            stream.set_nonblocking(false).expect("blocking mock client");
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
@@ -6924,6 +6925,7 @@ fn legacy_approval_peer(
                 Err(e) => panic!("accept legacy fixture client: {e}"),
             }
         };
+        stream.set_nonblocking(false).expect("blocking mock client");
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();

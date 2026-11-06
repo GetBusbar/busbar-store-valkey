@@ -143,6 +143,9 @@ fn proxy(valkey_url: &str, before: Hook, after: Hook) -> Proxy {
                     }
                     Err(error) => panic!("accept: {error}"),
                 };
+                client
+                    .set_nonblocking(false)
+                    .expect("blocking proxy client");
                 let mut server = upstream.iter().find_map(|address| {
                     if running.stopping.load(Ordering::SeqCst) {
                         return None;

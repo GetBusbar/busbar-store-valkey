@@ -330,6 +330,9 @@ impl Proxy {
             };
             drop(listener);
             client
+                .set_nonblocking(false)
+                .expect("blocking proxy client");
+            client
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
             client

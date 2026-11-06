@@ -379,6 +379,9 @@ fn lose_rewrap_reply(
 
         drop(listener);
         client
+            .set_nonblocking(false)
+            .expect("blocking proxy client");
+        client
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .unwrap();
         client
