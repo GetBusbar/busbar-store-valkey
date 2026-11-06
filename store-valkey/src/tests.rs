@@ -4911,22 +4911,22 @@ fn assert_1_5_5_keys_read_back(store: &ValkeyStore) {
             assert_eq!(row.pricing_version, fx_text(&w["pricing_version"]), "{w}");
             assert_eq!(
                 row.tokens_input,
-                fx_num(&w["tokens_input"]) * 1_000_000,
+                i128::from(fx_num(&w["tokens_input"])) * 1_000_000,
                 "{w}"
             );
             assert_eq!(
                 row.tokens_output,
-                fx_num(&w["tokens_output"]) * 1_000_000,
+                i128::from(fx_num(&w["tokens_output"])) * 1_000_000,
                 "{w}"
             );
             assert_eq!(
                 row.tokens_cache_read,
-                fx_num(&w["tokens_cache_read"]) * 1_000_000,
+                i128::from(fx_num(&w["tokens_cache_read"])) * 1_000_000,
                 "{w}"
             );
             assert_eq!(
                 row.tokens_cache_write,
-                fx_num(&w["tokens_cache_write"]) * 1_000_000,
+                i128::from(fx_num(&w["tokens_cache_write"])) * 1_000_000,
                 "{w}"
             );
             seen += 1;
@@ -4945,7 +4945,7 @@ fn assert_1_5_5_keys_read_back(store: &ValkeyStore) {
         let mut billable = 0;
         let mut models: std::collections::BTreeMap<
             String,
-            std::collections::BTreeMap<String, u64>,
+            std::collections::BTreeMap<String, i128>,
         > = Default::default();
         for (field, v) in row["value"].as_object().unwrap() {
             match field.as_str() {
@@ -4956,7 +4956,7 @@ fn assert_1_5_5_keys_read_back(store: &ValkeyStore) {
                     models
                         .entry(model.to_string())
                         .or_default()
-                        .insert(unit.to_string(), fx_num(v) * 1_000_000);
+                        .insert(unit.to_string(), i128::from(fx_num(v)) * 1_000_000);
                 }
             }
         }
@@ -4964,11 +4964,11 @@ fn assert_1_5_5_keys_read_back(store: &ValkeyStore) {
         assert_eq!(got.requests, requests, "{key}");
         assert_eq!(got.billable_requests, billable, "{key}");
         assert!(got.models.iter().all(|model| model.scale == 6));
-        let have: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> = got
-            .models
-            .iter()
-            .map(|m| (m.model.clone(), m.usage_units.clone()))
-            .collect();
+        let have: std::collections::BTreeMap<String, std::collections::BTreeMap<String, i128>> =
+            got.models
+                .iter()
+                .map(|m| (m.model.clone(), m.usage_units.clone()))
+                .collect();
         assert_eq!(have, models, "per-model tokens of {key}");
         windows += 1;
     }
