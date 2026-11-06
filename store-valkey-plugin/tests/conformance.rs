@@ -1103,3 +1103,43 @@ fn both_actual_doors_refuse_every_other_plugin_kind() {
         })
     );
 }
+
+/// A fresh actual image completes OPEN, successful READY, one benign read, and CLOSE.
+#[test]
+fn both_actual_valkey_images_complete_a_successful_minimal_lifecycle() {
+    use std::sync::atomic::Ordering;
+
+    let url = std::env::var("VALKEY_URL")
+        .expect("VALKEY_URL is required for the actual-image lifecycle witness");
+    let mut url: url::Url = url.parse().expect("owned Valkey fixture URL");
+    url.set_path("/14");
+    let _db = database::Database::take(url.as_str());
+    let lib = cdylib();
+    let stated = packed_rendering(&lib);
+    let settings = serde_json::json!({"url": url.as_str()}).to_string();
+    for dropped_in in [false, true] {
+        let (plugin, dispatcher) = if dropped_in {
+            dropped(&lib, &stated)
+        } else {
+            linked()
+        };
+        let held = Arc::clone(&plugin.inner);
+        let first = || held.crossings.load(Ordering::SeqCst) - held.resumes.load(Ordering::SeqCst);
+        let before = first();
+        let store = LoadedStore::open(plugin, dispatcher, settings.as_bytes(), mint)
+            .expect("actual Valkey OPEN and READY succeed");
+        assert_eq!(first() - before, 2, "actual OPEN and successful READY");
+        let missing = format!("minimal-lifecycle-missing-{}", unique());
+        assert!(RecordStore::get_key(&store, &missing)
+            .expect("one benign actual Valkey read succeeds")
+            .is_none());
+        let before_close = first();
+        assert!(
+            before_close > before + 2,
+            "the benign read crossed the actual door"
+        );
+        drop(store);
+        assert_eq!(first() - before_close, 1, "one actual lifecycle CLOSE");
+        drop(held);
+    }
+}
