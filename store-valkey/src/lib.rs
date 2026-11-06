@@ -946,11 +946,11 @@ impl ValkeyStore {
                     return Ok(Some(()));
                 };
                 let raw = Zeroizing::new(raw);
-                let mut cred = OwnedCredential(serde_json::from_str(&raw).map_err(|_| {
+                let mut cred = serde_json::from_str::<CredentialSecret>(&raw).map_err(|_| {
                     RedisError::refused(format!(
                         "credential upgrade: malformed credential at `{row_key}` (pointer `{ptr}`)"
                     ))
-                })?);
+                })?;
                 if slot_pointer(&cred.meta) != ptr {
                     return Err(RedisError::refused(format!(
                         "credential upgrade: mismatched slot at `{row_key}` (pointer `{ptr}`)"
@@ -1095,14 +1095,14 @@ async fn read_slot(c: &mut Conn, secret: &CredentialSecret, op: &str) -> RedisRe
     let existing = existing.map(Zeroizing::new);
     let mut prior = None;
     if let Some(raw) = &existing {
-        let cur = OwnedCredential(serde_json::from_str(raw).map_err(|_| {
+        let cur = serde_json::from_str::<CredentialSecret>(raw).map_err(|_| {
             RedisError::from((ErrorKind::Client, "credential row does not decode", row_key))
-        })?);
+        })?;
         if cur.meta.revoked_at.is_none() {
             if cur.meta.id == m.id {
                 let mut same = cur;
                 same.meta.revision = m.revision;
-                if same.0 != *secret {
+                if same != *secret {
                     return Err(RedisError::refused(format!(
                         "{op}: credential '{}' already exists with different content",
                         m.id
@@ -1609,12 +1609,13 @@ impl ValkeyStore {
                     // pointers dangling behind a reported success.
                     if let Some(raw) = c.get::<_, Option<String>>(&row_key).await? {
                         let raw = Zeroizing::new(raw);
-                        let cred = OwnedCredential(serde_json::from_str(&raw).map_err(|_| {
-                            RedisError::from((
-                                ErrorKind::Client,
-                                "delete_key: corrupt credential row",
-                            ))
-                        })?);
+                        let cred =
+                            serde_json::from_str::<CredentialSecret>(&raw).map_err(|_| {
+                                RedisError::from((
+                                    ErrorKind::Client,
+                                    "delete_key: corrupt credential row",
+                                ))
+                            })?;
                         pipe.del(cred_pub_key(kind, &cred.meta.public_id)).ignore();
                         pipe.del(cred_id_key(&cred.meta.id)).ignore();
                     }
@@ -1755,7 +1756,7 @@ impl ValkeyStore {
                     Slot::Replay => return Ok(Some(())),
                     Slot::Free(prior) => prior,
                 };
-                let mut secret = OwnedCredential(secret.clone());
+                let mut secret = secret.clone();
                 pipe.atomic();
                 secret.meta.revision = self.next_revision(c, pipe, 1).await?;
                 queue_credential(pipe, &secret, &prior)?;
@@ -1915,7 +1916,7 @@ impl ValkeyStore {
                         }
                         Slot::Free(prior) => prior,
                     };
-                    let (mut key, mut secret) = (key.clone(), OwnedCredential(secret.clone()));
+                    let (mut key, mut secret) = (key.clone(), secret.clone());
                     pipe.atomic();
                     key.revision = self.next_revision(c, pipe, 2).await?;
                     secret.meta.revision = key.revision + 1;
@@ -1998,10 +1999,8 @@ impl ValkeyStore {
                     )));
                 };
                 let raw = Zeroizing::new(raw);
-                let mut cred = OwnedCredential(
-                    cred_from_json("revoke_credential", &row_key, &raw)
-                        .map_err(|e| RedisError::refused(e.0))?,
-                );
+                let mut cred = cred_from_json("revoke_credential", &row_key, &raw)
+                    .map_err(|e| RedisError::refused(e.0))?;
                 if cred.meta.id != id || slot_pointer(&cred.meta) != ptr {
                     return Err(RedisError::refused(format!(
                         "revoke_credential: stale pointer busbar:cred:id:{id} -> {ptr} holds credential '{}' at row '{row_key}'; nothing was revoked",
@@ -2432,34 +2431,15 @@ impl ValkeyStore {
 #[path = "tests.rs"]
 mod tests;
 
-/// An internal credential copy whose secret is wiped on every exit, including refusals.
-struct OwnedCredential(CredentialSecret);
-impl std::ops::Deref for OwnedCredential {
-    type Target = CredentialSecret;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-impl std::ops::DerefMut for OwnedCredential {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-impl Drop for OwnedCredential {
-    fn drop(&mut self) {
-        self.0.secret.zeroize();
-    }
-}
-
 /// Captured operation inputs retain wiping ownership while an async operation is pending.
 trait SecureOwned {
     type Owned;
     fn secure_owned(&self) -> Self::Owned;
 }
 impl SecureOwned for CredentialSecret {
-    type Owned = OwnedCredential;
+    type Owned = CredentialSecret;
     fn secure_owned(&self) -> Self::Owned {
-        OwnedCredential(self.clone())
+        self.clone()
     }
 }
 impl SecureOwned for str {

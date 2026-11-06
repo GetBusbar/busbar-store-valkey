@@ -18,21 +18,8 @@ impl ValkeyStore {
 
         let receipt = op_key(request.op_id);
         let dedupe = Dedupe::usage_correction(request);
-        let mut normalized_request = request.clone();
-        for row in &mut normalized_request.metering {
-            row.normalize_scale6()
-                .map_err(|e| OpRefused::Refused(e.to_string()))?;
-        }
-        for change in &mut normalized_request.usage {
-            change
-                .expected
-                .normalize_scale6()
-                .map_err(|e| OpRefused::Refused(e.to_string()))?;
-            change
-                .replacement
-                .normalize_scale6()
-                .map_err(|e| OpRefused::Refused(e.to_string()))?;
-        }
+        let normalized_request =
+            correction::normalized(request).map_err(|e| OpRefused::Refused(e.to_string()))?;
         let request = &normalized_request;
         let owner = format!("{}{}", crate::KEY_PREFIX, request.key_id);
         let day = metering_set(request.day_start);
