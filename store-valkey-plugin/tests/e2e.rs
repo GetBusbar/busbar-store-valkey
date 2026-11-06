@@ -963,7 +963,6 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
         .bearer_auth(&admin_token)
         .json(&serde_json::json!({
             "store": { "module": "busbar-store-valkey", "settings": { "url": url } },
-            "persist": true,
         }))
         .send()
         .expect("PUT /api/v1/admin/config/settings");
@@ -972,6 +971,23 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
     assert!(
         settings_status.is_success(),
         "PUT /api/v1/admin/config/settings must succeed: {settings_status}: {settings_body}"
+    );
+
+    // Successful settings writes persist through the configured Store; no `persist` flag is needed.
+    let settings_body: serde_json::Value =
+        serde_json::from_str(&settings_body).expect("the settings response is JSON");
+    assert_eq!(settings_body["applied"], true);
+    assert_eq!(
+        settings_body["settings"]["store"]["module"],
+        "busbar-store-valkey"
+    );
+    assert!(
+        settings_body["reload_to_apply"]
+            .as_array()
+            .expect("restart fields")
+            .iter()
+            .any(|field| field == "store"),
+        "the stored backend change must require restart: {settings_body}"
     );
 
     std::fs::write(&config, config_text(Some(&archive_sha256), Some(&url))).unwrap();

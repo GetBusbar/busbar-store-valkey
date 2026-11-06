@@ -433,10 +433,10 @@ static PURGE: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
         for i = 1, #scan[2], 2 do cands[#cands + 1] = scan[2][i] end
         for _, f in ipairs(cands) do
             local side = redis.call('HGET', KEYS[1], f)
-            if side then
+            local separator = string.find(f, ':', 1, true)
+            if side and separator then
                 local ts = string.match(side, ',\"ts\":(%d+)}}$')
-                local separator = string.find(f, ':', 1, true)
-                if not ts or not separator then error('invalid plane purge sidecar') end
+                if not ts then error('invalid plane purge sidecar') end
                 local ident = string.sub(f, separator + 1)
                 local idx = ARGV[3] .. tohex(ident)
                 validate_drop(KEYS[1], KEYS[2], KEYS[3], KEYS[4], idx, ARGV[3], f, side)

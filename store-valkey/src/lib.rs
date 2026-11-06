@@ -1656,11 +1656,12 @@ impl ValkeyStore {
         }
         let mut cursor = String::from("0");
         let mut removed = 0_u64;
+        let mut seen = std::collections::HashSet::new();
         loop {
             let (next, keys) = with_conn!(self, |c| c.scan_page(&cursor, "busbar:usage:*").await)?;
             let expired: Vec<String> = keys
                 .into_iter()
-                .filter(|key| expired_usage_key(key, before))
+                .filter(|key| expired_usage_key(key, before) && seen.insert(key.clone()))
                 .collect();
             if !expired.is_empty() {
                 let deleted: u64 =
