@@ -1123,19 +1123,26 @@ fn both_actual_valkey_images_complete_a_successful_minimal_lifecycle() {
         } else {
             linked()
         };
+        // store_door! declares no optional READY callback. SDK947 treats that as
+        // successful readiness without an ABI crossing; the failed-READY fixture
+        // above deliberately supplies a different, failing callback.
+        assert!(
+            !plugin.has_ready(),
+            "the actual Valkey door has no READY callback"
+        );
         let held = Arc::clone(&plugin.inner);
         let first = || held.crossings.load(Ordering::SeqCst) - held.resumes.load(Ordering::SeqCst);
         let before = first();
         let store = LoadedStore::open(plugin, dispatcher, settings.as_bytes(), mint)
             .expect("actual Valkey OPEN and READY succeed");
-        assert_eq!(first() - before, 2, "actual OPEN and successful READY");
+        assert_eq!(first() - before, 1, "actual OPEN; optional READY is absent");
         let missing = format!("minimal-lifecycle-missing-{}", unique());
         assert!(RecordStore::get_key(&store, &missing)
             .expect("one benign actual Valkey read succeeds")
             .is_none());
         let before_close = first();
         assert!(
-            before_close > before + 2,
+            before_close > before + 1,
             "the benign read crossed the actual door"
         );
         drop(store);
