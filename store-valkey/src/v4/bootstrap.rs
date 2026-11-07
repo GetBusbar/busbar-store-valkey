@@ -589,7 +589,7 @@ impl OwnBackend {
         if array(&users.0)?.len() > 1024 {
             return Err(l::Error::Bounds);
         };
-        let mut owned = false;
+        let mut fence = None;
         for user in array(&users.0)? {
             let user = value_bytes(user)?;
             let grants = Raw(cmd("ACL")
@@ -609,15 +609,9 @@ impl OwnBackend {
             };
             let keys = value_bytes(field(&grants.0, b"keys")?)?;
             if user == who.as_bytes() {
-                // This existing native grant is the ownership contract. A URL,
-                // default-account name or current key inventory is not one.
-                if keys != b"~busbar:*"
-                    && keys != b"%R~busbar:* %W~busbar:*"
-                    && keys != b"%R~busbar:* ~busbar:v4:*"
-                {
-                    return Err(l::Error::MissingCapability);
-                }
-                owned = true;
+                // Admit only the two supported native scopes; never infer
+                // authority from the current key inventory or account name.
+                fence = Some(FenceKind::admit(keys).ok_or(l::Error::MissingCapability)?);
             } else {
                 // Preserve other accounts untouched. Only simple disjoint key
                 // scopes can currently be proved not to grant source writes.
@@ -630,9 +624,7 @@ impl OwnBackend {
                 }
             }
         }
-        if !owned {
-            return Err(l::Error::MissingCapability);
-        };
+        let fence = fence.ok_or(l::Error::MissingCapability)?;
         let configuration = Raw(cmd("CONFIG")
             .arg("GET")
             .arg("aclfile")
@@ -648,14 +640,14 @@ impl OwnBackend {
         if !aclfile && info(server.as_bytes(), b"config_file")?.is_empty() {
             return Err(l::Error::MissingCapability);
         };
-        let proposed = ["resetkeys", "%R~busbar:*", "~busbar:v4:*"];
         let mut dry = cmd("ACL");
         dry.arg("DRYRUN")
             .arg(who.as_bytes())
             .arg("ACL")
             .arg("SETUSER")
             .arg(who.as_bytes())
-            .arg(proposed);
+            .arg("resetkeys")
+            .arg(fence.rules());
         let allowed: Bytes = dry
             .query(c)
             .await
@@ -666,6 +658,7 @@ impl OwnBackend {
         let authority = Authority {
             user: who.as_bytes().to_vec(),
             aclfile,
+            fence,
         };
         // Persist the unchanged native policy first. A failed persistence check
         // cannot leave a partially installed fence or converted target behind.
@@ -705,9 +698,67 @@ fn copy_request(r: &l::Request<Own>) -> l::Request<Own> {
     r.clone()
 }
 
+#[derive(Clone, Copy)]
+enum FenceKind {
+    Scoped,
+    Broad,
+}
+impl FenceKind {
+    fn admit(keys: &[u8]) -> Option<Self> {
+        match keys {
+            b"~busbar:*" | b"%R~busbar:* %W~busbar:*" => Some(Self::Scoped),
+            b"~*" | b"%R~* %W~*" | b"%W~* %R~*" => Some(Self::Broad),
+            _ => Self::fenced(keys),
+        }
+    }
+    fn fenced(keys: &[u8]) -> Option<Self> {
+        if keys == Self::Scoped.canonical() {
+            Some(Self::Scoped)
+        } else if keys == Self::Broad.canonical() {
+            Some(Self::Broad)
+        } else {
+            None
+        }
+    }
+    fn rules(self) -> &'static [&'static str] {
+        match self {
+            Self::Scoped => &["%R~busbar:*", "~busbar:v4:*"],
+            // Exact byte-glob complement of busbar:, plus the new target.
+            // Short keys end before the prefix; each remaining pattern names
+            // the first mismatching byte. Reads retain the original full scope.
+            // Read/write commands require both rights in one native pattern,
+            // so these grants include reads already covered by %R~*.
+            Self::Broad => &[
+                "%R~*",
+                "~",
+                "~b",
+                "~bu",
+                "~bus",
+                "~busb",
+                "~busba",
+                "~busbar",
+                "~[^b]*",
+                "~b[^u]*",
+                "~bu[^s]*",
+                "~bus[^b]*",
+                "~busb[^a]*",
+                "~busba[^r]*",
+                "~busbar[^:]*",
+                "~busbar:v4:*",
+            ],
+        }
+    }
+    fn canonical(self) -> &'static [u8] {
+        match self {
+            Self::Scoped => b"%R~busbar:* ~busbar:v4:*",
+            Self::Broad => b"%R~* ~ ~b ~bu ~bus ~busb ~busba ~busbar ~[^b]* ~b[^u]* ~bu[^s]* ~bus[^b]* ~busb[^a]* ~busba[^r]* ~busbar[^:]* ~busbar:v4:*",
+        }
+    }
+}
 struct Authority {
     user: Vec<u8>,
     aclfile: bool,
+    fence: FenceKind,
 }
 impl Authority {
     async fn persist(&self, c: &mut Conn) -> Result<(), l::Error> {
@@ -734,8 +785,7 @@ impl Authority {
             .arg("SETUSER")
             .arg(&self.user)
             .arg("resetkeys")
-            .arg("%R~busbar:*")
-            .arg("~busbar:v4:*")
+            .arg(self.fence.rules())
             .query(c)
             .await
             .map_err(uncertain)?;
@@ -966,7 +1016,10 @@ impl OwnBackend {
                     None
                 }
             };
-            if old.client == client {
+            // Native client IDs are scoped to one server run and can be
+            // reused by a different connection after a configuration restart.
+            let same_instance = old.run_id == facts.run_id;
+            if same_instance && old.client == client {
                 if let Some(owned) = own_token {
                     token.clear();
                     token.extend_from_slice(&owned);
@@ -975,9 +1028,10 @@ impl OwnBackend {
                 };
                 old
             } else {
-                if native_clients(clients.as_bytes())?
-                    .iter()
-                    .any(|v| v.id == old.client)
+                if same_instance
+                    && native_clients(clients.as_bytes())?
+                        .iter()
+                        .any(|v| v.id == old.client)
                 {
                     return Err(l::Error::Busy);
                 };
@@ -1155,7 +1209,7 @@ impl OwnBackend {
         state.control = Some(control);
         Ok(response)
     }
-    async fn policy(&self, c: &mut Conn, control: &Control) -> Result<(), l::Error> {
+    async fn policy(&self, c: &mut Conn, control: &Control) -> Result<FenceKind, l::Error> {
         let topology: Bytes = cmd("INFO")
             .arg("replication")
             .query(c)
@@ -1175,9 +1229,9 @@ impl OwnBackend {
             .query::<Value>(c)
             .await
             .map_err(|_| l::Error::MissingCapability)?);
-        if value_bytes(field(&grants.0, b"keys")?)? != b"%R~busbar:* ~busbar:v4:*"
-            || !array(field(&grants.0, b"selectors")?)?.is_empty()
-        {
+        let fence = FenceKind::fenced(value_bytes(field(&grants.0, b"keys")?)?)
+            .ok_or(l::Error::SourceChanged)?;
+        if !array(field(&grants.0, b"selectors")?)?.is_empty() {
             return Err(l::Error::SourceChanged);
         };
         let server: Bytes = cmd("INFO")
@@ -1203,7 +1257,7 @@ impl OwnBackend {
         if client != control.client {
             return Err(l::Error::Busy);
         };
-        Ok(())
+        Ok(fence)
     }
     async fn verify(
         &self,
@@ -1223,7 +1277,7 @@ impl OwnBackend {
                 state.snapshot.as_ref().ok_or(l::Error::Refused)?.id,
             )
         };
-        self.policy(c, &control).await?;
+        let fence = self.policy(c, &control).await?;
         let current = self.control(c).await?.ok_or(l::Error::SourceChanged)?;
         let clients = self.client_list(c).await?;
         if native_clients(clients.as_bytes())?
@@ -1240,7 +1294,7 @@ impl OwnBackend {
         Ok(l::Fence {
             upgrade: control.id,
             source: control.source(),
-            enforcement_digest: archive::digest(b"%R~busbar:* ~busbar:v4:*"),
+            enforcement_digest: archive::digest(fence.canonical()),
             observation_digest: archive::digest(clients.as_bytes()),
             snapshot: id,
         })

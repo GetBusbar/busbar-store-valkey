@@ -74,6 +74,56 @@ impl Server {
             port,
         }
     }
+    fn disconnect_admin(&mut self) {
+        let id: u64 = redis::cmd("CLIENT")
+            .arg("ID")
+            .query(&mut self.conn)
+            .unwrap();
+        let _: redis::RedisResult<()> = redis::cmd("CLIENT")
+            .arg("KILL")
+            .arg("ID")
+            .arg(id)
+            .arg("SKIPME")
+            .arg("no")
+            .query(&mut self.conn);
+    }
+    fn restart_from_config(&mut self) {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+        let binary =
+            std::env::var_os("BUSBAR_VALKEY_SERVER").unwrap_or_else(|| "valkey-server".into());
+        self.child = Command::new(binary)
+            .arg(self.path.join("valkey.conf"))
+            .stdout(Stdio::from(
+                std::fs::File::options()
+                    .append(true)
+                    .open(self.path.join("server.log"))
+                    .unwrap(),
+            ))
+            .stderr(Stdio::from(
+                std::fs::File::options()
+                    .append(true)
+                    .open(self.path.join("server.log"))
+                    .unwrap(),
+            ))
+            .spawn()
+            .unwrap();
+        let client = redis::Client::open(format!(
+            "redis+unix://{}",
+            self.path.join("v.sock").display()
+        ))
+        .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        self.conn = loop {
+            match client.get_connection() {
+                Ok(conn) => break conn,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(error) => panic!("restarted native fixture: {error}"),
+            }
+        };
+    }
     fn eval(&mut self, script: &str, args: &[Vec<u8>]) -> Vec<Vec<u8>> {
         redis::cmd("EVAL")
             .arg(format!("{COMMON}\n{script}"))
@@ -796,22 +846,28 @@ fn v4_real_server_control_changes_require_predicates_and_monotonic_fences() {
 #[test]
 #[ignore = "isolated native automatic bootstrap; explicit task tmp/server required"]
 fn native_bootstrap_scoped_account_captures_pages_and_denies_old_reconnect() {
-    native_bootstrap_lifecycle(false, false);
+    native_bootstrap_lifecycle(false, false, false);
 }
 
 #[test]
 #[ignore = "isolated native crash-resume lifecycle; explicit task tmp/server required"]
 fn native_bootstrap_crash_resume_retains_snapshot_target_and_activation() {
-    native_bootstrap_lifecycle(true, false);
+    native_bootstrap_lifecycle(true, false, false);
 }
 
 #[test]
 #[ignore = "isolated native source larger than live allocation budget; explicit task tmp/server required"]
 fn native_bootstrap_source_larger_than_live_budget() {
-    native_bootstrap_lifecycle(false, true);
+    native_bootstrap_lifecycle(false, true, false);
 }
 
-fn native_bootstrap_lifecycle(resume: bool, large: bool) {
+#[test]
+#[ignore = "isolated broad native fence and actual config restart; explicit task tmp/server required"]
+fn native_bootstrap_broad_default_preserves_unrelated_keys_and_persistent_fence() {
+    native_bootstrap_lifecycle(true, false, true);
+}
+
+fn native_bootstrap_lifecycle(resume: bool, large: bool, broad: bool) {
     use busbar_contract::persistence::lifecycle::{self as l, PreparedStore};
     let mut server = Server::start();
     server.set("busbar:schema", b"9");
@@ -836,39 +892,44 @@ fn native_bootstrap_lifecycle(resume: bool, large: bool) {
         .arg(&[255, 0])
         .query(&mut server.conn)
         .unwrap();
-    let _: () = redis::cmd("ACL")
-        .arg("SETUSER")
-        .arg("busbar")
-        .arg("on")
-        .arg(">fixture")
-        .arg("~busbar:*")
-        .arg("+@all")
-        .query(&mut server.conn)
-        .unwrap();
-    let _: () = redis::cmd("ACL")
-        .arg("SETUSER")
-        .arg("default")
-        .arg("off")
-        .query(&mut server.conn)
-        .unwrap();
-    let admin: u64 = redis::cmd("CLIENT")
-        .arg("ID")
-        .query(&mut server.conn)
-        .unwrap();
-    let _: redis::RedisResult<()> = redis::cmd("CLIENT")
-        .arg("KILL")
-        .arg("ID")
-        .arg(admin)
-        .arg("SKIPME")
-        .arg("no")
-        .query(&mut server.conn);
+    if broad {
+        server.set("application:seed", b"unrelated original");
+    }
+    let original_acl = if broad {
+        Some(native_acl_other_fields(&mut server.conn))
+    } else {
+        None
+    };
+    if !broad {
+        let _: () = redis::cmd("ACL")
+            .arg("SETUSER")
+            .arg("busbar")
+            .arg("on")
+            .arg(">fixture")
+            .arg("~busbar:*")
+            .arg("+@all")
+            .query(&mut server.conn)
+            .unwrap();
+        let _: () = redis::cmd("ACL")
+            .arg("SETUSER")
+            .arg("default")
+            .arg("off")
+            .query(&mut server.conn)
+            .unwrap();
+    }
+    server.disconnect_admin();
+    let url = if broad {
+        format!("redis://127.0.0.1:{}", server.port)
+    } else {
+        format!("redis://busbar:fixture@127.0.0.1:{}", server.port)
+    };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     runtime.block_on(async {
         let budget=if large{2*1024*1024}else{64*1024*1024};
-        let make_prepared=|| native_prepared(&format!("redis://busbar:fixture@127.0.0.1:{}",server.port),budget);
+        let make_prepared=|| native_prepared(&url,budget);
         let mut prepared=make_prepared();
         let response=prepared.bootstrap(Arc::new(l::Request::Inspect{bounds:l::Bounds{items:1024,bytes:1<<20}})).await.unwrap();
         let l::Response::Inspected(inspected)=response.as_ref() else{panic!("inspection response")};
@@ -882,6 +943,21 @@ fn native_bootstrap_lifecycle(resume: bool, large: bool) {
         drop(response);
         if resume {
             drop(prepared);
+            if broad {
+                let mut old=redis::Client::open(url.as_str()).unwrap().get_connection().unwrap();
+                assert_native_old_writes_refused(&mut old);
+                assert_native_unrelated_writes(&mut old);
+                assert_eq!(native_acl_other_fields(&mut old),*original_acl.as_ref().unwrap());
+                // SAVE retains fixture data; the fence itself must already have
+                // persisted through the ordinary native CONFIG REWRITE path.
+                let _:()=redis::cmd("SAVE").query(&mut old).unwrap();drop(old);
+                server.restart_from_config();
+                assert_native_old_writes_refused(&mut server.conn);
+                assert_native_unrelated_writes(&mut server.conn);
+                assert_eq!(native_acl_other_fields(&mut server.conn),*original_acl.as_ref().unwrap());
+                assert_eq!(server.get("application:seed"),Some(b"unrelated original".to_vec()));
+                server.disconnect_admin();
+            }
             prepared=make_prepared();
             let response=prepared.bootstrap(Arc::new(l::Request::Inspect{bounds:l::Bounds{items:1024,bytes:1<<20}})).await.unwrap();
             let l::Response::Inspected(inspection)=response.as_ref() else{panic!("resumed inspection")};
@@ -898,19 +974,23 @@ fn native_bootstrap_lifecycle(resume: bool, large: bool) {
             busbar_contract::persistence::legacy_row::Cell::Integer(0),busbar_contract::persistence::legacy_row::Cell::Integer(1),busbar_contract::persistence::legacy_row::Cell::Integer(-1),
             busbar_contract::persistence::legacy_row::Cell::Blob(b"busbar:key:binary"),busbar_contract::persistence::legacy_row::Cell::Blob(b""),busbar_contract::persistence::legacy_row::Cell::Blob(&[0,255,b'x'])],4096).unwrap();
         let expected=Secret::new(expected.expose_own(&Own::here()).clone());
-        let mut cursor=None;let mut binary=false;let mut rows=0;
+        let unrelated=busbar_contract::persistence::legacy_row::encode::<Own>(&[
+            busbar_contract::persistence::legacy_row::Cell::Integer(0),busbar_contract::persistence::legacy_row::Cell::Integer(1),busbar_contract::persistence::legacy_row::Cell::Integer(-1),
+            busbar_contract::persistence::legacy_row::Cell::Blob(b"application:seed"),busbar_contract::persistence::legacy_row::Cell::Blob(b""),busbar_contract::persistence::legacy_row::Cell::Blob(b"unrelated original")],4096).unwrap();
+        let unrelated=Secret::new(unrelated.expose_own(&Own::here()).clone());
+        let mut cursor=None;let mut binary=false;let mut seeded_unrelated=false;let mut rows=0;
         loop {
             let page=prepared.bootstrap(Arc::new(l::Request::SourcePage{upgrade:upgrade.reference.clone(),snapshot:upgrade.snapshot,
                 family:[1;16],selector:l::SourceSelector::Scan{table:0},cursor,bounds:if large{l::Bounds{items:16,bytes:131072}}else{l::Bounds{items:2,bytes:4096}}})).await.unwrap();
             let l::Response::SourcePage(page)=page.as_ref() else{panic!("page response")};
             rows+=page.rows.len();
             for row in &page.rows{
-                binary|=row.value==expected;
+                binary|=row.value==expected;seeded_unrelated|=row.value==unrelated;
             }
             cursor=page.next.clone();if cursor.is_none(){break};
         }
-        assert!(binary);assert!(rows>=6);
-        let client=redis::Client::open(format!("redis://busbar:fixture@127.0.0.1:{}",server.port)).unwrap();
+        assert!(binary);assert!(rows>=6);if broad{assert!(seeded_unrelated,"native inventory must retain unrelated physical rows");}
+        let client=redis::Client::open(url.as_str()).unwrap();
         let mut old=client.get_connection().unwrap();
         if large {
             let raw:Vec<u8>=redis::cmd("GET").arg("busbar:v4:bootstrap").query(&mut old).unwrap();
@@ -918,12 +998,22 @@ fn native_bootstrap_lifecycle(resume: bool, large: bool) {
             assert!(control["length"].as_u64().unwrap()>budget as u64);
             assert!(rows>=2054);
         }
-        assert!(redis::cmd("SET").arg("busbar:key:old").arg("must fail").query::<()>(&mut old).is_err());
+        assert_native_old_writes_refused(&mut old);
         assert_eq!(redis::cmd("GET").arg("busbar:key:binary").query::<Vec<u8>>(&mut old).unwrap(),[0,255,b'x']);
+        let installed_digest=if broad {
+            assert_native_unrelated_writes(&mut old);
+            assert_eq!(native_acl_other_fields(&mut old),*original_acl.as_ref().unwrap());
+            assert_eq!(redis::cmd("GET").arg("application:seed").query::<Vec<u8>>(&mut old).unwrap(),b"unrelated original");
+            Some(p::archive::digest(&native_acl_keys(&mut old)))
+        }else{None};
         drop(old);
         let target=prepared.target(upgrade.reference.clone()).await.unwrap();
         assert_eq!(target.info(),upgrade.target);
-        assert!(prepared.bootstrap(Arc::new(l::Request::CheckFence{upgrade:upgrade.reference.clone()})).await.is_ok());
+        let checked=prepared.bootstrap(Arc::new(l::Request::CheckFence{upgrade:upgrade.reference.clone()})).await.unwrap();
+        if let Some(expected)=installed_digest {
+            let l::Response::Fence(fence)=checked.as_ref() else{panic!("native fence evidence")};
+            assert_eq!(fence.enforcement_digest,expected,"reported Broad evidence must describe actual native grants");
+        }
         let info=target.info();
         let root=Address{namespace:control::NAMESPACE.0,key:control::DATASET_KEY.to_vec()};
         let writer=Address{namespace:control::NAMESPACE.0,key:control::writer_key([2;16]).to_vec()};
@@ -1291,11 +1381,17 @@ fn native_prepared(url: &str, budget: usize) -> NativePrepared {
 
 #[test]
 #[ignore = "isolated native authority refusal; explicit task tmp/server required"]
-fn native_bootstrap_default_account_refuses_before_conversion() {
+fn native_bootstrap_missing_acl_authority_refuses_before_conversion() {
     use busbar_contract::persistence::lifecycle::{self as l, PreparedStore};
     let mut server = Server::start();
     server.set("busbar:schema", b"9");
     server.set("busbar:key:old", b"retained");
+    let _: () = redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg("default")
+        .arg("-acl|setuser")
+        .query(&mut server.conn)
+        .unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1315,7 +1411,7 @@ fn native_bootstrap_default_account_refuses_before_conversion() {
             .await
             .unwrap();
         let l::Response::Inspected(inspection) = response.as_ref() else {
-            panic!("default inspection")
+            panic!("missing ACL authority inspection")
         };
         assert_eq!(inspection.state, l::InspectionState::Legacy);
         assert!(!inspection
@@ -1331,11 +1427,137 @@ fn native_bootstrap_default_account_refuses_before_conversion() {
             .await;
         assert!(
             matches!(result, Err(l::Error::MissingCapability)),
-            "default native refusal: {result:?}"
+            "missing ACL authority refusal: {result:?}"
         );
     });
     assert_eq!(server.get("busbar:key:old"), Some(b"retained".to_vec()));
     assert_eq!(server.get("busbar:v4:bootstrap"), None);
     assert_eq!(server.get(META), None);
     server.set("busbar:key:old", b"unconverted");
+}
+
+fn native_acl_fields(conn: &mut redis::Connection) -> Vec<(String, redis::Value)> {
+    redis::cmd("ACL")
+        .arg("GETUSER")
+        .arg("default")
+        .query(conn)
+        .unwrap()
+}
+fn native_acl_keys(conn: &mut redis::Connection) -> Vec<u8> {
+    let fields = native_acl_fields(conn);
+    redis::from_redis_value(fields.into_iter().find(|(key, _)| key == "keys").unwrap().1).unwrap()
+}
+fn native_acl_other_fields(conn: &mut redis::Connection) -> Vec<(String, redis::Value)> {
+    native_acl_fields(conn)
+        .into_iter()
+        .filter(|(key, _)| key != "keys")
+        .collect()
+}
+fn assert_native_old_writes_refused(conn: &mut redis::Connection) {
+    for key in [
+        b"busbar:".as_slice(),
+        b"busbar:key:old",
+        b"busbar:\x00",
+        b"busbar:\xff",
+        b"busbar:v4",
+        b"busbar:v4\x00",
+        b"busbar:v4;",
+        b"busbar:v40:",
+    ] {
+        assert!(
+            redis::cmd("SET")
+                .arg(key)
+                .arg("must fail")
+                .query::<()>(conn)
+                .is_err(),
+            "legacy SET allowed for {key:?}"
+        );
+        assert!(
+            redis::cmd("EVAL")
+                .arg("return redis.call('SET',KEYS[1],ARGV[1])")
+                .arg(1)
+                .arg(key)
+                .arg("must fail")
+                .query::<()>(conn)
+                .is_err(),
+            "legacy Lua write allowed for {key:?}"
+        );
+        let mut transaction = redis::pipe();
+        transaction.atomic().cmd("SET").arg(key).arg("must fail");
+        assert!(
+            transaction.query::<Vec<redis::Value>>(conn).is_err(),
+            "legacy EXEC write allowed for {key:?}"
+        );
+        assert_eq!(
+            redis::cmd("GET")
+                .arg(key)
+                .query::<Option<Vec<u8>>>(conn)
+                .unwrap(),
+            None
+        );
+    }
+    assert_eq!(
+        redis::cmd("GET")
+            .arg("busbar:schema")
+            .query::<Vec<u8>>(conn)
+            .unwrap(),
+        b"9"
+    );
+}
+fn assert_native_unrelated_writes(conn: &mut redis::Connection) {
+    let keys: [&[u8]; 32] = [
+        b"",
+        b"b",
+        b"bu",
+        b"bus",
+        b"busb",
+        b"busba",
+        b"busbar",
+        b"application:other",
+        b"\x00",
+        b"\xff",
+        b"a",
+        b"c",
+        b"b\x00",
+        b"b\xff",
+        b"bv",
+        b"bu\x00",
+        b"bu\xff",
+        b"but",
+        b"bus\x00",
+        b"bus\xff",
+        b"busc",
+        b"busb\x00",
+        b"busb\xff",
+        b"busbb",
+        b"busba\x00",
+        b"busba\xff",
+        b"busbas",
+        b"busbar\x00",
+        b"busbar\xff",
+        b"busbar;",
+        b"busbar[",
+        b"busbar:v4:\x00probe",
+    ];
+    for (position, key) in keys.into_iter().enumerate() {
+        let value = [position as u8, 0, 255];
+        let _: () = redis::cmd("SET")
+            .arg(key)
+            .arg(value.as_slice())
+            .query(conn)
+            .unwrap_or_else(|error| panic!("unrelated write refused for {key:?}: {error}"));
+        assert_eq!(
+            redis::cmd("GET").arg(key).query::<Vec<u8>>(conn).unwrap(),
+            value
+        );
+        let retained: Vec<u8> = redis::cmd("EVAL")
+            .arg("local v=redis.call('GET',KEYS[1]);redis.call('SET',KEYS[1],v);return v")
+            .arg(1)
+            .arg(key)
+            .query(conn)
+            .unwrap_or_else(|error| {
+                panic!("unrelated read/write script refused for {key:?}: {error}")
+            });
+        assert_eq!(retained, value);
+    }
 }
