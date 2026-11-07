@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use busbar_plugin_loader::dispatch::kinds::store::Store;
+use busbar_plugin_loader::dispatch::kinds::store_v4::StoreV4 as Store;
 use busbar_plugin_loader::dispatch::{
     load_linked, Bind, ConnTable, DispatchConfig, Dispatcher, LinkedRow, NoSink, Plugin,
 };

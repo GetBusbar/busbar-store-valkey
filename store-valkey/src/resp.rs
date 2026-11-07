@@ -6,12 +6,9 @@
 //! [`Wire`]); this module only encodes commands, parses replies and converts them to Rust values.
 //! No socket, no TLS stack and no runtime of its own: the host's connector owns all three.
 //!
-//! The surface mirrors what the store used of the upstream driver (`cmd`, `pipe`, `Script`, the
-//! typed `get`/`hgetall`/... helpers and the optimistic [`transaction!`]), as `async` calls, so the
-//! store's bodies read as they did over the blocking client.
+//! Commands use the host-owned connection; atomic persistence is published by the v4 script.
 
 use std::fmt;
-use std::future::Future;
 
 use busbar_contract::abi::sdk::conn::ConnFailure;
 use busbar_contract::abi::sdk::cred::Cred;
@@ -20,8 +17,6 @@ use busbar_contract::abi::sdk::store::wire::Wire;
 /// What kind of failure a [`RedisError`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
-    /// A client-side failure the store itself raised; verbatim refusals use `RedisError::refused`.
-    Client,
     /// A reply that does not convert to the type asked for.
     TypeError,
     /// A reply that does not parse as RESP.
@@ -37,8 +32,6 @@ enum Repr {
     Io(String),
     /// The store's own refusal, its text verbatim (no `- Kind` suffix).
     Refused(String),
-    /// A transaction body's request to rebuild its watch set and run again.
-    Retry,
 }
 
 /// A command's failure. Its text is the upstream driver's shape (`desc - Kind: detail`), so the
@@ -57,14 +50,6 @@ impl RedisError {
         }
     }
 
-    /// A CONNECTION-LEVEL failure (the connector's: dropped, refused, timed out; or the server
-    /// closing), worth one reconnect-and-retry (the upstream driver's `is_io_error` /
-    /// `is_connection_dropped` / `is_connection_refusal` / `is_timeout`).
-    #[must_use]
-    pub fn is_connection_error(&self) -> bool {
-        matches!(self.repr, Repr::Io(_))
-    }
-
     /// The store's own refusal of an op (an unknown id, a tombstoned id): `text` reads verbatim,
     /// with no ` - Client` suffix, in the siblings' `<op>: <reason>` shape.
     #[must_use]
@@ -79,28 +64,6 @@ impl RedisError {
     #[must_use]
     pub fn is_refusal(&self) -> bool {
         matches!(self.repr, Repr::Refused(_))
-    }
-
-    /// A body's own signal that the state it watched changed shape: the caller reruns it.
-    #[must_use]
-    pub fn retry() -> Self {
-        Self { repr: Repr::Retry }
-    }
-
-    /// Whether this is [`RedisError::retry`].
-    #[must_use]
-    pub fn is_retry(&self) -> bool {
-        matches!(self.repr, Repr::Retry)
-    }
-
-    /// The server refused a multi-key operation across cluster slots.
-    pub fn is_crossslot(&self) -> bool {
-        matches!(&self.repr, Repr::Server(t) if t.split_whitespace().next() == Some("CROSSSLOT"))
-    }
-
-    /// The server's script cache does not hold the script an `EVALSHA` named.
-    fn is_noscript(&self) -> bool {
-        matches!(&self.repr, Repr::Server(t) if t.starts_with("NOSCRIPT"))
     }
 
     fn server(text: String) -> Self {
@@ -155,7 +118,6 @@ impl fmt::Display for RedisError {
                 }
             }
             Repr::Server(t) | Repr::Io(t) | Repr::Refused(t) => f.write_str(t),
-            Repr::Retry => f.write_str("transaction retry requested"),
         }
     }
 }
@@ -252,6 +214,8 @@ struct Frame {
     searched: usize,
     /// Total array entries declared in this frame.
     elements: u64,
+    /// v4 uses the explicit instance allocation budget instead of the legacy byte ceiling.
+    max_bytes: Option<usize>,
 }
 
 impl Frame {
@@ -273,7 +237,7 @@ impl Frame {
             let Some(&tag) = buf.get(self.at) else {
                 return Ok(None);
             };
-            if self.at >= MAX_REPLY_BYTES {
+            if self.at >= self.max_bytes.unwrap_or(MAX_REPLY_BYTES) {
                 return Err(bad("reply exceeds the byte limit"));
             }
             let from = self.at + 1;
@@ -285,7 +249,7 @@ impl Frame {
                 self.searched = buf.len().saturating_sub(1).max(from);
                 return Ok(None);
             };
-            if next - from > MAX_REPLY_LINE || next > MAX_REPLY_BYTES {
+            if next - from > MAX_REPLY_LINE || next > self.max_bytes.unwrap_or(MAX_REPLY_BYTES) {
                 return Err(bad("reply line exceeds the limit"));
             }
             let text = &buf[from..next - 2];
@@ -304,7 +268,7 @@ impl Frame {
                             .checked_add(n)
                             .and_then(|end| end.checked_add(2))
                             .ok_or_else(|| bad("a bulk length overflows"))?;
-                        if after > MAX_REPLY_BYTES {
+                        if after > self.max_bytes.unwrap_or(MAX_REPLY_BYTES) {
                             return Err(bad("reply exceeds the byte limit"));
                         }
                         if buf.len() < after {
@@ -356,6 +320,23 @@ fn parse_from(frame: &mut Frame, buf: &[u8]) -> RedisResult<Option<(Value, usize
     }
 }
 
+// Parsed payloads also need wiping if a later sibling is malformed.
+struct ParsedItems(Vec<Value>);
+impl Drop for ParsedItems {
+    fn drop(&mut self) {
+        fn wipe(value: &mut Value) {
+            use zeroize::Zeroize;
+            match value {
+                Value::Data(bytes) => bytes.zeroize(),
+                Value::Status(text) | Value::Error(text) => text.zeroize(),
+                Value::Array(items) => items.iter_mut().for_each(wipe),
+                _ => {}
+            }
+        }
+        self.0.iter_mut().for_each(wipe);
+    }
+}
+
 /// One whole reply at `at` (already measured complete), built.
 fn walk(buf: &[u8], at: usize, depth: usize) -> RedisResult<Option<(Value, usize)>> {
     let Some(&tag) = buf.get(at) else {
@@ -395,18 +376,20 @@ fn walk(buf: &[u8], at: usize, depth: usize) -> RedisResult<Option<(Value, usize
             if depth >= MAX_REPLY_DEPTH {
                 return Err(bad("arrays are nested too deeply"));
             }
-            let mut items = Vec::with_capacity(usize::try_from(n).unwrap_or(0).min(4096));
+            let mut items = ParsedItems(Vec::with_capacity(
+                usize::try_from(n).unwrap_or(0).min(4096),
+            ));
             let mut at = next;
             for _ in 0..n {
                 match walk(buf, at, depth + 1)? {
                     Some((v, after)) => {
-                        items.push(v);
+                        items.0.push(v);
                         at = after;
                     }
                     None => return Ok(None),
                 }
             }
-            Ok(Some((Value::Array(items), at)))
+            Ok(Some((Value::Array(std::mem::take(&mut items.0)), at)))
         }
         _ => Err(bad("an unknown reply type")),
     }
@@ -658,7 +641,7 @@ pub struct Conn {
     watching: bool,
     /// The measuring walk of the reply being read, resumed at each fill.
     frame: Frame,
-    scan_pages: usize,
+    reply_budget: Option<usize>,
 }
 
 impl Conn {
@@ -669,7 +652,7 @@ impl Conn {
             wire,
             watching: false,
             frame: Frame::default(),
-            scan_pages: 0,
+            reply_budget: None,
         }
     }
 
@@ -698,8 +681,18 @@ impl Conn {
         }
     }
 
+    /// v4 resource admission follows its explicit instance budget. Legacy callers
+    /// keep their existing parser limits. v4 packs rows into a bulk frame, so the
+    /// legacy array-element cap never limits record/range cardinality.
+    pub(crate) fn reply_budget(&mut self, budget: usize) {
+        self.reply_budget = Some(budget);
+    }
+
     async fn read(&mut self) -> RedisResult<Value> {
-        self.frame = Frame::default();
+        self.frame = Frame {
+            max_bytes: self.reply_budget,
+            ..Frame::default()
+        };
         loop {
             let frame = &mut self.frame;
             let got = self.wire.input(|i| -> RedisResult<Option<Value>> {
@@ -731,7 +724,73 @@ impl Conn {
         }
     }
 
-    /// Send `cmds` in one write and read one raw reply for each (error replies included).
+    /// Length-prefixed native replication RDB transfer. Valkey does not append
+    /// RESP's bulk CRLF to this payload. EOF-marker mode is never negotiated.
+    pub(crate) async fn native_rdb_length(&mut self) -> RedisResult<u64> {
+        loop {
+            let length = self.wire.input(|input| -> RedisResult<Option<u64>> {
+                // Replication sends bare newlines while the fork is pending.
+                while matches!(input.first(), Some(b'\r' | b'\n')) {
+                    input.drain(..1);
+                }
+                let Some(end) = input.windows(2).position(|v| v == b"\r\n") else {
+                    if input.len() > 64 {
+                        return Err(RedisError::refused("invalid native RDB length"));
+                    }
+                    return Ok(None);
+                };
+                if end > 64 || input.first() != Some(&b'$') {
+                    return Err(RedisError::refused("invalid native RDB length"));
+                }
+                let raw = &input[1..end];
+                if raw.is_empty() || !raw.iter().all(u8::is_ascii_digit) {
+                    return Err(RedisError::refused("unsupported native RDB framing"));
+                }
+                let length = std::str::from_utf8(raw)
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|v| *v > 0)
+                    .ok_or_else(|| RedisError::refused("invalid native RDB length"))?;
+                input.drain(..end + 2);
+                Ok(Some(length))
+            })?;
+            if let Some(length) = length {
+                return Ok(length);
+            }
+            if self.wire.fill().await.map_err(|e| RedisError::io(&e))? == 0 {
+                self.wire.discard();
+                return Err(RedisError::refused("truncated native RDB header"));
+            }
+        }
+    }
+
+    /// Consume at most one admitted payload chunk without materializing the RDB.
+    pub(crate) async fn native_rdb_chunk(
+        &mut self,
+        count: usize,
+    ) -> RedisResult<zeroize::Zeroizing<Vec<u8>>> {
+        let mut bytes = zeroize::Zeroizing::new(Vec::new());
+        bytes
+            .try_reserve_exact(count)
+            .map_err(|_| RedisError::refused("native RDB chunk allocation"))?;
+        while bytes.len() < count {
+            self.wire.input(|input| {
+                let take = (count - bytes.len()).min(input.len());
+                bytes.extend_from_slice(&input[..take]);
+                input.drain(..take);
+            });
+            if bytes.len() == count {
+                break;
+            }
+            if self.wire.fill().await.map_err(|e| RedisError::io(&e))? == 0 {
+                self.wire.discard();
+                return Err(RedisError::refused("truncated native RDB payload"));
+            }
+        }
+        Ok(bytes)
+    }
+
+    /// One command's reply; an error reply is `Err`.
     async fn round_trip<C: AsRef<[Vec<u8>]>>(&mut self, cmds: &[C]) -> RedisResult<Vec<Value>> {
         self.send(cmds).await?;
         let mut out = Vec::with_capacity(cmds.len());
@@ -741,7 +800,6 @@ impl Conn {
         Ok(out)
     }
 
-    /// One command's reply; an error reply is `Err`.
     async fn request(&mut self, args: &[Vec<u8>]) -> RedisResult<Value> {
         let name = args.first().map(Vec::as_slice);
         let v = self
@@ -771,11 +829,6 @@ impl Conn {
         &self.wire
     }
 
-    /// The connection was replaced by a fresh one: no `WATCH` is in force on it.
-    pub fn reset(&mut self) {
-        self.watching = false;
-    }
-
     /// The op is done with the connection: one that still has a `WATCH` in force (a body that left
     /// it in doubt) is not kept for the next op.
     pub fn settle(&self) {
@@ -783,137 +836,19 @@ impl Conn {
             self.wire.discard();
         }
     }
-
-    /// Whether a `WATCH` is still in force.
-    #[must_use]
-    pub fn watching(&self) -> bool {
-        self.watching
-    }
-
-    /// `GET`.
-    pub async fn get<K: ToArgs, RV: FromValue>(&mut self, key: K) -> RedisResult<RV> {
-        cmd("GET").arg(key).query(self).await
-    }
-
-    /// `DEL` (one key or several).
-    pub async fn del<K: ToArgs, RV: FromValue>(&mut self, key: K) -> RedisResult<RV> {
-        cmd("DEL").arg(key).query(self).await
-    }
-
-    /// `SMEMBERS`.
-    pub async fn smembers<K: ToArgs, RV: FromValue>(&mut self, key: K) -> RedisResult<RV> {
-        cmd("SMEMBERS").arg(key).query(self).await
-    }
-
-    /// `HGET`.
-    pub async fn hget<K: ToArgs, F: ToArgs, RV: FromValue>(
-        &mut self,
-        key: K,
-        field: F,
-    ) -> RedisResult<RV> {
-        cmd("HGET").arg(key).arg(field).query(self).await
-    }
-
-    /// `HGETALL`.
-    pub async fn hgetall<K: ToArgs, RV: FromValue>(&mut self, key: K) -> RedisResult<RV> {
-        cmd("HGETALL").arg(key).query(self).await
-    }
-
-    /// `ZRANGE key start stop`.
-    pub async fn zrange<K: ToArgs, RV: FromValue>(
-        &mut self,
-        key: K,
-        start: isize,
-        stop: isize,
-    ) -> RedisResult<RV> {
-        cmd("ZRANGE")
-            .arg(key)
-            .arg(start)
-            .arg(stop)
-            .query(self)
-            .await
-    }
-
-    /// Up to `max` keys matching `pattern` other than `skip`, stopping the `SCAN` as soon as
-    /// that many are found.
-    pub async fn scan_some(
-        &mut self,
-        pattern: &str,
-        skip: &str,
-        max: usize,
-    ) -> RedisResult<Vec<String>> {
-        let mut cursor = String::from("0");
-        let mut out = Vec::new();
-        loop {
-            let (next, keys) = self.scan_page(&cursor, pattern).await?;
-            out.extend(keys.into_iter().filter(|k| k != skip));
-            if out.len() >= max || next == "0" {
-                out.truncate(max);
-                return Ok(out);
-            }
-            cursor = next;
-        }
-    }
-
-    /// One `SCAN` page, including an empty page whose returned cursor may still be nonzero.
-    pub async fn scan_page(
-        &mut self,
-        cursor: &str,
-        pattern: &str,
-    ) -> RedisResult<(String, Vec<String>)> {
-        self.scan_pages += 1;
-        if self.scan_pages > MAX_SCAN_PAGES {
-            return Err(RedisError::refused(
-                "SCAN exceeded the per-operation page limit",
-            ));
-        }
-        cmd("SCAN")
-            .arg(cursor)
-            .arg("MATCH")
-            .arg(pattern)
-            .arg("COUNT")
-            .arg(SCAN_COUNT)
-            .query(self)
-            .await
-    }
-
-    /// Every key matching `pattern` (`SCAN ... MATCH`, followed to the end).
-    pub async fn scan_match(&mut self, pattern: &str) -> RedisResult<Vec<String>> {
-        let mut cursor = String::from("0");
-        let mut out = Vec::new();
-        let mut bytes = 0usize;
-        loop {
-            let (next, keys) = self.scan_page(&cursor, pattern).await?;
-            bytes = keys
-                .iter()
-                .fold(bytes, |n, key| n.saturating_add(key.len()));
-            if bytes > MAX_REPLY_BYTES {
-                return Err(RedisError::refused(
-                    "SCAN exceeded the collected-byte limit",
-                ));
-            }
-            if out.len().saturating_add(keys.len()) > MAX_REPLY_ELEMENTS as usize {
-                return Err(RedisError::refused("SCAN exceeded the collected-key limit"));
-            }
-            out.extend(keys);
-            if next == "0" {
-                return Ok(out);
-            }
-            cursor = next;
-        }
-    }
 }
 
-/// Keys a `SCAN` step is asked for.
-const SCAN_COUNT: usize = 1000;
-pub(crate) const MAX_SCAN_PAGES: usize = 1_000_000;
-
 /// One command.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Cmd {
     args: Vec<Vec<u8>>,
 }
 
+impl fmt::Debug for Cmd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Cmd([REDACTED])")
+    }
+}
 /// The command `name`.
 #[must_use]
 pub fn cmd(name: &str) -> Cmd {
@@ -946,292 +881,6 @@ impl Cmd {
     }
 }
 
-/// Several commands in one write; atomic ([`Pipeline::atomic`]) as `MULTI`/`EXEC`.
-#[derive(Debug, Clone, Default)]
-pub struct Pipeline {
-    cmds: Vec<(Vec<Vec<u8>>, bool)>,
-    atomic: bool,
-}
-
-/// A new pipeline.
-#[must_use]
-pub fn pipe() -> Pipeline {
-    Pipeline::default()
-}
-
-macro_rules! pipe_cmd {
-    ($(#[$m:meta])* $name:ident($($a:ident: $t:ident),*) => $word:literal) => {
-        $(#[$m])*
-        pub fn $name<$($t: ToArgs),*>(&mut self, $($a: $t),*) -> &mut Self {
-            self.cmd($word);
-            $(self.arg($a);)*
-            self
-        }
-    };
-}
-
-impl Pipeline {
-    /// Run the commands as one transaction (`MULTI`/`EXEC`).
-    pub fn atomic(&mut self) -> &mut Self {
-        self.atomic = true;
-        self
-    }
-
-    /// Start the command `name`.
-    pub fn cmd(&mut self, name: &str) -> &mut Self {
-        self.cmds.push((vec![name.as_bytes().to_vec()], false));
-        self
-    }
-
-    /// Append an argument to the last command.
-    pub fn arg<T: ToArgs>(&mut self, a: T) -> &mut Self {
-        if let Some((args, _)) = self.cmds.last_mut() {
-            a.write_args(args);
-        }
-        self
-    }
-
-    /// Leave the last command's reply out of the result.
-    pub fn ignore(&mut self) -> &mut Self {
-        if let Some((_, ignored)) = self.cmds.last_mut() {
-            *ignored = true;
-        }
-        self
-    }
-
-    pipe_cmd!(
-        /// `GET`.
-        get(k: K) => "GET");
-    pipe_cmd!(
-        /// `SET`.
-        set(k: K, v: V) => "SET");
-    pipe_cmd!(
-        /// `DEL`.
-        del(k: K) => "DEL");
-    pipe_cmd!(
-        /// `SADD`.
-        sadd(k: K, m: M) => "SADD");
-    pipe_cmd!(
-        /// `HSET key field value`.
-        hset(k: K, f: F, v: V) => "HSET");
-
-    /// `ZADD key score member`.
-    pub fn zadd<K: ToArgs, M: ToArgs, S: ToArgs>(&mut self, k: K, m: M, s: S) -> &mut Self {
-        self.cmd("ZADD").arg(k).arg(s).arg(m)
-    }
-
-    /// Run the pipeline and convert the replies of the commands not ignored (as one array). An
-    /// atomic pipeline whose `EXEC` a watched key aborted answers `Nil` (so `Option<_>` is
-    /// `None`); an error reply anywhere is `Err`.
-    ///
-    /// # Errors
-    /// The connection failed, a command answered an error, or the replies do not convert.
-    pub async fn query<T: FromValue>(&self, c: &mut Conn) -> RedisResult<T> {
-        if self.cmds.is_empty() {
-            return T::from_value(Value::Array(Vec::new()));
-        }
-        let multi = [b"MULTI".to_vec()];
-        let exec = [b"EXEC".to_vec()];
-        let mut wire: Vec<&[Vec<u8>]> = Vec::with_capacity(self.cmds.len() + 2);
-        if self.atomic {
-            wire.push(&multi);
-        }
-        wire.extend(self.cmds.iter().map(|(a, _)| a.as_slice()));
-        if self.atomic {
-            wire.push(&exec);
-        }
-        let mut replies = c.round_trip(&wire).await?;
-        let replies = if self.atomic {
-            c.watching = false;
-            let exec = replies.pop().unwrap_or(Value::Nil);
-
-            if let Some(Value::Error(e)) = replies.iter().find(|r| matches!(r, Value::Error(_))) {
-                return Err(RedisError::server(e.clone()));
-            }
-            match exec {
-                Value::Nil => return T::from_value(Value::Nil),
-                Value::Error(e) => return Err(RedisError::server(e)),
-                Value::Array(items) if items.len() == self.cmds.len() => items,
-                _ => {
-                    c.wire.discard();
-                    return Err(RedisError::from((
-                        ErrorKind::Parse,
-                        "EXEC reply does not match the queued command count",
-                    )));
-                }
-            }
-        } else {
-            replies
-        };
-        let mut kept = Vec::with_capacity(replies.len());
-        for ((_, ignored), r) in self.cmds.iter().zip(replies) {
-            if let Value::Error(e) = r {
-                return Err(RedisError::server(e));
-            }
-            if !ignored {
-                kept.push(r);
-            }
-        }
-        T::from_value(Value::Array(kept))
-    }
-}
-
-/// A Lua script, run as `EVALSHA` (its digest from one `SCRIPT LOAD`), and as `EVAL` when the
-/// server's script cache misses it (`NOSCRIPT`).
-#[derive(Debug, Clone)]
-pub struct Script {
-    src: String,
-    sha: std::sync::OnceLock<String>,
-}
-
-impl Script {
-    /// The script `src`.
-    #[must_use]
-    pub fn new(src: &str) -> Self {
-        Self {
-            src: src.to_string(),
-            sha: std::sync::OnceLock::new(),
-        }
-    }
-
-    /// An invocation with its first key.
-    pub fn key<T: ToArgs>(&self, k: T) -> ScriptInvocation<'_> {
-        let mut inv = ScriptInvocation {
-            script: self,
-            keys: Vec::new(),
-            args: Vec::new(),
-        };
-        inv.key(k);
-        inv
-    }
-}
-
-/// One call of a [`Script`]: its keys and arguments.
-#[derive(Debug, Clone)]
-pub struct ScriptInvocation<'s> {
-    script: &'s Script,
-    keys: Vec<Vec<u8>>,
-    args: Vec<Vec<u8>>,
-}
-
-impl ScriptInvocation<'_> {
-    /// Add a key.
-    pub fn key<T: ToArgs>(&mut self, k: T) -> &mut Self {
-        k.write_args(&mut self.keys);
-        self
-    }
-
-    /// Add an argument.
-    pub fn arg<T: ToArgs>(&mut self, a: T) -> &mut Self {
-        a.write_args(&mut self.args);
-        self
-    }
-
-    /// Run it and convert its reply. A `NOSCRIPT` miss never ran it, so `EVAL` runs it once.
-    ///
-    /// # Errors
-    /// As [`Cmd::query`].
-    pub async fn invoke<T: FromValue>(&self, c: &mut Conn) -> RedisResult<T> {
-        let sha = match self.script.sha.get() {
-            Some(sha) => sha,
-            None => {
-                let sha: String = cmd("SCRIPT")
-                    .arg("LOAD")
-                    .arg(&self.script.src)
-                    .query(c)
-                    .await?;
-                self.script.sha.get_or_init(|| sha)
-            }
-        };
-        match self.call("EVALSHA", sha).query(c).await {
-            Err(e) if e.is_noscript() => self.call("EVAL", &self.script.src).query(c).await,
-            ran => ran,
-        }
-    }
-
-    fn call(&self, how: &str, script: &str) -> Cmd {
-        let mut c = cmd(how);
-        c.arg(script)
-            .arg(self.keys.len())
-            .arg(&self.keys)
-            .arg(&self.args);
-        c
-    }
-}
-
-/// Pin an async block's output to a command result (so `?` inside it knows its error type).
-pub fn rr<T, F: Future<Output = RedisResult<T>>>(f: F) -> F {
-    f
-}
-
-/// The most attempts a `transaction!` makes, including the first, before it gives up.
-pub const MAX_TRANSACTION_ATTEMPTS: usize = 64;
-
-impl RedisError {
-    /// A `transaction!` that gave up after `aborts` aborted attempts.
-    #[must_use]
-    pub fn transaction_exhausted(aborts: usize) -> Self {
-        Self::from((
-            ErrorKind::Client,
-            "transaction aborted by concurrent writers; giving up",
-            format!("aborted {aborts} times"),
-        ))
-    }
-}
-
-/// The optimistic transaction, as the upstream driver's `transaction`: `WATCH` the keys, run the
-/// body (it reads, and queues its writes on the atomic pipeline it is handed, then answers that
-/// pipeline's `query`: `None` when a watched key changed and `EXEC` aborted), and run it all again
-/// on an abort, for at most [`MAX_TRANSACTION_ATTEMPTS`] attempts in total. Evaluates to the
-/// body's `Some` value, or its error (a `WATCH` left in force by a failed body is cleared).
-macro_rules! transaction {
-    ($c:ident, $keys:expr, |$c2:ident, $pipe:ident| $body:expr $(,)?) => {
-        $crate::resp::rr(async {
-            let __keys = $keys;
-            let mut __aborts = 0usize;
-            loop {
-                $crate::resp::cmd("WATCH")
-                    .arg(__keys)
-                    .exec(&mut *$c)
-                    .await?;
-                let mut __pipe = $crate::resp::pipe();
-                __pipe.atomic();
-                let __ran: $crate::resp::RedisResult<Option<_>> = $crate::resp::rr(async {
-                    let $pipe = &mut __pipe;
-                    let $c2 = &mut *$c;
-                    $body
-                })
-                .await;
-                match __ran {
-                    Ok(Some(v)) => {
-                        if $c.watching() {
-                            $crate::resp::cmd("UNWATCH").exec(&mut *$c).await?;
-                        }
-                        break Ok(v);
-                    }
-                    Ok(None) => {
-                        __aborts += 1;
-                        if __aborts >= $crate::resp::MAX_TRANSACTION_ATTEMPTS {
-                            if $c.watching() {
-                                let _ = $crate::resp::cmd("UNWATCH").exec(&mut *$c).await;
-                            }
-                            break Err($crate::resp::RedisError::transaction_exhausted(__aborts));
-                        }
-                        continue;
-                    }
-                    Err(e) => {
-                        if $c.watching() {
-                            let _ = $crate::resp::cmd("UNWATCH").exec(&mut *$c).await;
-                        }
-                        break Err(e);
-                    }
-                }
-            }
-        })
-        .await
-    };
-}
-
 #[cfg(test)]
 #[path = "tests/resp_tests.rs"]
 pub(crate) mod tests;
@@ -1241,16 +890,23 @@ impl Drop for Cmd {
         zeroize::Zeroize::zeroize(&mut self.args);
     }
 }
-impl Drop for Pipeline {
-    fn drop(&mut self) {
-        for (args, _) in &mut self.cmds {
-            zeroize::Zeroize::zeroize(args);
-        }
-    }
-}
-impl Drop for ScriptInvocation<'_> {
-    fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(&mut self.keys);
-        zeroize::Zeroize::zeroize(&mut self.args);
+#[cfg(test)]
+mod v4_budget_tests {
+    use super::*;
+
+    #[test]
+    fn instance_reply_budget_preserves_legacy_default_and_has_no_lower_bulk_ceiling() {
+        let header = format!("${}\r\n", MAX_REPLY_BYTES + 1);
+        assert!(Frame::default().measure(header.as_bytes()).is_err());
+        let mut frame = Frame {
+            max_bytes: Some(MAX_REPLY_BYTES + 1024),
+            ..Frame::default()
+        };
+        assert_eq!(frame.measure(header.as_bytes()).unwrap(), None);
+        let mut frame = Frame {
+            max_bytes: Some(16),
+            ..Frame::default()
+        };
+        assert!(frame.measure(b"$32\r\n").is_err());
     }
 }

@@ -35,10 +35,8 @@ rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 rcgen = { workspace = true }
 serde_json = { workspace = true }
-# Drives the store v3 slots (`StoreCalls`, async) to completion on a current-thread runtime.
+# Drives neutral persistence calls to completion on a current-thread runtime.
 tokio = { workspace = true, features = ["rt"] }
-# The typed rows the durability tests read back out of opaque plane-record bodies.
-serde = { workspace = true }
 # The real-admin-API e2e test drives an actual `busbar` process over HTTP (install a signed plugin
 # tarball via POST /api/v1/admin/plugins, mint a key+credential via POST /admin/keys) — a blocking
 # client keeps this test synchronous like the rest of the file. rustls-tls only.

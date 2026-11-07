@@ -9,11 +9,6 @@ pub fn parse(buf: &[u8]) -> RedisResult<Option<(Value, usize)>> {
     parse_from(&mut Frame::default(), buf)
 }
 
-impl Script {
-    pub(crate) fn source_for_test(&self) -> &str {
-        &self.src
-    }
-}
 use super::*;
 
 fn args_of<T: ToArgs>(t: T) -> Vec<Vec<u8>> {
@@ -107,11 +102,10 @@ fn conversions_refuse_what_does_not_fit() {
 
 #[test]
 fn errors_read_as_the_upstream_driver_wrote_them() {
-    let e = RedisError::from((ErrorKind::Client, "put_key refused", "why".to_string()));
-    assert_eq!(e.to_string(), "put_key refused - Client: why");
-    let e = RedisError::refused("delete_key: unknown id 'vk_x'");
-    assert_eq!(e.to_string(), "delete_key: unknown id 'vk_x'");
-    assert!(!e.is_connection_error());
+    let e = RedisError::from((ErrorKind::TypeError, "command refused", "why".to_string()));
+    assert_eq!(e.to_string(), "command refused - TypeError: why");
+    let e = RedisError::refused("historical source refused");
+    assert_eq!(e.to_string(), "historical source refused");
 }
 
 #[test]
