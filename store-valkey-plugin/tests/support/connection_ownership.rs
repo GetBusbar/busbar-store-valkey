@@ -59,7 +59,7 @@ fn establish(p: &Plugin<Store>, need: u32, target: &str) -> (Outcome, u64, Strin
     // SAFETY: the local input, exclusive output, nested buffers and strings live through this crossing.
     let raw = unsafe {
         f(
-            p.inner.ctx(),
+            p.test_host_context(),
             std::ptr::from_ref(&i).cast::<c_void>(),
             &mut o,
         )
@@ -86,7 +86,7 @@ fn io(p: &Plugin<Store>, stream: u64, write: bool) -> (Outcome, u64, String) {
     loop {
         let raw = unsafe {
             f.expect("the host offers READ and WRITE")(
-                p.inner.ctx(),
+                p.test_host_context(),
                 std::ptr::from_ref(&i).cast::<c_void>(),
                 &mut o,
             )
@@ -108,7 +108,7 @@ fn close_stream(p: &Plugin<Store>, stream: u64) -> (Outcome, u64, String) {
     // SAFETY: the local input, exclusive output, nested buffers and strings live through this crossing.
     let raw = unsafe {
         CONN_SLOTS.close.expect("the host offers CLOSE")(
-            p.inner.ctx(),
+            p.test_host_context(),
             std::ptr::from_ref(&i).cast::<c_void>(),
             &mut o,
         )

@@ -13,7 +13,10 @@ use busbar_plugin_loader::dispatch::{
 const URL: &str = "redis://cache.internal:6379/0";
 
 fn linked() -> (Plugin<Store>, Arc<Dispatcher>) {
-    let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
+    let d = Arc::new(Dispatcher::new(
+        DispatchConfig::default(),
+        busbar_contract::services::test_caller_binding(),
+    ));
     let bind = Bind {
         instance: Arc::from("reference-url"),
         max_inflight_cap: 64,

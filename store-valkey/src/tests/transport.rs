@@ -206,7 +206,10 @@ fn open_on(
     settings: &str,
     table: impl FnOnce(&Dispatcher) -> RecordedConnector,
 ) -> (Result<LoadedPersistence, String>, Arc<RecordedConnector>) {
-    let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
+    let d = Arc::new(Dispatcher::new(
+        DispatchConfig::default(),
+        busbar_contract::services::test_caller_binding(),
+    ));
     let t = Arc::new(table(&d));
     let row =
         LinkedRow::of_kind::<StoreV4>(crate::door as busbar_contract::abi::mechanism::door::DoorFn)

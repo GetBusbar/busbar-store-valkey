@@ -15,11 +15,11 @@ use std::time::Duration;
 mod historical;
 mod resp;
 mod v4;
-pub use v4::door;
+pub use v4::{door, MACRO_DOOR};
 
 /// A redacted connector failure.
 #[derive(Debug)]
-pub struct TransportError(pub String);
+pub(crate) struct TransportError(pub String);
 impl std::fmt::Display for TransportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -27,7 +27,7 @@ impl std::fmt::Display for TransportError {
 }
 impl std::error::Error for TransportError {}
 /// Connector operation result.
-pub type TransportResult<T> = Result<T, TransportError>;
+pub(crate) type TransportResult<T> = Result<T, TransportError>;
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const KEPT_CONNECTIONS: usize = 8;
@@ -274,7 +274,7 @@ fn parse_unix(url: &url::Url, input: &ValkeyUrl) -> RedisResult<Target> {
 /// one per op in flight;
 /// the store holds no socket and no TLS stack of its own.
 #[derive(Debug, Clone)]
-pub struct ValkeyStore {
+pub(crate) struct ValkeyStore {
     inner: Arc<Inner>,
 }
 
@@ -309,7 +309,7 @@ impl std::fmt::Debug for Inner {
 /// The store's one outbound need: a `tcp` stream to the server the settings' URL names (the store
 /// names the target at each connect), governed as operator infrastructure (private, loopback and
 /// plaintext allowed). Its timeout bounds the dial.
-pub const NEEDS: &[busbar_contract::abi::host::conn::connector::Need] = {
+pub(crate) const NEEDS: &[busbar_contract::abi::host::conn::connector::Need] = {
     use busbar_contract::abi::host::conn::connector::{
         Need, DIRECTION_OUTBOUND, EGRESS_OPERATOR_INFRASTRUCTURE, KEEP_NAMED,
     };

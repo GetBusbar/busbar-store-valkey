@@ -128,7 +128,7 @@ fn actual_valkey_door_rejects_incompatible_abi_and_layout() {
         MALFORMED.load(Ordering::SeqCst)
     }
     // SAFETY: the actual shipped SDK door is static and complete.
-    let real = unsafe { Door::read_parts(busbar_store_valkey::door()) };
+    let real = busbar_store_valkey::door().parts();
     let kind = KindCode::Store;
     let row = LinkedRow::of(busbar_store_valkey::door).unwrap();
     let lib = cdylib();
@@ -485,7 +485,7 @@ fn a_failed_ready_closes_the_actual_opened_valkey_store_once() {
     url.set_path("/14");
     let _db = database::Database::take(url.as_str());
     // SAFETY: the real door and Ops are complete immutable SDK-owned statics.
-    let real = unsafe { Door::read_parts(busbar_store_valkey::door()) };
+    let real = busbar_store_valkey::door().parts();
     let mut ops = unsafe {
         real.ops
             .cast::<busbar_contract::abi::store::v4::Ops>()
@@ -506,8 +506,11 @@ fn a_failed_ready_closes_the_actual_opened_valkey_store_once() {
     DOOR.store(Box::into_raw(Box::new(restated)), Ordering::SeqCst);
     let d = dispatcher();
     let plugin = load_linked::<Store>(&LinkedRow::of_raw(door).unwrap(), bind(&d)).unwrap();
-    let held = Arc::clone(&plugin.inner);
-    let first = || held.crossings.load(Ordering::SeqCst) - held.resumes.load(Ordering::SeqCst);
+    let held = plugin.test_invocation_probe();
+    let first = || {
+        let (crossings, resumes) = held();
+        crossings - resumes
+    };
     let before = first();
     let error = block(LoadedPersistence::open(
         plugin,
@@ -529,7 +532,6 @@ fn a_failed_ready_closes_the_actual_opened_valkey_store_once() {
 
 #[test]
 fn both_actual_valkey_images_complete_a_successful_minimal_lifecycle() {
-    use std::sync::atomic::Ordering;
     let Some(base) = valkey_url() else { return };
     let url = db_url(&base, 14);
     let _db = database::Database::take(&url);
@@ -538,9 +540,11 @@ fn both_actual_valkey_images_complete_a_successful_minimal_lifecycle() {
             let dispatcher = dispatcher();
             let plugin = plugin(dropped, bind(&dispatcher));
             assert!(!plugin.has_ready());
-            let held = Arc::clone(&plugin.inner);
-            let first =
-                || held.crossings.load(Ordering::SeqCst) - held.resumes.load(Ordering::SeqCst);
+            let held = plugin.test_invocation_probe();
+            let first = || {
+                let (crossings, resumes) = held();
+                crossings - resumes
+            };
             let before = first();
             let backend = LoadedPersistence::open(plugin, dispatcher, &settings(&url), limits())
                 .await

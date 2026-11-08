@@ -472,7 +472,11 @@ impl Backend for OwnBackend {
         let (bytes, _, _) = settings(bytes)?;
         ValkeyStore::from_settings(&bytes).map(drop)
     }
-    fn open(bytes: &[u8], secrets: &[&[u8]], _: Option<Host>) -> Result<Self, String> {
+    fn open(
+        bytes: &[u8],
+        secrets: &[&[u8]],
+        _: Option<Host<busbar_contract::plugin::markers::StoreKind>>,
+    ) -> Result<Self, String> {
         let (bytes, budget, local) = settings(bytes)?;
         let transport = ValkeyStore::from_settings_lent(&bytes, secrets)?;
         fn id() -> Result<[u8; 16], String> {

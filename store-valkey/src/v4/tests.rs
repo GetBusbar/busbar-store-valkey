@@ -568,7 +568,7 @@ fn v4_real_server_door_uses_host_connections_and_returns_persistent_metadata() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let dispatcher=Arc::new(Dispatcher::new(DispatchConfig::default()));
+        let dispatcher=Arc::new(Dispatcher::new(DispatchConfig::default(), busbar_contract::services::test_caller_binding()));
         let conns=valkey_io::host(dispatcher.conn_waker(),busbar_contract::transport::EgressTrust::default());
         let open=||{
             let row=LinkedRow::of_kind::<StoreV4>(super::door as busbar_contract::abi::mechanism::door::DoorFn).unwrap();
@@ -1129,6 +1129,7 @@ impl busbar_contract::services::HostServices for BootstrapClock {
     fn trust_decide(
         &self,
         _caller: &Caller,
+        _ticket: busbar_contract::abi::mechanism::ticket::Ticket,
         _key: busbar_contract::services::TrustKeyRef<'_>,
         _expected: Option<&str>,
         _approve: bool,
@@ -1338,6 +1339,7 @@ fn native_prepared(url: &str, budget: usize) -> NativePrepared {
     let dispatcher = Arc::new(Dispatcher::with_services(
         DispatchConfig::default(),
         Arc::new(BootstrapClock(Instant::now())),
+        busbar_contract::services::test_caller_binding(),
     ));
     let conns = valkey_io::host(
         dispatcher.conn_waker(),

@@ -42,7 +42,7 @@ rdb-parser = { path = "../vendor/rdb-parser" }
 # `LoadedPersistence`), over the loader's test connection table with a
 # runtime for asynchronous primitive calls. The upstream RESP client verifies what landed in Valkey
 # INDEPENDENTLY of the store (tests only; never in the shipped image).
-busbar-plugin-loader = { workspace = true }
+busbar-plugin-loader = { workspace = true , features = ["test-support"] }
 busbar-core-connector = { workspace = true }
 busbar-transport-tcp = { workspace = true }
 tokio = { workspace = true, features = ["rt"] }
@@ -51,3 +51,4 @@ redis = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 rcgen = { workspace = true }
+busbar-contract = { workspace = true, features = ["test-seal"] }

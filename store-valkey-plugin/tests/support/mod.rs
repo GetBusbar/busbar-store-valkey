@@ -80,7 +80,10 @@ pub fn packed_rendering(path: &Path) -> Vec<u8> {
         .expect("actual exported door")
 }
 pub fn dispatcher() -> Arc<Dispatcher> {
-    Arc::new(Dispatcher::new(DispatchConfig::default()))
+    Arc::new(Dispatcher::new(
+        DispatchConfig::default(),
+        busbar_contract::services::test_caller_binding(),
+    ))
 }
 pub fn bind(dispatcher: &Dispatcher) -> Bind {
     Bind {
