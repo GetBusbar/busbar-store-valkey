@@ -140,47 +140,49 @@ fn actual_valkey_instances_refuse_undeclared_needs_and_foreign_connections() {
         },
     )
     .unwrap();
-    let (outcome, stream, text) = establish(&owner, 0, &target);
-    assert_eq!(outcome, Outcome::Ready, "declared need opens: {text}");
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let _accepted = loop {
-        match listener.accept() {
-            Ok(connection) => break connection,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(
-                    std::time::Instant::now() < until,
-                    "actual TCP carrier never reached listener"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(1));
+    owner.test_in_host_operation(|| {
+        let (outcome, stream, text) = establish(&owner, 0, &target);
+        assert_eq!(outcome, Outcome::Ready, "declared need opens: {text}");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let _accepted = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "actual TCP carrier never reached listener"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => panic!("listener: {error}"),
             }
-            Err(error) => panic!("listener: {error}"),
+        };
+        for need in [1, u32::MAX] {
+            let (answer, _, text) = establish(&owner, need, &target);
+            assert_eq!(
+                (answer, text.as_str()),
+                (Outcome::Refused, ConnError::UndeclaredNeed.text())
+            );
         }
-    };
-    for need in [1, u32::MAX] {
-        let (answer, _, text) = establish(&owner, need, &target);
+        assert_eq!(io(&owner, stream, true).0, Outcome::Ready, "owner writes");
+        for (what, (answer, _, text)) in [
+            ("write", io(&other, stream, true)),
+            ("read", io(&other, stream, false)),
+            ("close", close_stream(&other, stream)),
+        ] {
+            assert_eq!(
+                (answer, text.as_str()),
+                (Outcome::Refused, ConnError::NotOwner.text()),
+                "foreign {what}"
+            );
+        }
         assert_eq!(
-            (answer, text.as_str()),
-            (Outcome::Refused, ConnError::UndeclaredNeed.text())
+            io(&owner, stream, true).0,
+            Outcome::Ready,
+            "owner connection untouched"
         );
-    }
-    assert_eq!(io(&owner, stream, true).0, Outcome::Ready, "owner writes");
-    for (what, (answer, _, text)) in [
-        ("write", io(&other, stream, true)),
-        ("read", io(&other, stream, false)),
-        ("close", close_stream(&other, stream)),
-    ] {
-        assert_eq!(
-            (answer, text.as_str()),
-            (Outcome::Refused, ConnError::NotOwner.text()),
-            "foreign {what}"
-        );
-    }
-    assert_eq!(
-        io(&owner, stream, true).0,
-        Outcome::Ready,
-        "owner connection untouched"
-    );
-    assert_eq!(close_stream(&owner, stream).0, Outcome::Ready);
+        assert_eq!(close_stream(&owner, stream).0, Outcome::Ready);
+    });
 }
 #[test]
 fn valkey_declares_exactly_its_statement_needs_and_requested_profile() {
