@@ -323,10 +323,7 @@ fn a_unix_socket_url_reaches_the_server() {
         return;
     }
     let (_, db, _) = live_parts();
-    let dir = std::path::PathBuf::from(
-        "/Users/matthew/Developer/tmp/corefix-implementation/valkey-cleanup",
-    )
-    .join(format!("unix-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("vk-unix-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     for (n, scheme) in ["redis+unix", "unix", "valkey+unix"].iter().enumerate() {
         let path = dir.join(format!("s{n}.sock"));

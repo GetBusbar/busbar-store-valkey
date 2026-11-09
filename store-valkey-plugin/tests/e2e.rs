@@ -97,6 +97,17 @@ fn busbar_root() -> PathBuf {
 /// `busbar-plugin-loader` in busbar 1.6.0. busbar is the `test-harness` build, the one that takes a
 /// test's first-party key ([`HARNESS_FIRST_PARTY_KEY_ENV`]); no release build reads it.
 fn build_real_binaries() -> (PathBuf, PathBuf) {
+    if let (Some(busbar), Some(pack)) = (
+        std::env::var_os("BUSBAR_E2E_BINARY"),
+        std::env::var_os("BUSBAR_PLUGIN_PACK_BINARY"),
+    ) {
+        let paths = (PathBuf::from(busbar), PathBuf::from(pack));
+        assert!(
+            paths.0.is_file() && paths.1.is_file(),
+            "explicit real binaries must exist"
+        );
+        return paths;
+    }
     let root = busbar_root();
     let toolchain =
         std::env::var_os("RUSTUP_TOOLCHAIN").unwrap_or_else(|| std::ffi::OsString::from("1.98"));
@@ -463,11 +474,12 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    let guard2 = ChildGuard(spawn("2"));
+    let mut guard2 = ChildGuard(spawn("2"));
     assert!(
         poll_admin_up(&admin, &admin_token, &client),
         "busbar (boot #2, with the valkey plugin persisted as store.module) must come back up; \
-         log:\n{}",
+         status: {:?}; log:\n{}",
+        guard2.0.try_wait().expect("observe boot #2 status"),
         boot_log("2")
     );
     assert!(

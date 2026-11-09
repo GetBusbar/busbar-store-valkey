@@ -520,12 +520,13 @@ impl OwnBackend {
         } else {
             l::InspectionState::Unsupported
         };
-        let catalogue = vec![layout(
+        let catalogue = inspection_catalogue(
+            state,
             facts.db,
             facts.physical,
             facts.databases,
             &facts.engine,
-        )?];
+        )?;
         if state == l::InspectionState::InProgress {
             let retained = Control::decode(pending.as_ref().ok_or(l::Error::Corrupt)?.as_bytes())?;
             facts.source = retained.source();
@@ -535,7 +536,10 @@ impl OwnBackend {
         } else {
             Some(facts.source.clone())
         };
-        let capabilities = if state == l::InspectionState::Current {
+        let capabilities = if matches!(
+            state,
+            l::InspectionState::Empty | l::InspectionState::Current
+        ) {
             vec![l::NativeCapability::CurrentOpen]
         } else if matches!(
             state,
@@ -668,6 +672,21 @@ impl OwnBackend {
         Ok(authority)
     }
 }
+fn inspection_catalogue(
+    state: l::InspectionState,
+    db: u32,
+    physical: u32,
+    databases: u32,
+    engine: &[u8],
+) -> Result<Vec<archive::Table>, l::Error> {
+    // Empty inspection has no source catalogue; the lifecycle codec enforces this.
+    if state == l::InspectionState::Empty {
+        Ok(Vec::new())
+    } else {
+        Ok(vec![layout(db, physical, databases, engine)?])
+    }
+}
+
 fn layout(
     db: u32,
     physical: u32,
@@ -1718,4 +1737,42 @@ fn hash_value(hash: &mut archive::Hasher, value: &Value, depth: u32) -> Result<(
         Value::Error(_) => return Err(l::Error::Corrupt),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod inspection_tests {
+    use super::*;
+
+    #[test]
+    fn empty_native_inspection_encodes_without_a_source_catalogue() {
+        let bounds = l::Bounds {
+            items: 16,
+            bytes: 4096,
+        };
+        let response = l::Response::<Own>::Inspected(l::Inspection {
+            state: l::InspectionState::Empty,
+            source: None,
+            admission_marker: None,
+            catalogue: inspection_catalogue(l::InspectionState::Empty, 15, 0, 16, b"8.1.6")
+                .unwrap(),
+            capabilities: Vec::new(),
+        });
+        l::codec::encode_response(&Ok(response), bounds)
+            .expect("empty inspection crosses the lifecycle ABI");
+
+        let expected = layout(15, 9, 16, b"8.1.6").unwrap();
+        for state in [
+            l::InspectionState::Legacy,
+            l::InspectionState::InProgress,
+            l::InspectionState::Current,
+            l::InspectionState::Unsupported,
+            l::InspectionState::Busy,
+        ] {
+            let catalogue = inspection_catalogue(state, 15, 9, 16, b"8.1.6").unwrap();
+            assert_eq!(catalogue.len(), 1);
+            assert_eq!(catalogue[0].name, expected.name);
+            assert_eq!(catalogue[0].columns, expected.columns);
+            assert_eq!(catalogue[0].native_layout, expected.native_layout);
+        }
+    }
 }
