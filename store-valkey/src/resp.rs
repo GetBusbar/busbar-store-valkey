@@ -85,6 +85,28 @@ impl RedisError {
         matches!(self.repr, Repr::Refused(_))
     }
 
+    /// Whether this is a permanent capability denial: the server definitively said it cannot
+    /// or will not execute this command. Transient server errors (`LOADING`, `BUSY`, `OOM`,
+    /// `MASTERDOWN`, `READONLY`, `NOAUTH`) are **not** capability denials.
+    #[must_use]
+    pub fn is_capability_denial(&self) -> bool {
+        let text = match &self.repr {
+            Repr::Server(t) => t.as_str(),
+            _ => return false,
+        };
+        text.starts_with("NOPERM")
+            || text.starts_with("ERR unknown command")
+            || text.starts_with("ERR unknown subcommand")
+            || text.starts_with("ERR wrong number of arguments")
+    }
+
+    /// Whether this is a type conversion error (the server replied successfully but the value
+    /// could not be converted to the requested Rust type).
+    #[must_use]
+    pub fn is_type_error(&self) -> bool {
+        matches!(self.repr, Repr::General(ErrorKind::TypeError, ..))
+    }
+
     fn server(text: String) -> Self {
         Self {
             repr: Repr::Server(
@@ -414,6 +436,28 @@ fn walk(buf: &[u8], at: usize, depth: usize) -> RedisResult<Option<(Value, usize
     }
 }
 
+/// The exact encoded size of one RESP2 command, for pre-allocation.
+fn encode_len(args: &[Vec<u8>]) -> usize {
+    fn decimal_len(mut n: usize) -> usize {
+        if n == 0 {
+            return 1;
+        }
+        let mut len = 0;
+        while n > 0 {
+            n /= 10;
+            len += 1;
+        }
+        len
+    }
+    // *N\r\n
+    let mut total = 1 + decimal_len(args.len()) + 2;
+    for a in args {
+        // $L\r\n{data}\r\n
+        total += 1 + decimal_len(a.len()) + 2 + a.len() + 2;
+    }
+    total
+}
+
 /// Encode one command (an array of bulk strings) onto `out`.
 pub fn encode(args: &[Vec<u8>], out: &mut Vec<u8>) {
     out.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
@@ -677,6 +721,8 @@ impl Conn {
 
     async fn send<C: AsRef<[Vec<u8>]>>(&mut self, cmds: &[C]) -> RedisResult<()> {
         let mut out = zeroize::Zeroizing::new(Vec::new());
+        let needed: usize = cmds.iter().map(|c| encode_len(c.as_ref())).sum();
+        out.reserve(needed);
         for c in cmds {
             encode(c.as_ref(), &mut out);
         }

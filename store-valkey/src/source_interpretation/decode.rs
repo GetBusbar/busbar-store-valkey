@@ -28,10 +28,10 @@ fn text(bytes: &[u8]) -> Result<&str, Error> {
     std::str::from_utf8(bytes).map_err(|_| Error::Type)
 }
 fn counter(bytes: &[u8]) -> Result<u64, Error> {
-    text(bytes)?.parse().map_err(|_| Error::Range)
+    text(bytes)?.parse().map_err(|_| Error::Invalid)
 }
 fn quantity(bytes: &[u8], profile: Profile) -> Result<i128, Error> {
-    let value: i128 = text(bytes)?.parse().map_err(|_| Error::Range)?;
+    let value: i128 = text(bytes)?.parse().map_err(|_| Error::Invalid)?;
     if value < 0 {
         return Err(Error::Range);
     }

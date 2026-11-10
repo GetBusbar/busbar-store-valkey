@@ -163,10 +163,18 @@ impl Snapshot {
             .arg(chunk_key(self.upgrade, index))
             .query(c)
             .await
-            .map_err(|_| {
+            .map_err(|error| {
                 #[cfg(test)]
-                eprintln!("native snapshot chunk fetch failed");
-                l::Error::Unavailable
+                eprintln!("native snapshot chunk fetch failed: {error:?}");
+                if error.is_type_error() {
+                    // Nil or wrong type means the chunk key was evicted or never
+                    // stored — the snapshot is incomplete.
+                    l::Error::Corrupt
+                } else {
+                    // Transport errors and transient server errors (LOADING, BUSY,
+                    // OOM, READONLY, etc.) are retriable.
+                    l::Error::Unavailable
+                }
             })?;
         let expected = (self.length - index * CHUNK_BYTES as u64).min(CHUNK_BYTES as u64) as usize;
         if bytes.as_bytes().len() != expected {

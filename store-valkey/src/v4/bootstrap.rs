@@ -50,6 +50,18 @@ fn uncertain(error: crate::resp::RedisError) -> l::Error {
     let _ = error;
     l::Error::Unknown
 }
+/// Distinguish a permanent capability denial (`NOPERM`, `ERR unknown command`, etc.) from
+/// transient failures (IO errors, `-LOADING`, `-BUSY`, `-OOM`, type errors).
+fn capability(error: crate::resp::RedisError) -> l::Error {
+    if error.is_capability_denial() {
+        l::Error::MissingCapability
+    } else {
+        #[cfg(test)]
+        eprintln!("native bootstrap capability probe failed (transient): {error:?}");
+        let _ = error;
+        l::Error::Unavailable
+    }
+}
 fn info<'a>(bytes: &'a [u8], key: &[u8]) -> Result<&'a [u8], l::Error> {
     let mut found = None;
     for line in bytes.split(|b| *b == b'\n') {
@@ -361,7 +373,7 @@ impl OwnBackend {
             .arg("LIST")
             .query::<Value>(c)
             .await
-            .map_err(|_| l::Error::MissingCapability)?);
+            .map_err(capability)?);
         let modules = array(&modules.0)?;
         if modules.len() > 1 {
             return Err(l::Error::UnsupportedFormat);
@@ -386,7 +398,7 @@ impl OwnBackend {
                 .arg("no-appendfsync-on-rewrite")
                 .query(c)
                 .await
-                .map_err(|_| l::Error::MissingCapability)?;
+                .map_err(capability)?;
             let status: Bytes = cmd("INFO")
                 .arg("persistence")
                 .query(c)
@@ -587,12 +599,12 @@ impl OwnBackend {
             .arg("WHOAMI")
             .query(c)
             .await
-            .map_err(|_| l::Error::MissingCapability)?;
+            .map_err(capability)?;
         let users = Raw(cmd("ACL")
             .arg("USERS")
             .query::<Value>(c)
             .await
-            .map_err(|_| l::Error::MissingCapability)?);
+            .map_err(capability)?);
         if array(&users.0)?.len() > 1024 {
             return Err(l::Error::Bounds);
         };
@@ -604,7 +616,7 @@ impl OwnBackend {
                 .arg(user)
                 .query::<Value>(c)
                 .await
-                .map_err(|_| l::Error::MissingCapability)?);
+                .map_err(capability)?);
             let enabled = array(field(&grants.0, b"flags")?)?
                 .iter()
                 .any(|v| value_bytes(v) == Ok(b"on"));
@@ -637,7 +649,7 @@ impl OwnBackend {
             .arg("aclfile")
             .query::<Value>(c)
             .await
-            .map_err(|_| l::Error::MissingCapability)?);
+            .map_err(capability)?);
         let aclfile = !value_bytes(field(&configuration.0, b"aclfile")?)?.is_empty();
         let server: Bytes = cmd("INFO")
             .arg("server")
@@ -655,10 +667,7 @@ impl OwnBackend {
             .arg(who.as_bytes())
             .arg("resetkeys")
             .arg(fence.rules());
-        let allowed: Bytes = dry
-            .query(c)
-            .await
-            .map_err(|_| l::Error::MissingCapability)?;
+        let allowed: Bytes = dry.query(c).await.map_err(capability)?;
         if allowed.as_bytes() != b"OK" {
             return Err(l::Error::MissingCapability);
         };
@@ -793,10 +802,7 @@ impl Authority {
             v.arg("REWRITE");
             v
         };
-        let answer: Bytes = command
-            .query(c)
-            .await
-            .map_err(|_| l::Error::MissingCapability)?;
+        let answer: Bytes = command.query(c).await.map_err(capability)?;
         if answer.as_bytes() != b"OK" {
             return Err(l::Error::MissingCapability);
         };
@@ -899,8 +905,9 @@ impl Control {
             || value.run_id.len() != 40
             || value.user.len() > 256
             || (value.chunks > 0
-                && value.chunks
-                    != value.length.div_ceil(snapshot::CHUNK_BYTES as u64))
+                && value.length > 0
+                && value.chunks != value.length.div_ceil(snapshot::CHUNK_BYTES as u64))
+            || (value.length > 0 && value.chunks == 0)
         {
             return Err(l::Error::Corrupt);
         }
@@ -941,7 +948,7 @@ impl OwnBackend {
             .arg("USERS")
             .query::<Value>(c)
             .await
-            .map_err(|_| l::Error::MissingCapability)?);
+            .map_err(capability)?);
         let users = array(&users.0)?;
         if users.len() > 1024 {
             return Err(l::Error::Bounds);
@@ -970,17 +977,13 @@ impl OwnBackend {
                 .arg(name)
                 .query::<Value>(c)
                 .await
-                .map_err(|_| l::Error::MissingCapability)?);
+                .map_err(capability)?);
             hash_value(&mut hash, &grants.0, 0)?;
         }
         Ok(hash.finish())
     }
     async fn client_list(&self, c: &mut Conn) -> Result<Bytes, l::Error> {
-        cmd("CLIENT")
-            .arg("LIST")
-            .query(c)
-            .await
-            .map_err(|_| l::Error::MissingCapability)
+        cmd("CLIENT").arg("LIST").query(c).await.map_err(capability)
     }
     async fn begin(
         &self,
@@ -1011,11 +1014,7 @@ impl OwnBackend {
         // A recorded exact restricted policy is admitted on resume. The control
         // route, physical identity and target must still match below.
         let authority = self.preflight_authority(c, &facts, true).await?;
-        let client: u64 = cmd("CLIENT")
-            .arg("ID")
-            .query(c)
-            .await
-            .map_err(|_| l::Error::MissingCapability)?;
+        let client: u64 = cmd("CLIENT").arg("ID").query(c).await.map_err(capability)?;
         let clients = self.client_list(c).await?;
         let mut token = Zeroizing::new(vec![0u8; 32]);
         getrandom::fill(&mut token).map_err(|_| l::Error::Unavailable)?;
@@ -1036,7 +1035,7 @@ impl OwnBackend {
                 if state.control.as_ref().is_some_and(|v| v.id == old.id)
                     && archive::digest(&state.token) == old.token
                 {
-                    Some(state.token.to_vec())
+                    Some(state.token.clone())
                 } else {
                     None
                 }
@@ -1253,7 +1252,7 @@ impl OwnBackend {
             .arg(&control.user)
             .query::<Value>(c)
             .await
-            .map_err(|_| l::Error::MissingCapability)?);
+            .map_err(capability)?);
         let fence = FenceKind::fenced(value_bytes(field(&grants.0, b"keys")?)?)
             .ok_or(l::Error::SourceChanged)?;
         if !array(field(&grants.0, b"selectors")?)?.is_empty() {
@@ -1592,7 +1591,15 @@ impl OwnBackend {
             .arg(&checkpoint_key)
             .query(c)
             .await
-            .map_err(|error| fail(error, line!()))?;
+            .map_err(|error| {
+                if error.is_type_error() {
+                    // A Nil element means the receipt or checkpoint key is absent.
+                    l::Error::Refused
+                } else {
+                    // Transport errors and transient server errors are retriable.
+                    fail(error, line!())
+                }
+            })?;
         let [native_receipt, checkpoint] = observed.as_slice() else {
             return Err(l::Error::Corrupt);
         };
