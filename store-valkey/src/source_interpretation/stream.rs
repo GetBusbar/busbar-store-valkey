@@ -41,8 +41,12 @@ fn tag(family: HistoricalFamily) -> u8 {
         HistoricalFamily::Evidence => 4,
     }
 }
-fn corrupt(_: super::Error) -> l::Error {
-    l::Error::Corrupt
+fn classify_error(error: super::Error) -> l::Error {
+    match error {
+        super::Error::Range => l::Error::Bounds,
+        super::Error::Unsupported => l::Error::UnsupportedFormat,
+        _ => l::Error::Corrupt,
+    }
 }
 impl Prepared {
     pub(crate) fn build(
@@ -61,7 +65,7 @@ impl Prepared {
             return Err(l::Error::Bounds);
         }
         let table = source.header().tables.first().ok_or(l::Error::Corrupt)?;
-        let layout = decode::NativeLayout::decode(&table.native_layout).map_err(corrupt)?;
+        let layout = decode::NativeLayout::decode(&table.native_layout).map_err(classify_error)?;
         if layout.source_rdb != digest {
             return Err(l::Error::SourceChanged);
         }
@@ -88,7 +92,7 @@ impl Prepared {
                 Row::decode(original.value.expose_own(&Own::here()))
                     .map_err(|_| l::Error::Corrupt)?,
             )
-            .map_err(corrupt)?;
+            .map_err(classify_error)?;
             entries.push(Entry {
                 family: classified.family,
                 group: archive::digest(classified.key.expose_own(&Own::here())),
@@ -153,7 +157,7 @@ impl Prepared {
                     Row::decode(row.value.expose_own(&Own::here()))
                         .map_err(|_| l::Error::Corrupt)?,
                 )
-                .map_err(corrupt)
+                .map_err(classify_error)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let facts = facts::interpret(

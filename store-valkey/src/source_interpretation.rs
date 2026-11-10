@@ -14,7 +14,8 @@ pub(crate) fn descriptor(physical: u32) -> Result<SourceReader, LifecycleError> 
         7..=9 => DocumentSemantics::Current,
         _ => return Err(LifecycleError::UnsupportedFormat),
     };
-    SourceReader::new(SourceCodec::HistoricalV1, documents, {
+    static DIGEST: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    let digest = *DIGEST.get_or_init(|| {
         let mut hash = archive::Hasher::new();
         for bytes in [
             include_bytes!("source_interpretation.rs").as_slice(),
@@ -43,7 +44,8 @@ pub(crate) fn descriptor(physical: u32) -> Result<SourceReader, LifecycleError> 
             hash.update(bytes);
         }
         hash.finish()
-    })
+    });
+    SourceReader::new(SourceCodec::HistoricalV1, documents, digest)
 }
 
 mod decode;

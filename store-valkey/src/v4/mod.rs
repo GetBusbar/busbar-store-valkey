@@ -681,7 +681,9 @@ impl Backend for OwnBackend {
                 [tag] if tag == b"refused" => Err(Failure::Refused),
                 [tag] if tag == b"corrupt" => Err(Failure::Corrupt),
                 [tag, time, result] if tag == b"applied" => Ok(Committed {
-                    observed_at: me.observation(time)?,
+                    // The server confirmed the commit landed. A garbled timestamp
+                    // must not surface as Corrupt (which implies data damage).
+                    observed_at: me.observation(time).map_err(|_| Failure::Unknown)?,
                     decision: Decision::Applied(Secret::held(
                         owned(result).map_err(|_| Failure::Unknown)?,
                     )),

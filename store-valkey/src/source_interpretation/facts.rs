@@ -342,7 +342,7 @@ pub(super) fn receipt_group<'a>(
 ) -> Result<ReceiptGroup<'a>, l::Error> {
     let group = complete(cells, bounds)?;
     if group.header.value != b"hash" || group.values.len() != 1 || group.values[0].0 != b"b" {
-        return Err(l::Error::Refused);
+        return Err(l::Error::Corrupt);
     }
     let operation = text(group.header.key)?
         .strip_prefix("busbar:op:")

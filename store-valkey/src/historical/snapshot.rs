@@ -485,6 +485,11 @@ impl Drop for Worker {
     fn drop(&mut self) {
         self.bridge.cancelled.store(true, Ordering::Release);
         self.commands.take();
+        // Acquire and release the slot mutex before notifying. If the worker thread
+        // is inside emit() between evaluating the while condition and entering
+        // condvar wait, this lock blocks until it enters wait (which releases the
+        // mutex). Releasing here then lets notify_all wake it reliably.
+        drop(self.bridge.slot.lock());
         self.bridge.changed.notify_all();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
