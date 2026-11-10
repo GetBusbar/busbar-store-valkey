@@ -899,8 +899,7 @@ impl Control {
             || value.run_id.len() != 40
             || value.user.len() > 256
             || (value.chunks > 0
-                && value.chunks
-                    != value.length.div_ceil(snapshot::CHUNK_BYTES as u64))
+                && value.chunks != value.length.div_ceil(snapshot::CHUNK_BYTES as u64))
         {
             return Err(l::Error::Corrupt);
         }
