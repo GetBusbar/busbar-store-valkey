@@ -233,3 +233,29 @@ fn i128_quantity_arguments_are_exact_decimal_bulk_strings() {
         assert_eq!(wire, expected.as_bytes());
     }
 }
+
+#[test]
+fn resp_auth_is_one_whole_command() {
+    use busbar_contract::abi::sdk::cred::SealedWrite;
+    use busbar_contract::abi::sdk::test_support::chip::{cred, drive_sealed};
+    use std::task::Poll;
+    let c = cred("pw");
+    assert!(auth_message(&cred("pw").require_secure(), None).secure_required());
+    let wire = |user| {
+        let mut out = Vec::new();
+        let mut writer = SealedWrite::message(auth_message(&c, user));
+        assert!(matches!(
+            drive_sealed::<()>(&mut writer, |bytes| {
+                out.extend_from_slice(bytes);
+                Poll::Ready(Ok(bytes.len()))
+            }),
+            Poll::Ready(Ok(()))
+        ));
+        out
+    };
+    assert_eq!(wire(None), b"*2\r\n$4\r\nAUTH\r\n$2\r\npw\r\n");
+    assert_eq!(
+        wire(Some("u")),
+        b"*3\r\n$4\r\nAUTH\r\n$1\r\nu\r\n$2\r\npw\r\n"
+    );
+}

@@ -14,6 +14,25 @@ use busbar_contract::abi::sdk::conn::ConnFailure;
 use busbar_contract::abi::sdk::cred::Cred;
 use busbar_contract::abi::sdk::store::wire::Wire;
 
+/// Frame AUTH without reading any captured credential bytes.
+fn auth_message(password: &Cred, user: Option<&str>) -> busbar_contract::abi::sdk::cred::Seal {
+    use busbar_contract::abi::sdk::chip::{CredentialPart as Part, SealedValue};
+    let mut prefix =
+        format!("*{}\r\n$4\r\nAUTH\r\n", if user.is_some() { 3 } else { 2 }).into_bytes();
+    if let Some(user) = user {
+        prefix.extend_from_slice(format!("${}\r\n", user.len()).as_bytes());
+        prefix.extend_from_slice(user.as_bytes());
+        prefix.extend_from_slice(b"\r\n");
+    }
+    prefix.extend_from_slice(format!("${}\r\n", password.len()).as_bytes());
+    SealedValue::compose(&[
+        Part::Public(&prefix),
+        Part::Credential(password),
+        Part::Public(b"\r\n"),
+    ])
+    .field()
+}
+
 /// What kind of failure a [`RedisError`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
@@ -667,12 +686,12 @@ impl Conn {
         })
     }
 
-    /// Authenticate with one SDK-owned complete RESP command. Neither the credential nor its
+    /// Authenticate with one owner-framed RESP command in SDK sealed custody. Neither the credential nor its
     /// packet enters the public command encoder; the wire retains the seal across partial writes
     /// and Pending, and discards an interrupted exchange before it can be reused.
     pub async fn authenticate(&mut self, password: &Cred, user: Option<&str>) -> RedisResult<()> {
         self.wire
-            .write_sealed(password.resp_auth(user))
+            .write_sealed(auth_message(password, user))
             .await
             .map_err(|e| RedisError::io(&e))?;
         match self.read().await? {

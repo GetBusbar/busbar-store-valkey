@@ -572,7 +572,7 @@ fn v4_real_server_door_uses_host_connections_and_returns_persistent_metadata() {
         let conns=valkey_io::host(dispatcher.conn_waker(),busbar_contract::transport::EgressTrust::default());
         let open=||{
             let row=LinkedRow::of_kind::<StoreV4>(super::door as busbar_contract::abi::mechanism::door::DoorFn).unwrap();
-            load_linked::<StoreV4>(&row,Bind{instance:Arc::from("valkey-v4-disposable"),max_inflight_cap:64,sink:Arc::new(NoSink),dispatcher:dispatcher.adopter(),conns:ConnTable::Host(conns.clone())}).unwrap()
+            load_linked::<StoreV4>(&row,Bind{instance:Arc::from("valkey-v4-disposable"),max_inflight_cap:64,sink:Arc::new(NoSink),dispatcher:dispatcher.adopter(),conns:ConnTable::Host(busbar_contract::conn::admissions::AdmissionAuthority::issue(&busbar_contract::caps::KernelSeal::acquire_for_kernel(), conns.clone()))}).unwrap()
         };
         let bytes=serde_json::to_vec(&serde_json::json!({"url":format!("redis://127.0.0.1:{}",server.port),"input_budget":67108864,"durability":"ephemeral"})).unwrap();
         let limits=||Limits{descriptor_bytes:1<<20,output_items:1<<20,output_bytes:1<<24,decode_bytes:1<<25};
@@ -933,7 +933,7 @@ fn native_bootstrap_lifecycle(resume: bool, large: bool, broad: bool) {
         let mut prepared=make_prepared();
         let response=prepared.bootstrap(Arc::new(l::Request::Inspect{bounds:l::Bounds{items:1024,bytes:1<<20}})).await.unwrap();
         let l::Response::Inspected(inspected)=response.as_ref() else{panic!("inspection response")};
-        assert_eq!(inspected.state,l::InspectionState::Legacy);
+        assert!(matches!(inspected.state, l::InspectionState::Legacy(_)));
         assert!(inspected.capabilities.contains(&l::NativeCapability::PersistentFence));
         let response=prepared.bootstrap(Arc::new(l::Request::BeginOrResume{expected_source:inspected.source.clone().unwrap(),
             route_digest:[7;32],target_format:l::CORE_FORMAT,operation_id:[8;16]})).await.unwrap_or_else(|error|panic!("native Begin failed: {error:?}; forged={},latched={}",busbar_plugin_loader::dispatch::handle::forged(),busbar_plugin_loader::dispatch::handle::latched()));
@@ -961,7 +961,7 @@ fn native_bootstrap_lifecycle(resume: bool, large: bool, broad: bool) {
             prepared=make_prepared();
             let response=prepared.bootstrap(Arc::new(l::Request::Inspect{bounds:l::Bounds{items:1024,bytes:1<<20}})).await.unwrap();
             let l::Response::Inspected(inspection)=response.as_ref() else{panic!("resumed inspection")};
-            assert_eq!(inspection.state,l::InspectionState::InProgress);
+            assert!(matches!(inspection.state, l::InspectionState::InProgress(_)));
             let response=prepared.bootstrap(Arc::new(l::Request::BeginOrResume{expected_source:inspection.source.clone().unwrap(),route_digest:[7;32],target_format:l::CORE_FORMAT,operation_id:[8;16]})).await.unwrap_or_else(|error|panic!("native Begin failed: {error:?}; forged={},latched={}",busbar_plugin_loader::dispatch::handle::forged(),busbar_plugin_loader::dispatch::handle::latched()));
             let l::Response::Begun(resumed)=response.as_ref() else{panic!("resumed upgrade")};
             assert_eq!(resumed.snapshot,upgrade.snapshot);
@@ -1040,7 +1040,7 @@ fn native_bootstrap_lifecycle(resume: bool, large: bool, broad: bool) {
             prepared=make_prepared();
             let response=prepared.bootstrap(Arc::new(l::Request::Inspect{bounds:l::Bounds{items:1024,bytes:1<<20}})).await.unwrap();
             let l::Response::Inspected(inspection)=response.as_ref() else{panic!("activation-resume inspection")};
-            assert_eq!(inspection.state,l::InspectionState::InProgress);
+            assert!(matches!(inspection.state, l::InspectionState::InProgress(_)));
             let response=prepared.bootstrap(Arc::new(l::Request::BeginOrResume{expected_source:inspection.source.clone().unwrap(),route_digest:[7;32],target_format:l::CORE_FORMAT,operation_id:[8;16]})).await.unwrap_or_else(|error|panic!("native Begin failed: {error:?}; forged={},latched={}",busbar_plugin_loader::dispatch::handle::forged(),busbar_plugin_loader::dispatch::handle::latched()));
             let l::Response::Begun(resumed)=response.as_ref() else{panic!("activation-resume upgrade")};
             assert_eq!(resumed.snapshot,upgrade.snapshot);
@@ -1355,7 +1355,12 @@ fn native_prepared(url: &str, budget: usize) -> NativePrepared {
             max_inflight_cap: 64,
             sink: Arc::new(NoSink),
             dispatcher: dispatcher.adopter(),
-            conns: ConnTable::Host(conns),
+            conns: ConnTable::Host(
+                busbar_contract::conn::admissions::AdmissionAuthority::issue(
+                    &busbar_contract::caps::KernelSeal::acquire_for_kernel(),
+                    conns,
+                ),
+            ),
         },
     )
     .unwrap();
@@ -1415,7 +1420,7 @@ fn native_bootstrap_missing_acl_authority_refuses_before_conversion() {
         let l::Response::Inspected(inspection) = response.as_ref() else {
             panic!("missing ACL authority inspection")
         };
-        assert_eq!(inspection.state, l::InspectionState::Legacy);
+        assert!(matches!(inspection.state, l::InspectionState::Legacy(_)));
         assert!(!inspection
             .capabilities
             .contains(&l::NativeCapability::PersistentFence));

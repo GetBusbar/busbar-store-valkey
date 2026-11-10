@@ -6,12 +6,14 @@
 
 #![forbid(unsafe_code)]
 
-use busbar_contract::abi::sdk::cred::{settings_lent, Cred, ValkeyUrl};
+use busbar_contract::abi::sdk::cred::{settings_lent, Cred};
 use busbar_contract::abi::sdk::store::wire::{Pool, Wire};
+use credentials::ValkeyUrl;
 use resp::{cmd, Conn, ErrorKind, RedisError, RedisResult};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod credentials;
 mod historical;
 mod resp;
 mod v4;
@@ -579,3 +581,5 @@ fn json_type(v: &serde_json::Value) -> &'static str {
 
 #[cfg(test)]
 mod tests;
+
+mod source_interpretation;

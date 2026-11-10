@@ -3,13 +3,13 @@ use super::*;
 #[path = "../../test-support/valkey_io.rs"]
 pub(crate) mod valkey_io;
 fn parse_url(input: &str) -> resp::RedisResult<Target> {
-    let url = busbar_contract::abi::sdk::cred::ValkeyUrl(
-        busbar_contract::abi::sdk::cred::CredUrl::parse_valkey(input).map_err(url_refused)?,
+    let url = crate::credentials::ValkeyUrl(
+        crate::credentials::CredUrl::parse_valkey(input).map_err(url_refused)?,
     );
     parse_target(&url)
 }
 fn captured_url(input: &str) -> ValkeyUrl {
-    ValkeyUrl(busbar_contract::abi::sdk::cred::CredUrl::parse_valkey(input).unwrap())
+    ValkeyUrl(crate::credentials::CredUrl::parse_valkey(input).unwrap())
 }
 fn assert_auth(target: &Target, user: Option<&str>, password: &str) {
     let (got_user, got_password) = target.auth.as_ref().expect("AUTH configured");

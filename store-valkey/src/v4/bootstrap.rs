@@ -17,7 +17,7 @@ use busbar_contract::persistence::{
 use zeroize::Zeroizing;
 
 const SOURCE: &[u8] = b"busbar:schema";
-const OWNER: [u8; 16] = *b"legacy.valkey.v1";
+const OWNER: [u8; 16] = crate::source_interpretation::SOURCE_OWNER;
 const JOURNAL: &str = "busbar:v4:bootstrap";
 
 #[derive(Default)]
@@ -503,7 +503,10 @@ impl OwnBackend {
             .as_ref()
             .is_some_and(|v| Control::decode(v.as_bytes()).map_or(true, |v| v.stage < 6))
         {
-            l::InspectionState::InProgress
+            let retained = Control::decode(pending.as_ref().ok_or(l::Error::Corrupt)?.as_bytes())?;
+            l::InspectionState::InProgress(crate::source_interpretation::descriptor(
+                retained.physical,
+            )?)
         } else if let Some(bytes) = metadata {
             let native = metadata::decode(bytes.as_bytes()).map_err(|_| l::Error::Corrupt)?;
             if native.physical_version != 1 {
@@ -516,7 +519,7 @@ impl OwnBackend {
         } else if count == 0 {
             l::InspectionState::Empty
         } else if (6..=9).contains(&facts.physical) {
-            l::InspectionState::Legacy
+            l::InspectionState::Legacy(crate::source_interpretation::descriptor(facts.physical)?)
         } else {
             l::InspectionState::Unsupported
         };
@@ -527,7 +530,7 @@ impl OwnBackend {
             facts.databases,
             &facts.engine,
         )?;
-        if state == l::InspectionState::InProgress {
+        if matches!(state, l::InspectionState::InProgress(_)) {
             let retained = Control::decode(pending.as_ref().ok_or(l::Error::Corrupt)?.as_bytes())?;
             facts.source = retained.source();
         }
@@ -543,7 +546,7 @@ impl OwnBackend {
             vec![l::NativeCapability::CurrentOpen]
         } else if matches!(
             state,
-            l::InspectionState::Legacy | l::InspectionState::InProgress
+            l::InspectionState::Legacy(_) | l::InspectionState::InProgress(_)
         ) && self.preflight_authority(c, &facts, false).await.is_ok()
         {
             vec![
@@ -901,9 +904,9 @@ impl Control {
         Ok(value)
     }
 }
-const CAS:&str="if redis.call('GET',KEYS[1])~=ARGV[1] then return 0 end redis.call('SET',KEYS[1],ARGV[2]) return 1";
-const CLAIM:&str="if redis.call('EXISTS',KEYS[1])~=0 then return 0 end redis.call('SET',KEYS[1],ARGV[1]) return 1";
-const CHUNK:&str="if redis.call('GET',KEYS[1])~=ARGV[1] then return 0 end redis.call('MSET',KEYS[1],ARGV[2],KEYS[2],ARGV[3]) return 1";
+const CAS: &str = "if redis.call('GET',KEYS[1])~=ARGV[1] then return 0 end redis.call('SET',KEYS[1],ARGV[2]) return 1";
+const CLAIM: &str = "if redis.call('EXISTS',KEYS[1])~=0 then return 0 end redis.call('SET',KEYS[1],ARGV[1]) return 1";
+const CHUNK: &str = "if redis.call('GET',KEYS[1])~=ARGV[1] then return 0 end redis.call('MSET',KEYS[1],ARGV[2],KEYS[2],ARGV[3]) return 1";
 impl OwnBackend {
     async fn control(&self, c: &mut Conn) -> Result<Option<Control>, l::Error> {
         let bytes: Option<Bytes> = cmd("GET")
@@ -1476,7 +1479,7 @@ impl OwnBackend {
         self.authorize_target(c, id, token)
             .await
             .map_err(|_| crate::resp::RedisError::refused("V4_SOURCE_CHANGED"))?;
-        const GUARD:&str="local raw=redis.call('GET',KEYS[2]); if not raw then return redis.error_reply('V4_SOURCE_CHANGED') end local c=cjson.decode(raw); local token=ARGV[#ARGV]; table.remove(ARGV); if c.stage<4 or #c.token~=32 or string.char(unpack(c.token))~=token then return redis.error_reply('V4_SOURCE_CHANGED') end\n";
+        const GUARD: &str = "local raw=redis.call('GET',KEYS[2]); if not raw then return redis.error_reply('V4_SOURCE_CHANGED') end local c=cjson.decode(raw); local token=ARGV[#ARGV]; table.remove(ARGV); if c.stage<4 or #c.token~=32 or string.char(unpack(c.token))~=token then return redis.error_reply('V4_SOURCE_CHANGED') end\n";
         cmd("EVAL")
             .arg(format!("{GUARD}{COMMON}\n{source}"))
             .arg(2)
@@ -1628,7 +1631,7 @@ impl OwnBackend {
         }
         let old = control.encoded()?;
         let new = next.encoded()?;
-        const FINISH:&str="if redis.call('GET',KEYS[1])~=ARGV[1] or redis.call('GET',KEYS[2])~=ARGV[3] or redis.call('GET',KEYS[3])~=ARGV[4] then return 0 end redis.call('MSET',KEYS[1],ARGV[2],KEYS[4],ARGV[5]) return 1";
+        const FINISH: &str = "if redis.call('GET',KEYS[1])~=ARGV[1] or redis.call('GET',KEYS[2])~=ARGV[3] or redis.call('GET',KEYS[3])~=ARGV[4] then return 0 end redis.call('MSET',KEYS[1],ARGV[2],KEYS[4],ARGV[5]) return 1";
         let ok: u64 = cmd("EVAL")
             .arg(FINISH)
             .arg(4)
@@ -1762,8 +1765,8 @@ mod inspection_tests {
 
         let expected = layout(15, 9, 16, b"8.1.6").unwrap();
         for state in [
-            l::InspectionState::Legacy,
-            l::InspectionState::InProgress,
+            l::InspectionState::Legacy(crate::source_interpretation::descriptor(9).unwrap()),
+            l::InspectionState::InProgress(crate::source_interpretation::descriptor(9).unwrap()),
             l::InspectionState::Current,
             l::InspectionState::Unsupported,
             l::InspectionState::Busy,

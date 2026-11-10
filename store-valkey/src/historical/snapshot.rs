@@ -28,6 +28,8 @@ use std::{
 use zeroize::Zeroizing;
 
 busbar_contract::own_seal!(Own);
+mod row_spool;
+
 pub(crate) const CHUNK_BYTES: usize = 65536;
 #[derive(Clone)]
 pub(crate) struct Capture {
@@ -50,6 +52,7 @@ pub(crate) struct Snapshot {
     chunks: u64,
     budget: usize,
     worker: Mutex<Option<Worker>>,
+    row_spool: Mutex<Option<row_spool::RowSpool>>,
 }
 impl std::fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -106,6 +109,7 @@ impl Snapshot {
             chunks,
             budget,
             worker: Mutex::new(None),
+            row_spool: Mutex::new(None),
         };
         let mut worker = snapshot.start(false)?;
         loop {
@@ -173,6 +177,7 @@ impl Snapshot {
     pub(crate) fn retire_worker(&self) -> Result<(), l::Error> {
         let worker = { self.worker.lock().map_err(|_| l::Error::Corrupt)?.take() };
         drop(worker);
+        self.row_spool.lock().map_err(|_| l::Error::Corrupt)?.take();
         Ok(())
     }
     pub(crate) fn catalogue(&self) -> Result<archive::Table, l::Error> {
@@ -215,6 +220,18 @@ impl Snapshot {
         bounds: l::Bounds,
         owner: &O,
     ) -> Result<l::SourcePage<O>, l::Error> {
+        if let l::SourceSelector::Interpret {
+            reader,
+            bounds: interpretation,
+        } = selector
+        {
+            if family != l::INTERPRETED_SOURCE {
+                return Err(l::Error::Refused);
+            }
+            return self
+                .interpreted_page(c, *reader, *interpretation, cursor, bounds)
+                .await;
+        }
         if bounds.items == 0
             || bounds.bytes == 0
             || bounds.bytes as usize > self.budget / 4

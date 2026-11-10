@@ -221,7 +221,12 @@ fn open_on(
             max_inflight_cap: 64,
             sink: Arc::new(NoSink),
             dispatcher: d.adopter(),
-            conns: busbar_plugin_loader::dispatch::ConnTable::Host(t.clone()),
+            conns: busbar_plugin_loader::dispatch::ConnTable::Host(
+                busbar_contract::conn::admissions::AdmissionAuthority::issue(
+                    &busbar_contract::caps::KernelSeal::acquire_for_kernel(),
+                    t.clone(),
+                ),
+            ),
         },
     )
     .unwrap();
