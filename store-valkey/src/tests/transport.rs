@@ -225,6 +225,7 @@ fn open_on(
                 busbar_contract::conn::admissions::AdmissionAuthority::issue(
                     &busbar_contract::caps::KernelSeal::acquire_for_kernel(),
                     t.clone(),
+                    busbar_contract::secret_ref::Sugars::default(),
                 ),
             ),
         },

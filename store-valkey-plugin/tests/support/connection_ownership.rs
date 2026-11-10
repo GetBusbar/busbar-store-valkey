@@ -127,7 +127,13 @@ fn actual_valkey_instances_refuse_undeclared_needs_and_foreign_connections() {
     let owner = load_linked::<Store>(
         &row,
         Bind {
-            conns: ConnTable::Host(table.clone()),
+            conns: ConnTable::Host(
+                busbar_contract::conn::admissions::AdmissionAuthority::issue(
+                    &busbar_contract::caps::KernelSeal::acquire_for_kernel(),
+                    table.clone(),
+                    busbar_contract::secret_ref::Sugars::default(),
+                ),
+            ),
             ..bind(&d)
         },
     )
@@ -135,7 +141,13 @@ fn actual_valkey_instances_refuse_undeclared_needs_and_foreign_connections() {
     let other = load_linked::<Store>(
         &row,
         Bind {
-            conns: ConnTable::Host(table),
+            conns: ConnTable::Host(
+                busbar_contract::conn::admissions::AdmissionAuthority::issue(
+                    &busbar_contract::caps::KernelSeal::acquire_for_kernel(),
+                    table,
+                    busbar_contract::secret_ref::Sugars::default(),
+                ),
+            ),
             ..bind(&d)
         },
     )

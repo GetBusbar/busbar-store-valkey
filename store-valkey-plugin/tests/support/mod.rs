@@ -91,7 +91,13 @@ pub fn bind(dispatcher: &Dispatcher) -> Bind {
         max_inflight_cap: 64,
         sink: Arc::new(NoSink),
         dispatcher: dispatcher.adopter(),
-        conns: ConnTable::Host(valkey_io::host(dispatcher.conn_waker(), Default::default())),
+        conns: ConnTable::Host(
+            busbar_contract::conn::admissions::AdmissionAuthority::issue(
+                &busbar_contract::caps::KernelSeal::acquire_for_kernel(),
+                valkey_io::host(dispatcher.conn_waker(), Default::default()),
+                busbar_contract::secret_ref::Sugars::default(),
+            ),
+        ),
     }
 }
 pub fn plugin(dropped: bool, bind: Bind) -> Plugin<StoreV4> {

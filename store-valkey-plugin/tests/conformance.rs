@@ -415,7 +415,13 @@ fn linked_and_dropped_store_use_the_hosts_tls_trust_and_refuse_untrusted_peers()
                     ..Default::default()
                 };
                 let bind = Bind {
-                    conns: ConnTable::Host(valkey_io::host(dispatcher.conn_waker(), trust)),
+                    conns: ConnTable::Host(
+                        busbar_contract::conn::admissions::AdmissionAuthority::issue(
+                            &busbar_contract::caps::KernelSeal::acquire_for_kernel(),
+                            valkey_io::host(dispatcher.conn_waker(), trust),
+                            busbar_contract::secret_ref::Sugars::default(),
+                        ),
+                    ),
                     ..bind(&dispatcher)
                 };
                 let plugin = plugin(dropped, bind);

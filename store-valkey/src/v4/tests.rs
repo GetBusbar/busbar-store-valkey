@@ -572,7 +572,7 @@ fn v4_real_server_door_uses_host_connections_and_returns_persistent_metadata() {
         let conns=valkey_io::host(dispatcher.conn_waker(),busbar_contract::transport::EgressTrust::default());
         let open=||{
             let row=LinkedRow::of_kind::<StoreV4>(super::door as busbar_contract::abi::mechanism::door::DoorFn).unwrap();
-            load_linked::<StoreV4>(&row,Bind{instance:Arc::from("valkey-v4-disposable"),max_inflight_cap:64,sink:Arc::new(NoSink),dispatcher:dispatcher.adopter(),conns:ConnTable::Host(busbar_contract::conn::admissions::AdmissionAuthority::issue(&busbar_contract::caps::KernelSeal::acquire_for_kernel(), conns.clone()))}).unwrap()
+            load_linked::<StoreV4>(&row,Bind{instance:Arc::from("valkey-v4-disposable"),max_inflight_cap:64,sink:Arc::new(NoSink),dispatcher:dispatcher.adopter(),conns:ConnTable::Host(busbar_contract::conn::admissions::AdmissionAuthority::issue(&busbar_contract::caps::KernelSeal::acquire_for_kernel(), conns.clone(), busbar_contract::secret_ref::Sugars::default()))}).unwrap()
         };
         let bytes=serde_json::to_vec(&serde_json::json!({"url":format!("redis://127.0.0.1:{}",server.port),"input_budget":67108864,"durability":"ephemeral"})).unwrap();
         let limits=||Limits{descriptor_bytes:1<<20,output_items:1<<20,output_bytes:1<<24,decode_bytes:1<<25};
@@ -1359,6 +1359,7 @@ fn native_prepared(url: &str, budget: usize) -> NativePrepared {
                 busbar_contract::conn::admissions::AdmissionAuthority::issue(
                     &busbar_contract::caps::KernelSeal::acquire_for_kernel(),
                     conns,
+                    busbar_contract::secret_ref::Sugars::default(),
                 ),
             ),
         },
