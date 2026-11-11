@@ -7,9 +7,63 @@ use std::process::{Child, Command, Stdio};
 struct Server {
     child: Child,
     path: PathBuf,
+    socket: PathBuf,
+    _socket_directory: std::fs::File,
     conn: redis::Connection,
     port: u16,
 }
+
+fn server_socket_path(directory: &std::path::Path) -> (PathBuf, std::fs::File) {
+    // Keep the socket in the assigned fixture directory while avoiding Linux's
+    // 108-byte sockaddr_un limit under long CI roots. The parent retains this
+    // close-on-exec directory fd across server restarts; children do not inherit it.
+    let handle = std::fs::File::open(directory).unwrap();
+    #[cfg(target_os = "linux")]
+    let socket = {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!(
+            "/proc/{}/fd/{}/v.sock",
+            std::process::id(),
+            handle.as_raw_fd()
+        ))
+    };
+    #[cfg(not(target_os = "linux"))]
+    let socket = directory.join("v.sock");
+    (socket, handle)
+}
+
+#[cfg(unix)]
+#[test]
+fn server_socket_alias_preserves_assigned_directory_and_rebinds() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let mut random = [0; 8];
+    getrandom::fill(&mut random).unwrap();
+    let root = std::env::temp_dir().join(format!("vs-{}", hex(&random)));
+    #[cfg(target_os = "linux")]
+    let directory = root.join("long-ci-root-".repeat(12));
+    #[cfg(not(target_os = "linux"))]
+    let directory = root.clone();
+    std::fs::create_dir_all(&directory).unwrap();
+    let (socket, handle) = server_socket_path(&directory);
+    #[cfg(target_os = "linux")]
+    assert!(directory.join("v.sock").as_os_str().len() >= 108);
+    for _ in 0..2 {
+        let listener = UnixListener::bind(&socket).unwrap();
+        assert!(directory.join("v.sock").exists());
+        let mut client = UnixStream::connect(&socket).unwrap();
+        client.write_all(b"ping").unwrap();
+        let (mut accepted, _) = listener.accept().unwrap();
+        let mut received = [0; 4];
+        accepted.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"ping");
+        drop(listener);
+        std::fs::remove_file(directory.join("v.sock")).unwrap();
+    }
+    drop(handle);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 impl Server {
     fn start() -> Self {
         let root = std::env::var_os("BUSBAR_V4_TEST_TMP")
@@ -20,7 +74,7 @@ impl Server {
         std::fs::create_dir_all(&path).unwrap();
         let configuration = path.join("valkey.conf");
         std::fs::write(&configuration, b"enable-debug-command yes\n").unwrap();
-        let socket = path.join("v.sock");
+        let (socket, socket_directory) = server_socket_path(&path);
         let binary =
             std::env::var_os("BUSBAR_VALKEY_SERVER").unwrap_or_else(|| "valkey-server".into());
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -70,6 +124,8 @@ impl Server {
         Self {
             child,
             path,
+            socket,
+            _socket_directory: socket_directory,
             conn,
             port,
         }
@@ -108,11 +164,8 @@ impl Server {
             ))
             .spawn()
             .unwrap();
-        let client = redis::Client::open(format!(
-            "redis+unix://{}",
-            self.path.join("v.sock").display()
-        ))
-        .unwrap();
+        let client =
+            redis::Client::open(format!("redis+unix://{}", self.socket.display())).unwrap();
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         self.conn = loop {
             match client.get_connection() {
