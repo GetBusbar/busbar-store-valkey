@@ -567,6 +567,13 @@ fn both_actual_valkey_images_complete_a_successful_minimal_lifecycle() {
             let before_close = first();
             assert!(before_close > before + 1);
             drop(backend);
+            // The read answer wakes its caller before the worker drops its
+            // retained session outside the worker lock. Wait for that final
+            // teardown crossing; do not retry any store operation.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while first() == before_close && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             assert_eq!(first() - before_close, 1, "exactly one CLOSE");
         }
     });

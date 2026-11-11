@@ -92,70 +92,49 @@ fn busbar_root() -> PathBuf {
     })
 }
 
-/// Build (once, cached by cargo) the real `busbar` binary and the real `busbar-plugin-pack` tool
-/// from that checkout — never a fixture, never a stub. The pack tool is a feature-gated bin of
-/// `busbar-plugin-loader` in busbar 1.6.0. busbar is the `test-harness` build, the one that takes a
-/// test's first-party key ([`HARNESS_FIRST_PARTY_KEY_ENV`]); no release build reads it.
+/// Run the same locked debug builds as native preparation. Cargo checks the
+/// admitted sources before reusing the subjects, including explicitly supplied paths.
 fn build_real_binaries() -> (PathBuf, PathBuf) {
-    if let (Some(busbar), Some(pack)) = (
-        std::env::var_os("BUSBAR_E2E_BINARY"),
-        std::env::var_os("BUSBAR_PLUGIN_PACK_BINARY"),
-    ) {
-        let paths = (PathBuf::from(busbar), PathBuf::from(pack));
-        assert!(
-            paths.0.is_file() && paths.1.is_file(),
-            "explicit real binaries must exist"
-        );
-        return paths;
-    }
     let root = busbar_root();
-    let toolchain =
-        std::env::var_os("RUSTUP_TOOLCHAIN").unwrap_or_else(|| std::ffi::OsString::from("1.98"));
     let target = match std::env::var_os("CARGO_TARGET_DIR") {
         Some(dir) => root.join(dir),
         None => root.join("target"),
     };
-    for args in [
-        &[
-            "build",
-            "--locked",
-            "--release",
-            "--manifest-path",
-            "dist/default/Cargo.toml",
-            "--features",
-            "test-harness",
-            "--bin",
-            "busbar",
-        ][..],
-        &[
-            "build",
-            "--locked",
-            "--release",
-            "-p",
-            "busbar-plugin-loader",
-            "--features",
-            "pack",
-            "--bin",
-            "busbar-plugin-pack",
-        ][..],
-    ] {
-        let status = Command::new("cargo")
-            .env("RUSTUP_TOOLCHAIN", &toolchain)
-            .args(args)
-            .arg("--target-dir")
-            .arg(&target)
-            .current_dir(&root)
-            .status()
-            .expect("run cargo build for busbar + busbar-plugin-pack");
-        assert!(
-            status.success(),
-            "building the real busbar + busbar-plugin-pack binaries must succeed ({args:?})"
-        );
+    std::fs::create_dir_all(&target).expect("create assigned build target");
+    let prepare = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../testing/native/prepare.py");
+    let status = Command::new("python3")
+        .arg("-I")
+        .arg(prepare)
+        .env("BUSBAR_CHECKOUT", &root)
+        .env("CARGO_TARGET_DIR", &target)
+        .status()
+        .expect("run locked subject preparation");
+    assert!(
+        status.success(),
+        "actual host and packer preparation must succeed"
+    );
+    let paths = (
+        target.join("debug/busbar"),
+        target.join("debug/busbar-plugin-pack"),
+    );
+    match (
+        std::env::var_os("BUSBAR_E2E_BINARY"),
+        std::env::var_os("BUSBAR_PLUGIN_PACK_BINARY"),
+    ) {
+        (Some(busbar), Some(pack)) => {
+            assert_eq!(
+                PathBuf::from(busbar).canonicalize().unwrap(),
+                paths.0.canonicalize().unwrap()
+            );
+            assert_eq!(
+                PathBuf::from(pack).canonicalize().unwrap(),
+                paths.1.canonicalize().unwrap()
+            );
+        }
+        (None, None) => {}
+        _ => panic!("set both explicit subject paths or neither"),
     }
-    (
-        target.join("release/busbar"),
-        target.join("release/busbar-plugin-pack"),
-    )
+    paths
 }
 
 /// A placeholder provider credential: busbar 1.6.0 refuses to boot on an unresolvable provider
