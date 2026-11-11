@@ -444,9 +444,11 @@ fn linked_and_dropped_store_use_the_hosts_tls_trust_and_refuse_untrusted_peers()
 fn a_failed_ready_closes_the_actual_opened_valkey_store_once() {
     use busbar_contract::abi::mechanism::call::{AbiStr, Op, OutHead, Outcome, RawOutcome};
     use busbar_contract::abi::mechanism::door::{Door, DoorParts};
+    use busbar_contract::abi::mechanism::{lifecycle::ReadyIn, ticket::Ticket};
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
     static DOOR: AtomicPtr<Door> = AtomicPtr::new(std::ptr::null_mut());
+    static READY_TICKET: std::sync::Mutex<Option<Ticket>> = std::sync::Mutex::new(None);
     static READY: AtomicUsize = AtomicUsize::new(0);
     static CLOSED: AtomicUsize = AtomicUsize::new(0);
     static CLOSE_FAILED: AtomicUsize = AtomicUsize::new(0);
@@ -454,7 +456,9 @@ fn a_failed_ready_closes_the_actual_opened_valkey_store_once() {
     extern "C" fn door() -> *const Door {
         DOOR.load(Ordering::SeqCst)
     }
-    extern "C" fn ready(_: *mut c_void, _: *const c_void, out: *mut c_void) -> RawOutcome {
+    extern "C" fn ready(_: *mut c_void, input: *const c_void, out: *mut c_void) -> RawOutcome {
+        // SAFETY: the loader supplies the complete READY input frame.
+        *READY_TICKET.lock().unwrap() = Some(unsafe { (*input.cast::<ReadyIn>()).head.ticket });
         READY.fetch_add(1, Ordering::SeqCst);
         let failed = RawOutcome::of(Outcome::Failed);
         let text = "Valkey test: discovery refused";
@@ -520,13 +524,24 @@ fn a_failed_ready_closes_the_actual_opened_valkey_store_once() {
     let before = first();
     let error = block(LoadedPersistence::open(
         plugin,
-        d,
+        d.clone(),
         &settings(url.as_str()),
         limits(),
     ))
     .expect_err("READY fails");
     assert!(error.to_string().contains("ready failed"), "{error}");
     assert_eq!(READY.load(Ordering::SeqCst), 1);
+    // READY publishes its answer before the worker releases its retained session.
+    // Drain that actual READY worker through its retirement acknowledgment before
+    // asserting teardown, including completion of the forwarded real CLOSE.
+    let ticket = READY_TICKET
+        .lock()
+        .unwrap()
+        .expect("READY recorded its ticket");
+    assert!(
+        d.retirement_barrier(ticket, std::time::Duration::from_secs(5)),
+        "READY worker did not retire its retained session"
+    );
     assert_eq!(CLOSED.load(Ordering::SeqCst), 1);
     assert_eq!(CLOSE_FAILED.load(Ordering::SeqCst), 0);
     assert_eq!(
