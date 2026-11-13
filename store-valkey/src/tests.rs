@@ -18,28 +18,42 @@ fn assert_auth(target: &Target, user: Option<&str>, password: &str) {
         busbar_contract::abi::sdk::cred::settings(&serde_json::to_vec(password).unwrap()).unwrap();
     assert!(got_password == &expected, "sealed password differs");
 }
+/// A clearly synthetic password generated at test time, so no credential-shaped literal sits in
+/// source: `test-only-<tag>-<random hex>`.
+fn test_secret(tag: &str) -> String {
+    use std::hash::BuildHasher;
+    let hex = std::collections::hash_map::RandomState::new().hash_one(tag);
+    format!("test-only-{tag}-{hex:016x}")
+}
 
 /// An unencoded password starting with `?` moves the userinfo `@` into the query: the refusal must
 /// not echo the query's first key (a password fragment) or a `protocol=` value.
 #[test]
 fn a_password_split_at_question_mark_is_not_echoed_in_the_refusal() {
+    let part = test_secret("part");
     for url in [
-        "redis://default:?S3cretPart=x@valkey.internal:6379",
-        "redis://default:?protocol=S3cretPart@valkey.internal:6379",
+        format!("redis://default:?{part}=x@valkey.internal:6379"),
+        format!("redis://default:?protocol={part}@valkey.internal:6379"),
     ] {
-        let err = parse_url(url).expect_err("refused").to_string();
-        assert!(!err.contains("S3cretPart"), "{url}: secret echoed: {err}");
+        let err = parse_url(&url).expect_err("refused").to_string();
+        assert!(!err.contains(&part), "{url}: secret echoed: {err}");
     }
 }
 /// The password-scrub never lets the URL secret out in an error string, and the URL password
 /// extractor handles every URL shape.
 #[test]
 fn password_capture_and_redaction_preserve_raw_and_decoded_forms() {
+    let s = test_secret("scrub");
     for (url, decoded, raw) in [
-        ("redis://:s3cr3t@host:6379/0", "s3cr3t", "s3cr3t"),
-        ("rediss://user:p%40ss@host:6380", "p@ss", "p%40ss"),
+        (format!("redis://:{s}@host:6379/0"), s.clone(), s.clone()),
+        (
+            format!("rediss://user:{s}%40ss@host:6380"),
+            format!("{s}@ss"),
+            format!("{s}%40ss"),
+        ),
     ] {
-        let captured = captured_url(url);
+        let (decoded, raw) = (decoded.as_str(), raw.as_str());
+        let captured = captured_url(&url);
         assert!(captured.password().is_some());
         for leak in [
             format!("connection refused for {url}"),
@@ -156,12 +170,13 @@ fn unix_socket_urls_parse_as_the_upstream_driver_read_them() {
 }
 #[test]
 fn debug_output_redacts_the_url_password() {
-    let url = "redis://user:s3cr3t@host:6379/0";
+    let password = test_secret("debug");
+    let url = format!("redis://user:{password}@host:6379/0");
     let store =
         crate::ValkeyStore::from_settings(format!(r#"{{"url":"{url}"}}"#).as_bytes()).unwrap();
-    let t = parse_url(url).unwrap();
+    let t = parse_url(&url).unwrap();
     for out in [format!("{store:?}"), format!("{t:?}")] {
-        assert!(!out.contains("s3cr3t"), "password leaked: {out}");
+        assert!(!out.contains(&password), "password leaked: {out}");
         assert!(out.contains("<redacted>"), "no redaction marker: {out}");
     }
 }
@@ -268,36 +283,42 @@ fn a_url_parse_refusal_is_not_worded_as_a_failed_connect() {
 
 #[test]
 fn the_unix_socket_query_password_never_reaches_an_error_or_a_debug() {
+    let s = test_secret("unix");
+    let encoded = format!("{s}%40w0rd");
+    let decoded = format!("{s}@w0rd");
     for (url, secret) in [
-        ("valkey+unix:///run/v.sock?pass=hunter2xyz", "hunter2xyz"),
+        (format!("valkey+unix:///run/v.sock?pass={s}"), s.as_str()),
         (
-            "valkey+unix:///run/v.sock?db=1&password=hunter2xyz",
-            "hunter2xyz",
+            format!("valkey+unix:///run/v.sock?db=1&password={s}"),
+            s.as_str(),
         ),
-        ("unix:///run/v.sock?user=al&pass=p%40ssw0rd", "p%40ssw0rd"),
+        (
+            format!("unix:///run/v.sock?user=al&pass={encoded}"),
+            encoded.as_str(),
+        ),
     ] {
-        let captured = captured_url(url);
+        let captured = captured_url(&url);
         let leaked = captured.redact_echo(&format!("could not reach {url}"));
         assert!(
-            !leaked.contains(secret) && !leaked.contains("p@ssw0rd"),
+            !leaked.contains(secret) && !leaked.contains(&decoded),
             "{url}: {leaked}"
         );
 
-        let shown = match parse_url(url) {
+        let shown = match parse_url(&url) {
             Ok(t) => format!("{t:?}"),
             Err(e) => e.to_string(),
         };
         assert!(
-            !shown.contains(secret) && !shown.contains("p@ssw0rd"),
+            !shown.contains(secret) && !shown.contains(&decoded),
             "{shown}"
         );
     }
 
     let e = crate::ValkeyStore::from_settings(
-        br#"{"url":"valkey+unix:///run/v.sock?pass=hunter2xyz&db=notanumber"}"#,
+        format!(r#"{{"url":"valkey+unix:///run/v.sock?pass={s}&db=notanumber"}}"#).as_bytes(),
     )
     .expect_err("a bad db is refused");
-    assert!(!e.contains("hunter2xyz"), "{e}");
+    assert!(!e.contains(&s), "{e}");
 }
 #[test]
 fn an_unknown_url_parameter_is_refused_not_ignored() {
